@@ -4,14 +4,10 @@
 #include <cstdint>
 #include <cstddef>
 
+#include "prx/libkernel/KernelErrors.hpp"
+
 static constexpr size_t DIRECT_MEMORY_SIZE = 13824ULL * 1024 * 1024;
 static constexpr size_t PS5_PAGE_SIZE = 0x4000;
-
-static constexpr int SCE_KERNEL_ERROR_EINVAL = 0x80020016;
-static constexpr int SCE_KERNEL_ERROR_EAGAIN = 0x80020023;
-static constexpr int SCE_KERNEL_ERROR_ENOMEM = 0x8002000C;
-static constexpr int SCE_KERNEL_ERROR_EACCES = 0x8002000D;
-static constexpr int SCE_KERNEL_ERROR_EFAULT = 0x8002000E;
 
 // A block of GPU-visible ("direct") memory the guest asked for, remembered so that later
 // queries can answer with the real extent and the type it was allocated as. A title that gets

@@ -2,14 +2,13 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 #include "SceTypes.hpp"
 
 #include <cerrno>
 #include <limits>
 #include <stdexcept>
 #include <string>
-
-static constexpr int SCE_KERNEL_ERROR_ENOENT = -2147352574;
 
 #ifdef _WIN32
 #include <fcntl.h>
