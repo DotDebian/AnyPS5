@@ -49,13 +49,18 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
 // guest writes made meanwhile to untouched bytes survive. Compares in 256-byte blocks.
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
 
-// Write tracking. The guest arena is reserved with page write watching, so CollectWrites learns which
-// pages of a range the CPU wrote since they were last collected, stamps their 64 KiB blocks with a new
-// generation and returns it; a snapshot of the range taken after that call is current while
-// UnchangedSince(range, that generation) holds. Every validation collects its own range first, so
-// resources sharing pages see each other's writes. GPU writes into host-imported memory bypass the
-// page tables and are reported with MarkWritten. Without write watching CollectWrites returns 0 and
-// UnchangedSince is always false, so callers fall back to comparing bytes.
+// Write tracking. Guest memory is watched per page (Windows: the guest arena is reserved with
+// MEM_WRITE_WATCH; Linux: every guest mapping is registered for asynchronous userfaultfd write
+// protection, see GuestWriteWatch.hpp), so CollectWrites learns which pages of a range the CPU wrote
+// since they were last collected, stamps their 64 KiB blocks with a new generation and returns it; a
+// snapshot of the range taken after that call is current while UnchangedSince(range, that
+// generation) holds. Every validation collects its own range first, so resources sharing pages see
+// each other's writes. GPU writes into host-imported memory bypass the page tables and are reported
+// with MarkWritten. Without write watching (or outside the watched memory) CollectWrites returns 0
+// and UnchangedSince is always false, so callers fall back to comparing bytes.
+// WriteWatched: whether any memory is watched; Watched: whether every page of a range is.
+bool WriteWatched();
+bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // UnchangedSince for several ranges under one tracker lock: true only when every one holds.
@@ -65,7 +70,7 @@ struct UnchangedQuery {
     std::uint64_t generation;
 };
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
-// Returns the generation the blocks were stamped with (0 when the arena is not write-watched):
+// Returns the generation the blocks were stamped with (0 when the range is not write-watched):
 // UnchangedSince(range, it) holds until the next store over the range.
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
@@ -94,7 +99,7 @@ std::uint64_t TrackerGeneration();
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
 // range's pages first (a game store not collected yet becomes a block stamp), then the compare over
 // the stamps collects make (dirty pages), not the MarkWritten stamps of the driver's own GPU label
-// records, which share the title's label blocks. False when the arena is not write-watched.
+// records, which share the title's label blocks. False when the range is not write-watched.
 bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // Per 64 KiB tracker block of [address, address + bytes) (block 0 holds `address`): `changed[k]`
 // receives whether the block was stamped after generations[k] (UnchangedSince over that block

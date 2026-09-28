@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include <mutex>
 #include <array>
 #include <chrono>
@@ -10,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -63,6 +65,8 @@ std::atomic<std::uint64_t> collectEpochBumps{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
 // tracker mutex acquisitions that had to wait (APS5_PROFILE_DRAW; see lockTracker).
 std::atomic<std::uint64_t> collectDirty{0};
+// Runs of written pages the Linux write watch reported (a walk that stamped any counts as dirty).
+std::atomic<std::uint64_t> collectDirtyRuns{0};
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 std::uintptr_t PagesBase();
@@ -621,6 +625,7 @@ struct WriteTracker {
     std::mutex mutex;
     bool initialized = false;
     bool watched = false;
+#ifdef _WIN32
     std::uintptr_t base = 0;
     std::size_t size = 0;
     // Generation of the last collected write per 64 KiB block of the arena.
@@ -629,6 +634,19 @@ struct WriteTracker {
     // late label rule asks whether the CPU touched a label's block, and the driver's own GPU label
     // records in the same block (the title's per-job slots are 0x20 apart) must not count.
     std::vector<std::uint32_t> cpuBlocks;
+#else
+    // The same two stamps per 64 KiB block of the user address space: Linux guest mappings are
+    // placed wherever the title's hints or the kernel put them, and each is watched on its own
+    // (GuestWriteWatch). A 4 GiB leaf is made when a block of it is first stamped; the blocks of a
+    // missing leaf read 0, as the arena's blocks do before their first stamp.
+    static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
+    static constexpr std::size_t LeafCount = std::size_t{1} << 15;
+    struct Leaf {
+        std::array<std::uint32_t, LeafBlocks> blocks{};
+        std::array<std::uint32_t, LeafBlocks> cpuBlocks{};
+    };
+    std::vector<std::unique_ptr<Leaf>> leaves;
+#endif
     // Atomic only so a per-thread memo hit can read it without the mutex (every mutation and every
     // stamp still happen under it): a hit must return the current value, including MarkWritten
     // bumps, or an image refreshed after a stamp would keep failing UnchangedSince until the next
@@ -654,12 +672,66 @@ struct WriteTracker {
     void initialize() {
         if (initialized) return;
         initialized = true;
+#ifdef _WIN32
         GuestArena::GuestArenaRange_nid_postfix(&base, &size);
         watched = size != 0 && GuestArena::GuestArenaWriteWatched_nid_postfix();
         if (!watched) return;
         blocks.assign(size / WriteBlockBytes + 1, 0);
         cpuBlocks.assign(size / WriteBlockBytes + 1, 0);
         pages.resize(1u << 16);
+#else
+        watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
+        if (watched) leaves.resize(LeafCount);
+#endif
+    }
+
+    // Whether the pages of a non-empty range are watched (callers check `watched` first).
+    bool covers(std::uint64_t address, std::size_t bytes) const {
+#ifdef _WIN32
+        return address >= base && address - base <= size - bytes;
+#else
+        return address + bytes <= LeafCount * LeafBlocks * WriteBlockBytes && GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+#endif
+    }
+
+    // The block index of an address inside a covered range.
+    std::uint64_t blockOf(std::uint64_t address) const {
+#ifdef _WIN32
+        return (address - base) / WriteBlockBytes;
+#else
+        return address / WriteBlockBytes;
+#endif
+    }
+
+    std::uint32_t stampOf(std::uint64_t block) const {
+#ifdef _WIN32
+        return blocks[block];
+#else
+        const auto& leaf = leaves[block / LeafBlocks];
+        return leaf != nullptr ? leaf->blocks[block % LeafBlocks] : 0;
+#endif
+    }
+
+    std::uint32_t cpuStampOf(std::uint64_t block) const {
+#ifdef _WIN32
+        return cpuBlocks[block];
+#else
+        const auto& leaf = leaves[block / LeafBlocks];
+        return leaf != nullptr ? leaf->cpuBlocks[block % LeafBlocks] : 0;
+#endif
+    }
+
+    // Stamps a block with `stampGeneration`; `cpu` also stamps it as a CPU store (a collect).
+    void stamp(std::uint64_t block, std::uint32_t stampGeneration, bool cpu) {
+#ifdef _WIN32
+        blocks[block] = stampGeneration;
+        if (cpu) cpuBlocks[block] = stampGeneration;
+#else
+        auto& leaf = leaves[block / LeafBlocks];
+        if (leaf == nullptr) leaf = std::make_unique<Leaf>();
+        leaf->blocks[block % LeafBlocks] = stampGeneration;
+        if (cpu) leaf->cpuBlocks[block % LeafBlocks] = stampGeneration;
+#endif
     }
 };
 
@@ -715,9 +787,20 @@ bool sharedCollectMemo() {
     return shared;
 }
 
+#ifndef _WIN32
+// A run of written pages reported by GuestWriteWatch: every block it touches takes the walk's
+// generation, as a CPU store.
+void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
+    auto& tracker = *static_cast<WriteTracker*>(context);
+    if (end <= begin) return;
+    const auto generation = tracker.generation.load(std::memory_order_relaxed);
+    for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, true);
+    collectDirtyRuns.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     auto& tracker = Tracker();
-#ifdef _WIN32
     // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
     const auto first = address & ~(page - 1);
@@ -739,11 +822,9 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
-#endif
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || address < tracker.base || address - tracker.base > tracker.size - bytes) return 0;
-#ifdef _WIN32
+    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
@@ -755,6 +836,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const TimedAccess timed(CounterCollect, bytes);
     ++tracker.generation;
+#ifdef _WIN32
     // One resetting walk: the kernel reports and clears a page's dirty bit together, a write landing
     // after the walk passed a page is reported by the next walk, and a clean page is not touched by the
     // reset, so a probe pass first (which doubled the walk of every dirty range) buys nothing.
@@ -769,11 +851,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             return 0;
         }
         if (count != 0) dirty = true;
-        for (ULONG_PTR i = 0; i < count; ++i) {
-            const auto block = (reinterpret_cast<std::uintptr_t>(tracker.pages[i]) - tracker.base) / WriteBlockBytes;
-            tracker.blocks[block] = tracker.generation;
-            tracker.cpuBlocks[block] = tracker.generation;
-        }
+        for (ULONG_PTR i = 0; i < count; ++i) tracker.stamp(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])), tracker.generation, true);
         if (count < tracker.pages.size()) break;
         cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + (granularity != 0 ? granularity : page);
     }
@@ -785,26 +863,26 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             ULONG_PTR count = tracker.pages.size();
             DWORD granularity = 0;
             if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(cursor), static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, &granularity) != 0) return 0;
-            for (ULONG_PTR i = 0; i < count; ++i) {
-                const auto block = (reinterpret_cast<std::uintptr_t>(tracker.pages[i]) - tracker.base) / WriteBlockBytes;
-                tracker.blocks[block] = tracker.generation;
-                tracker.cpuBlocks[block] = tracker.generation;
-            }
+            for (ULONG_PTR i = 0; i < count; ++i) tracker.stamp(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])), tracker.generation, true);
             if (count < tracker.pages.size()) break;
             cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + (granularity != 0 ? granularity : page);
         }
     }
+#else
+    // One resetting scan (PAGEMAP_SCAN re-protects the pages it reports written, in the kernel,
+    // under the page table lock), as the single-pass GetWriteWatch walk above. A range the watch
+    // cannot scan whole reports its remaining pages as written and answers 0: compared instead.
+    const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
+    const bool complete = GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &tracker);
+    if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (!complete) return 0;
+#endif
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch};
         else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch};
     }
     return tracker.generation;
-#else
-    static_cast<void>(memoized);
-    static_cast<void>(threadCollectMemo);
-    return 0;
-#endif
 }
 
 }
@@ -826,15 +904,29 @@ std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
 }
 
+bool WriteWatched() {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    return tracker.watched;
+}
+
+bool Watched(std::uint64_t address, std::size_t bytes) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
+}
+
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || generation == 0 || bytes == 0 || address < tracker.base || address - tracker.base > tracker.size - bytes) return false;
-    const auto first = (address - tracker.base) / WriteBlockBytes;
-    const auto last = (address - tracker.base + bytes - 1) / WriteBlockBytes;
+    if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+    const auto first = tracker.blockOf(address);
+    const auto last = tracker.blockOf(address + bytes - 1);
     for (auto block = first; block <= last; ++block) {
-        if (tracker.blocks[block] > generation) return false;
+        if (tracker.stampOf(block) > generation) return false;
     }
     return true;
 }
@@ -845,11 +937,11 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     tracker.initialize();
     if (!tracker.watched) return false;
     for (const auto& [address, bytes, generation] : queries) {
-        if (generation == 0 || bytes == 0 || address < tracker.base || address - tracker.base > tracker.size - bytes) return false;
-        const auto first = (address - tracker.base) / WriteBlockBytes;
-        const auto last = (address - tracker.base + bytes - 1) / WriteBlockBytes;
+        if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+        const auto first = tracker.blockOf(address);
+        const auto last = tracker.blockOf(address + bytes - 1);
         for (auto block = first; block <= last; ++block) {
-            if (tracker.blocks[block] > generation) return false;
+            if (tracker.stampOf(block) > generation) return false;
         }
     }
     return true;
@@ -859,11 +951,11 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || address < tracker.base || address - tracker.base > tracker.size - bytes) return 0;
-    const auto first = (address - tracker.base) / WriteBlockBytes;
-    const auto last = (address - tracker.base + bytes - 1) / WriteBlockBytes;
+    if (!tracker.watched || bytes == 0 || !tracker.covers(address, bytes)) return 0;
+    const auto first = tracker.blockOf(address);
+    const auto last = tracker.blockOf(address + bytes - 1);
     ++tracker.generation;
-    for (auto block = first; block <= last; ++block) tracker.blocks[block] = tracker.generation;
+    for (auto block = first; block <= last; ++block) tracker.stamp(block, tracker.generation, false);
     return tracker.generation;
 }
 
@@ -879,11 +971,11 @@ bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint
     if (CollectWritesUncached(address, bytes) == 0) return false;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
-    if (!tracker.watched || generation == 0 || bytes == 0 || address < tracker.base || address - tracker.base > tracker.size - bytes) return false;
-    const auto first = (address - tracker.base) / WriteBlockBytes;
-    const auto last = (address - tracker.base + bytes - 1) / WriteBlockBytes;
+    if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
+    const auto first = tracker.blockOf(address);
+    const auto last = tracker.blockOf(address + bytes - 1);
     for (auto block = first; block <= last; ++block) {
-        if (tracker.cpuBlocks[block] > generation) return false;
+        if (tracker.cpuStampOf(block) > generation) return false;
     }
     return true;
 }
@@ -894,15 +986,15 @@ void ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || address < tracker.base || address - tracker.base > tracker.size - bytes) return;
-    const auto first = (address - tracker.base) / WriteBlockBytes;
-    const auto last = (address - tracker.base + bytes - 1) / WriteBlockBytes;
+    if (!tracker.watched || bytes == 0 || !tracker.covers(address, bytes)) return;
+    const auto first = tracker.blockOf(address);
+    const auto last = tracker.blockOf(address + bytes - 1);
     for (auto block = first; block <= last; ++block) {
         const auto k = block - first;
         if (k >= generations.size() || k >= changed.size()) break;
         const auto generation = generations[k];
-        changed[k] = generation == 0 || tracker.blocks[block] > generation ? 1 : 0;
-        if (k < cpu.size()) cpu[k] = generation == 0 || tracker.cpuBlocks[block] > generation ? 1 : 0;
+        changed[k] = generation == 0 || tracker.stampOf(block) > generation ? 1 : 0;
+        if (k < cpu.size()) cpu[k] = generation == 0 || tracker.cpuStampOf(block) > generation ? 1 : 0;
     }
 }
 

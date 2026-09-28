@@ -1,6 +1,7 @@
 #include "DirectMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <iterator>
@@ -234,13 +235,14 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
 void Unmap(void* addr, size_t len) {
 #if defined(__linux__)
     if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(addr, len);
 #else
     if (KernelArena::Get().Contains(addr, len)) munmap(addr, len);
     else munmap_release(addr);
 #endif
 }
 
-void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment) {
+void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     ValidateLength(len);
     alignment = ValidateAlignment(alignment);
     constexpr int GuestMapFixed = 0x10;
@@ -304,6 +306,14 @@ void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment) 
         throw std::system_error(error, std::generic_category(), "Mapping suffix munmap failed");
     }
     return aligned;
+}
+
+void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment) {
+    void* mapped = MapPlaced(addr, len, prot, flags, alignment);
+#if defined(__linux__)
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(mapped, len);
+#endif
+    return mapped;
 }
 
 void ValidateOutput(void** addr) {

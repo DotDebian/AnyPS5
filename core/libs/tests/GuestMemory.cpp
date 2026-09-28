@@ -1,5 +1,6 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "SceTypes.hpp"
 #include <cstring>
 #include <exception>
@@ -7,6 +8,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <thread>
+#include <utility>
+#include <vector>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 extern "C" {
 void* APS5_VABI mmap_nid_postfix(void*, std::size_t, int, int, int, std::int64_t) noexcept;
@@ -15,6 +22,7 @@ int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceKernelMapNamedFlexibleMemory(void**, std::size_t, int, int, const char*);
 int APS5_VABI sceKernelMapFlexibleMemory(void**, std::size_t, int, int);
 int APS5_VABI sceKernelMunmap(void*, std::size_t);
+int APS5_VABI sceKernelMprotect(const void*, std::size_t, int);
 int APS5_VABI sceKernelVirtualQuery(const void*, int, VirtualQueryInfo*, std::uint64_t);
 int APS5_VABI sceKernelSetVirtualRangeName(const void*, std::uint64_t, const char*);
 int APS5_VABI sceKernelClearVirtualRangeName(const void*, std::uint64_t);
@@ -58,8 +66,95 @@ static void CheckNamedAndHintedMappings() {
     Require(sceKernelMunmap(first, length) == 0);
 }
 
+#if defined(__linux__)
+using PageRuns = std::vector<std::pair<std::uintptr_t, std::uintptr_t>>;
+
+static bool CollectRuns(const void* base, std::size_t offset, std::size_t bytes, PageRuns& runs) {
+    runs.clear();
+    const auto address = reinterpret_cast<std::uintptr_t>(base);
+    std::pair<std::uintptr_t, PageRuns*> context{address, &runs};
+    return GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(address + offset, bytes, [](void* context, std::uintptr_t begin, std::uintptr_t end) {
+        auto& [origin, into] = *static_cast<std::pair<std::uintptr_t, PageRuns*>*>(context);
+        if (!into->empty() && into->back().second == (begin - origin) / 4096) into->back().second = (end - origin) / 4096;
+        else into->emplace_back((begin - origin) / 4096, (end - origin) / 4096);
+    }, &context);
+}
+
+static bool Written(const void* base, std::size_t bytes, PageRuns expected) {
+    PageRuns runs;
+    return CollectRuns(base, 0, bytes, runs) && runs == expected;
+}
+
+// Page write watching of guest mappings (GuestWriteWatch): a mapping is watched from the call that
+// made it, a collect reports the 4 KiB pages written since the last one whatever wrote them and
+// re-protects only those, and a mapping change reads as a write of its pages.
+static void CheckWriteWatch() {
+    if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
+        std::puts("write watch unavailable: not tested");
+        return;
+    }
+    constexpr std::size_t length = 0x100000;
+    constexpr std::size_t small = 4096;
+    void* mapping = nullptr;
+    Require(sceKernelMapFlexibleMemory(&mapping, length, 3, 0) == 0);
+    auto* bytes = static_cast<volatile unsigned char*>(mapping);
+    const auto address = reinterpret_cast<std::uintptr_t>(mapping);
+    Require(GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address, length));
+    Require(GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address + small, small));
+    Require(!GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address, length + small));
+    Require(!GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(reinterpret_cast<std::uintptr_t>(&length), sizeof(length)));
+    Require(Written(mapping, length, {{0, length / small}}));
+    Require(Written(mapping, length, {}));
+    bytes[5 * small + 17] = 1;
+    Require(Written(mapping, length, {{5, 6}}));
+    Require(Written(mapping, length, {}));
+    static_cast<void>(bytes[10 * small]);
+    Require(Written(mapping, length, {}));
+    bytes[7 * small] = 1;
+    bytes[9 * small] = 1;
+    PageRuns runs;
+    Require(CollectRuns(mapping, 8 * small, small, runs) && runs.empty());
+    Require(CollectRuns(mapping, 7 * small + 100, 1, runs) && runs == PageRuns{{7, 8}});
+    Require(Written(mapping, length, {{9, 10}}));
+    int pipe[2];
+    Require(::pipe(pipe) == 0);
+    Require(::write(pipe[1], "kernel", 6) == 6);
+    Require(::read(pipe[0], const_cast<unsigned char*>(bytes + 20 * small + 8), 6) == 6);
+    ::close(pipe[0]);
+    ::close(pipe[1]);
+    Require(bytes[20 * small + 8] == 'k' && Written(mapping, length, {{20, 21}}));
+    std::thread([&] { bytes[30 * small + 5] = 3; }).join();
+    Require(Written(mapping, length, {{30, 31}}));
+    std::vector<unsigned char> source(2 * small, 0xab);
+    std::memcpy(const_cast<unsigned char*>(bytes + 40 * small + 2048), source.data(), source.size());
+    Require(Written(mapping, length, {{40, 43}}));
+    Require(sceKernelMprotect(mapping, length, 1) == 0);
+    Require(sceKernelMprotect(mapping, length, 3) == 0);
+    Require(Written(mapping, length, {}));
+    bytes[50 * small] = 1;
+    Require(Written(mapping, length, {{50, 51}}));
+    constexpr std::size_t guestPage = 0x4000;
+    auto* middle = const_cast<unsigned char*>(bytes + 4 * guestPage);
+    Require(sceKernelMunmap(middle, guestPage) == 0);
+    Require(!GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address, length));
+    Require(!CollectRuns(mapping, 0, length, runs) && runs.empty());
+    void* fixed = middle;
+    Require(sceKernelMapFlexibleMemory(&fixed, guestPage, 3, 0x10) == 0 && fixed == middle);
+    Require(GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address, length));
+    Require(Written(mapping, length, {{16, 20}}));
+    Require(Written(mapping, length, {}));
+    middle[1] = 1;
+    Require(Written(mapping, length, {{16, 17}}));
+    Require(sceKernelMunmap(mapping, length) == 0);
+    Require(!GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address, small));
+}
+#endif
+
 int main() {
     CheckNamedAndHintedMappings();
+#if defined(__linux__)
+    CheckWriteWatch();
+#endif
     constexpr std::size_t page = 0x4000;
     const auto failed = reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1));
     const auto reject = [&](std::size_t length, int protection, int flags, int fd,

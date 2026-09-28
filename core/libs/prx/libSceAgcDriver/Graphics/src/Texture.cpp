@@ -1084,9 +1084,10 @@ bool StorageTexture::Refresh() {
     // clear code make every result dead on hardware too. Without a generation (no tracking) a
     // unit's stamps say nothing, so it is stored. The clear code the image was cleared under is no
     // new clear: it stays in the title's metadata after draws into the image (they never update
-    // keys here), so it says nothing about results made since. Without write watching (the Linux
-    // arena) every unit reads as changed at every Refresh, and dropping under those keys threw away
-    // a draw's results at the next lookup of the target (a draw sampling it saw the clear).
+    // keys here), so it says nothing about results made since. Without write watching (or outside
+    // the watched memory) every unit reads as changed at every Refresh, and dropping under those
+    // keys threw away a draw's results at the next lookup of the target (a draw sampling it saw the
+    // clear).
     const auto droppable = [&](std::uint32_t unit) {
         if (keysChanged && IsDccClear(keys)) return true;
         return layerGeneration[unit] != 0 && unit < stampedBlocks.size() && stampedBlocks[unit] != 0;

@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "ViewAliases.hpp"
 #include <SDL_loadso.h>
 #ifdef _WIN32
@@ -19,6 +20,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <sys/mman.h>
 #endif
 #include <array>
 #include <atomic>
@@ -27,6 +30,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -35,6 +39,38 @@ namespace {
 
 using namespace AgcDriver::Graphics;
 using AgcDriver::GuestMemory::GpuMutex;
+
+// Guest memory the write tracker watches (GuestMemory::Watched): a committed block of the Windows
+// arena reserved with write watching, or a Linux mapping registered with the page write watch as
+// libkernel registers the title's. Null when the tracker watches nothing.
+void* AllocateWatched(std::size_t bytes, std::size_t alignment) {
+    if (!AgcDriver::GuestMemory::WriteWatched()) return nullptr;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, alignment);
+    if (VirtualAlloc(block, bytes, MEM_COMMIT, PAGE_READWRITE) == nullptr) throw std::runtime_error("cannot commit the arena block");
+#else
+    void* raw = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) throw std::runtime_error("cannot map the watched block");
+    const auto begin = reinterpret_cast<std::uintptr_t>(raw);
+    const auto aligned = (begin + alignment - 1) & ~(static_cast<std::uintptr_t>(alignment) - 1);
+    if (aligned != begin) munmap(raw, aligned - begin);
+    if (aligned + bytes != begin + bytes + alignment) munmap(reinterpret_cast<void*>(aligned + bytes), begin + alignment - aligned);
+    void* block = reinterpret_cast<void*>(aligned);
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
+#endif
+    if (!AgcDriver::GuestMemory::Watched(reinterpret_cast<std::uint64_t>(block), bytes)) throw std::runtime_error("the watched block is not watched");
+    return block;
+}
+
+void ReleaseWatched(void* block, std::size_t bytes) {
+#ifdef _WIN32
+    VirtualFree(block, bytes, MEM_DECOMMIT);
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+#else
+    munmap(block, bytes);
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, bytes);
+#endif
+}
 
 // A compute-capable device with host imports (VK_EXT_external_memory_host) when the host offers
 // them, as the driver creates its own; the recorder's batches need a real queue and real fences.
@@ -340,24 +376,17 @@ void lateLabelTests(Recorder& recorder) {
 void unchangedSinceTests() {
     using namespace AgcDriver::GuestMemory;
     static std::uint32_t outside[16];
-    Require(!UnchangedSinceCollected(reinterpret_cast<std::uint64_t>(outside), 4, TrackerGeneration()), "(6) a range outside the arena is unchanged");
-    if (!GuestArena::GuestArenaAvailable_nid_postfix()) {
-        std::cout << "guest arena unavailable: UnchangedSinceCollected not tested inside it\n";
+    Require(!UnchangedSinceCollected(reinterpret_cast<std::uint64_t>(outside), 4, TrackerGeneration()), "(6) a range outside the watched memory is unchanged");
+    Require(!Watched(reinterpret_cast<std::uint64_t>(outside), 4) && CollectWrites(reinterpret_cast<std::uint64_t>(outside), 4) == 0, "(6) a range outside the watched memory is watched");
+    constexpr std::size_t bytes = 65536;
+    void* block = AllocateWatched(bytes, bytes);
+    if (block == nullptr) {
+        std::cout << "no write watching: UnchangedSinceCollected is always false\n";
         return;
     }
-    constexpr std::size_t bytes = 65536;
-    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
-#ifdef _WIN32
-    Require(VirtualAlloc(block, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot commit the arena block");
-#endif
     auto* words = static_cast<volatile std::uint32_t*>(block);
     const auto address = reinterpret_cast<std::uint64_t>(block);
     words[0] = 0;
-    if (!GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        Require(!UnchangedSinceCollected(address, 4, TrackerGeneration()), "(6) an unwatched arena reports unchanged");
-        std::cout << "arena not write-watched: UnchangedSinceCollected is always false\n";
-        return;
-    }
     CollectWritesUncached(address, 4);
     const auto generation = TrackerGeneration();
     Require(UnchangedSinceCollected(address, 4, generation), "(6) an untouched range is not unchanged");
@@ -375,10 +404,7 @@ void unchangedSinceTests() {
     words[1] = 2;
     CollectWritesUncached(address, 4);
     Require(!UnchangedSinceCollected(address, 4, generation3), "(6) a CPU write collected by another caller is not seen");
-#ifdef _WIN32
-    VirtualFree(block, bytes, MEM_DECOMMIT);
-#endif
-    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+    ReleaseWatched(block, bytes);
 }
 
 // (9) ProvedClearKeys: a surface's DCC keys are scanned once and answered from the proof after,
@@ -387,23 +413,15 @@ void unchangedSinceTests() {
 // scans and no proof is stored.
 void keyProofTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
-    if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: key proofs not tested\n";
+    constexpr std::size_t bytes = 65536;
+    void* block = AllocateWatched(bytes, bytes);
+    if (block == nullptr) {
+        std::cout << "no write watching: key proofs not tested\n";
         return;
     }
-    constexpr std::size_t bytes = 65536;
-    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
-#ifdef _WIN32
-    Require(VirtualAlloc(block, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot commit the arena block");
-#endif
     struct Release {
         void* block;
-        ~Release() {
-#ifdef _WIN32
-            VirtualFree(block, bytes, MEM_DECOMMIT);
-#endif
-            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
-        }
+        ~Release() { ReleaseWatched(block, bytes); }
     } release{block};
     constexpr std::size_t keyCount = 1024;
     constexpr std::uint64_t surfaceBytes = keyCount * 256;
@@ -477,12 +495,9 @@ void closeRaceTests(const Device& device, Recorder& recorder) {
     Require(!Recorder::LookupLabel(0x80000, 4, 70, &refusal).has_value() && refusal == Refusal::Unclosed, "(8) a submitted batch's entry was closed");
     device.WaitQueue();
     recorder.Sync();
-    if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) return;
     constexpr std::size_t bytes = 1u << 20;
-    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
-#ifdef _WIN32
-    Require(VirtualAlloc(block, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot commit the arena block");
-#endif
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) return;
     const auto base = reinterpret_cast<std::uint64_t>(block);
     // Late in the range, so the walker is usually still ahead of the page when the store lands.
     const auto label = base + 4096 * 250;
@@ -514,10 +529,7 @@ void closeRaceTests(const Device& device, Recorder& recorder) {
     walker.thread.join();
     recorder.Sync();
     Require(!Recorder::LookupLabel(label, 4, 5).has_value(), "(8) the entry outlived its batch");
-#ifdef _WIN32
-    VirtualFree(block, bytes, MEM_DECOMMIT);
-#endif
-    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+    ReleaseWatched(block, bytes);
 }
 
 // A resource build over host-imported guest memory notes its in-place reads when its writes are
@@ -676,29 +688,21 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (!UnitShadowEnabled()) {
         Require(!AnyShadowedOverlaps(0x10000, 16) && PublishShadow(0x10000, 16, PublishScope::Whole, PublishReason::Hook) == 0, "unit shadows are off but not inert");
-        std::cout << "unit shadows off (APS5_NO_UNIT_SHADOW, or an arena without write watching): primitives inert\n";
+        std::cout << "unit shadows off (APS5_NO_UNIT_SHADOW, or no write watching): primitives inert\n";
         return;
     }
-    if (context.hostImportAlignment == 0 || !GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "host imports or the write-watched arena unavailable: unit shadows not tested\n";
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: unit shadows not tested\n";
         return;
     }
     constexpr std::uint64_t unit = 65536;
     // Three slabs at the default 8 MiB: units 0..127, 128..255, 256..271.
     constexpr std::size_t bytes = (17u << 20u);
-    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
-    Require(block != nullptr, "cannot allocate the shadow test block");
-#ifdef _WIN32
-    Require(VirtualAlloc(block, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot commit the shadow test block");
-#endif
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "unit shadows are on without write watching");
     struct Release {
         void* block;
-        ~Release() {
-#ifdef _WIN32
-            VirtualFree(block, bytes, MEM_DECOMMIT);
-#endif
-            GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
-        }
+        ~Release() { ReleaseWatched(block, bytes); }
     } release{block};
     std::memset(block, 0x11, bytes);
     const auto address = reinterpret_cast<std::uint64_t>(block);
@@ -868,7 +872,11 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
 // them), which is no new clear: the results are stored and re-uploaded, not dropped for the clear.
 // The store must reach the import (no unit shadow can be fresh without the tracker), or the
 // re-upload reads stale texels. New clear keys still drop pending results and clear the image.
-void storageRefreshTests(const Device& device, Recorder& recorder) {
+// In watched memory (`watched`) the refresh proves the surface unchanged and keeps the results on
+// the GPU, a CPU reader of the memory still sees them, and a CPU store into one unit while newer
+// results are pending is detected by the write watch alone (no MarkWritten): that unit takes the
+// CPU's bytes and the others keep the results.
+void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: storage refresh not tested\n";
@@ -879,11 +887,20 @@ void storageRefreshTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t surfaceBytes = side * side * 4;
     constexpr std::size_t keyCount = surfaceBytes / 256;
     constexpr std::size_t bytes = surfaceBytes + 65536;
+    void* block = nullptr;
+    if (watched) {
+        block = AllocateWatched(bytes, 65536);
+        if (block == nullptr) {
+            std::cout << "no write watching: storage refresh in watched memory not tested\n";
+            return;
+        }
+    } else {
 #ifdef _WIN32
-    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
-    void* block = std::aligned_alloc(65536, bytes);
+        block = std::aligned_alloc(65536, bytes);
 #endif
+    }
     Require(block != nullptr, "cannot allocate the storage refresh block");
     auto* texels = static_cast<std::uint8_t*>(block);
     auto* keys = texels + surfaceBytes;
@@ -912,8 +929,8 @@ void storageRefreshTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the storage refresh block refused: storage refresh not tested\n";
         return;
     }
-    Require(!ShadowDestinationFor(base, *import, address, address + 65536).has_value(), "a unit shadow was offered for memory the write tracker does not watch");
-    if (!GuestArena::GuestArenaWriteWatched_nid_postfix()) Require(!UnitShadowEnabled(), "unit shadows are on without write watching");
+    Require(watched || !ShadowDestinationFor(base, *import, address, address + 65536).has_value(), "a unit shadow was offered for memory the write tracker does not watch");
+    if (!AgcDriver::GuestMemory::WriteWatched()) Require(!UnitShadowEnabled(), "unit shadows are on without write watching");
     TextureDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
@@ -965,12 +982,43 @@ void storageRefreshTests(const Device& device, Recorder& recorder) {
             return true;
         };
         // Guest memory: every byte of the surface one texel repeated (a uniform surface reads the
-        // same in any tiling).
-        const auto memoryHolds = [&](std::array<std::uint8_t, 4> texel) {
+        // same in any tiling). Watched memory is read as the CPU reads it, through the flush hook
+        // (results kept on the GPU are stored first); `first` bytes may hold `other` instead.
+        const auto memoryHolds = [&](std::array<std::uint8_t, 4> texel, std::size_t first = 0, std::uint8_t other = 0) {
+            std::vector<std::byte> read(surfaceBytes);
+            if (watched) AgcDriver::GuestMemory::Read(address, read);
+            else std::memcpy(read.data(), texels, surfaceBytes);
             for (std::size_t i = 0; i < surfaceBytes; ++i) {
-                if (texels[i] != texel[i % 4]) return false;
+                if (std::to_integer<std::uint8_t>(read[i]) != (i < first ? other : texel[i % 4])) return false;
             }
             return true;
+        };
+        // The image holds `count` texels of four `other` bytes and `texel` everywhere else.
+        const auto holdsMixed = [&](std::array<std::uint8_t, 4> texel, std::size_t count, std::uint8_t other) {
+            Buffer readback(context, surfaceBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {side, side, 1};
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            const auto pixels = readback.Bytes();
+            std::size_t others = 0;
+            for (std::size_t i = 0; i < pixels.size(); i += 4) {
+                bool isOther = true, isTexel = true;
+                for (std::size_t c = 0; c < 4; ++c) {
+                    const auto value = std::to_integer<std::uint8_t>(pixels[i + c]);
+                    isOther = isOther && value == other;
+                    isTexel = isTexel && value == texel[c];
+                }
+                if (isOther) ++others;
+                else if (!isTexel) return false;
+            }
+            return others == count;
         };
         Require(holds({0, 0, 0, 0}), "a surface under 0000 clear keys was not cleared");
         draw({{1.0f, 0.0f, 0.0f, 1.0f}});
@@ -978,12 +1026,24 @@ void storageRefreshTests(const Device& device, Recorder& recorder) {
         image->Refresh();
         Require(holds({255, 0, 0, 255}), "a refresh under the image's own clear keys dropped the draw's results");
         Require(memoryHolds({255, 0, 0, 255}), "the refresh's store of the results did not reach guest memory");
+        if (watched) {
+            // The store above marked the keys uncompressed; newer results pending, then a plain
+            // CPU store over the first unit (one 64 KiB tile: 128x128 texels).
+            draw({{0.0f, 0.0f, 1.0f, 1.0f}});
+            std::memset(texels, 0x33, 65536);
+            image->Refresh();
+            Require(holdsMixed({0, 0, 255, 255}, 65536 / 4, 0x33), "a CPU store into a unit with results pending was not seen by the refresh");
+            Require(memoryHolds({0, 0, 255, 255}, 65536, 0x33), "guest memory lost the CPU store or the other units' results");
+            // Nothing written since: the next refresh keeps the image as it is.
+            image->Refresh();
+            Require(holdsMixed({0, 0, 255, 255}, 65536 / 4, 0x33), "an unchanged surface changed at a refresh");
+        }
         // A new fast clear by the title (other clear keys): the pending results are dead.
         draw({{0.0f, 1.0f, 0.0f, 1.0f}});
         std::memset(keys, 0x40, keyCount);
         image->Refresh();
         Require(holds({0, 0, 0, 255}), "new 0001 clear keys did not clear the image");
-        Require(memoryHolds({255, 0, 0, 255}), "results dead under new clear keys were stored");
+        Require(watched ? memoryHolds({0, 0, 255, 255}, 65536, 0x33) : memoryHolds({255, 0, 0, 255}), "results dead under new clear keys were stored");
     }
     recorder.Sync();
 }
@@ -1068,7 +1128,8 @@ int main() {
         RunViewAliasTests(device.GetContext(), recorder);
         storeRunTests(device, recorder);
         unitShadowTests(device, recorder);
-        storageRefreshTests(device, recorder);
+        storageRefreshTests(device, recorder, false);
+        storageRefreshTests(device, recorder, true);
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
