@@ -52,12 +52,20 @@ void EraseRangeNames(uintptr_t start, uintptr_t end) {
  }
 }
 
-void CopyRangeName(uintptr_t address, char (&name)[32]) {
+void ApplyRangeName(uintptr_t address, VirtualQueryInfo* info) {
  std::lock_guard lock(g_rangeNameLock);
- auto it = g_rangeNames.upper_bound(address);
- if (it == g_rangeNames.begin()) return;
- --it;
- if (address < it->second.end) std::strncpy(name, it->second.name.c_str(), sizeof(name) - 1);
+ auto next = g_rangeNames.upper_bound(address);
+ if (next != g_rangeNames.begin()) {
+  const auto containing = std::prev(next);
+  if (address < containing->second.end) {
+   info->start = std::max<uintptr_t>(info->start, containing->first);
+   info->end = std::min<uintptr_t>(info->end, containing->second.end);
+   std::strncpy(info->name, containing->second.name.c_str(), sizeof(info->name) - 1);
+   return;
+  }
+  info->start = std::max<uintptr_t>(info->start, containing->second.end);
+ }
+ if (next != g_rangeNames.end()) info->end = std::min<uintptr_t>(info->end, next->first);
 }
 
 std::mutex g_prtLock;
@@ -156,14 +164,18 @@ int APS5_VABI sceKernelMapFlexibleMemory(void** addr_in_out, size_t len, int pro
  return _mapFlexible(addr_in_out, len, prot, flags);
 }
 
+int APS5_VABI sceKernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name);
+
 int APS5_VABI sceKernelMapNamedDirectMemory(void** addr, size_t len, int prot, int flags, int64_t direct_memory_start, size_t alignment, const char* name) {
- (void)name;
- return DoMapDirect(addr, len, prot, flags, direct_memory_start, alignment);
+ const int result = DoMapDirect(addr, len, prot, flags, direct_memory_start, alignment);
+ if (result == 0 && name) sceKernelSetVirtualRangeName(*addr, len, name);
+ return result;
 }
 
 int32_t APS5_VABI sceKernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags, const char* name) {
- (void)name;
- return _mapFlexible(addr_in_out, len, prot, flags);
+ const int result = _mapFlexible(addr_in_out, len, prot, flags);
+ if (result == 0 && name) sceKernelSetVirtualRangeName(*addr_in_out, len, name);
+ return result;
 }
 
 int APS5_VABI sceKernelMprotect(const void* addr, size_t len, int prot) {
@@ -209,7 +221,7 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
   info->protection = (best->readable ? 1 : 0) | (best->writable ? 2 : 0) | (!best->releasable ? 4 : 0);
   info->is_direct = best->releasable ? 1u : 0u;
   info->is_committed = 1;
-  CopyRangeName(info->start, info->name);
+  ApplyRangeName(std::max<uintptr_t>(address, info->start), info);
   return 0;
  }
  // Memory the registry does not know (the title's own heap blocks, stacks): the host's committed
@@ -244,7 +256,7 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
  info->protection = 1 | (writable ? 2 : 0) | (executable ? 4 : 0);
  info->is_flexible = 1;
  info->is_committed = 1;
- CopyRangeName(info->start, info->name);
+ ApplyRangeName(std::max<uintptr_t>(address, info->start), info);
  return 0;
 }
 

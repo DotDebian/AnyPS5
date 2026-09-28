@@ -132,6 +132,8 @@ static int mprotect(void* addr, size_t len, int prot) {
 
 namespace {
 
+constexpr int GuestMapFixedFlag = 0x10;
+
 #if defined(__linux__)
 void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment) {
     constexpr std::uintptr_t UserLimit = 0x7fff00000000ull;
@@ -215,7 +217,8 @@ void Trace(const char* format, ...) {
 
 bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, size_t len, int prot, int flags, int64_t physStart = -1) {
     constexpr int GuestMapFixed = 0x10;
-    if (addr == nullptr || (flags & GuestMapFixed) == 0 || !mutation.Covers(addr, len)) return false;
+    constexpr int GuestMapNoOverwrite = 0x80;
+    if (addr == nullptr || (flags & GuestMapFixed) == 0 || (flags & GuestMapNoOverwrite) != 0 || !mutation.Covers(addr, len)) return false;
     ValidateRange(addr, len, PS5_PAGE_SIZE);
     Trace("remap fixed %p+0x%zx prot=0x%x phys=0x%llx", addr, len, prot, static_cast<long long>(physStart));
     const auto nativeProtection = LinuxProtFromSce(prot);
@@ -320,7 +323,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     }
     GuestAllocations::Mutation mutation;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) return 0;
-    if (*addr != nullptr) mutation.RequireAvailable(*addr, len);
+    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
     void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, alignment);
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);
@@ -338,7 +341,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
     if (RemapFixedIntoRegistered(mutation, *addr, len, prot, flags)) return 0;
-    if (*addr != nullptr) mutation.RequireAvailable(*addr, len);
+    if (*addr != nullptr && (flags & GuestMapFixedFlag) != 0) mutation.RequireAvailable(*addr, len);
     void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, PS5_PAGE_SIZE);
     try {
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0);

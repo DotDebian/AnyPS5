@@ -14,21 +14,14 @@
 #include "prx/libc/include/WindowsFormatting.hpp"
 #endif
 
-extern "C" [[noreturn]] void APS5_VABI _ZSt11_Xbad_allocv_nid_postfix();
-
 namespace {
 
 using GuestNewHandler = void (APS5_VABI*)();
 
 GuestNewHandler g_newHandler = nullptr;
 
-void* AllocateOrHandle(std::size_t size, bool nothrow) {
-    for (;;) {
-        if (void* pointer = ApplicationHeapAllocate_nid_no_patch(size == 0 ? 1 : size)) return pointer;
-        if (nothrow) return nullptr;
-        if (g_newHandler == nullptr) _ZSt11_Xbad_allocv_nid_postfix();
-        g_newHandler();
-    }
+void* Allocate(std::size_t size) {
+    return ApplicationHeapAllocate_nid_no_patch(size == 0 ? 1 : size);
 }
 
 }
@@ -77,19 +70,19 @@ GuestNewHandler APS5_VABI _ZSt15get_new_handlerv_nid_postfix() {
 unsigned char _ZSt7nothrow_nid_postfix = 0;
 
 void* APS5_VABI _Znwm_nid_postfix(std::size_t size) {
-    return AllocateOrHandle(size, false);
+    return Allocate(size);
 }
 
 void* APS5_VABI _Znam_nid_postfix(std::size_t size) {
-    return AllocateOrHandle(size, false);
+    return Allocate(size);
 }
 
 void* APS5_VABI _ZnwmRKSt9nothrow_t_nid_postfix(std::size_t size, const void*) {
-    return AllocateOrHandle(size, true);
+    return Allocate(size);
 }
 
 void* APS5_VABI _ZnamRKSt9nothrow_t_nid_postfix(std::size_t size, const void*) {
-    return AllocateOrHandle(size, true);
+    return Allocate(size);
 }
 
 void APS5_VABI _ZdlPv_nid_postfix(void* pointer) {

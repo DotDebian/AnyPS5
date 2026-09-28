@@ -7,6 +7,13 @@
 #include <limits>
 #include <stdexcept>
 
+extern "C" {
+void* APS5_VABI _Znwm_nid_postfix(std::size_t);
+void* APS5_VABI _ZnamRKSt9nothrow_t_nid_postfix(std::size_t, const void*);
+void APS5_VABI _ZdlPv_nid_postfix(void*);
+void APS5_VABI _ZdaPv_nid_postfix(void*);
+}
+
 namespace {
 
 alignas(64) std::array<std::byte, 256> storage{};
@@ -117,7 +124,15 @@ int main(int argc, char**) {
     require(ApplicationHeapPosixAlign_nid_no_patch(&pointer, 64, 128) == 0 && pointer == storage.data() && lastAlignment == 64);
     reject([] { ApplicationHeapAlign_nid_no_patch(3, 64); });
     reject([] { ApplicationHeapCalloc_nid_no_patch(2, std::numeric_limits<std::size_t>::max()); });
+    require(_Znwm_nid_postfix(0) == storage.data() && lastSize == 1);
+    _ZdlPv_nid_postfix(storage.data());
+    _ZdlPv_nid_postfix(nullptr);
+    require(frees == 3);
+    require(_ZnamRKSt9nothrow_t_nid_postfix(24, nullptr) == storage.data() && lastSize == 24);
+    _ZdaPv_nid_postfix(storage.data());
+    require(frees == 4);
     fail = true;
+    reject([] { _Znwm_nid_postfix(8); });
     reject([] { ApplicationHeapAlign_nid_no_patch(4, 64); });
     reject([] { ApplicationHeapAllocate_nid_no_patch(64); });
     void* unchanged = storage.data();
