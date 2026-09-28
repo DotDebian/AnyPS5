@@ -34,9 +34,14 @@ int APS5_VABI sceSystemServiceGetDisplaySafeAreaInfo(SystemServiceDisplaySafeAre
 }
 
 int APS5_VABI sceSystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance) {
- (void)luminance;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (luminance == nullptr) {
+  return SYSTEM_SERVICE_ERROR_PARAMETER;
+ }
+ constexpr float SdrReferenceWhiteNits = 100.0f;
+ luminance->max_full_frame_tone_map_luminance = SdrReferenceWhiteNits;
+ luminance->max_tone_map_luminance = SdrReferenceWhiteNits;
+ luminance->min_tone_map_luminance = 0.0f;
+ return SYSTEM_SERVICE_OK;
 }
 
 int APS5_VABI sceSystemServiceGetNoticeScreenSkipFlag(bool* value) {
