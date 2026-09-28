@@ -81,10 +81,7 @@ int APS5_VABI fscanf_nid_postfix() {
  return 0;
 }
 
-int APS5_VABI vswprintf_nid_postfix() {
- NotImplemented_nid_no_patch(__func__);
- return 0;
-}
+// vswprintf_nid_postfix is implemented in src/FormattingWide.cpp.
 
 APS5_EXPORT("Pu0Ecyk-7FU", libcUnknown_Pu0Ecyk_M7FU);
 int APS5_VABI libcUnknown_Pu0Ecyk_M7FU() {
