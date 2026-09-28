@@ -18,6 +18,7 @@ RdnaOpcode decodeSop1Opcode(std::uint32_t opcode) {
         case 0x09u: return RdnaOpcode::SWqmB32;
         case 0x0au: return RdnaOpcode::SWqmB64;
         case 0x0bu: return RdnaOpcode::SBrevB32;
+        case 0x0cu: return RdnaOpcode::SBrevB64;
         case 0x0du: return RdnaOpcode::SBcnt0I32B32;
         case 0x0fu: return RdnaOpcode::SBcnt1I32B32;
         case 0x10u: return RdnaOpcode::SBcnt1I32B64;
@@ -85,6 +86,7 @@ RdnaOpcode decodeSop2Opcode(std::uint32_t opcode) {
         case 0x20u: return RdnaOpcode::SLshrB32;
         case 0x21u: return RdnaOpcode::SLshrB64;
         case 0x22u: return RdnaOpcode::SAshrI32;
+        case 0x23u: return RdnaOpcode::SAshrI64;
         case 0x24u: return RdnaOpcode::SBfmB32;
         case 0x25u: return RdnaOpcode::SBfmB64;
         case 0x26u: return RdnaOpcode::SMulI32;
@@ -197,6 +199,8 @@ std::uint32_t scalarDestinationDwordCount(RdnaOpcode opcode) {
         case RdnaOpcode::SMovB64:
         case RdnaOpcode::SCmovB64:
         case RdnaOpcode::SNotB64:
+        case RdnaOpcode::SBrevB64:
+        case RdnaOpcode::SAshrI64:
         case RdnaOpcode::SWqmB64:
         case RdnaOpcode::SBitset0B64:
         case RdnaOpcode::SBitset1B64:
