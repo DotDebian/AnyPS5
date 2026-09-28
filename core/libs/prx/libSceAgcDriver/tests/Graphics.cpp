@@ -85,7 +85,9 @@ void stateTests() {
     Require(state.viewport.y == 4 && state.viewport.height == -4, "negative viewport height was lost");
     Require(state.color.format == VK_FORMAT_R8G8B8A8_UNORM, "RGBA format changed");
     queue.userConfig[0x24b] = 1;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "GE_MULTI_PRIM_IB_RESET_EN");
+    (void)AgcDriver::Graphics::DecodeState(queue);
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "primitive restart rejected a non-indexed draw");
+    Require(AgcDriver::Graphics::DrawRejection(queue, true).find("GE_MULTI_PRIM_IB_RESET_EN") != std::string::npos, "primitive restart was accepted for an indexed draw");
     queue = makeState();
     queue.userConfig.erase(0x24b);
     queue.context[0x2a5] = 0;
@@ -123,7 +125,7 @@ void stateTests() {
     queue.context[0x1b3] = 2;
     queue.context[0x1b4] = 2;
     state = AgcDriver::Graphics::DecodeState(queue);
-    Require(AgcDriver::Graphics::DrawRejection(queue).empty(), "precheck rejected the reference state");
+    Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "precheck rejected the reference state");
     static_cast<void>(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, state.hasColorTarget, state.color.componentMapping));
     AgcDriver::Graphics::RegisterReadLog() = nullptr;
     Require(!log.empty(), "the register facade recorded nothing");

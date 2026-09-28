@@ -2,6 +2,7 @@
 
 #include "prx/libSceAgc/Command/include/Memory.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
+#include "prx/libSceAgc/DcbState/include/Marker.hpp"
 #include <cstdint>
 #include <cstddef>
 #include "SceTypes.hpp"
@@ -73,25 +74,19 @@ std::uint32_t* APS5_VABI sceAgcAcbSetFlip(CommandBuffer* buf, std::uint32_t vide
 }
 
 uint32_t* APS5_VABI sceAgcAcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color) {
- (void)buf;
- (void)str;
- (void)color;
- NotImplemented_nid_no_patch(__func__);
- return nullptr;
+    (void)color;
+    return Agc::Marker::Push(buf, str, __func__);
 }
 
 uint32_t* APS5_VABI sceAgcAcbPopMarker(CommandBuffer* buf) {
- (void)buf;
- NotImplemented_nid_no_patch(__func__);
- return nullptr;
+    return Agc::Marker::Pop(buf, __func__);
 }
 
 uint32_t* APS5_VABI sceAgcAcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
- (void)buf;
- (void)str;
- (void)color;
- NotImplemented_nid_no_patch(__func__);
- return nullptr;
+    (void)color;
+    auto* packet = Agc::Marker::Push(buf, str, __func__);
+    Agc::Marker::Pop(buf, __func__);
+    return packet;
 }
 
 }

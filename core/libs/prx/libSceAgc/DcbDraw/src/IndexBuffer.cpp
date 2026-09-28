@@ -9,7 +9,7 @@
 extern "C" {
 
 std::uint32_t* APS5_VABI sceAgcDcbSetIndexBuffer(CommandBuffer* buf, std::uint64_t indexAddress) {
-    Agc::Command::CheckAddress(indexAddress, 2, __func__);
+    if (indexAddress != 0) Agc::Command::CheckAddress(indexAddress, 2, __func__);
     return Agc::Command::Emit(buf, 0x26u, {static_cast<std::uint32_t>(indexAddress), static_cast<std::uint32_t>(indexAddress >> 32u)}, __func__);
 }
 

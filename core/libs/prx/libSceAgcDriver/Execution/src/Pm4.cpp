@@ -95,6 +95,31 @@ std::vector<std::byte> copySource(std::uint64_t source, std::size_t bytes, bool 
     return data;
 }
 
+constexpr std::uint32_t DmaSelectGds = 1;
+constexpr std::size_t GdsBytes = 0x10000;
+
+struct GdsStorage {
+    std::mutex mutex;
+    std::array<std::byte, GdsBytes> bytes{};
+};
+
+GdsStorage& Gds() {
+    static GdsStorage storage;
+    return storage;
+}
+
+bool gdsRange(std::uint64_t offset, std::size_t bytes) {
+    return offset <= GdsBytes && bytes <= GdsBytes - offset;
+}
+
+std::vector<std::byte> dmaSourceBytes(std::span<const std::uint32_t> packet) {
+    const std::size_t bytes = packet[6] & 0x3ffffffu;
+    if (dmaSource(packet) != DmaSelectGds) return copySource(address(packet[2], packet[3]), bytes, dmaSource(packet) == 2);
+    auto& gds = Gds();
+    std::lock_guard lock(gds.mutex);
+    return {gds.bytes.begin() + packet[2], gds.bytes.begin() + packet[2] + bytes};
+}
+
 void copyMemory(std::uint64_t source, std::uint64_t destination, std::size_t bytes, bool immediate) {
     if (bytes == 0) return;
     GuestMemory::CheckRange(reinterpret_cast<void*>(destination), bytes, 1, true);
@@ -164,6 +189,9 @@ std::string_view UnsupportedReason(std::uint32_t header) {
         default: return "opcode is not known in the reference";
     }
 }
+
+constexpr std::uint32_t DmaSourceCachePolicy = 3u << 13u;
+constexpr std::uint32_t DmaDestinationCachePolicy = 3u << 25u;
 
 void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
     require(!packet.empty(), "truncated PM4 header");
@@ -349,9 +377,11 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
         }
         case 0x50:
             size(7);
-            require((packet[1] & ~0xe0300001u) == 0, "DMA_DATA cache or reserved fields are not implemented");
-            require(memorySelector(dmaDestination(packet)), "DMA_DATA register, GDS or prefetch destination is not implemented");
-            require(memorySelector(dmaSource(packet)) || dmaSource(packet) == 2, "DMA_DATA register or GDS source is not implemented");
+            require((packet[1] & ~(0xe0300001u | DmaSourceCachePolicy | DmaDestinationCachePolicy)) == 0, "DMA_DATA reserved fields are not implemented");
+            require(memorySelector(dmaDestination(packet)) || dmaDestination(packet) == DmaSelectGds, "DMA_DATA register or prefetch destination is not implemented");
+            require(memorySelector(dmaSource(packet)) || dmaSource(packet) == 2 || dmaSource(packet) == DmaSelectGds, "DMA_DATA register source is not implemented");
+            require(dmaSource(packet) != DmaSelectGds || (packet[3] == 0 && gdsRange(packet[2], packet[6] & 0x3ffffffu)), "DMA_DATA GDS source range exceeds the GDS");
+            require(dmaDestination(packet) != DmaSelectGds || (packet[5] == 0 && gdsRange(packet[4], packet[6] & 0x3ffffffu)), "DMA_DATA GDS destination range exceeds the GDS");
             require(dmaSource(packet) != 2 || packet[3] == 0, "DMA_DATA immediate exceeds 32 bits");
             break;
         default: throw std::runtime_error("known packet has no validator");
@@ -445,11 +475,11 @@ std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, co
             return StoreWrite{destination, {}, copySource(address(packet[2], packet[3]), bytes, source >= 10)};
         }
         case 0x50: {
-            if (packet.size() < 7) return std::nullopt;
+            if (packet.size() < 7 || dmaDestination(packet) == DmaSelectGds) return std::nullopt;
             const std::size_t bytes = packet[6] & 0x3ffffffu;
             const auto destination = address(packet[4], packet[5]);
             if (!fits(destination, bytes)) return std::nullopt;
-            return StoreWrite{destination, {}, copySource(address(packet[2], packet[3]), bytes, dmaSource(packet) == 2)};
+            return StoreWrite{destination, {}, dmaSourceBytes(packet)};
         }
         case 0x83: {
             if (packet.size() < 5 || packet[1] / 4 > queue.constantRam.size() || packet[2] > queue.constantRam.size() - packet[1] / 4) return std::nullopt;
@@ -703,9 +733,21 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             copyMemory(address(packet[2], packet[3]), address(packet[4], packet[5]), (packet[1] & 0x10000u) != 0 ? 8 : 4, source >= 10);
             return;
         }
-        case 0x50:
-            copyMemory(address(packet[2], packet[3]), address(packet[4], packet[5]), packet[6] & 0x3ffffffu, dmaSource(packet) == 2);
+        case 0x50: {
+            const std::size_t bytes = packet[6] & 0x3ffffffu;
+            if (bytes == 0) return;
+            auto data = dmaSourceBytes(packet);
+            if (dmaDestination(packet) == DmaSelectGds) {
+                auto& gds = Gds();
+                std::lock_guard lock(gds.mutex);
+                std::copy(data.begin(), data.end(), gds.bytes.begin() + packet[4]);
+                return;
+            }
+            const auto destination = address(packet[4], packet[5]);
+            GuestMemory::CheckRange(reinterpret_cast<void*>(destination), bytes, 1, true);
+            GuestMemory::Write(destination, data);
             return;
+        }
         default: throw std::runtime_error("packet requires driver execution");
     }
 }

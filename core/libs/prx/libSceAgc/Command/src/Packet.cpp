@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 
 #include <algorithm>
@@ -22,7 +23,10 @@ void CheckBits(std::uint64_t value, std::uint64_t mask, const char* function) {
 }
 
 void CheckAddress(std::uint64_t address, std::uint32_t alignment, const char* function) {
-    Require(address != 0 && (address & (alignment - 1u)) == 0, function, "null or misaligned address");
+    if (address != 0 && (address & (alignment - 1u)) == 0) return;
+    char message[64];
+    std::snprintf(message, sizeof(message), "null or misaligned address 0x%llx", static_cast<unsigned long long>(address));
+    Require(false, function, message);
 }
 
 std::uint32_t Header(std::uint32_t opcode, std::uint32_t count, std::uint32_t flags) {

@@ -651,7 +651,11 @@ public:
                 std::lock_guard lock(GuestMemory::GpuMutex());
                 timing.Mark("gpu_mutex_wait");
                 if (device == nullptr || device->Window() == nullptr) {
-                    if (device) device->PrepareForReplacement();
+                    if (device) {
+                        device->PrepareForReplacement();
+                        static std::vector<std::shared_ptr<VulkanDevice>> replacedDevices;
+                        replacedDevices.push_back(device);
+                    }
                     device = std::make_shared<VulkanDevice>(&window);
                 }
                 require(device->Window() == window.context, "presentation window does not match device surface");
@@ -3836,8 +3840,15 @@ private:
             const bool colorWrites = targetMask != queue.context.end() && shaderMask != queue.context.end() && (targetMask->second & shaderMask->second) != 0;
             if (!colorWrites && !queue.shader.contains(0x8)) return DrawVerdict::Nothing;
         }
+        if (drawParameters.indexed) {
+            const auto restart = queue.userConfig.find(0x24b);
+            if (restart != queue.userConfig.end() && restart->second != 0) {
+                rejected = "AGC graphics: primitive restart (GE_MULTI_PRIM_IB_RESET_EN) is unsupported for indexed draws";
+                return DrawVerdict::Rejected;
+            }
+        }
         if (DrawPrecheck()) {
-            rejected = Graphics::DrawRejection(queue);
+            rejected = Graphics::DrawRejection(queue, drawParameters.indexed);
             if (!rejected.empty()) return DrawVerdict::Rejected;
         }
         phase(DrawRowPrecheck);

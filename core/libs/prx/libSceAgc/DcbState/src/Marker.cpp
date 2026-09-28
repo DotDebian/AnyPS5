@@ -15,7 +15,11 @@ constexpr std::uint32_t OpcodeNop = 0x10;
 constexpr std::uint32_t CustomPushMarker = 0x0b;
 constexpr std::uint32_t CustomPopMarker = 0x0c;
 
-std::uint32_t* PushMarker(CommandBuffer* buf, const char* str, const char* function) {
+}
+
+namespace Agc::Marker {
+
+std::uint32_t* Push(CommandBuffer* buf, const char* str, const char* function) {
     Agc::Command::Require(buf != nullptr, function, "null command buffer");
     const char* text = str ? str : "";
     const std::size_t bytes = std::strlen(text) + 1;
@@ -28,7 +32,7 @@ std::uint32_t* PushMarker(CommandBuffer* buf, const char* str, const char* funct
     return packet;
 }
 
-std::uint32_t* PopMarker(CommandBuffer* buf, const char* function) {
+std::uint32_t* Pop(CommandBuffer* buf, const char* function) {
     Agc::Command::Require(buf != nullptr, function, "null command buffer");
     auto* packet = Agc::Command::Allocate(buf, 2, function);
     packet[0] = Agc::Command::Header(OpcodeNop, 2, CustomPopMarker << 2);
@@ -42,18 +46,18 @@ extern "C" {
 
 uint32_t* APS5_VABI sceAgcDcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
     (void)color;
-    auto* packet = PushMarker(buf, str, __func__);
-    PopMarker(buf, __func__);
+    auto* packet = Agc::Marker::Push(buf, str, __func__);
+    Agc::Marker::Pop(buf, __func__);
     return packet;
 }
 
 uint32_t* APS5_VABI sceAgcDcbPopMarker(CommandBuffer* buf) {
-    return PopMarker(buf, __func__);
+    return Agc::Marker::Pop(buf, __func__);
 }
 
 uint32_t* APS5_VABI sceAgcDcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color) {
     (void)color;
-    return PushMarker(buf, str, __func__);
+    return Agc::Marker::Push(buf, str, __func__);
 }
 
 }

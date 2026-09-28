@@ -67,7 +67,7 @@ State DecodeState(const QueueState& queue);
 // The message DecodeState (or the pixel stage decode after it) would throw for the register rules
 // this precheck covers, evaluated without exceptions before the draw is decoded; empty when they
 // pass (DecodeState still checks everything). A register a rule needs that is absent is no verdict.
-std::string DrawRejection(const QueueState& queue);
+std::string DrawRejection(const QueueState& queue, bool indexed);
 
 // The recording facade of the draw decoders (design_cpu_final M8, step 8a): every register read
 // of DecodeShaderStages, DecodeState, DrawRejection, DecodePixelStageInfo and Driver::draw's

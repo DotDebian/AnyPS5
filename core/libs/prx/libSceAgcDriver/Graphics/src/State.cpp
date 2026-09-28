@@ -293,7 +293,7 @@ State DecodeState(const QueueState& queue) {
         default: throw std::runtime_error("AGC graphics: unsupported primitive type " + std::to_string(primitive));
     }
     APS5_LOG_OUT_DEBUG("Topology=%u", static_cast<unsigned>(result.topology));
-    zero(queue.userConfig, 0x24b, ~0u, "primitive restart (GE_MULTI_PRIM_IB_RESET_EN)", RegisterBank::UserConfig);
+    (void)read(queue.userConfig, 0x24b, RegisterBank::UserConfig);
     if ((read(cx, 0x207) & LayerExports) != 0) {
         static bool reported = false;
         if (!reported) {
@@ -498,7 +498,7 @@ State DecodeState(const QueueState& queue) {
     return result;
 }
 
-std::string DrawRejection(const QueueState& queue) {
+std::string DrawRejection(const QueueState& queue, bool indexed) {
     const auto& cx = queue.context;
     // A register a rule needs that is absent gives no verdict here: DecodeState reports it.
     const auto value = [&](const Registers& registers, std::uint32_t offset, std::uint32_t& out) {
@@ -514,7 +514,7 @@ std::string DrawRejection(const QueueState& queue) {
     const auto require = [&](bool condition, const char* reason) {
         return condition ? std::string() : "AGC graphics: " + std::string(reason);
     };
-    if (auto reason = nonzero(queue.userConfig, 0x24b, ~0u, "primitive restart (GE_MULTI_PRIM_IB_RESET_EN)"); !reason.empty()) return reason;
+    if (auto reason = indexed ? nonzero(queue.userConfig, 0x24b, ~0u, "primitive restart (GE_MULTI_PRIM_IB_RESET_EN)") : std::string(); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
     if (value(cx, 0x200, word)) {
         if (!depthPassThrough(word) && !IgnoreDepthTest() && (word & DepthControlMask) != 0) return zeroMessage(0x200, word, "depth, stencil or conditional color writes");
