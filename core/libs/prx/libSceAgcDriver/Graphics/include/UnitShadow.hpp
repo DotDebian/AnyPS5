@@ -39,9 +39,10 @@ struct HostImport;
 // Slabs are 8 MiB pieces of a shadow (APS5_UNIT_SHADOW_SLAB_MIB) with their own VkDeviceMemory,
 // made on the first retile into them under a budget (APS5_UNIT_SHADOW_MIB, default 1024, LRU
 // eviction with a publish of the evicted slab's fresh units). APS5_NO_UNIT_SHADOW=1 makes every
-// primitive inert. Every call but AnyShadowedOverlaps runs under GuestMemory::GpuMutex (they record
-// or mutate freshness); the registry's own mutex is a leaf (lock order GpuMutex -> Imports/Pending ->
-// Shadows -> tracker).
+// primitive inert, as does a guest arena without write watching (freshness needs the tracker; the
+// Linux arena has none), and no destination is offered outside the arena. Every call but
+// AnyShadowedOverlaps runs under GuestMemory::GpuMutex (they record or mutate freshness); the
+// registry's own mutex is a leaf (lock order GpuMutex -> Imports/Pending -> Shadows -> tracker).
 bool UnitShadowEnabled();
 
 // None: a device-facing caller (a storage upload reads the slab itself); Whole: a reader of every

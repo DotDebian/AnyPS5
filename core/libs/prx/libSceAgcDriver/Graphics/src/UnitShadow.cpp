@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -14,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <utility>
 
 namespace AgcDriver::Graphics {
 
@@ -416,8 +418,13 @@ bool evictOne(Shadows& registry) {
 }
 
 bool UnitShadowEnabled() {
-    static const bool disabled = std::getenv("APS5_NO_UNIT_SHADOW") != nullptr;
-    return !disabled;
+    // A slab's unit is fresh only at a generation of the write tracker (MarkShadowed ignores 0), so
+    // without write watching (the Linux arena: CollectWrites answers 0) a piece retiled into a slab
+    // was never marked, published or read back: the write-back's texels were lost and the next
+    // upload re-read the stale import. The retile then goes into the import itself, as with
+    // APS5_NO_UNIT_SHADOW=1.
+    static const bool enabled = std::getenv("APS5_NO_UNIT_SHADOW") == nullptr && GuestArena::GuestArenaWriteWatched_nid_postfix();
+    return enabled;
 }
 
 bool ShadowVerify() {
@@ -517,6 +524,15 @@ VkDeviceSize SlabOffset(const HostImport& import, const ShadowSlab& slab, std::u
 
 std::optional<ShadowDestination> ShadowDestinationFor(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end) {
     if (!UnitShadowEnabled() || end <= begin || begin < import.base || end > import.base + import.bytes) return std::nullopt;
+    // Likewise per range: memory outside the watched arena collects as generation 0, so a piece
+    // shadowed there could never be fresh. It is retiled into the import.
+    static const auto arena = [] {
+        std::uintptr_t base = 0;
+        std::size_t size = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+        return std::pair<std::uint64_t, std::uint64_t>{base, size};
+    }();
+    if (arena.second == 0 || begin < arena.first || end > arena.first + arena.second) return std::nullopt;
     auto& registry = Registry();
     std::shared_ptr<UnitShadow> shadow;
     std::size_t slabIndex = 0;
