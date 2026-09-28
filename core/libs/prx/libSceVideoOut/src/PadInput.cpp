@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -24,6 +25,15 @@ PadInput::~PadInput() {
 
 void PadInput::openFirstAvailableController() {
     if (controller != nullptr) return;
+    // Read continuously (not just when the SDL hint is checked at subsystem init), so this is set every
+    // time regardless of whether the video driver already brought SDL_INIT_GAMECONTROLLER up.
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1"); // keep reading the pad while the window is unfocused
+    if ((SDL_WasInit(SDL_INIT_GAMECONTROLLER) & SDL_INIT_GAMECONTROLLER) == 0) {
+        if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
+            APS5_LOG_ERR("Pad: SDL game controller init failed: %s", SDL_GetError());
+            return; // no controller support: keyboard and mouse keep working
+        }
+    }
     for (int deviceIndex = 0; deviceIndex < SDL_NumJoysticks(); ++deviceIndex) {
         if (!SDL_IsGameController(deviceIndex)) continue;
         openController(deviceIndex);
@@ -39,13 +49,67 @@ void PadInput::openController(int deviceIndex) {
         return;
     }
     const char* name = SDL_GameControllerName(controller);
-    APS5_LOG_OUT("Pad: connected game controller: %s", name != nullptr ? name : "unknown");
+    APS5_LOG_OUT("Pad: connected game controller: %s (type %d, sensors accel=%d gyro=%d, touchpads=%d, led=%d, trigger rumble=%d)",
+        name != nullptr ? name : "unknown", static_cast<int>(SDL_GameControllerGetType(controller)),
+        SDL_GameControllerHasSensor(controller, SDL_SENSOR_ACCEL) == SDL_TRUE, SDL_GameControllerHasSensor(controller, SDL_SENSOR_GYRO) == SDL_TRUE,
+        SDL_GameControllerGetNumTouchpads(controller), SDL_GameControllerHasLED(controller) == SDL_TRUE, SDL_GameControllerHasRumbleTriggers(controller) == SDL_TRUE);
+    enableSensors();
+    outputPending = true; // re-apply the current guest output request to the newly opened pad
+}
+
+void PadInput::enableSensors() {
+    if (controller == nullptr) return;
+    const SDL_bool wanted = outputState.motionEnabled ? SDL_TRUE : SDL_FALSE;
+    if (SDL_GameControllerHasSensor(controller, SDL_SENSOR_ACCEL) == SDL_TRUE) SDL_GameControllerSetSensorEnabled(controller, SDL_SENSOR_ACCEL, wanted);
+    if (SDL_GameControllerHasSensor(controller, SDL_SENSOR_GYRO) == SDL_TRUE) SDL_GameControllerSetSensorEnabled(controller, SDL_SENSOR_GYRO, wanted);
 }
 
 void PadInput::closeController() {
     if (controller == nullptr) return;
     SDL_GameControllerClose(controller);
     controller = nullptr;
+    controllerState = {};
+}
+
+// Pushes the rumble / light bar / trigger requests of the guest to the host pad. Runs on the window thread that owns the SDL joystick.
+void PadInput::applyOutput() {
+    PadOutputState fetched;
+    if (PadFetchOutput_nid_postfix(&outputSequence, &fetched)) {
+        const bool motionChanged = fetched.motionEnabled != outputState.motionEnabled;
+        outputState = fetched;
+        outputPending = true;
+        if (motionChanged) enableSensors();
+    }
+    if (controller == nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+    const bool rumbling = outputState.vibrationLarge != 0 || outputState.vibrationSmall != 0;
+    const bool triggerRumble = outputState.trigger[0].fallback != 0 || outputState.trigger[1].fallback != 0;
+    const bool isPs5 = SDL_GameControllerGetType(controller) == SDL_CONTROLLER_TYPE_PS5;
+    if (!outputPending) {
+        // Rumble requests expire host-side after a fixed time; keep them alive while the guest holds them.
+        if ((rumbling || (triggerRumble && !isPs5)) && now >= nextRumbleRefresh) outputPending = true;
+        else return;
+    }
+    outputPending = false;
+    nextRumbleRefresh = now + std::chrono::milliseconds(700);
+    constexpr Uint32 rumbleMs = 2000;
+    SDL_GameControllerRumble(controller, static_cast<Uint16>(outputState.vibrationLarge * 257), static_cast<Uint16>(outputState.vibrationSmall * 257), rumbling ? rumbleMs : 0);
+    if (SDL_GameControllerHasLED(controller) == SDL_TRUE) {
+        if (outputState.lightBarValid) SDL_GameControllerSetLED(controller, outputState.lightBar[0], outputState.lightBar[1], outputState.lightBar[2]);
+        else SDL_GameControllerSetLED(controller, 0, 64, 255);
+    }
+    if (outputState.triggerTouched) {
+        if (isPs5) {
+            // DS5EffectsState: enable bits 0x04 (right) / 0x08 (left) at byte 0, right effect block at +10, left effect block at +21 (47 bytes).
+            Uint8 effect[47] = {};
+            effect[0] = 0x04 | 0x08;
+            std::memcpy(effect + 10, outputState.trigger[1].effect, 11);
+            std::memcpy(effect + 21, outputState.trigger[0].effect, 11);
+            SDL_GameControllerSendEffect(controller, effect, sizeof(effect));
+        } else if (SDL_GameControllerHasRumbleTriggers(controller) == SDL_TRUE) {
+            SDL_GameControllerRumbleTriggers(controller, static_cast<Uint16>(outputState.trigger[0].fallback * 257), static_cast<Uint16>(outputState.trigger[1].fallback * 257), triggerRumble ? rumbleMs : 0);
+        }
+    }
 }
 
 void PadInput::setMouseMode(bool enabled) {
@@ -56,6 +120,82 @@ void PadInput::setMouseMode(bool enabled) {
     mouseEnabled = enabled;
     mouseStick = {128, 128};
     nextMousePoll = std::chrono::steady_clock::now() + std::chrono::milliseconds(Pad::MousePollIntervalMs);
+}
+
+// SDL reports buttons by physical position (A = bottom face button), which on a PlayStation layout is Cross, so the mapping below is the
+// PlayStation one for every pad type; a Switch-style layout is normalised by SDL's own mapping database.
+PadInputState PadInput::sampleController() const {
+    PadInputState result;
+    if (controller == nullptr) return result;
+    // Button/trigger/stick mapping and scaling kept identical to the pre-existing gamepad support
+    // (SDL_GameControllerGetAttached block previously inlined in publish()); only motion, touchpad
+    // finger tracking, and device-kind detection are new here.
+    const auto readButton = [this](SDL_GameControllerButton button) {
+        return SDL_GameControllerGetButton(controller, button) != 0;
+    };
+    const auto addButton = [&result, &readButton](SDL_GameControllerButton source, Pad::PadButton button) {
+        if (readButton(source)) result.buttons |= static_cast<std::uint32_t>(button);
+    };
+    addButton(SDL_CONTROLLER_BUTTON_A, Pad::PadButton::Cross);
+    addButton(SDL_CONTROLLER_BUTTON_B, Pad::PadButton::Circle);
+    addButton(SDL_CONTROLLER_BUTTON_X, Pad::PadButton::Square);
+    addButton(SDL_CONTROLLER_BUTTON_Y, Pad::PadButton::Triangle);
+    addButton(SDL_CONTROLLER_BUTTON_LEFTSHOULDER, Pad::PadButton::L1);
+    addButton(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, Pad::PadButton::R1);
+    addButton(SDL_CONTROLLER_BUTTON_START, Pad::PadButton::Options);
+    addButton(SDL_CONTROLLER_BUTTON_LEFTSTICK, Pad::PadButton::L3);
+    addButton(SDL_CONTROLLER_BUTTON_RIGHTSTICK, Pad::PadButton::R3);
+    addButton(SDL_CONTROLLER_BUTTON_DPAD_UP, Pad::PadButton::Up);
+    addButton(SDL_CONTROLLER_BUTTON_DPAD_RIGHT, Pad::PadButton::Right);
+    addButton(SDL_CONTROLLER_BUTTON_DPAD_DOWN, Pad::PadButton::Down);
+    addButton(SDL_CONTROLLER_BUTTON_DPAD_LEFT, Pad::PadButton::Left);
+    addButton(SDL_CONTROLLER_BUTTON_TOUCHPAD, Pad::PadButton::TouchPad);
+
+    const auto triggerValue = [this](SDL_GameControllerAxis axis) {
+        const auto value = std::clamp<int>(SDL_GameControllerGetAxis(controller, axis), 0, 32767);
+        return static_cast<std::uint8_t>((value * 255 + 16383) / 32767);
+    };
+    result.analogButtonsL2 = triggerValue(SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+    result.analogButtonsR2 = triggerValue(SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+    if (result.analogButtonsL2 != 0) result.buttons |= static_cast<std::uint32_t>(Pad::PadButton::L2);
+    if (result.analogButtonsR2 != 0) result.buttons |= static_cast<std::uint32_t>(Pad::PadButton::R2);
+
+    const auto stickValue = [this](SDL_GameControllerAxis axis) {
+        const auto value = static_cast<std::int32_t>(SDL_GameControllerGetAxis(controller, axis)) + 32768;
+        return static_cast<std::uint8_t>((value * 255 + 32767) / 65535);
+    };
+    result.sticks = {
+        stickValue(SDL_CONTROLLER_AXIS_LEFTX),
+        stickValue(SDL_CONTROLLER_AXIS_LEFTY),
+        stickValue(SDL_CONTROLLER_AXIS_RIGHTX),
+        stickValue(SDL_CONTROLLER_AXIS_RIGHTY)
+    };
+    switch (SDL_GameControllerGetType(controller)) {
+        case SDL_CONTROLLER_TYPE_PS5: result.deviceKind = 1; break;
+        case SDL_CONTROLLER_TYPE_PS4: result.deviceKind = 2; break;
+        default: result.deviceKind = 3; break;
+    }
+    if (SDL_GameControllerIsSensorEnabled(controller, SDL_SENSOR_ACCEL) == SDL_TRUE && SDL_GameControllerIsSensorEnabled(controller, SDL_SENSOR_GYRO) == SDL_TRUE) {
+        float accel[3];
+        float gyro[3];
+        if (SDL_GameControllerGetSensorData(controller, SDL_SENSOR_ACCEL, accel, 3) == 0 && SDL_GameControllerGetSensorData(controller, SDL_SENSOR_GYRO, gyro, 3) == 0) {
+            result.hasMotion = true;
+            for (int i = 0; i < 3; ++i) { result.accel[i] = accel[i]; result.gyro[i] = gyro[i]; }
+        }
+    }
+    if (SDL_GameControllerGetNumTouchpads(controller) > 0) {
+        for (int finger = 0; finger < 2; ++finger) {
+            Uint8 down = 0;
+            float x = 0.0f;
+            float y = 0.0f;
+            float pressure = 0.0f;
+            if (SDL_GameControllerGetTouchpadFinger(controller, 0, finger, &down, &x, &y, &pressure) != 0 || down == 0) continue;
+            result.touch[finger].active = true;
+            result.touch[finger].x = static_cast<std::uint16_t>(std::clamp(x, 0.0f, 1.0f) * 1919.0f);
+            result.touch[finger].y = static_cast<std::uint16_t>(std::clamp(y, 0.0f, 1.0f) * 942.0f);
+        }
+    }
+    return result;
 }
 
 void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
@@ -125,7 +265,9 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
 }
 
 void PadInput::Update() {
-    const auto now = std::chrono::steady_clock::now();
+    if (controller != nullptr) SDL_GameControllerUpdate();
+    applyOutput();
+    const auto scriptNow = std::chrono::steady_clock::now();
     // Debug aid: APS5_PAD_PRESS=<seconds>:<SDL key name>[,...] presses that key's bindings for
     // 200 ms at the given time after the first update, so unattended runs can get past prompts.
     struct ScriptedPress {
@@ -145,7 +287,7 @@ void PadInput::Update() {
             const auto colon = item.find(':');
             if (colon != std::string::npos) {
                 const auto key = SDL_GetScancodeFromName(item.substr(colon + 1).c_str());
-                const auto at = now + std::chrono::milliseconds(static_cast<long long>(std::stod(item.substr(0, colon)) * 1000.0));
+                const auto at = scriptNow + std::chrono::milliseconds(static_cast<long long>(std::stod(item.substr(0, colon)) * 1000.0));
                 if (key != SDL_SCANCODE_UNKNOWN) result.push_back({at, key, 0});
             }
             start = end + 1;
@@ -153,8 +295,8 @@ void PadInput::Update() {
         return result;
     }();
     for (auto& press : script) {
-        const bool down = press.state == 0 && now >= press.at;
-        const bool up = press.state == 1 && now >= press.at + std::chrono::milliseconds(200);
+        const bool down = press.state == 0 && scriptNow >= press.at;
+        const bool up = press.state == 1 && scriptNow >= press.at + std::chrono::milliseconds(200);
         if (!down && !up) continue;
         press.state = down ? 1 : 2;
         for (std::size_t index = 0; index < bindings.size(); ++index)
@@ -162,9 +304,11 @@ void PadInput::Update() {
         publish();
     }
     if (controller != nullptr) {
-        SDL_GameControllerUpdate();
+        // Sensors change on every sample, so a pad with motion republishes continuously.
+        controllerState = sampleController();
         publish();
     }
+    const auto now = std::chrono::steady_clock::now();
     bool released = false;
     for (std::size_t index = 0; index < bindings.size(); ++index) {
         if (bindings[index].wheelDirection == 0 || !pressed[index] || now < wheelReleaseTimes[index]) continue;
@@ -197,49 +341,19 @@ void PadInput::Update() {
 }
 
 void PadInput::publish() {
+    // Gamepad is the base layer (like a title reading a real DualSense); keyboard and mouse bindings are
+    // applied on top and win when they conflict with the gamepad, matching the pre-existing keyboard/mouse behaviour.
     PadInputState state;
-    if (controller != nullptr && SDL_GameControllerGetAttached(controller) == SDL_TRUE) {
-        const auto readButton = [this](SDL_GameControllerButton button) {
-            return SDL_GameControllerGetButton(controller, button) != 0;
-        };
-        const auto addButton = [&state, &readButton](SDL_GameControllerButton source, Pad::PadButton button) {
-            if (readButton(source)) state.buttons |= static_cast<std::uint32_t>(button);
-        };
-        addButton(SDL_CONTROLLER_BUTTON_A, Pad::PadButton::Cross);
-        addButton(SDL_CONTROLLER_BUTTON_B, Pad::PadButton::Circle);
-        addButton(SDL_CONTROLLER_BUTTON_X, Pad::PadButton::Square);
-        addButton(SDL_CONTROLLER_BUTTON_Y, Pad::PadButton::Triangle);
-        addButton(SDL_CONTROLLER_BUTTON_LEFTSHOULDER, Pad::PadButton::L1);
-        addButton(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, Pad::PadButton::R1);
-        addButton(SDL_CONTROLLER_BUTTON_START, Pad::PadButton::Options);
-        addButton(SDL_CONTROLLER_BUTTON_LEFTSTICK, Pad::PadButton::L3);
-        addButton(SDL_CONTROLLER_BUTTON_RIGHTSTICK, Pad::PadButton::R3);
-        addButton(SDL_CONTROLLER_BUTTON_DPAD_UP, Pad::PadButton::Up);
-        addButton(SDL_CONTROLLER_BUTTON_DPAD_RIGHT, Pad::PadButton::Right);
-        addButton(SDL_CONTROLLER_BUTTON_DPAD_DOWN, Pad::PadButton::Down);
-        addButton(SDL_CONTROLLER_BUTTON_DPAD_LEFT, Pad::PadButton::Left);
-        addButton(SDL_CONTROLLER_BUTTON_TOUCHPAD, Pad::PadButton::TouchPad);
+    state.buttons = controllerState.buttons;
+    state.sticks = controllerState.sticks;
+    state.analogButtonsL2 = controllerState.analogButtonsL2;
+    state.analogButtonsR2 = controllerState.analogButtonsR2;
+    state.hasMotion = controllerState.hasMotion;
+    state.accel = controllerState.accel;
+    state.gyro = controllerState.gyro;
+    state.touch = controllerState.touch;
+    state.deviceKind = controllerState.deviceKind;
 
-        const auto triggerValue = [this](SDL_GameControllerAxis axis) {
-            const auto value = std::clamp<int>(SDL_GameControllerGetAxis(controller, axis), 0, 32767);
-            return static_cast<std::uint8_t>((value * 255 + 16383) / 32767);
-        };
-        state.analogButtonsL2 = triggerValue(SDL_CONTROLLER_AXIS_TRIGGERLEFT);
-        state.analogButtonsR2 = triggerValue(SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
-        if (state.analogButtonsL2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::L2);
-        if (state.analogButtonsR2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::R2);
-
-        const auto stickValue = [this](SDL_GameControllerAxis axis) {
-            const auto value = static_cast<std::int32_t>(SDL_GameControllerGetAxis(controller, axis)) + 32768;
-            return static_cast<std::uint8_t>((value * 255 + 32767) / 65535);
-        };
-        state.sticks = {
-            stickValue(SDL_CONTROLLER_AXIS_LEFTX),
-            stickValue(SDL_CONTROLLER_AXIS_LEFTY),
-            stickValue(SDL_CONTROLLER_AXIS_RIGHTX),
-            stickValue(SDL_CONTROLLER_AXIS_RIGHTY)
-        };
-    }
     std::array<bool, 4> negative{};
     std::array<bool, 4> positive{};
     for (std::size_t index = 0; index < bindings.size(); ++index) {
@@ -272,5 +386,7 @@ void PadInput::publish() {
         state.sticks[2] = mouseStick[0];
         state.sticks[3] = mouseStick[1];
     }
+    if (state.analogButtonsL2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::L2);
+    if (state.analogButtonsR2 != 0) state.buttons |= static_cast<std::uint32_t>(Pad::PadButton::R2);
     PadPublishInput_nid_postfix(state);
 }

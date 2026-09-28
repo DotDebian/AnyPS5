@@ -4,6 +4,7 @@
 #include "SDL_events.h"
 #include "SDL_gamecontroller.h"
 #include "prx/libScePad/include/InputMapping.hpp"
+#include "prx/libScePad/include/PadState.hpp"
 #include <array>
 #include <chrono>
 #include <vector>
@@ -23,13 +24,24 @@ private:
     void openFirstAvailableController();
     void openController(int deviceIndex);
     void closeController();
+    PadInputState sampleController() const;
+    void applyOutput();
+    void enableSensors();
+
     std::vector<Pad::InputBinding> bindings;
     std::vector<bool> pressed;
     std::vector<std::chrono::steady_clock::time_point> wheelReleaseTimes;
     std::array<std::uint8_t, 2> mouseStick{128, 128};
     std::chrono::steady_clock::time_point nextMousePoll{};
-    SDL_GameController* controller = nullptr;
     bool mouseEnabled = false;
+    // Host gamepad (Xbox / DualShock / DualSense / Switch Pro ... through SDL's GameController mapping database), merged with keyboard and mouse.
+    SDL_GameController* controller = nullptr;
+    PadInputState controllerState{};
+    // Guest output requests (rumble, light bar, adaptive triggers) mirrored onto the host pad.
+    std::uint32_t outputSequence = 0;
+    PadOutputState outputState{};
+    bool outputPending = false;
+    std::chrono::steady_clock::time_point nextRumbleRefresh{};
 };
 
 #endif
