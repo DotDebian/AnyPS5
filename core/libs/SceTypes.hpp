@@ -689,8 +689,8 @@ struct AvPlayerStreamInfo {
     std::uint8_t reserved[4];
     AvPlayerStreamDetails details;
     std::uint64_t duration;
-    std::uint64_t start_time;
 };
+static_assert(sizeof(AvPlayerStreamInfo) == 0x20);
 
 struct AvPlayerAudioEx {
     std::uint16_t channel_count;

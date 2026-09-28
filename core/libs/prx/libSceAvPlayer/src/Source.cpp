@@ -479,7 +479,6 @@ private:
         const auto* parameters = stream.codecpar;
         info.type = parameters->codec_type == AVMEDIA_TYPE_VIDEO ? StreamTypeVideo : StreamTypeAudio;
         info.duration = StreamDuration(*format, stream);
-        info.start_time = 0;
         char language[4]{};
         if (const auto* entry = av_dict_get(stream.metadata, "language", nullptr, 0)) std::strncpy(language, entry->value, 3);
         if (info.type == StreamTypeVideo) {
