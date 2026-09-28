@@ -9,7 +9,9 @@ namespace ShaderRecompiler {
 
 // hostSubgroupSize is the device subgroup width; wave64 workgroups on 32-wide subgroups run each
 // invocation as two guest lanes so a guest wave stays one host subgroup.
-ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const GuestContext& context, std::uint32_t hostSubgroupSize);
+// `mesh` is the geometry subgroup configuration of a mesh-stage (NGG geometry) program; the other
+// stages ignore it.
+ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const GuestContext& context, std::uint32_t hostSubgroupSize, const MeshConfiguration* mesh = nullptr);
 
 }
 

@@ -335,7 +335,8 @@ void DefineOutputs(SpirvEmitterState& state) {
 void DefineDescriptors(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     const IrShaderStage stage = state.program.Resources().stage;
-    if (layout.UsesPushData()) {
+    // A mesh-stage program also reads its draw parameters from the push block.
+    if (layout.UsesPushData() || stage == IrShaderStage::Mesh) {
         const auto type = PushConstantBlockType(state);
         state.pushConstantVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
         state.module.AddName(type, "BufferResource");

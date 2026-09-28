@@ -148,7 +148,7 @@ struct DrawKeyRange {
     std::uint32_t first;
     std::uint32_t count;
 };
-inline constexpr std::array<DrawKeyRange, 46> DrawKeyRegisters{{
+inline constexpr std::array<DrawKeyRange, 47> DrawKeyRegisters{{
     // DB_RENDER_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_DEPTH_SIZE_XY, DB_STENCIL_CLEAR and
     // DB_DEPTH_CLEAR with PA_SC_SCREEN_SCISSOR, DB_Z_INFO .. DB_STENCIL_WRITE_BASE, the *_BASE_HI words.
     {RegisterBank::Context, 0x000, 1}, {RegisterBank::Context, 0x002, 1}, {RegisterBank::Context, 0x005, 1}, {RegisterBank::Context, 0x007, 1}, {RegisterBank::Context, 0x00a, 4}, {RegisterBank::Context, 0x010, 6}, {RegisterBank::Context, 0x01a, 5},
@@ -160,9 +160,9 @@ inline constexpr std::array<DrawKeyRange, 46> DrawKeyRegisters{{
     // CB_BLEND0..7_CONTROL, GE_MAX_OUTPUT_PER_SUBGROUP.
     {RegisterBank::Context, 0x191, 32}, {RegisterBank::Context, 0x1b3, 2}, {RegisterBank::Context, 0x1b6, 1}, {RegisterBank::Context, 0x1c3, 3}, {RegisterBank::Context, 0x1e0, 8}, {RegisterBank::Context, 0x1ff, 1},
     // DB_DEPTH_CONTROL .. PA_CL_VS_OUT_CNTL, PA_SC_MODE_CNTL_0/1, VGT_GS_MODE, VGT_GS_VERT_ITEMSIZE,
-    // VGT_SHADER_STAGES_EN/GS_ONCHIP, VGT_TF_PARAM/DB_ALPHA_TO_MASK, PA_SC_AA_CONFIG and
+    // VGT_ESGS_RING_ITEMSIZE, VGT_SHADER_STAGES_EN/GS_ONCHIP, VGT_TF_PARAM/DB_ALPHA_TO_MASK, PA_SC_AA_CONFIG and
     // PA_SU_VTX_CNTL, the sample masks, PA_SC_CONSERVATIVE_RASTERIZATION_CNTL; PA_SU_POLY_OFFSET_*.
-    {RegisterBank::Context, 0x200, 8}, {RegisterBank::Context, 0x292, 2}, {RegisterBank::Context, 0x29b, 1}, {RegisterBank::Context, 0x2ce, 1}, {RegisterBank::Context, 0x2d5, 2}, {RegisterBank::Context, 0x2db, 2}, {RegisterBank::Context, 0x2de, 6}, {RegisterBank::Context, 0x2f8, 2}, {RegisterBank::Context, 0x30e, 2}, {RegisterBank::Context, 0x313, 1},
+    {RegisterBank::Context, 0x200, 8}, {RegisterBank::Context, 0x292, 2}, {RegisterBank::Context, 0x29b, 1}, {RegisterBank::Context, 0x2ab, 1}, {RegisterBank::Context, 0x2ce, 1}, {RegisterBank::Context, 0x2d5, 2}, {RegisterBank::Context, 0x2db, 2}, {RegisterBank::Context, 0x2de, 6}, {RegisterBank::Context, 0x2f8, 2}, {RegisterBank::Context, 0x30e, 2}, {RegisterBank::Context, 0x313, 1},
     // CB_COLOR0..7_BASE .. DCC_BASE (15 words a slot), CB_COLOR0..7_BASE_EXT, DCC_BASE_EXT, ATTRIB2, ATTRIB3.
     {RegisterBank::Context, 0x318, 0x78}, {RegisterBank::Context, 0x390, 8}, {RegisterBank::Context, 0x3a8, 0x18},
     // The pixel program address, RSRC2 and user words; the geometry-back user pointer and program

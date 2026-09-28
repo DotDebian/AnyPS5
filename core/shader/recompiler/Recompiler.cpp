@@ -82,11 +82,17 @@ std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
     return request.target.subgroupSize;
 }
 
+// The stage input metadata of a request (a mesh-stage program's with its subgroup configuration).
+ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
+    const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
+    return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request), mesh);
+}
+
 }
 
 IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     const auto stageKind = toShaderStageKind(request.shader.stage);
-    const auto inputInfo = BuildShaderStageInputInfo(stageKind, request.context, HostSubgroupSize(request));
+    const auto inputInfo = RequestInputInfo(request);
 
     constexpr RdnaInstructionDecoder decoder;
     const auto decoded = decoder.Decode(request.shader.code);
@@ -273,7 +279,7 @@ std::uint64_t nextVariantId() {
 }
 
 CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, const ResourceSnapshot& resourceSnapshot, const ResourceSpecialization& resourceSpecialization) {
-    const auto inputInfo = BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request));
+    const auto inputInfo = RequestInputInfo(request);
     constexpr DeadCodeEliminator deadCodeEliminator;
     constexpr ResourceMaterializer resourceMaterializer;
     resourceMaterializer.Apply(program, resourceSpecialization);
@@ -404,7 +410,7 @@ RecompileResult materializeVariant(SourceEntry& source, const RecompileRequest& 
 }
 
 RecompileResult RecompileImpl(const RecompileRequest& request) {
-    static_cast<void>(BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request)));
+    static_cast<void>(RequestInputInfo(request));
     RequestMemoryView memory(request.context.memory);
     const auto runtime = memory.MakeRuntime(request.context.userData, request.shader.codeAddress);
     ResourceSnapshot snapshot;
@@ -585,7 +591,7 @@ auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltyp
 }
 
 std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request) {
-    static_cast<void>(BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request)));
+    static_cast<void>(RequestInputInfo(request));
     if (request.useCache) return getSource(request)->plan;
     return makeResourcePlan(request);
 }
@@ -614,7 +620,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Validates the stage inputs once per request, as GetResourcePlan and Recompile(request) do.
-    static_cast<void>(BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request)));
+    static_cast<void>(RequestInputInfo(request));
     auto capture = std::make_shared<ResourceCapture>();
     if (request.useCache) {
         capture->source = getSource(request);
@@ -629,7 +635,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
 
 std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& request) {
     if (!request.useCache) return nullptr;
-    static_cast<void>(BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request)));
+    static_cast<void>(RequestInputInfo(request));
     return std::make_shared<const SourceHandle>(SourceHandle{getSource(request)});
 }
 
@@ -637,7 +643,7 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // The whole vertex family (Vertex, Local, TC, TE, Mesh) validates V# fields the memo key does not cover.
-    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) static_cast<void>(BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request)));
+    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) static_cast<void>(RequestInputInfo(request));
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle.source;
     capture->plan = handle.source->plan;

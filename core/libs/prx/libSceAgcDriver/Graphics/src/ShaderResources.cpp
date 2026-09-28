@@ -2009,10 +2009,11 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     Require(target == nullptr || !overlap(address, size, target->address, target->bytes), "shader buffer aliases the render target");
     // APS5_ALL_BUFFERS_WRITTEN=1: every element is noted as written, as before bufferWritten existed.
     static const bool allWritten = std::getenv("APS5_ALL_BUFFERS_WRITTEN") != nullptr;
+    // Before the APS5_ALL_BUFFERS_WRITTEN override (a read-only element, such as a mesh stage's
+    // index buffer, may cover the index range): Draw.cpp's CheckBufferAliases repeats this check on
+    // every resource-cache hit, and a draw must fail its hit exactly when it fails its build.
+    Require(!written || !overlap(address, size, indexAddress, indexBytes), "writable shader buffer aliases the index buffer");
     written = written || allWritten;
-    // Unconditional (also for read-only elements): Draw.cpp's CheckBufferAliases repeats this check
-    // on every resource-cache hit, and a draw must fail its hit exactly when it fails its build.
-    Require(!overlap(address, size, indexAddress, indexBytes), "writable shader buffer aliases the index buffer");
     if (written) guestMemory.AddWritable(address, size, atomic);
     else {
         guestMemory.AddReadable(address, size);

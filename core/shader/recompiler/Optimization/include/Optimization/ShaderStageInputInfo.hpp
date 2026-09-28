@@ -93,6 +93,9 @@ struct ShaderWorkgroupInputInfo {
     std::uint32_t waveSize = 64;
 };
 
+// An NGG geometry subgroup emulated by one mesh workgroup: `primitivesPerGroup` input primitives of
+// the draw (with no vertex reuse, so `verticesPerGroup` ES vertices), whose GS threads emit up to
+// `maxVertices` vertices and `maxPrimitives` triangles.
 struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
     std::uint32_t inputPrimitive = 0;
     std::uint32_t primitivesPerGroup = 0;
@@ -100,18 +103,23 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
     std::uint32_t maxVertices = 0;
     std::uint32_t maxPrimitives = 0;
     std::uint32_t provokingVertex = 0;
+    // VGT_ESGS_RING_ITEMSIZE: the GS vertex offsets are the ES thread index times this value.
+    std::uint32_t esgsItemSize = 0;
 
+    // The vertices of one input primitive: VGT_PRIMITIVE_TYPE point list (1), line list (2), else
+    // a triangle list (4) or strip (6).
     [[nodiscard]] std::uint32_t InputPrimitiveSize() const {
-        throw std::runtime_error("shader input helper not implemented");
+        return inputPrimitive == 1u ? 1u : inputPrimitive == 2u ? 2u : 3u;
     }
+    // The vertices between the first vertices of consecutive input primitives.
     [[nodiscard]] std::uint32_t InputPrimitiveStep() const {
-        throw std::runtime_error("shader input helper not implemented");
+        return inputPrimitive == 6u ? 1u : InputPrimitiveSize();
     }
     [[nodiscard]] std::uint32_t InputPrimitiveCount(std::uint32_t vertices) const {
-        throw std::runtime_error("shader input helper not implemented");
+        return vertices < InputPrimitiveSize() ? 0u : (vertices - InputPrimitiveSize()) / InputPrimitiveStep() + 1u;
     }
     [[nodiscard]] std::uint32_t InputVertexCount(std::uint32_t primitives) const {
-        throw std::runtime_error("shader input helper not implemented");
+        return primitives == 0u ? 0u : (primitives - 1u) * InputPrimitiveStep() + InputPrimitiveSize();
     }
 };
 

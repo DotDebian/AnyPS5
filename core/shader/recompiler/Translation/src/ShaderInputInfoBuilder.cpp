@@ -67,7 +67,7 @@ void _detectVertexBuffers(ShaderVertexInputInfo& info) {
 
 }
 
-ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const GuestContext& context, std::uint32_t hostSubgroupSize) {
+ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const GuestContext& context, std::uint32_t hostSubgroupSize, const MeshConfiguration* mesh) {
     switch (stage) {
     case ShaderStageKind::Compute: {
         if (!context.compute.has_value()) {
@@ -166,6 +166,24 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             vertexStorage.resourcesDst[i].fetchIndex = vertex.resourcesDst[i].fetchIndex;
         }
         _detectVertexBuffers(vertexStorage);
+        if (stage == ShaderStageKind::Mesh) {
+            if (mesh == nullptr) throw std::runtime_error("ShaderInputInfoBuilder: a mesh-stage program has no mesh configuration");
+            auto& target = vertexStorage.mesh;
+            target.threadsNum[0] = mesh->threadsPerGroup;
+            target.threadsNum[1] = 1u;
+            target.threadsNum[2] = 1u;
+            target.ldsSizeDwords = mesh->ldsSizeDwords;
+            target.waveSize = context.waveSize;
+            target.hostSubgroupSize = hostSubgroupSize;
+            target.inputPrimitive = mesh->inputPrimitive;
+            target.primitivesPerGroup = mesh->primitivesPerGroup;
+            target.verticesPerGroup = mesh->verticesPerGroup;
+            target.maxVertices = mesh->maxVertices;
+            target.maxPrimitives = mesh->maxPrimitives;
+            target.provokingVertex = mesh->provokingVertex;
+            target.esgsItemSize = mesh->esgsItemSize;
+            if (target.threadsNum[0] == 0u || target.maxVertices == 0u || target.maxPrimitives == 0u || target.provokingVertex > 2u) throw std::runtime_error("ShaderInputInfoBuilder: invalid mesh configuration");
+        }
         ShaderStageInputInfo result;
         result.vertex = &vertexStorage;
         return result;

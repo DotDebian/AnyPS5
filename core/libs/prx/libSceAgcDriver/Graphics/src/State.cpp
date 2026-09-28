@@ -507,7 +507,12 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
         validate(groupPrimitives != 0, "geometry subgroup contains no primitives");
         const auto resources = read(queue.shader, 0x8b, RegisterBank::Shader);
         validate(((read(queue.shader, 0x8a, RegisterBank::Shader) >> 29u) & 3u) == 3 && ((resources >> 16u) & 3u) == 3, "unsupported geometry VGPR allocation");
-        result.mesh = ShaderRecompiler::MeshConfiguration{primitive, groupPrimitives, (groupPrimitives - 1u) * inputStep + inputSize, maxVertices, primitives * (verticesPerPrimitive - 2u), ((maxVertices + result.vertexWaveSize - 1u) / result.vertexWaveSize) * result.vertexWaveSize, ((resources >> 19u) & 0xffu) * 128u, 0};
+        // The GS vertex offsets are 16-bit fields of the ES thread index times the item size.
+        const auto esgsItemSize = read(queue.context, 0x2ab);
+        validate(esgsItemSize != 0 && esgsItemSize * vertices <= 0xffffu, "invalid VGT_ESGS_RING_ITEMSIZE");
+        // One thread per ES vertex, GS primitive, output vertex and output primitive of the subgroup.
+        const auto threads = std::max({(groupPrimitives - 1u) * inputStep + inputSize, primitives, maxVertices, primitives * (verticesPerPrimitive - 2u)});
+        result.mesh = ShaderRecompiler::MeshConfiguration{primitive, groupPrimitives, (groupPrimitives - 1u) * inputStep + inputSize, maxVertices, primitives * (verticesPerPrimitive - 2u), ((threads + result.vertexWaveSize - 1u) / result.vertexWaveSize) * result.vertexWaveSize, ((resources >> 19u) & 0xffu) * 128u, 0, esgsItemSize};
     }
     return result;
 }

@@ -229,6 +229,8 @@ struct MeshConfiguration {
     std::uint32_t threadsPerGroup;
     std::uint32_t ldsSizeDwords;
     std::uint32_t provokingVertex;
+    // VGT_ESGS_RING_ITEMSIZE: the scale from an ES thread index to the GS vertex offset VGPR fields.
+    std::uint32_t esgsItemSize = 0;
 };
 
 struct TessellationConfiguration {
@@ -238,6 +240,15 @@ struct TessellationConfiguration {
     std::uint32_t partitioning;
     std::uint32_t outputTopology;
 };
+
+// A mesh-stage program's draw parameters: six dwords at the end of the 128-byte push constant block
+// of its pipeline, which the driver writes per draw (the stages' own push data must stay below
+// them): the vertex (index) count, the base vertex, the base instance, the index element bytes (0
+// for a non-indexed draw) and two reserved zeros. The index buffer itself is a raw V# in hidden
+// user words 4..7 of the program (MeshIndexBufferUserWord).
+inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 104;
+inline constexpr std::uint32_t MeshDrawPushBytes = 24;
+inline constexpr std::uint32_t MeshIndexBufferUserWord = 4;
 
 struct GraphicsDrawParameters {
     std::uint64_t indexAddress;

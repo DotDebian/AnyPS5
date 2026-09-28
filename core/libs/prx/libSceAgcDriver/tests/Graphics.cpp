@@ -381,10 +381,15 @@ void ShaderStageTests() {
     queue.context[0x1ff] = 64;
     queue.context[0x2ce] = 3;
     queue.context[0x29b] = 2;
+    queue.context[0x2ab] = 4;
     queue.shader[0x8a] = 3u << 29u;
     queue.shader[0x8b] = 3u << 16u;
     auto stages = AgcDriver::Graphics::DecodeState(queue).stages;
     Require(stages.path == AgcDriver::Graphics::ShaderPath::Geometry && stages.mesh && stages.mesh->primitivesPerGroup == 21 && stages.mesh->verticesPerGroup == 63, "geometry assembly changed");
+    Require(stages.mesh->maxVertices == 64 && stages.mesh->maxPrimitives == 21 && stages.mesh->threadsPerGroup == 64 && stages.mesh->esgsItemSize == 4, "geometry subgroup outputs changed");
+    queue.context[0x2ab] = 0;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "invalid VGT_ESGS_RING_ITEMSIZE");
+    queue.context[0x2ab] = 4;
     queue.userConfig[0x25b] = 0;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "invalid geometry subgroup");
     queue = makeState();

@@ -1327,7 +1327,7 @@ private:
         const auto sameMesh = [](const std::optional<ShaderRecompiler::MeshConfiguration>& x, const std::optional<ShaderRecompiler::MeshConfiguration>& y) {
             if (x.has_value() != y.has_value()) return false;
             if (!x) return true;
-            return x->inputPrimitive == y->inputPrimitive && x->primitivesPerGroup == y->primitivesPerGroup && x->verticesPerGroup == y->verticesPerGroup && x->maxVertices == y->maxVertices && x->maxPrimitives == y->maxPrimitives && x->threadsPerGroup == y->threadsPerGroup && x->ldsSizeDwords == y->ldsSizeDwords && x->provokingVertex == y->provokingVertex;
+            return x->inputPrimitive == y->inputPrimitive && x->primitivesPerGroup == y->primitivesPerGroup && x->verticesPerGroup == y->verticesPerGroup && x->maxVertices == y->maxVertices && x->maxPrimitives == y->maxPrimitives && x->threadsPerGroup == y->threadsPerGroup && x->ldsSizeDwords == y->ldsSizeDwords && x->provokingVertex == y->provokingVertex && x->esgsItemSize == y->esgsItemSize;
         };
         const auto sameTess = [](const std::optional<ShaderRecompiler::TessellationConfiguration>& x, const std::optional<ShaderRecompiler::TessellationConfiguration>& y) {
             if (x.has_value() != y.has_value()) return false;
@@ -4146,6 +4146,19 @@ private:
         const auto& graphics = decode->state;
         const auto& pixel = decode->pixel;
         std::vector<DrawProgram> programs = decode->programs;
+        // The mesh path's index buffer: a raw V# in hidden user words 4..7 of the merged program
+        // (ShaderRecompiler::MeshIndexBufferUserWord), the draw's index range rounded up to whole
+        // dwords, or four bytes of the program's code (never read) for a non-indexed draw. It is
+        // in the draw key like any user word.
+        const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
+            if (!graphics.stages.mesh) return;
+            auto& words = programs.front().userData;
+            require(programs.front().firstUserSgpr == 0 && words.size() >= ShaderRecompiler::MeshIndexBufferUserWord + 4, "mesh program lacks the hidden user words");
+            const auto descriptor = Graphics::MeshIndexBufferDescriptor(parameters, programs.front().binary.codeAddress);
+            std::copy(descriptor.begin(), descriptor.end(), words.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
+        };
+        if (!drawParameters.indirect) setMeshIndexBuffer(drawParameters);
+        else if (graphics.stages.mesh) setMeshIndexBuffer(Pm4::DrawParameters{drawParameters.indexAddress, std::max(drawParameters.indexCount, 1u), drawParameters.indexSize, 1, 0, drawParameters.indexed});
         const std::vector<Role>& roles = decode->roles;
         phase(DrawRowDecode);
         // The user word an SH register named by an indirect draw packet lands in: the program whose
@@ -4240,7 +4253,7 @@ private:
                 mix(graphics.stages.mesh.has_value());
                 if (graphics.stages.mesh) {
                     const auto& mesh = *graphics.stages.mesh;
-                    for (const auto value : {mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex}) mix(value);
+                    for (const auto value : {mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex, mesh.esgsItemSize}) mix(value);
                 }
                 mix(graphics.stages.tessellation.has_value());
                 if (graphics.stages.tessellation) {
@@ -4426,7 +4439,8 @@ private:
                 program.binary,
                 {waveSize, program.firstUserSgpr, program.userData, std::nullopt, program.binary.stage == Stage::Fragment ? std::optional(pixel) : std::nullopt, vertexInfos[i], memory},
                 localDevice->Target(),
-                {0, 0, pushOffset, Graphics::PipelinePushConstantBytes - pushOffset},
+                // The mesh path's draw parameters take the end of the block (MeshDrawPushOffsetBytes).
+                {0, 0, pushOffset, (graphics.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : Graphics::PipelinePushConstantBytes) - pushOffset},
                 ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
             };
             const auto waitedBefore = TraceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
@@ -4752,6 +4766,11 @@ private:
                     direct.indexSize = drawParameters.indexSize;
                 } else {
                     direct.firstVertex = indirect.indxOffset;
+                }
+                if (graphics.stages.mesh) {
+                    // The mesh stage reads the record's own index range.
+                    setMeshIndexBuffer(direct);
+                    patched.insert(0);
                 }
                 for (const auto programIndex : patched) {
                     auto& result = results[resultIndex[programIndex]];

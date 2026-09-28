@@ -445,9 +445,10 @@ void writeMeshConfiguration(Writer& writer, const MeshConfiguration& configurati
     writer.WriteU32(configuration.threadsPerGroup);
     writer.WriteU32(configuration.ldsSizeDwords);
     writer.WriteU32(configuration.provokingVertex);
+    writer.WriteU32(configuration.esgsItemSize);
 }
 
-MeshConfiguration readMeshConfiguration(Reader& reader) {
+MeshConfiguration readMeshConfiguration(Reader& reader, std::uint32_t version) {
     MeshConfiguration configuration{};
     configuration.inputPrimitive = reader.ReadU32();
     configuration.primitivesPerGroup = reader.ReadU32();
@@ -457,6 +458,8 @@ MeshConfiguration readMeshConfiguration(Reader& reader) {
     configuration.threadsPerGroup = reader.ReadU32();
     configuration.ldsSizeDwords = reader.ReadU32();
     configuration.provokingVertex = reader.ReadU32();
+    // Version 2 requests predate the field; their programs were all translated with offsets of four.
+    configuration.esgsItemSize = version >= 3u ? reader.ReadU32() : 4u;
     return configuration;
 }
 
@@ -634,7 +637,7 @@ void writeGraphicsCompileContext(Writer& writer, const GraphicsCompileContext& g
     writer.WriteU32(graphics.draw.instanceCount);
 }
 
-GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGraphicsCompileContext& storage) {
+GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGraphicsCompileContext& storage, std::uint32_t version) {
     GraphicsCompileContext graphics{};
     graphics.firstUserSgpr = reader.ReadU32();
     const auto programCount = reader.ReadU64();
@@ -658,7 +661,7 @@ GraphicsCompileContext readGraphicsCompileContext(Reader& reader, DeserializedGr
     }
     graphics.linkedPrograms = storage.linkedPrograms;
     if (reader.ReadBool()) {
-        storage.mesh = readMeshConfiguration(reader);
+        storage.mesh = readMeshConfiguration(reader, version);
         graphics.mesh = storage.mesh;
     }
     if (reader.ReadBool()) {
@@ -705,7 +708,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     result.request.layout = readBindingLayout(reader);
     if (reader.ReadBool()) {
         result.graphicsStorage = std::make_unique<DeserializedGraphicsCompileContext>();
-        result.request.graphics = readGraphicsCompileContext(reader, *result.graphicsStorage);
+        result.request.graphics = readGraphicsCompileContext(reader, *result.graphicsStorage, version);
     }
     if (version >= 2u) result.request.useCache = reader.ReadBool();
     return result;
