@@ -30,6 +30,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <shared_mutex>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -258,6 +259,36 @@ public:
 
 private:
     std::atomic<std::shared_ptr<VulkanDevice>> pointer;
+};
+
+class DeviceUseGate {
+public:
+    void lock_shared() {
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [&] { return !replacing; });
+        ++users;
+    }
+    void unlock_shared() {
+        std::lock_guard lock(mutex);
+        if (--users == 0) changed.notify_all();
+    }
+    void lock() {
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [&] { return !replacing; });
+        replacing = true;
+        changed.wait(lock, [&] { return users == 0; });
+    }
+    void unlock() {
+        std::lock_guard lock(mutex);
+        replacing = false;
+        changed.notify_all();
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::size_t users = 0;
+    bool replacing = false;
 };
 
 // [sync] statistics (APS5_PROFILE_DRAW): device drains by packet, and the label outcomes of
@@ -647,6 +678,8 @@ public:
             bool presentable = false;
             double waitedMs = 0;
             {
+                std::unique_lock replacing(deviceReplacement, std::defer_lock);
+                if (const auto current = device.load(); current == nullptr || current->Window() == nullptr) replacing.lock();
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
                 std::lock_guard lock(GuestMemory::GpuMutex());
                 timing.Mark("gpu_mutex_wait");
@@ -1449,6 +1482,7 @@ private:
     std::map<std::uint32_t, QueueState> queues;
     std::map<std::uint32_t, std::shared_ptr<IVideoOutput>> outputs;
     DevicePointer device;
+    DeviceUseGate deviceReplacement;
     std::uint64_t accepted = 0;
     std::uint64_t completed = 0;
     std::set<std::uint64_t> completedOutOfOrder;
@@ -5618,6 +5652,8 @@ private:
             const auto count = Pm4::PacketWords(header);
             const auto packet = std::span(submission.commands).subspan(cursor, count);
             const auto opcode = (header >> 8u) & 0xffu;
+            std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
+            if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
             // Names this packet for the flush hook's sync attribution ([hooksync]); the flip is 0xffff.
             GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
             // Pending labels and full batches go to the GPU before this packet's own work starts
