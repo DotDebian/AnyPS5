@@ -133,6 +133,15 @@ struct ColorMetadataPass {
 // when the pass does more than the metadata operation over whole targets (depth or stencil work,
 // multisampling, a nonstandard ROP, a viewport or scissor short of a target).
 std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue);
+// A DB metadata blit: DB_RENDER_CONTROL names HTILE operations only (DEPTH/STENCIL_COMPRESS_DISABLE,
+// an in-place expansion of the surface; RESUMMARIZE_ENABLE, HTILE recomputed from it), the depth and
+// stencil tests, writes and bounds are off, nothing reaches a color target (CB mode disable, or no
+// enabled channel the shader exports), and the pixel shader is one the hardware does not run (no
+// color, depth, stencil or mask export, no kill, no alpha-to-mask, EXEC_ON_NOOP clear), so its input
+// registers (SPI_PS_INPUT_ENA/ADDR) need not be set. HTILE is not modeled (DepthTarget.hpp: the
+// surface's memory is not coherent with its resident image, HTILE fills only mark clears), so such a
+// blit changes nothing here. A register a rule needs that is absent makes it no blit.
+bool DepthMetadataBlit(const QueueState& queue);
 // The message DecodeState (or the pixel stage decode after it) would throw for the register rules
 // this precheck covers, evaluated without exceptions before the draw is decoded; empty when they
 // pass (DecodeState still checks everything). A register a rule needs that is absent is no verdict.

@@ -811,6 +811,34 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     return pass;
 }
 
+bool DepthMetadataBlit(const QueueState& queue) {
+    const auto& cx = queue.context;
+    const auto value = [&](std::uint32_t offset) -> std::optional<std::uint32_t> {
+        const auto it = find(cx, offset);
+        if (it == cx.end()) return std::nullopt;
+        return it->second;
+    };
+    const auto renderControl = value(0x0);
+    const auto depthControl = value(0x200);
+    const auto colorControl = value(0x202);
+    const auto shaderControl = value(0x203);
+    const auto zFormat = value(0x1c4);
+    const auto colFormat = value(0x1c5);
+    const auto alphaToMask = value(0x2dc);
+    const auto targetMask = value(0x8e);
+    const auto shaderMask = value(0x8f);
+    if (!renderControl || !depthControl || !colorControl || !shaderControl || !zFormat || !colFormat || !alphaToMask || !targetMask || !shaderMask) return false;
+    // RESUMMARIZE_ENABLE (4), STENCIL_COMPRESS_DISABLE (5), DEPTH_COMPRESS_DISABLE (6) and nothing else:
+    // no clear, copy or DECOMPRESS_ENABLE.
+    if ((*renderControl & 0x70u) == 0 || (*renderControl & ~0x70u) != 0) return false;
+    // STENCIL_ENABLE, Z_ENABLE, Z_WRITE_ENABLE, DEPTH_BOUNDS_ENABLE.
+    if ((*depthControl & 0xfu) != 0) return false;
+    if (((*colorControl >> 4u) & 7u) != 0 && (*targetMask & *shaderMask) != 0) return false;
+    // Z_EXPORT_ENABLE, STENCIL_TEST_VAL/OP_VAL_EXPORT_ENABLE, KILL_ENABLE, MASK_EXPORT_ENABLE, EXEC_ON_NOOP.
+    if ((*shaderControl & 0x547u) != 0 || *zFormat != 0 || *colFormat != 0 || (*alphaToMask & 1u) != 0) return false;
+    return true;
+}
+
 std::string DrawRejection(const QueueState& queue, bool indexed) {
     const auto& cx = queue.context;
     // A register a rule needs that is absent gives no verdict here: DecodeState reports it.

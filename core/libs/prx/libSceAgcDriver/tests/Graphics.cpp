@@ -689,6 +689,34 @@ void metadataPassTests() {
 
 }
 
+// DB metadata blits: DB_RENDER_CONTROL HTILE operations, no depth/stencil/color work, a skipped pixel
+// shader, so SPI_PS_INPUT_ENA/ADDR may be absent.
+void depthMetadataBlitTests() {
+    using AgcDriver::Graphics::DepthMetadataBlit;
+    auto queue = makeState();
+    for (const auto [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x0, 0x60}, {0x200, 0}, {0x202, 0xcc0000}, {0x203, 0}, {0x1c4, 0}, {0x1c5, 0}, {0x8e, 0}, {0x8f, 0}}) queue.context[offset] = value;
+    queue.context.erase(0x1b3);
+    queue.context.erase(0x1b4);
+    Require(DepthMetadataBlit(queue), "an in-place HTILE decompress blit was not recognized");
+    queue.context[0x0] = 0x10;
+    Require(DepthMetadataBlit(queue), "an HTILE resummarize blit was not recognized");
+    // Normal CB mode with no enabled channel the shader exports writes no color either.
+    queue.context[0x202] = 0xcc0010;
+    queue.context[0x8e] = 0xf;
+    Require(DepthMetadataBlit(queue), "a blit with a target mask but no shader channels was refused");
+    queue.context[0x8f] = 0xf;
+    Require(!DepthMetadataBlit(queue), "a blit writing color was taken for a DB metadata blit");
+    queue.context[0x8f] = 0;
+    for (const auto [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x0, 0}, {0x0, 0x61}, {0x0, 0x1060}, {0x200, 2}, {0x200, 1}, {0x203, 0x40}, {0x203, 0x400}, {0x203, 1}, {0x1c4, 1}, {0x1c5, 4}, {0x2dc, 0xaa01}}) {
+        auto changed = queue;
+        changed.context[offset] = value;
+        Require(!DepthMetadataBlit(changed), "a draw with depth, stencil or pixel shader work was taken for a DB metadata blit");
+    }
+    auto absent = queue;
+    absent.context.erase(0x203);
+    Require(!DepthMetadataBlit(absent), "a draw missing DB_SHADER_CONTROL was taken for a DB metadata blit");
+}
+
 void DepthClipTests() {
     auto queue = makeState();
     const auto direct = AgcDriver::Graphics::DecodeState(queue);
@@ -1874,6 +1902,7 @@ int main() {
         DepthClipTests();
         DisabledColorTests();
         metadataPassTests();
+        depthMetadataBlitTests();
         ShaderStageTests();
         pixelInputLayoutTests();
         InitialContextTests();

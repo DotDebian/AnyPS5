@@ -3971,6 +3971,9 @@ private:
             localDevice->ColorMetadataPass(*pass);
             return DrawVerdict::Drawn;
         }
+        // An HTILE decompress or resummarize blit with no depth, stencil or color work and a pixel
+        // shader the hardware skips: nothing this driver models changes (State.hpp's DepthMetadataBlit).
+        if (metadataPasses && Graphics::DepthMetadataBlit(queue)) return DrawVerdict::Nothing;
         static const bool traceIndirect = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
         if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
         // A draw with no color writes and no pixel shader program ever set has nothing to render
