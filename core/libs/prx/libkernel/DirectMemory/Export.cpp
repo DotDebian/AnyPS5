@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <iterator>
 #include <map>
 #include <cstdio>
 #include <mutex>
@@ -30,6 +31,34 @@ struct PrtAperture {
     void* address;
     size_t length;
 };
+
+struct NamedRange {
+ uintptr_t end;
+ std::string name;
+};
+
+std::mutex g_rangeNameLock;
+std::map<uintptr_t, NamedRange> g_rangeNames;
+
+void EraseRangeNames(uintptr_t start, uintptr_t end) {
+ auto it = g_rangeNames.lower_bound(start);
+ if (it != g_rangeNames.begin() && std::prev(it)->second.end > start) --it;
+ while (it != g_rangeNames.end() && it->first < end) {
+  const auto rangeStart = it->first;
+  const auto range = it->second;
+  it = g_rangeNames.erase(it);
+  if (rangeStart < start) g_rangeNames.emplace(rangeStart, NamedRange{start, range.name});
+  if (range.end > end) it = g_rangeNames.emplace(end, NamedRange{range.end, range.name}).first;
+ }
+}
+
+void CopyRangeName(uintptr_t address, char (&name)[32]) {
+ std::lock_guard lock(g_rangeNameLock);
+ auto it = g_rangeNames.upper_bound(address);
+ if (it == g_rangeNames.begin()) return;
+ --it;
+ if (address < it->second.end) std::strncpy(name, it->second.name.c_str(), sizeof(name) - 1);
+}
 
 std::mutex g_prtLock;
 PrtAperture g_prtApertures[PRT_APERTURE_COUNT] = {};
@@ -180,6 +209,7 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
   info->protection = (best->readable ? 1 : 0) | (best->writable ? 2 : 0) | (!best->releasable ? 4 : 0);
   info->is_direct = best->releasable ? 1u : 0u;
   info->is_committed = 1;
+  CopyRangeName(info->start, info->name);
   return 0;
  }
  // Memory the registry does not know (the title's own heap blocks, stacks): the host's committed
@@ -214,6 +244,7 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
  info->protection = 1 | (writable ? 2 : 0) | (executable ? 4 : 0);
  info->is_flexible = 1;
  info->is_committed = 1;
+ CopyRangeName(info->start, info->name);
  return 0;
 }
 
@@ -268,12 +299,19 @@ int APS5_VABI sceKernelConfiguredFlexibleMemorySize(size_t* size) {
 }
 
 int APS5_VABI sceKernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name) {
- if (!addr || len == 0 || !name) return SCE_KERNEL_ERROR_EINVAL;
+ const auto start = reinterpret_cast<uintptr_t>(addr);
+ if (!addr || len == 0 || !name || len > UINTPTR_MAX - start) return SCE_KERNEL_ERROR_EINVAL;
+ std::lock_guard lock(g_rangeNameLock);
+ EraseRangeNames(start, start + len);
+ g_rangeNames.emplace(start, NamedRange{start + len, std::string(name, strnlen(name, 31))});
  return 0;
 }
 
 int APS5_VABI sceKernelClearVirtualRangeName(const void* addr, uint64_t len) {
- if (!addr || len == 0) return SCE_KERNEL_ERROR_EINVAL;
+ const auto start = reinterpret_cast<uintptr_t>(addr);
+ if (!addr || len == 0 || len > UINTPTR_MAX - start) return SCE_KERNEL_ERROR_EINVAL;
+ std::lock_guard lock(g_rangeNameLock);
+ EraseRangeNames(start, start + len);
  return 0;
 }
 

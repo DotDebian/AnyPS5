@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cstdio>
+#include <iterator>
 #include <cstdlib>
 #include <stdexcept>
 #include <functional>
@@ -18,6 +20,16 @@ namespace {
 
 std::recursive_mutex g_sysLock;
 
+struct ExitDestructor {
+    void (*func)(void*);
+    void* arg;
+    void* dsoHandle;
+};
+
+std::mutex g_exitMutex;
+std::vector<ExitDestructor> g_exitDestructors;
+bool g_exitRunnerRegistered = false;
+
 }
 
 extern "C" {
@@ -27,19 +39,29 @@ FileStream _Stdout_nid_postfix{stdout};
 FileStream _Stdin_nid_postfix{stdin};
 
 int APS5_VABI __cxa_atexit_nid_postfix(void (*func)(void*), void* arg, void* dsoHandle) {
-    (void)dsoHandle;
-    static std::vector<std::pair<void (*)(void*), void*>> destructors;
-    static bool runnerRegistered = false;
-    destructors.emplace_back(func, arg);
-    if (!runnerRegistered) {
-        runnerRegistered = true;
-        std::atexit([] {
-            for (auto it = destructors.rbegin(); it != destructors.rend(); ++it) {
-                it->first(it->second);
-            }
-        });
+    std::lock_guard lock(g_exitMutex);
+    g_exitDestructors.push_back({func, arg, dsoHandle});
+    if (!g_exitRunnerRegistered) {
+        g_exitRunnerRegistered = true;
+        std::atexit([] { CxaFinalize_nid_no_patch(nullptr); });
     }
     return 0;
+}
+
+void CxaFinalize_nid_no_patch(void* dsoHandle) {
+    for (;;) {
+        ExitDestructor destructor{};
+        {
+            std::lock_guard lock(g_exitMutex);
+            const auto found = std::find_if(g_exitDestructors.rbegin(), g_exitDestructors.rend(), [&](const ExitDestructor& entry) {
+                return dsoHandle == nullptr || entry.dsoHandle == dsoHandle;
+            });
+            if (found == g_exitDestructors.rend()) return;
+            destructor = *found;
+            g_exitDestructors.erase(std::next(found).base());
+        }
+        destructor.func(destructor.arg);
+    }
 }
 
 unsigned int APS5_VABI _Atomic_fetch_add_4_nid_postfix(volatile unsigned int* target, unsigned int value, int memoryOrder) {
