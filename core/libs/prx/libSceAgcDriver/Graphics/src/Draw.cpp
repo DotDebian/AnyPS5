@@ -33,9 +33,8 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-// A guest texture format code with the same Vulkan format and texel size as a color buffer.
 std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
-    if (const auto guest = FindGuestTextureFormat(format, elementBytes)) return *guest;
+    if (const auto guest = FindGuestColorTargetFormat(format, elementBytes)) return *guest;
     throw std::runtime_error("AGC graphics: no guest texture format matches the color buffer format " + std::to_string(static_cast<int>(format)));
 }
 

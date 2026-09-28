@@ -23,11 +23,11 @@ static constexpr uint16_t EV_CLEAR = 0x0020;
 static constexpr uint16_t EV_ERROR = 0x4000;
 
 static constexpr int EQUEUE_OK = 0;
-static constexpr int EQUEUE_ERROR_EBADF = static_cast<int>(0x80020009);
-static constexpr int EQUEUE_ERROR_EFAULT = static_cast<int>(0x8002000E);
-static constexpr int EQUEUE_ERROR_EINVAL = static_cast<int>(0x80020016);
-static constexpr int EQUEUE_ERROR_ENOENT = static_cast<int>(0x80020002);
-static constexpr int EQUEUE_ERROR_ETIMEDOUT = static_cast<int>(0x8002003C);
+static constexpr int EQUEUE_ERROR_EBADF = 0x80020009;
+static constexpr int EQUEUE_ERROR_EFAULT = 0x8002000E;
+static constexpr int EQUEUE_ERROR_EINVAL = 0x80020016;
+static constexpr int EQUEUE_ERROR_ENOENT = 0x80020002;
+static constexpr int EQUEUE_ERROR_ETIMEDOUT = 0x8002003C;
 
 struct KernelEqueueEvent;
 

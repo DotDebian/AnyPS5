@@ -119,6 +119,15 @@ std::uint32_t BytesPerElement(std::uint32_t guestFormat) {
     return findFormatEntry(guestFormat).bytesPerElement;
 }
 
+std::optional<std::uint32_t> FindGuestColorTargetFormat(VkFormat format, std::uint32_t elementBytes) {
+    switch (format) {
+        case VK_FORMAT_B8G8R8A8_UNORM: format = VK_FORMAT_R8G8B8A8_UNORM; break;
+        case VK_FORMAT_B8G8R8A8_SRGB: format = VK_FORMAT_R8G8B8A8_SRGB; break;
+        default: break;
+    }
+    return FindGuestTextureFormat(format, elementBytes);
+}
+
 bool IsBlockCompressed(std::uint32_t guestFormat) {
     return findFormatEntry(guestFormat).blockCompressed;
 }

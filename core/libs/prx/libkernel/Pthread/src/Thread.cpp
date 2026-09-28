@@ -14,6 +14,7 @@
 #include <system_error>
 
 #ifndef _WIN32
+#include <csetjmp>
 #include <pthread.h>
 #endif
 
@@ -41,6 +42,14 @@ static std::atomic<get_thread_atexit_count_func_t> threadAtexitCount{nullptr};
 static std::atomic<thread_atexit_report_func_t> threadAtexitReport{nullptr};
 static thread_local PthreadPrivate* currentThread = nullptr;
 static thread_local bool threadFinishing = false;
+#ifndef _WIN32
+static thread_local std::unique_ptr<PthreadPrivate> adoptedThread;
+// pthread_exit force-unwinds through guest frames, whose personality resolves to
+// libc.prx's __gxx_personality_v0; that routine cannot read libgcc's unwind context
+// and aborts. scePthreadExit instead jumps back to the thread start routine, which,
+// like _endthreadex on Windows, skips the guest frames without unwinding them.
+static thread_local std::jmp_buf* threadExitJump = nullptr;
+#endif
 
 void ThreadLifecycle::SetThreadDtors(thread_dtors_func_t callback) {
     if (!callback)
@@ -93,15 +102,19 @@ static void RunThread(std::unique_ptr<ThreadArgs> args) {
     currentThread = nullptr;
 }
 
-#ifdef _WIN32
 static void ReleaseThread(PthreadPrivate* thread) {
+    if (thread->_adopted)
+        return;
     if (thread->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
+#ifdef _WIN32
     if (!CloseHandle(thread->nativeHandle))
         throw std::system_error(GetLastError(), std::system_category(), "Closing guest thread handle");
+#endif
     delete thread;
 }
 
+#ifdef _WIN32
 // The title's job workers ("BPE JobWorkerThread CPU0".."CPU12") spin at full load on one core each.
 // Pinning them to the efficiency cores of a hybrid CPU (APS5_JOB_AFFINITY=1, with the driver's
 // worker pinning) measured 0 to -9 % at the video stage, so the default leaves them free;
@@ -220,8 +233,23 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
     if (detached)
         ReleaseThread(published);
 #else
-    p->_thr = std::thread([args = std::move(args), ready = start.get_future()]() mutable {
-        if (ready.get()) RunThread(std::move(args));
+    auto* self = p.get();
+    p->_thr = std::thread([self, args = std::move(args), ready = start.get_future()]() mutable {
+        if (!ready.get()) return;
+        self->threadId = std::this_thread::get_id();
+        struct ThreadGuard {
+            PthreadPrivate* self;
+            ~ThreadGuard() {
+                currentThread = nullptr;
+                ReleaseThread(self);
+            }
+        } guard{self};
+        std::jmp_buf exitJump;
+        if (setjmp(exitJump) == 0) {
+            threadExitJump = &exitJump;
+            RunThread(std::move(args));
+        }
+        threadExitJump = nullptr;
     });
     try {
         if (detached) p->_thr.detach();
@@ -230,8 +258,11 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
         p->_thr.join();
         throw;
     }
-    *thread = p.release();
+    auto* published = p.release();
+    *thread = published;
     start.set_value(true);
+    if (detached)
+        ReleaseThread(published);
 #endif
     return SCE_OK;
 }
@@ -239,9 +270,9 @@ int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, Pthread
 int APS5_VABI scePthreadJoin(Pthread thread, void** retval) {
     if (!thread) throw std::runtime_error("scePthreadJoin: null thread");
     if (thread->_detached) return SCE_KERNEL_ERROR_EINVAL;
-#ifdef _WIN32
     if (thread == currentThread)
         throw std::runtime_error("scePthreadJoin: cannot join current thread");
+#ifdef _WIN32
     if (WaitForSingleObject(thread->nativeHandle, INFINITE) != WAIT_OBJECT_0)
         throw std::system_error(GetLastError(), std::system_category(), "Joining guest thread");
     if (retval) *retval = thread->_retval;
@@ -249,7 +280,7 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval) {
 #else
     if (thread->_thr.joinable()) thread->_thr.join();
     if (retval) *retval = thread->_retval;
-    delete thread;
+    ReleaseThread(thread);
 #endif
     return SCE_OK;
 }
@@ -262,6 +293,7 @@ int APS5_VABI scePthreadDetach(Pthread thread) {
     ReleaseThread(thread);
 #else
     if (thread->_thr.joinable()) thread->_thr.detach();
+    ReleaseThread(thread);
 #endif
     return SCE_OK;
 }
@@ -276,6 +308,8 @@ void APS5_VABI scePthreadExit(void* retval) {
     ReleaseThread(self);
     _endthreadex(0);
 #else
+    if (threadExitJump)
+        std::longjmp(*threadExitJump, 1);
     pthread_exit(retval);
 #endif
     throw std::runtime_error("Native thread exit returned");
@@ -293,6 +327,14 @@ Pthread APS5_VABI scePthreadSelf() {
         adopted->_detached = true;
         adopted->references.store(1, std::memory_order_relaxed);
         currentThread = adopted.release();
+    }
+#else
+    if (!currentThread) {
+        adoptedThread = std::make_unique<PthreadPrivate>();
+        adoptedThread->_detached = true;
+        adoptedThread->_adopted = true;
+        adoptedThread->threadId = std::this_thread::get_id();
+        currentThread = adoptedThread.get();
     }
 #endif
     return currentThread;

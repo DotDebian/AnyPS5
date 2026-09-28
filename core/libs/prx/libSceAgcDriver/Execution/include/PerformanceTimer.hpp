@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include "prx/libc/include/general/LogMacros.hpp"
 
 namespace AgcDriver {
 
@@ -138,9 +139,7 @@ public:
             if (metric.bytes != 0) output << ',' << metric.bytes;
             output << ')';
         }
-        output << '\n';
-        const auto text = output.str();
-        if (std::fwrite(text.data(), 1, text.size(), stdout) != text.size() || std::fflush(stdout) != 0) throw std::runtime_error("Frame timing: report write failed");
+        APS5_LOG_TIMING("%s", output.str().c_str());
     }
 
 private:

@@ -134,7 +134,7 @@ std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes
     return static_cast<std::int64_t>(n);
 }
 
-int APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
+std::int64_t APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
     if (whence < 0 || whence > 2) {
         throw std::invalid_argument(std::string(__func__) + ": invalid whence=" + std::to_string(whence));
     }
@@ -142,10 +142,7 @@ int APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
     if (result < 0) {
         throw std::runtime_error(std::string(__func__) + ": lseek failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
     }
-    if (result > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
-        throw std::overflow_error(std::string(__func__) + ": result " + std::to_string(result) + " overflows int return type");
-    }
-    return static_cast<int>(result);
+    return result;
 }
 
 int APS5_VABI sceKernelStat(const char* path, FileStat* sb) {

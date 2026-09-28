@@ -1602,12 +1602,11 @@ bool ResidentPresentable(const Graphics::Context& context, const Graphics::Stora
     if (descriptor.width != buffer.width || descriptor.height != buffer.height || descriptor.mipCount != 1 || image.ImageLayers() != 1 || image.ImageDepth() != 1) return false;
     if (image.GuestBytes() != DisplayBufferSize(buffer)) return false;
     const auto format = Graphics::StorageFormatForGuest(context, descriptor.format);
-    switch (format) {
-        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
-        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
-            break;
-        default: return false;
-    }
+    constexpr std::uint64_t tenBitFormat = 0x0100000000000000ull;
+    const bool tenBit = (buffer.pixelFormat & tenBitFormat) != 0;
+    const bool rgba = (buffer.pixelFormat & ~tenBitFormat) == 0x8000000022000000ull;
+    const auto displayFormat = tenBit ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : rgba ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
+    if (format != displayFormat) return false;
     VkFormatProperties properties{};
     context.formatProperties(context.physical, format, &properties);
     if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) == 0) return false;

@@ -69,11 +69,11 @@ struct PthreadAttrPrivate {
 struct PthreadPrivate {
 #ifdef _WIN32
     void* nativeHandle = nullptr;
-    std::thread::id threadId;
-    std::atomic<unsigned> references{2};
 #else
     std::thread _thr;
 #endif
+    std::thread::id threadId;
+    std::atomic<unsigned> references{2};
     void* stackAddress = nullptr;
     std::size_t stackSize = 0;
     std::atomic<KernelCpumask> affinity{DEFAULT_THREAD_AFFINITY};
@@ -83,10 +83,11 @@ struct PthreadPrivate {
     std::atomic<bool> _finished;
     void* _retval;
     bool _detached;
+    bool _adopted;
     std::mutex _join_mtx;
     std::condition_variable _join_cv;
 
-    PthreadPrivate() : _finished(false), _retval(nullptr), _detached(false) {}
+    PthreadPrivate() : _finished(false), _retval(nullptr), _detached(false), _adopted(false) {}
 };
 
 #endif
