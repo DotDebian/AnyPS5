@@ -204,6 +204,8 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
 
                 // Enabled unconditionally or by the device setup in VulkanDevice.
                 const bool isFeatureCapability =
+                    capability == spv::CapabilitySampled1D ||
+                    capability == spv::CapabilityImage1D ||
                     capability == spv::CapabilityImageGatherExtended ||
                     capability == spv::CapabilityImageQuery ||
                     capability == spv::CapabilityStorageImageWriteWithoutFormat ||
