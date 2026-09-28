@@ -77,6 +77,8 @@ struct DrawRecipe {
     std::weak_ptr<Graphics::Framebuffer> framebuffer;
     std::vector<std::weak_ptr<Graphics::StorageTexture>> targets;
     std::vector<VkImageView> targetViews;
+    // The resident depth image of a draw with a depth attachment (DepthTarget.hpp).
+    std::weak_ptr<Graphics::DepthImage> depth;
     std::uint64_t passKey = 0;
     Graphics::VertexInputLayout vertexInput;
     std::array<std::byte, Graphics::PipelinePushConstantBytes> pushBytes{};

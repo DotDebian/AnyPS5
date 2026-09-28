@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -270,6 +271,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return keys;
     };
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+    // Depth surfaces are rendered into resident depth images only (DepthTarget.hpp): say so once
+    // when one is sampled.
+    NoteDepthSurfaceSampled(resource.baseAddress);
     auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);

@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -1343,6 +1344,15 @@ private:
         }
         if (s.hasColorTarget != t.hasColorTarget || s.rectList != t.rectList || s.renderExtent.width != t.renderExtent.width || s.renderExtent.height != t.renderExtent.height || s.topology != t.topology || s.negativeOneToOne != t.negativeOneToOne || s.depthClamp != t.depthClamp || s.cullMode != t.cullMode || s.frontFace != t.frontFace || !sameBlend(s.blend, t.blend) || s.blendConstants != t.blendConstants) return false;
         if (std::memcmp(&s.viewport, &t.viewport, sizeof(VkViewport)) != 0 || std::memcmp(&s.scissor, &t.scissor, sizeof(VkRect2D)) != 0) return false;
+        const auto sameStencil = [](const VkStencilOpState& x, const VkStencilOpState& y) {
+            return x.failOp == y.failOp && x.passOp == y.passOp && x.depthFailOp == y.depthFailOp && x.compareOp == y.compareOp && x.compareMask == y.compareMask && x.writeMask == y.writeMask && x.reference == y.reference;
+        };
+        const auto& d = s.depth;
+        const auto& e = t.depth;
+        if (d.attached != e.attached || d.depthTest != e.depthTest || d.depthWrite != e.depthWrite || d.depthCompare != e.depthCompare || d.stencilTest != e.stencilTest || !sameStencil(d.front, e.front) || !sameStencil(d.back, e.back) || d.clearDepth != e.clearDepth || d.clearStencil != e.clearStencil || std::bit_cast<std::uint32_t>(d.depthClearValue) != std::bit_cast<std::uint32_t>(e.depthClearValue) || d.stencilClearValue != e.stencilClearValue || d.depthBias != e.depthBias || d.depthBiasConstant != e.depthBiasConstant || d.depthBiasSlope != e.depthBiasSlope || d.depthBiasClamp != e.depthBiasClamp) return false;
+        const auto& z = s.depthTarget;
+        const auto& w = t.depthTarget;
+        if (z.address != w.address || z.stencilAddress != w.stencilAddress || z.htileAddress != w.htileAddress || z.extent.width != w.extent.width || z.extent.height != w.extent.height || z.zFormat != w.zFormat || z.stencil != w.stencil || z.tileMode != w.tileMode || z.slice != w.slice) return false;
         const auto& p = a.pixel;
         const auto& q = b.pixel;
         if (p.interpolatorCount != q.interpolatorCount || p.interpolatorSettings != q.interpolatorSettings || p.wave32 != q.wave32 || p.perspectiveCenterVgpr != q.perspectiveCenterVgpr || p.hasPerspectiveCenterVgpr != q.hasPerspectiveCenterVgpr || p.posX != q.posX || p.posY != q.posY || p.posZ != q.posZ || p.posW != q.posW || p.frontFace != q.frontFace || p.ancillary != q.ancillary || p.sampleShading != q.sampleShading || p.noPerspective != q.noPerspective || p.pixelKillEnable != q.pixelKillEnable || p.depthExportEnable != q.depthExportEnable || p.sampleMaskExportEnable != q.sampleMaskExportEnable || p.earlyZ != q.earlyZ || p.executeOnNoop != q.executeOnNoop || p.targetOutputMode != q.targetOutputMode || p.targetExportMapping != q.targetExportMapping) return false;
@@ -1855,6 +1865,9 @@ private:
             GuestMemory::CheckRange(reinterpret_cast<const void*>(base), bytes, 16, true);
             phase(FillCheck);
             const auto coverage = Graphics::StorageTexture::ClassifyFill(base, bytes);
+            // A fill of a resident depth image's HTILE buffer with the cleared state clears the image
+            // (its contents never reach guest memory; see DepthTarget.hpp).
+            Graphics::NoteDepthMetadataFill(base, bytes, pattern[0]);
             phase(FillClassify);
             // Debug aid (APS5_TRACE_DCC_KEYS=1): the title's fills of a surface's DCC metadata.
             static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
@@ -3914,8 +3927,9 @@ private:
         if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
         static const bool traceIndirect = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
         if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
-        // Depth/stencil-only passes (no color writes, no pixel shader) have no effect without depth
-        // targets, which are not emulated.
+        // A draw with no color writes and no pixel shader program ever set has nothing to render
+        // here (a depth-only pass needs a pixel program for the pipeline; the register stays set
+        // once a title bound one, so such passes do render into depth targets).
         {
             const auto targetMask = queue.context.find(0x8e);
             const auto shaderMask = queue.context.find(0x8f);

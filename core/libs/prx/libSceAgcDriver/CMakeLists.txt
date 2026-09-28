@@ -63,6 +63,7 @@ add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorTargetTransfer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Pipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DepthTarget.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
@@ -230,6 +231,7 @@ add_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/TextureDetiler.cpp
         Graphics/src/Draw.cpp
         Graphics/src/Pipeline.cpp
+        Graphics/src/DepthTarget.cpp
         Graphics/src/State.cpp
         Graphics/src/Recorder.cpp
         Graphics/src/ShaderInputState.cpp
@@ -346,6 +348,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/ColorTargetTransfer.cpp
             Graphics/src/Pipeline.cpp
             Graphics/src/PipelineCache.cpp
+            Graphics/src/DepthTarget.cpp
             Graphics/src/Resources.cpp
             Graphics/src/ShaderResources.cpp
             Graphics/src/ShaderAddressResources.cpp

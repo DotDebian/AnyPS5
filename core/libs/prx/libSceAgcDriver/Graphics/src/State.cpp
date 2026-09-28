@@ -5,6 +5,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
 #include <bitset>
 #include <cmath>
@@ -60,7 +62,6 @@ std::string vteMessage(std::uint32_t viewportControl) {
 // Render target index, viewport index and the misc export vector that carries them are accepted but
 // not routed: color targets are single-layer, so layered draws land in layer 0.
 constexpr std::uint32_t LayerExports = (1u << 18u) | (1u << 19u) | (1u << 21u) | (1u << 24u);
-constexpr std::uint32_t DepthControlMask = ~0x007007f0u;
 // EXEC_ON_HIER_FAIL / EXEC_ON_NOOP / EXEC_IF_OVERLAPPED (bits 9, 10, 17) only force the pixel shader
 // to run, which it always does here.
 constexpr std::uint32_t ShaderControlMask = ~(0x00009870u | 0x00020600u);
@@ -72,26 +73,260 @@ constexpr std::uint32_t ScreenOffsetMask = ~0x01ff01ffu;
 constexpr std::uint32_t ClipControlMask = ~(0x80000u | 0x0c000000u);
 
 // Debug aid: APS5_IGNORE_DEPTH_TEST=1 renders depth- and stencil-tested draws without a depth
-// target as if their tests always passed (wrong occlusion, but the draws run), so stages that
-// depth-test everything can exercise the draw paths before depth targets exist.
+// target as if their tests always passed (wrong occlusion, but the draws run), as before depth
+// targets existed.
 bool IgnoreDepthTest() {
     static const bool ignore = std::getenv("APS5_IGNORE_DEPTH_TEST") != nullptr;
     return ignore;
 }
 
-// DB_DEPTH_CONTROL: depth and stencil tests whose function is ALWAYS and that write no depth cannot
-// change color output, so they are accepted without a depth target (stencil writes are dropped).
-bool depthPassThrough(std::uint32_t depthControl) {
-    const bool stencil = (depthControl & 1u) != 0;
-    const bool depth = (depthControl & 2u) != 0;
-    const bool depthWrite = (depthControl & 4u) != 0;
-    const bool passThroughDepth = !depth || (!depthWrite && ((depthControl >> 4u) & 7u) == 7u);
-    const bool passThroughStencil = !stencil || (((depthControl >> 8u) & 7u) == 7u && ((depthControl & 0x80u) == 0 || ((depthControl >> 20u) & 7u) == 7u));
-    return (stencil || depth) && passThroughDepth && passThroughStencil;
+// One stderr line per kind for the whole process (decodeDepth is instantiated for DecodeState and
+// DrawRejection alike).
+enum class DepthReport { Ignored, PassThrough, DroppedStencil, Count };
+
+void reportOnce(DepthReport kind, const char* format, std::uint32_t value) {
+    static std::array<std::atomic<bool>, static_cast<std::size_t>(DepthReport::Count)> reported{};
+    if (reported[static_cast<std::size_t>(kind)].exchange(true)) return;
+    std::fprintf(stderr, format, value);
 }
 
-std::uint32_t effectiveDepthControl(std::uint32_t depthControl) {
-    return (depthControl & 3u) == 0 ? depthControl & ~4u : depthControl;
+std::string depthMessage(const char* reason, std::uint32_t offset, std::uint32_t value) {
+    char detail[64];
+    std::snprintf(detail, sizeof(detail), " (register 0x%x = 0x%08x)", offset, value);
+    return std::string("AGC graphics: ") + reason + detail;
+}
+
+// DB_DEPTH_CONTROL / DB_STENCILREFMASK(_BF) STENCILFUNC and ZFUNC share VkCompareOp's order (NEVER,
+// LESS, EQUAL, LEQUAL, GREATER, NOTEQUAL, GEQUAL, ALWAYS); the reference is the left operand in both.
+VkCompareOp compareOp(std::uint32_t value) {
+    return static_cast<VkCompareOp>(value & 7u);
+}
+
+// DB_STENCIL_CONTROL operations: KEEP, ZERO, ONES, REPLACE_TEST (the test value), REPLACE_OP (the op
+// value), ADD_CLAMP, SUB_CLAMP, INVERT, ADD_WRAP, SUB_WRAP, then bitwise AND/OR/XOR/NAND/NOR/XNOR with
+// the op value. Vulkan replaces with the reference and steps by one, so REPLACE_OP needs the op value
+// to equal the test value, the arithmetic ones an op value of 1 (what radeonsi programs for
+// INCR/DECR), ONES a test value of 0xff; the bitwise ones have no Vulkan form.
+std::optional<VkStencilOp> stencilOp(std::uint32_t op, std::uint32_t testValue, std::uint32_t opValue) {
+    switch (op) {
+        case 0: return VK_STENCIL_OP_KEEP;
+        case 1: return VK_STENCIL_OP_ZERO;
+        case 2: if (testValue == 0xffu) return VK_STENCIL_OP_REPLACE; return std::nullopt;
+        case 3: return VK_STENCIL_OP_REPLACE;
+        case 4: if (opValue == testValue) return VK_STENCIL_OP_REPLACE; return std::nullopt;
+        case 5: if (opValue == 1) return VK_STENCIL_OP_INCREMENT_AND_CLAMP; return std::nullopt;
+        case 6: if (opValue == 1) return VK_STENCIL_OP_DECREMENT_AND_CLAMP; return std::nullopt;
+        case 7: return VK_STENCIL_OP_INVERT;
+        case 8: if (opValue == 1) return VK_STENCIL_OP_INCREMENT_AND_WRAP; return std::nullopt;
+        case 9: if (opValue == 1) return VK_STENCIL_OP_DECREMENT_AND_WRAP; return std::nullopt;
+        default: return std::nullopt;
+    }
+}
+
+struct DepthDecode {
+    DepthTarget target;
+    DepthState state;
+};
+
+// The depth/stencil rules DecodeState and DrawRejection share, so the precheck rejects exactly what
+// the decode would: `required(offset)` reads a register a rule needs (DrawRejection's gives nullopt
+// for an absent one, which ends the rules without a verdict; DecodeState's throws), `optional(offset)`
+// one that may be absent (the gfx10 *_BASE_HI words; absent reads as 0). Returns the rejection, or
+// empty with `out` filled (out.state.attached false: the draw renders without a depth attachment).
+//
+// A draw needs the attachment when a depth test can fail or writes depth, when a stencil test can fail
+// or writes stencil, or when it clears either. A surface whose format is invalid has no tests (the DB
+// passes everything), which is what a pass-through state amounts to as well. Stencil writes of an
+// always-passing stencil test that Vulkan cannot express are dropped (reported once), as before depth
+// targets existed.
+template<typename TRequired, typename TOptional>
+std::string decodeDepth(TRequired required, TOptional optional, DepthDecode& out) {
+    out = {};
+    const auto depthControl = required(0x200);
+    if (!depthControl) return {};
+    const auto dc = *depthControl;
+    if ((dc & 0xc0000008u) != 0) return "AGC graphics: depth bounds or depth-conditional color writes are unsupported";
+    if (IgnoreDepthTest()) {
+        if ((dc & 3u) != 0) reportOnce(DepthReport::Ignored, "[gpu] depth/stencil tests are ignored (APS5_IGNORE_DEPTH_TEST; DB_DEPTH_CONTROL=0x%08x)\n", dc);
+        return {};
+    }
+    // DB_Z_INFO / DB_STENCIL_INFO are absent until the title binds a surface: FORMAT INVALID, the
+    // context default.
+    const std::optional<std::uint32_t> zInfo = optional(0x10);
+    const std::optional<std::uint32_t> stencilInfo = optional(0x11);
+    const auto zFormat = *zInfo & 3u;
+    const bool hasZ = zFormat != 0;
+    const bool hasStencil = (*stencilInfo & 1u) != 0;
+    if (!hasZ && !hasStencil) return {};
+    const auto renderControl = required(0x0);
+    if (!renderControl) return {};
+    // DEPTH_COPY / STENCIL_COPY (a depth-to-color copy) and DECOMPRESS_ENABLE (an in-place HTILE
+    // expansion into the surface's memory) have no meaning without the guest surface; RESUMMARIZE and
+    // the compression disables only concern HTILE.
+    if ((*renderControl & 0x100cu) != 0) return depthMessage("depth copy or decompress passes are unsupported", 0x0, *renderControl);
+    auto& state = out.state;
+    state.clearDepth = hasZ && (*renderControl & 1u) != 0;
+    state.clearStencil = hasStencil && (*renderControl & 2u) != 0;
+    const auto view = required(0x2);
+    if (!view) return {};
+    // SLICE_START/SLICE_MAX (with their HI bits 11-12 and 30-31) select the array layers, MIPID
+    // (bits 26-29) the mip; Z_READ_ONLY (bit 24) and STENCIL_READ_ONLY (bit 25) turn the writes off.
+    // One layer of an array (a shadow cascade) is a surface of its own here: guest memory is never
+    // read, so layer n is simply another resident image (DepthTarget::slice).
+    const auto sliceStart = (*view & 0x7ffu) | (((*view >> 11u) & 3u) << 11u);
+    const auto sliceMax = ((*view >> 13u) & 0x7ffu) | (((*view >> 30u) & 3u) << 11u);
+    if (sliceStart != sliceMax) return depthMessage("layered depth rendering is unsupported", 0x2, *view);
+    if (((*view >> 26u) & 0xfu) != 0) return depthMessage("rendering into a depth mip other than 0 is unsupported", 0x2, *view);
+    const bool depthReadOnly = (*view & 0x01000000u) != 0;
+    const bool stencilReadOnly = (*view & 0x02000000u) != 0;
+    state.depthTest = hasZ && (dc & 2u) != 0;
+    state.depthWrite = state.depthTest && (dc & 4u) != 0 && !depthReadOnly;
+    state.depthCompare = compareOp(dc >> 4u);
+    bool depthNeeded = state.depthTest && (state.depthWrite || state.depthCompare != VK_COMPARE_OP_ALWAYS);
+    bool stencilNeeded = false;
+    if (hasStencil && (dc & 1u) != 0) {
+        const auto control = required(0x10b);
+        const auto front = required(0x10c);
+        const auto back = required(0x10d);
+        if (!control || !front || !back) return {};
+        const bool backface = (dc & 0x80u) != 0;
+        const std::array<std::uint32_t, 2> funcs{(dc >> 8u) & 7u, backface ? (dc >> 20u) & 7u : (dc >> 8u) & 7u};
+        const std::array<std::uint32_t, 2> ops{*control & 0xfffu, backface ? (*control >> 12u) & 0xfffu : *control & 0xfffu};
+        const std::array<std::uint32_t, 2> refs{*front, backface ? *back : *front};
+        bool writes = false;
+        bool alwaysPasses = true;
+        for (std::size_t face = 0; face < 2; ++face) {
+            alwaysPasses = alwaysPasses && funcs[face] == 7u;
+            const auto writeMask = stencilReadOnly ? 0u : (refs[face] >> 16u) & 0xffu;
+            // With an always-passing test only the pass operation (STENCILZPASS; STENCILZFAIL when a
+            // depth test can fail) runs.
+            writes = writes || (writeMask != 0 && ops[face] != 0);
+        }
+        stencilNeeded = !alwaysPasses || writes;
+        state.stencilTest = stencilNeeded;
+        for (std::size_t face = 0; face < 2 && stencilNeeded; ++face) {
+            auto& op = face == 0 ? state.front : state.back;
+            const auto testValue = refs[face] & 0xffu;
+            const auto opValue = refs[face] >> 24u;
+            const auto fail = stencilOp(ops[face] & 0xfu, testValue, opValue);
+            const auto pass = stencilOp((ops[face] >> 4u) & 0xfu, testValue, opValue);
+            const auto depthFail = stencilOp((ops[face] >> 8u) & 0xfu, testValue, opValue);
+            if (!fail || !pass || !depthFail) {
+                if (!alwaysPasses) return depthMessage("stencil operations other than keep, zero, replace, invert and increment/decrement by one are unsupported", 0x10b, *control);
+                reportOnce(DepthReport::DroppedStencil, "[gpu] stencil writes Vulkan cannot express are dropped for always-passing stencil tests (DB_STENCIL_CONTROL=0x%08x)\n", *control);
+                stencilNeeded = false;
+                state.stencilTest = false;
+                state.front = state.back = {};
+                break;
+            }
+            op.failOp = *fail;
+            op.passOp = *pass;
+            op.depthFailOp = *depthFail;
+            op.compareOp = compareOp(funcs[face]);
+            op.compareMask = (refs[face] >> 8u) & 0xffu;
+            op.writeMask = stencilReadOnly ? 0u : (refs[face] >> 16u) & 0xffu;
+            op.reference = testValue;
+        }
+    }
+    if (state.clearDepth) {
+        // The DB writes the clear value wherever the clear draw covers, whatever the depth function.
+        state.depthTest = true;
+        state.depthWrite = true;
+        state.depthCompare = VK_COMPARE_OP_ALWAYS;
+        depthNeeded = true;
+    }
+    if (state.clearStencil) {
+        state.stencilTest = true;
+        stencilNeeded = true;
+    }
+    if (!depthNeeded && !stencilNeeded) {
+        if ((dc & 3u) != 0) reportOnce(DepthReport::PassThrough, "[gpu] always-pass depth/stencil state is rendered without a depth target (DB_DEPTH_CONTROL=0x%08x)\n", dc);
+        out.state = {};
+        return {};
+    }
+    if (!depthNeeded) {
+        state.depthTest = false;
+        state.depthWrite = false;
+        state.depthCompare = VK_COMPARE_OP_ALWAYS;
+    }
+    // The surface. NUM_SAMPLES (bits 2-3) is the MSAA sample count; format 2 (Z_24) does not exist on
+    // gfx10. Everything else in DB_Z_INFO / DB_STENCIL_INFO concerns the memory layout, HTILE use or
+    // residency of a surface that is never read.
+    if ((*zInfo & 0xcu) != 0) return depthMessage("multisampled depth targets are unsupported", 0x10, *zInfo);
+    if (zFormat == 2) return depthMessage("the Z_24 depth format is unsupported", 0x10, *zInfo);
+    auto& target = out.target;
+    target.zFormat = zFormat;
+    target.stencil = hasStencil;
+    target.slice = sliceStart;
+    target.tileMode = ((hasZ ? *zInfo : *stencilInfo) >> 4u) & 0x1fu;
+    const auto base = [&](std::uint32_t low, std::uint32_t high) -> std::optional<std::uint64_t> {
+        const auto word = required(low);
+        if (!word) return std::nullopt;
+        return (static_cast<std::uint64_t>(*word) << 8u) | (static_cast<std::uint64_t>(optional(high) & 0xffu) << 40u);
+    };
+    if (hasZ) {
+        const auto read = base(0x12, 0x1a);
+        const auto write = base(0x14, 0x1c);
+        if (!read || !write) return {};
+        if (*read != *write) return "AGC graphics: separate depth read and write surfaces are unsupported";
+        if (*read == 0) return "AGC graphics: null depth surface";
+        target.address = *read;
+    }
+    if (hasStencil) {
+        const auto read = base(0x13, 0x1b);
+        const auto write = base(0x15, 0x1d);
+        if (!read || !write) return {};
+        if (*read != *write) return "AGC graphics: separate stencil read and write surfaces are unsupported";
+        if (*read == 0) return "AGC graphics: null stencil surface";
+        target.stencilAddress = *read;
+        if (!hasZ) target.address = *read;
+    }
+    if (hasZ && (*zInfo & (1u << 29u)) != 0) {
+        const auto htile = base(0x5, 0x1e);
+        if (!htile) return {};
+        target.htileAddress = *htile;
+    }
+    const auto size = required(0x7);
+    if (!size) return {};
+    target.extent = {(*size & 0x3fffu) + 1u, ((*size >> 16u) & 0x3fffu) + 1u};
+    const auto depthClear = required(0xb);
+    const auto stencilClear = required(0xa);
+    if (!depthClear || !stencilClear) return {};
+    state.depthClearValue = std::bit_cast<float>(*depthClear);
+    if (!std::isfinite(state.depthClearValue)) return depthMessage("non-finite depth clear value", 0xb, *depthClear);
+    state.stencilClearValue = *stencilClear & 0xffu;
+    if (state.clearStencil) {
+        for (auto* op : {&state.front, &state.back}) *op = {VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_ALWAYS, 0xffu, 0xffu, state.stencilClearValue};
+    }
+    // Depth bias (PA_SU_SC_MODE_CNTL POLY_OFFSET_FRONT/BACK_ENABLE; PARA_ENABLE is for points and lines,
+    // which Vulkan does not bias). Vulkan has one bias for both faces: a face culled away needs none.
+    const auto raster = required(0x205);
+    if (!raster) return {};
+    const bool frontBias = (*raster & 0x800u) != 0 && (*raster & 1u) == 0;
+    const bool backBias = (*raster & 0x1000u) != 0 && (*raster & 2u) == 0;
+    if (hasZ && (frontBias || backBias)) {
+        const auto clamp = required(0x2df);
+        const auto frontScale = required(0x2e0);
+        const auto frontOffset = required(0x2e1);
+        const auto backScale = required(0x2e2);
+        const auto backOffset = required(0x2e3);
+        if (!clamp || !frontScale || !frontOffset || !backScale || !backOffset) return {};
+        const bool frontFaces = (*raster & 1u) == 0;
+        const bool backFaces = (*raster & 2u) == 0;
+        if ((frontFaces && !frontBias) || (backFaces && !backBias)) return depthMessage("depth bias on one face only is unsupported", 0x205, *raster);
+        if (frontBias && backBias && (*frontScale != *backScale || *frontOffset != *backOffset)) return "AGC graphics: different front and back depth bias is unsupported";
+        const auto scale = std::bit_cast<float>(frontBias ? *frontScale : *backScale);
+        const auto offset = std::bit_cast<float>(frontBias ? *frontOffset : *backOffset);
+        const auto limit = std::bit_cast<float>(*clamp);
+        if (!std::isfinite(scale) || !std::isfinite(offset) || !std::isfinite(limit)) return "AGC graphics: non-finite depth bias";
+        // radeonsi programs scale * 16 and units * 4 (Z_16) or * 1 (Z_32_FLOAT).
+        state.depthBias = true;
+        state.depthBiasSlope = scale / 16.0f;
+        state.depthBiasConstant = zFormat == 1 ? offset / 4.0f : offset;
+        state.depthBiasClamp = limit;
+    }
+    state.attached = true;
+    return {};
 }
 
 bool colorControlSupported(std::uint32_t colorControl, bool hasColorTarget) {
@@ -209,7 +444,9 @@ DecodedColorFormat DecodeColorFormat(std::uint32_t format, std::uint32_t number,
 void intersect(VkRect2D& result, const Registers& registers, std::uint32_t offset, bool screen) {
     const auto tl = read(registers, offset);
     const auto br = read(registers, offset + 1);
-    if (!screen) Require((tl & 0x80008000u) == 0x80000000u && (br & 0x80008000u) == 0, "scissor window offsets or reserved bits are unsupported");
+    // WINDOW_OFFSET_DISABLE (bit 31) only matters with a nonzero PA_SC_WINDOW_OFFSET, which
+    // DecodeState rejects.
+    if (!screen) Require((tl & 0x00008000u) == 0 && (br & 0x80008000u) == 0, "reserved scissor bits are set");
     const auto x = tl & 0xffffu;
     const auto y = (tl >> 16u) & (screen ? 0xffffu : 0x7fffu);
     const auto right = br & 0xffffu;
@@ -307,23 +544,14 @@ State DecodeState(const QueueState& queue) {
     }
     zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
     {
-        const auto depthControl = read(cx, 0x200);
-        if (depthPassThrough(depthControl)) {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
-                std::fprintf(stderr, "[gpu] always-pass depth/stencil state is rendered without a depth target (DB_DEPTH_CONTROL=0x%08x)\n", depthControl);
-            }
-        } else if (IgnoreDepthTest()) {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
-                std::fprintf(stderr, "[gpu] depth/stencil tests are ignored (APS5_IGNORE_DEPTH_TEST; DB_DEPTH_CONTROL=0x%08x)\n", depthControl);
-            }
-        } else {
-            if ((effectiveDepthControl(depthControl) & DepthControlMask) != 0) zero(cx, 0x200, DepthControlMask, "depth, stencil or conditional color writes");
-        }
-        Require((depthControl & 0xc0000008u) == 0, "depth bounds or depth-conditional color writes are unsupported");
+        DepthDecode depth;
+        const auto reason = decodeDepth([&](std::uint32_t offset) { return std::optional<std::uint32_t>(read(cx, offset)); }, [&](std::uint32_t offset) {
+            const auto it = find(cx, offset);
+            return it == cx.end() ? 0u : it->second;
+        }, depth);
+        if (!reason.empty()) throw std::runtime_error(reason);
+        result.depthTarget = depth.target;
+        result.depth = depth.state;
     }
     zero(cx, 0x203, ShaderControlMask, "depth export, shader coverage or ordered fragment execution");
     zero(cx, 0x2dc, AlphaToCoverageMask, "alpha-to-coverage");
@@ -345,8 +573,10 @@ State DecodeState(const QueueState& queue) {
     const auto raster = read(cx, 0x205);
     // Bits 5-10 give the front/back polygon type (2 = filled triangles), which POLY_MODE (bit 3) turns on
     // explicitly; KEEP_TOGETHER_ENABLE (bit 24) only affects primitive distribution across the chip.
-    const auto rasterMode = raster & ~0x7u & ~(1u << 24u);
-    Require(rasterMode == 0 || rasterMode == 0x240u || rasterMode == 0x248u, "polygon mode, depth bias, provoking vertex or nonstandard rasterization is unsupported");
+    // POLY_OFFSET_FRONT/BACK/PARA_ENABLE (bits 11-13) are the depth bias the depth decode above
+    // took (without a depth attachment it has nothing to bias).
+    const auto rasterMode = raster & ~0x7u & ~(1u << 24u) & ~0x3800u;
+    Require(rasterMode == 0 || rasterMode == 0x240u || rasterMode == 0x248u, "polygon mode, provoking vertex or nonstandard rasterization is unsupported");
     result.cullMode = ((raster & 1u) != 0 ? VK_CULL_MODE_FRONT_BIT : 0u) | ((raster & 2u) != 0 ? VK_CULL_MODE_BACK_BIT : 0u);
     if (result.rectList) result.cullMode = VK_CULL_MODE_NONE;
     result.frontFace = (raster & 4u) != 0 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
@@ -454,6 +684,11 @@ State DecodeState(const QueueState& queue) {
         APS5_LOG_OUT_DEBUG("Render extent from screen=%ux%u", result.renderExtent.width, result.renderExtent.height);
         Require(result.renderExtent.width != 0 && result.renderExtent.height != 0, "empty framebuffer extent for a draw without color writes");
     }
+    if (result.depth.attached) {
+        // The framebuffer covers what every attachment covers.
+        result.renderExtent = {std::min(result.renderExtent.width, result.depthTarget.extent.width), std::min(result.renderExtent.height, result.depthTarget.extent.height)};
+        APS5_LOG_OUT_DEBUG("Depth target address=0x%llx extent=%ux%u zFormat=%u stencil=%u", static_cast<unsigned long long>(result.depthTarget.address), result.depthTarget.extent.width, result.depthTarget.extent.height, result.depthTarget.zFormat, result.depthTarget.stencil ? 1u : 0u);
+    }
     const auto xs = readFloat(cx, 0x10f);
     const auto xo = readFloat(cx, 0x110);
     const auto ys = readFloat(cx, 0x111);
@@ -470,6 +705,9 @@ State DecodeState(const QueueState& queue) {
     }
     Require(readFloat(cx, 0xb4) <= readFloat(cx, 0xb5), "inverted viewport depth clamp bounds");
     result.viewport = {xo - xs, yo - ys, 2 * xs, 2 * ys, minDepth, maxDepth};
+    // A depth clear draw writes DB_DEPTH_CLEAR wherever it covers: a viewport depth range pinned to
+    // the value gives every fragment that depth (its test is ALWAYS, see decodeDepth).
+    if (result.depth.clearDepth) result.viewport.minDepth = result.viewport.maxDepth = result.depth.depthClearValue;
     APS5_LOG_OUT_DEBUG("Viewport x=%f y=%f w=%f h=%f minDepth=%f maxDepth=%f", result.viewport.x, result.viewport.y, result.viewport.width, result.viewport.height, result.viewport.minDepth, result.viewport.maxDepth);
     result.scissor = {{0, 0}, result.renderExtent};
     intersect(result.scissor, cx, 0xc, true);
@@ -525,9 +763,16 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
         if (value(cx, 0x103, resetIndex) && (resetIndex & 0xffffu) != 0xffffu) return "AGC graphics: primitive restart index other than all ones is unsupported";
     }
     if (auto reason = nonzero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
-    if (value(cx, 0x200, word)) {
-        if (!depthPassThrough(word) && !IgnoreDepthTest() && (effectiveDepthControl(word) & DepthControlMask) != 0) return zeroMessage(0x200, word, "depth, stencil or conditional color writes");
-        if (auto reason = require((word & 0xc0000008u) == 0, "depth bounds or depth-conditional color writes are unsupported"); !reason.empty()) return reason;
+    {
+        DepthDecode depth;
+        auto reason = decodeDepth([&](std::uint32_t offset) {
+            std::uint32_t out = 0;
+            return value(cx, offset, out) ? std::optional<std::uint32_t>(out) : std::nullopt;
+        }, [&](std::uint32_t offset) {
+            const auto it = find(cx, offset);
+            return it == cx.end() ? 0u : it->second;
+        }, depth);
+        if (!reason.empty()) return reason;
     }
     if (auto reason = nonzero(cx, 0x203, ShaderControlMask, "depth export, shader coverage or ordered fragment execution"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x2dc, AlphaToCoverageMask, "alpha-to-coverage"); !reason.empty()) return reason;

@@ -7,6 +7,7 @@
 namespace AgcDriver::Graphics {
 
 struct VertexInputLayout;
+class DepthImage;
 
 // The attachments of one render pass instance. Work recorded with it references the handle until
 // the batch completes, so a recorded draw keeps the object (Recorder::Keep) like its pipeline.
@@ -34,7 +35,8 @@ public:
     // `vertexInput` the layout of the draw's vertex descriptors; the shaders were validated by the
     // caller (ValidateShaders). `attachmentLayout` is the layout the color attachments are in
     // before, during and after the pass (GENERAL for resident targets, which then need no
-    // transitions).
+    // transitions). A state with `depth.attached` gets a depth attachment after the colors, always
+    // in GENERAL (the resident depth images never leave it; see DepthTarget.hpp).
     Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     ~Pipeline();
     Pipeline(const Pipeline&) = delete;
@@ -42,8 +44,9 @@ public:
     VkPipelineLayout Layout() const;
     // The framebuffer of these attachment views. A resident target's view (`owners[i]` set) is stable
     // while its StorageTexture lives, so framebuffers made of resident views are kept in the pipeline
-    // and reused when every owner is still the same object; any other set is built per call.
-    std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent);
+    // and reused when every owner is still the same object; any other set is built per call. `depth`
+    // is the depth attachment of a pipeline made with one (resident by construction), after the colors.
+    std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, const std::shared_ptr<DepthImage>& depth = nullptr);
     // Begins the render pass on the framebuffer, binds the pipeline and sets viewport and scissor.
     void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const VkViewport& viewport, const VkRect2D& scissor) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
@@ -59,6 +62,8 @@ private:
     struct CachedFramebuffer {
         std::vector<VkImageView> views;
         std::vector<std::weak_ptr<StorageTexture>> owners;
+        VkImageView depthView = VK_NULL_HANDLE;
+        std::weak_ptr<DepthImage> depthOwner;
         VkExtent2D extent;
         std::shared_ptr<Framebuffer> framebuffer;
     };
@@ -69,6 +74,7 @@ private:
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
     std::size_t attachments = 0;
+    bool depthAttachment = false;
     std::vector<CachedFramebuffer> framebuffers;
 };
 

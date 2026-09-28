@@ -42,6 +42,51 @@ struct ColorTarget {
     bool dccAlphaOnMsb = false;
 };
 
+// The depth/stencil surface a draw tests against (DB_Z_INFO, DB_STENCIL_INFO, the DB_*_BASE words,
+// DB_DEPTH_SIZE_XY). Its contents live in a GPU-resident image (DepthTarget.hpp) keyed by these
+// fields; the guest memory behind the surface is neither read nor written (see DepthTarget.hpp).
+struct DepthTarget {
+    // DB_Z_READ_BASE (the same as DB_Z_WRITE_BASE), or the stencil base of a stencil-only surface.
+    std::uint64_t address = 0;
+    std::uint64_t stencilAddress = 0;
+    // DB_HTILE_DATA_BASE when DB_Z_INFO.TILE_SURFACE_ENABLE is set (HTILE fills mean clears), else 0.
+    std::uint64_t htileAddress = 0;
+    VkExtent2D extent{};
+    // DB_Z_INFO.FORMAT (0 none, 1 Z_16, 3 Z_32_FLOAT) and whether DB_STENCIL_INFO.FORMAT is STENCIL_8.
+    std::uint32_t zFormat = 0;
+    bool stencil = false;
+    // DB_Z_INFO.SW_MODE, for the record (the surface is never detiled).
+    std::uint32_t tileMode = 0;
+    // DB_DEPTH_VIEW.SLICE_START of a single-layer view into an array surface.
+    std::uint32_t slice = 0;
+};
+
+// The depth/stencil state of a draw that renders with a depth attachment (`attached`), decoded from
+// DB_DEPTH_CONTROL, DB_STENCIL_CONTROL, DB_STENCILREFMASK(_BF), DB_DEPTH_VIEW and DB_RENDER_CONTROL.
+// A depth or stencil clear draw (DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE / STENCIL_CLEAR_ENABLE, the
+// fast clear the DB does through HTILE) is rendered as an always-passing test that writes the clear
+// values: DecodeState pins the viewport depth range to DB_DEPTH_CLEAR and replaces the stencil
+// operations with REPLACE of DB_STENCIL_CLEAR. The clear values are decoded for every attached draw:
+// a pending clear of the resident image (a new image, an HTILE fill) is resolved with them.
+struct DepthState {
+    bool attached = false;
+    bool depthTest = false;
+    bool depthWrite = false;
+    VkCompareOp depthCompare = VK_COMPARE_OP_ALWAYS;
+    bool stencilTest = false;
+    VkStencilOpState front{};
+    VkStencilOpState back{};
+    bool clearDepth = false;
+    bool clearStencil = false;
+    float depthClearValue = 0;
+    std::uint32_t stencilClearValue = 0;
+    // PA_SU_SC_MODE_CNTL.POLY_OFFSET_*_ENABLE with PA_SU_POLY_OFFSET_*, in Vulkan's units.
+    bool depthBias = false;
+    float depthBiasConstant = 0;
+    float depthBiasSlope = 0;
+    float depthBiasClamp = 0;
+};
+
 struct State {
     ShaderStages stages;
     // MRT slot 0; `colors`/`blends` hold every written slot, attachment i being slot i.
@@ -61,6 +106,9 @@ struct State {
     VkFrontFace frontFace;
     VkPipelineColorBlendAttachmentState blend;
     std::array<float, 4> blendConstants;
+    // Meaningful only with `depth.attached`.
+    DepthTarget depthTarget;
+    DepthState depth;
 };
 
 ShaderStages DecodeShaderStages(const QueueState& queue);
@@ -100,18 +148,21 @@ struct DrawKeyRange {
     std::uint32_t first;
     std::uint32_t count;
 };
-inline constexpr std::array<DrawKeyRange, 38> DrawKeyRegisters{{
-    // PA_SC_SCREEN_SCISSOR, the window offset/scissor and clip rect, the edge rule, the hardware
-    // screen offset, CB_TARGET_MASK/CB_SHADER_MASK, the generic and viewport 0 scissors, the
-    // viewport 0 depth clamp, the blend constants, the viewport 0 transform.
-    {RegisterBank::Context, 0x00c, 2}, {RegisterBank::Context, 0x080, 4}, {RegisterBank::Context, 0x08c, 4}, {RegisterBank::Context, 0x090, 2}, {RegisterBank::Context, 0x094, 2}, {RegisterBank::Context, 0x0b4, 2}, {RegisterBank::Context, 0x105, 4}, {RegisterBank::Context, 0x10f, 6},
+inline constexpr std::array<DrawKeyRange, 46> DrawKeyRegisters{{
+    // DB_RENDER_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_DEPTH_SIZE_XY, DB_STENCIL_CLEAR and
+    // DB_DEPTH_CLEAR with PA_SC_SCREEN_SCISSOR, DB_Z_INFO .. DB_STENCIL_WRITE_BASE, the *_BASE_HI words.
+    {RegisterBank::Context, 0x000, 1}, {RegisterBank::Context, 0x002, 1}, {RegisterBank::Context, 0x005, 1}, {RegisterBank::Context, 0x007, 1}, {RegisterBank::Context, 0x00a, 4}, {RegisterBank::Context, 0x010, 6}, {RegisterBank::Context, 0x01a, 5},
+    // The window offset/scissor and clip rect, the edge rule, the hardware screen offset,
+    // CB_TARGET_MASK/CB_SHADER_MASK, the generic and viewport 0 scissors, the viewport 0 depth clamp,
+    // the blend constants, DB_STENCIL_CONTROL and DB_STENCILREFMASK(_BF), the viewport 0 transform.
+    {RegisterBank::Context, 0x080, 4}, {RegisterBank::Context, 0x08c, 4}, {RegisterBank::Context, 0x090, 2}, {RegisterBank::Context, 0x094, 2}, {RegisterBank::Context, 0x0b4, 2}, {RegisterBank::Context, 0x105, 4}, {RegisterBank::Context, 0x10b, 3}, {RegisterBank::Context, 0x10f, 6},
     // SPI_PS_INPUT_CNTL_0..31, SPI_PS_INPUT_ENA/ADDR, SPI_PS_IN_CONTROL, SPI_SHADER_POS/Z/COL_FORMAT,
     // CB_BLEND0..7_CONTROL, GE_MAX_OUTPUT_PER_SUBGROUP.
     {RegisterBank::Context, 0x191, 32}, {RegisterBank::Context, 0x1b3, 2}, {RegisterBank::Context, 0x1b6, 1}, {RegisterBank::Context, 0x1c3, 3}, {RegisterBank::Context, 0x1e0, 8}, {RegisterBank::Context, 0x1ff, 1},
     // DB_DEPTH_CONTROL .. PA_CL_VS_OUT_CNTL, PA_SC_MODE_CNTL_0/1, VGT_GS_MODE, VGT_GS_VERT_ITEMSIZE,
     // VGT_SHADER_STAGES_EN/GS_ONCHIP, VGT_TF_PARAM/DB_ALPHA_TO_MASK, PA_SC_AA_CONFIG and
-    // PA_SU_VTX_CNTL, the sample masks, PA_SC_CONSERVATIVE_RASTERIZATION_CNTL.
-    {RegisterBank::Context, 0x200, 8}, {RegisterBank::Context, 0x292, 2}, {RegisterBank::Context, 0x29b, 1}, {RegisterBank::Context, 0x2ce, 1}, {RegisterBank::Context, 0x2d5, 2}, {RegisterBank::Context, 0x2db, 2}, {RegisterBank::Context, 0x2f8, 2}, {RegisterBank::Context, 0x30e, 2}, {RegisterBank::Context, 0x313, 1},
+    // PA_SU_VTX_CNTL, the sample masks, PA_SC_CONSERVATIVE_RASTERIZATION_CNTL; PA_SU_POLY_OFFSET_*.
+    {RegisterBank::Context, 0x200, 8}, {RegisterBank::Context, 0x292, 2}, {RegisterBank::Context, 0x29b, 1}, {RegisterBank::Context, 0x2ce, 1}, {RegisterBank::Context, 0x2d5, 2}, {RegisterBank::Context, 0x2db, 2}, {RegisterBank::Context, 0x2de, 6}, {RegisterBank::Context, 0x2f8, 2}, {RegisterBank::Context, 0x30e, 2}, {RegisterBank::Context, 0x313, 1},
     // CB_COLOR0..7_BASE .. DCC_BASE (15 words a slot), CB_COLOR0..7_BASE_EXT, DCC_BASE_EXT, ATTRIB2, ATTRIB3.
     {RegisterBank::Context, 0x318, 0x78}, {RegisterBank::Context, 0x390, 8}, {RegisterBank::Context, 0x3a8, 0x18},
     // The pixel program address, RSRC2 and user words; the geometry-back user pointer and program

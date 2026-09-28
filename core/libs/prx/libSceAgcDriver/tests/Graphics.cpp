@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <array>
 #include <bit>
@@ -12,7 +13,9 @@
 #include <initializer_list>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -129,18 +132,19 @@ void stateTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register");
     queue.context[0x8e] = 0xf0f;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "gaps");
+    // Without a depth surface (DB_Z_INFO / DB_STENCIL_INFO absent: FORMAT INVALID) the DB passes
+    // every test: no attachment (see depthTests for surfaces).
     queue = makeState();
-    queue.context[0x200] = 2;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "depth");
-    queue = makeState();
-    queue.context[0x200] = 0x007007b4;
     queue.context[0x1b3] = 2;
     queue.context[0x1b4] = 2;
-    (void)AgcDriver::Graphics::DecodeState(queue);
-    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "a depth write without the depth test was rejected");
-    queue = makeState();
-    queue.context[0x200] = 0x007007b6;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "depth");
+    for (const auto control : {2u, 0x007007b4u, 0x007007b6u}) {
+        queue.context[0x200] = control;
+        Require(!AgcDriver::Graphics::DecodeState(queue).depth.attached, "a depth test without a depth surface needed a depth target");
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "a depth test without a depth surface was rejected");
+    }
+    queue.context[0x200] = 8;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "depth bounds");
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("depth bounds") != std::string::npos, "the precheck accepted depth bounds");
     queue = makeState();
     queue.context[0x10f] = 0x7fc00000;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "non-finite");
@@ -161,6 +165,176 @@ void stateTests() {
     log.clear();
     static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
     Require(log.empty(), "the register facade recorded without a log");
+}
+
+// A Z_32_FLOAT + STENCIL_8 surface as Astro Bot binds it (64x4 like makeState's color target):
+// depth test and write with LESS_EQUAL, stencil off, HTILE enabled, a depth clear value of 1.
+AgcDriver::QueueState makeDepthState() {
+    auto queue = makeState();
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    queue.context[0x0] = 0;
+    queue.context[0x2] = 0;
+    queue.context[0x5] = 0x51405;
+    queue.context[0x7] = (3u << 16u) | 63u;
+    queue.context[0xa] = 0;
+    queue.context[0xb] = std::bit_cast<std::uint32_t>(1.0f);
+    queue.context[0x10] = 0xa0000183u;
+    queue.context[0x11] = 0x20000181u;
+    queue.context[0x12] = queue.context[0x14] = 0x51356;
+    queue.context[0x13] = queue.context[0x15] = 0x513dd;
+    queue.context[0x10b] = 0;
+    queue.context[0x10c] = queue.context[0x10d] = 0x01ffff00u;
+    queue.context[0x200] = 0x007007b6u;
+    return queue;
+}
+
+// DecodeState and the precheck reject the state with the same reason.
+void expectDepthRejection(const AgcDriver::QueueState& queue, std::string_view reason) {
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, reason);
+    const auto rejection = AgcDriver::Graphics::DrawRejection(queue, false);
+    Require(rejection.find(reason) != std::string::npos, "the precheck disagrees with the decode: '" + rejection + "' for " + std::string(reason));
+}
+
+void depthTests() {
+    using namespace AgcDriver::Graphics;
+    auto queue = makeDepthState();
+    auto state = DecodeState(queue);
+    Require(DrawRejection(queue, false).empty(), "the precheck rejected a depth-tested draw");
+    Require(state.depth.attached && state.depth.depthTest && state.depth.depthWrite && state.depth.depthCompare == VK_COMPARE_OP_LESS_OR_EQUAL && !state.depth.stencilTest, "Z_ENABLE, Z_WRITE_ENABLE and ZFUNC were not decoded");
+    Require(state.depthTarget.address == 0x5135600u && state.depthTarget.stencilAddress == 0x513dd00u && state.depthTarget.htileAddress == 0x5140500u, "depth surface addresses changed");
+    Require(state.depthTarget.extent.width == 64 && state.depthTarget.extent.height == 4 && state.depthTarget.zFormat == 3 && state.depthTarget.stencil && state.depthTarget.slice == 0, "depth surface layout changed");
+    Require(state.depth.depthClearValue == 1.0f && state.depth.stencilClearValue == 0 && !state.depth.clearDepth && !state.depth.clearStencil && !state.depth.depthBias, "depth clear values changed");
+    Require(state.viewport.minDepth == 0 && state.viewport.maxDepth == 1, "a depth-tested draw changed the viewport depth range");
+    // The framebuffer covers what every attachment covers.
+    queue.context[0x7] = (1u << 16u) | 31u;
+    state = DecodeState(queue);
+    Require(state.renderExtent.width == 32 && state.renderExtent.height == 2, "a smaller depth surface did not bound the framebuffer");
+    queue = makeDepthState();
+    // ZFUNC shares VkCompareOp's order; an always-passing test that writes nothing needs no target.
+    for (std::uint32_t func = 0; func < 8; ++func) {
+        queue.context[0x200] = (0x007007b6u & ~0x70u) | (func << 4u);
+        state = DecodeState(queue);
+        Require(state.depth.attached && state.depth.depthCompare == static_cast<VkCompareOp>(func), "ZFUNC was not decoded");
+        queue.context[0x200] &= ~4u;
+        Require(DecodeState(queue).depth.attached == (func != 7), "a depth test that cannot fail or write needed a target");
+        Require(DrawRejection(queue, false).empty(), "the precheck rejected a depth function");
+    }
+    // Z_ENABLE off leaves Z_WRITE_ENABLE without effect; DB_DEPTH_VIEW.Z_READ_ONLY turns writes off.
+    queue = makeDepthState();
+    queue.context[0x200] = 0x007007b4u;
+    Require(!DecodeState(queue).depth.attached, "a depth write without the depth test needed a target");
+    queue = makeDepthState();
+    queue.context[0x2] = 1u << 24u;
+    state = DecodeState(queue);
+    Require(state.depth.attached && state.depth.depthTest && !state.depth.depthWrite, "Z_READ_ONLY did not disable depth writes");
+    // A surface whose format is INVALID has no tests (the DB passes everything).
+    queue = makeDepthState();
+    queue.context[0x10] = 0x80000180u;
+    queue.context[0x11] = 0x20000180u;
+    Require(!DecodeState(queue).depth.attached && DrawRejection(queue, false).empty(), "a depth test without a depth surface needed a target");
+    // Z_16 without stencil, and one layer of an array surface (a shadow cascade).
+    queue = makeDepthState();
+    queue.context[0x10] = 0x80000181u;
+    queue.context[0x11] = 0;
+    queue.context[0x2] = (2u << 13u) | 2u;
+    state = DecodeState(queue);
+    Require(state.depth.attached && state.depthTarget.zFormat == 1 && !state.depthTarget.stencil && state.depthTarget.stencilAddress == 0 && state.depthTarget.slice == 2, "a Z_16 array layer was not decoded");
+    // Unsupported surfaces and modes, rejected alike by the decode and the precheck.
+    const std::array<std::tuple<std::uint32_t, std::uint32_t, const char*>, 8> rejected{{
+        {0x10, 0xa0000187u, "multisampled depth"},
+        {0x10, 0xa0000182u, "Z_24"},
+        {0x14, 0x51357u, "separate depth read and write"},
+        {0x15, 0x513deu, "separate stencil read and write"},
+        {0x2, (3u << 13u) | 1u, "layered depth rendering"},
+        {0x2, 1u << 26u, "depth mip"},
+        {0x0, 1u << 12u, "decompress"},
+        {0x200, 0x007007beu, "depth bounds"},
+    }};
+    for (const auto& [offset, value, reason] : rejected) {
+        queue = makeDepthState();
+        queue.context[offset] = value;
+        expectDepthRejection(queue, reason);
+    }
+    // Stencil: an EQUAL front test replacing on pass, a separate ALWAYS back face that increments.
+    queue = makeDepthState();
+    queue.context[0x200] = (0x007007b6u & ~0x700u) | 1u | (2u << 8u);
+    queue.context[0x10b] = (3u << 4u) | (5u << 16u);
+    queue.context[0x10c] = 0x01ff0f05u;
+    queue.context[0x10d] = 0x01ffff10u;
+    state = DecodeState(queue);
+    Require(DrawRejection(queue, false).empty(), "the precheck rejected a stencil test");
+    const auto& front = state.depth.front;
+    const auto& back = state.depth.back;
+    Require(state.depth.stencilTest && front.compareOp == VK_COMPARE_OP_EQUAL && front.passOp == VK_STENCIL_OP_REPLACE && front.failOp == VK_STENCIL_OP_KEEP && front.depthFailOp == VK_STENCIL_OP_KEEP && front.reference == 5 && front.compareMask == 0x0f && front.writeMask == 0xff, "the front stencil state was not decoded");
+    Require(back.compareOp == VK_COMPARE_OP_ALWAYS && back.passOp == VK_STENCIL_OP_INCREMENT_AND_CLAMP && back.reference == 0x10 && back.compareMask == 0xff, "the back stencil state was not decoded");
+    // Without BACKFACE_ENABLE the back face uses the front state.
+    queue.context[0x200] &= ~0x80u;
+    state = DecodeState(queue);
+    Require(state.depth.back.compareOp == VK_COMPARE_OP_EQUAL && state.depth.back.passOp == VK_STENCIL_OP_REPLACE && state.depth.back.reference == 5, "the front stencil state did not cover back faces");
+    // Increments by more than one, and bitwise operations, have no Vulkan form.
+    queue.context[0x10b] = 5u << 4u;
+    queue.context[0x10c] = 0x02ff0f05u;
+    expectDepthRejection(queue, "stencil operations");
+    queue.context[0x10b] = 10u << 4u;
+    expectDepthRejection(queue, "stencil operations");
+    // ...unless the test always passes: the writes are dropped (as before depth targets existed).
+    queue.context[0x200] = 0x007007b6u | 1u;
+    state = DecodeState(queue);
+    Require(DrawRejection(queue, false).empty() && state.depth.attached && !state.depth.stencilTest, "inexpressible stencil writes of an always-passing test were not dropped");
+    // A stencil-only surface.
+    queue = makeDepthState();
+    queue.context[0x10] = 0;
+    queue.context[0x200] = 1u | (4u << 8u);
+    state = DecodeState(queue);
+    Require(state.depth.attached && state.depth.stencilTest && !state.depth.depthTest && state.depthTarget.zFormat == 0 && state.depthTarget.address == 0x513dd00u && state.depthTarget.htileAddress == 0, "a stencil-only surface was not decoded");
+    // Clears (DB_RENDER_CONTROL): an always-passing test writing DB_DEPTH_CLEAR through a pinned
+    // viewport depth range, DB_STENCIL_CLEAR through REPLACE.
+    queue = makeDepthState();
+    queue.context[0x0] = 3;
+    queue.context[0x200] = 0x00700700u;
+    queue.context[0xb] = std::bit_cast<std::uint32_t>(0.25f);
+    queue.context[0xa] = 0x5a;
+    state = DecodeState(queue);
+    Require(DrawRejection(queue, false).empty(), "the precheck rejected a clear");
+    Require(state.depth.attached && state.depth.clearDepth && state.depth.clearStencil && state.depth.depthTest && state.depth.depthWrite && state.depth.depthCompare == VK_COMPARE_OP_ALWAYS, "a depth clear did not write every covered pixel");
+    Require(state.viewport.minDepth == 0.25f && state.viewport.maxDepth == 0.25f, "a depth clear did not pin the depth range to the clear value");
+    Require(state.depth.stencilTest && state.depth.front.passOp == VK_STENCIL_OP_REPLACE && state.depth.front.compareOp == VK_COMPARE_OP_ALWAYS && state.depth.front.reference == 0x5a && state.depth.front.writeMask == 0xff && state.depth.back.reference == 0x5a, "a stencil clear did not replace with the clear value");
+    // Depth bias: radeonsi's scale * 16 and units (* 4 for Z_16) back to Vulkan's factors.
+    queue = makeDepthState();
+    queue.context[0x205] = 0x240u | 0x1800u;
+    queue.context[0x2de] = 0x1e9;
+    queue.context[0x2df] = 0;
+    queue.context[0x2e0] = queue.context[0x2e2] = std::bit_cast<std::uint32_t>(32.0f);
+    queue.context[0x2e1] = queue.context[0x2e3] = std::bit_cast<std::uint32_t>(3.0f);
+    state = DecodeState(queue);
+    Require(DrawRejection(queue, false).empty() && state.depth.depthBias && state.depth.depthBiasSlope == 2.0f && state.depth.depthBiasConstant == 3.0f, "depth bias was not decoded");
+    queue.context[0x10] = 0x80000181u;
+    Require(DecodeState(queue).depth.depthBiasConstant == 0.75f, "Z_16 depth bias units were not scaled");
+    queue.context[0x10] = 0xa0000183u;
+    queue.context[0x2e3] = std::bit_cast<std::uint32_t>(4.0f);
+    expectDepthRejection(queue, "different front and back depth bias");
+    queue.context[0x205] = 0x240u | 0x800u;
+    expectDepthRejection(queue, "one face only");
+    queue.context[0x205] = 0x240u | 0x800u | 2u;
+    Require(DecodeState(queue).depth.depthBias, "depth bias of the only rasterized face was lost");
+    // The register facade over a depth state: every register the depth rules read is in the key.
+    queue = makeDepthState();
+    queue.context[0x200] = (0x007007b6u & ~0x700u) | 1u | (2u << 8u);
+    queue.context[0x205] = 0x240u | 0x1800u;
+    queue.context[0x2de] = 0x1e9;
+    queue.context[0x2df] = 0;
+    queue.context[0x2e0] = queue.context[0x2e2] = queue.context[0x2e1] = queue.context[0x2e3] = 0;
+    queue.context[0x1a] = queue.context[0x1b] = queue.context[0x1c] = queue.context[0x1d] = queue.context[0x1e] = 0;
+    std::vector<RegisterRead> log;
+    RegisterReadLog() = &log;
+    state = DecodeState(queue);
+    Require(DrawRejection(queue, true).empty(), "precheck rejected the depth reference state");
+    RegisterReadLog() = nullptr;
+    for (const auto read : log) Require(DrawKeyCovers(read), "DrawKeyRegisters lacks a register the depth decode reads: " + std::string(RegisterBankName(read.bank)) + " " + std::to_string(read.offset));
+    for (const auto offset : {0x0u, 0x2u, 0x5u, 0x7u, 0xau, 0xbu, 0x10u, 0x11u, 0x12u, 0x15u, 0x1au, 0x1eu, 0x10bu, 0x10du, 0x2e3u}) {
+        Require(std::any_of(log.begin(), log.end(), [&](const RegisterRead& read) { return read.bank == RegisterBank::Context && read.offset == offset; }), "the depth decode did not read context register " + std::to_string(offset));
+    }
 }
 
 void hardwareScreenOffsetTests() {
@@ -346,6 +520,10 @@ struct MockVulkan {
     std::uint32_t pipelineCreateCount = 0;
     std::vector<std::array<std::uint32_t, 3>> pipelineSpecializations;
     VkPipeline boundPipeline = VK_NULL_HANDLE;
+    std::vector<VkAttachmentDescription> renderPassAttachments;
+    std::optional<VkAttachmentReference> renderPassDepth;
+    std::optional<VkPipelineDepthStencilStateCreateInfo> depthStencil;
+    VkPipelineRasterizationStateCreateInfo raster{};
     std::vector<std::byte> lastPushConstants;
     struct { std::uint32_t x = 0, y = 0, z = 0; } lastDispatchGroups;
 };
@@ -492,6 +670,37 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateComputePipelines(VkDevice, VkPipelineCa
     return VK_SUCCESS;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateRenderPass(VkDevice, const VkRenderPassCreateInfo* info, const VkAllocationCallbacks*, VkRenderPass* pass) {
+    Require(info->subpassCount == 1, "mock expects one subpass");
+    mock.renderPassAttachments.assign(info->pAttachments, info->pAttachments + info->attachmentCount);
+    const auto* depth = info->pSubpasses[0].pDepthStencilAttachment;
+    mock.renderPassDepth = depth != nullptr ? std::optional<VkAttachmentReference>(*depth) : std::nullopt;
+    *pass = makeHandle<VkRenderPass>();
+    ++mock.live;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockDestroyRenderPass(VkDevice, VkRenderPass, const VkAllocationCallbacks*) {
+    --mock.live;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipelines) {
+    Require(count == 1, "mock expects exactly one graphics pipeline per call");
+    const auto* depthStencil = infos[0].pDepthStencilState;
+    mock.depthStencil = depthStencil != nullptr ? std::optional<VkPipelineDepthStencilStateCreateInfo>(*depthStencil) : std::nullopt;
+    mock.raster = *infos[0].pRasterizationState;
+    *pipelines = makeHandle<VkPipeline>();
+    ++mock.pipelineCreateCount;
+    ++mock.live;
+    return VK_SUCCESS;
+}
+
+// Every depth format but D16_UNORM_S8_UINT (which NVIDIA lacks) can be a depth attachment.
+VKAPI_ATTR void VKAPI_CALL mockFormatProperties(VkPhysicalDevice, VkFormat format, VkFormatProperties* properties) {
+    *properties = {};
+    if (format != VK_FORMAT_D16_UNORM_S8_UINT) properties->optimalTilingFeatures = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+}
+
 VKAPI_ATTR void VKAPI_CALL mockDestroyPipeline(VkDevice, VkPipeline, const VkAllocationCallbacks*) {
     --mock.live;
 }
@@ -533,6 +742,9 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkDestroyShaderModule", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyShaderModule)},
         {"vkCreateComputePipelines", reinterpret_cast<PFN_vkVoidFunction>(mockCreateComputePipelines)},
         {"vkDestroyPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyPipeline)},
+        {"vkCreateRenderPass", reinterpret_cast<PFN_vkVoidFunction>(mockCreateRenderPass)},
+        {"vkDestroyRenderPass", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyRenderPass)},
+        {"vkCreateGraphicsPipelines", reinterpret_cast<PFN_vkVoidFunction>(mockCreateGraphicsPipelines)},
         {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindPipeline)},
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)}
@@ -955,6 +1167,57 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     return words;
 }
 
+// A depth-tested state makes a render pass with the resident depth image's attachment after the
+// colors (always GENERAL, loaded and stored) and the pipeline's depth-stencil state.
+void depthPipelineTests() {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.formatProperties = mockFormatProperties;
+    context.limits.maxColorAttachments = 8;
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.spirv = makeModule({});
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.spirv = makeModule({.fragment = true});
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    auto queue = makeDepthState();
+    queue.context[0x205] = 0x240u | 0x1800u;
+    queue.context[0x2de] = 0x1e9;
+    queue.context[0x2df] = 0;
+    queue.context[0x2e0] = queue.context[0x2e2] = std::bit_cast<std::uint32_t>(32.0f);
+    queue.context[0x2e1] = queue.context[0x2e3] = std::bit_cast<std::uint32_t>(3.0f);
+    const auto state = DecodeState(queue);
+    Require(DepthAttachmentFormat(context, state.depthTarget) == VK_FORMAT_D32_SFLOAT_S8_UINT, "Z_32_FLOAT with stencil did not render as D32_SFLOAT_S8_UINT");
+    {
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        const VertexInputLayout input{};
+        Pipeline pipeline(context, state, input, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        Require(mock.renderPassAttachments.size() == 2 && mock.renderPassDepth && mock.renderPassDepth->attachment == 1 && mock.renderPassDepth->layout == VK_IMAGE_LAYOUT_GENERAL, "the render pass lacks the depth attachment");
+        const auto& depth = mock.renderPassAttachments[1];
+        Require(depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT && depth.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && depth.storeOp == VK_ATTACHMENT_STORE_OP_STORE && depth.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD && depth.stencilStoreOp == VK_ATTACHMENT_STORE_OP_STORE && depth.initialLayout == VK_IMAGE_LAYOUT_GENERAL && depth.finalLayout == VK_IMAGE_LAYOUT_GENERAL, "the depth attachment does not keep its contents in GENERAL");
+        Require(mock.depthStencil && mock.depthStencil->depthTestEnable && mock.depthStencil->depthWriteEnable && mock.depthStencil->depthCompareOp == VK_COMPARE_OP_LESS_OR_EQUAL && !mock.depthStencil->stencilTestEnable && !mock.depthStencil->depthBoundsTestEnable, "the pipeline's depth-stencil state was not built");
+        Require(mock.raster.depthBiasEnable && mock.raster.depthBiasSlopeFactor == 2.0f && mock.raster.depthBiasConstantFactor == 3.0f, "the pipeline lacks the depth bias");
+    }
+    // Without a depth attachment the pipeline carries no depth-stencil state.
+    {
+        const auto plain = DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, plain.color, 0, 0);
+        Pipeline pipeline(context, plain, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        Require(mock.renderPassAttachments.size() == 1 && !mock.renderPassDepth && !mock.depthStencil && !mock.raster.depthBiasEnable, "a color-only draw got depth state");
+    }
+    Require(mock.live == 0, "depth pipelines leaked Vulkan objects");
+    // The fallbacks of a device without D16_UNORM_S8_UINT.
+    DepthTarget z16{};
+    z16.zFormat = 1;
+    z16.stencil = true;
+    Require(DepthAttachmentFormat(context, z16) == VK_FORMAT_D24_UNORM_S8_UINT, "Z_16 with stencil did not fall back to D24_UNORM_S8_UINT");
+    z16.stencil = false;
+    Require(DepthAttachmentFormat(context, z16) == VK_FORMAT_D16_UNORM, "Z_16 did not render as D16_UNORM");
+    DepthTarget stencilOnly{};
+    stencilOnly.stencil = true;
+    Require(DepthAttachmentFormat(context, stencilOnly) == VK_FORMAT_S8_UINT && DepthAspects(VK_FORMAT_S8_UINT) == VK_IMAGE_ASPECT_STENCIL_BIT, "a stencil-only surface did not render as S8_UINT");
+}
+
 void rectListTests() {
     using namespace ShaderRecompiler;
     using namespace AgcDriver::Graphics;
@@ -1203,6 +1466,7 @@ int main() {
             expectFailure([&] { AgcDriver::Graphics::Draw(context, state, draw, {}); }, "draw modifiers");
         }
         stateTests();
+        depthTests();
         hardwareScreenOffsetTests();
         DepthClipTests();
         DisabledColorTests();
@@ -1212,6 +1476,7 @@ int main() {
         resourceTests();
         validationTests();
         rectListTests();
+        depthPipelineTests();
         mock = MockVulkan{};
         auto bdaContext = mockContext();
         bdaContext.bufferDeviceAddress = true;

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -41,13 +42,13 @@ void ValidateViewport(const Context& context, const VkViewport& viewport) {
     Require(std::min(viewport.y, viewport.y + viewport.height) >= context.limits.viewportBoundsRange[0] && std::max(viewport.y, viewport.y + viewport.height) <= context.limits.viewportBoundsRange[1], "viewport Y exceeds device bounds");
 }
 
-Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size()) {
+Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size()), depthAttachment(state.depth.attached) {
     // A cached pipeline may outlive its device's teardown (see ClearCachedPipelines); it must not keep
     // the buffer pool, which is reset with the device, alive past it.
     this->context.bufferPool.reset();
     Require(state.blends.size() == state.colors.size(), "blend states do not match decoded color state");
     Require(state.colors.size() <= context.limits.maxColorAttachments, "color targets exceed device attachment limits");
-    Require(state.hasColorTarget || (context.limits.framebufferNoAttachmentsSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0, "device does not support single-sample rendering without attachments");
+    Require(state.hasColorTarget || state.depth.attached || (context.limits.framebufferNoAttachmentsSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0, "device does not support single-sample rendering without attachments");
     Require(!state.negativeOneToOne || context.depthClipControl, "negative-one-to-one depth clipping requires VK_EXT_depth_clip_control with depthClipControl enabled");
     if (state.rectList) Require(context.tessellationShader && context.limits.maxTessellationPatchSize >= 4, "rect-list requires tessellation with four output control points");
     if (state.stages.tessellation) {
@@ -101,10 +102,29 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             colors.push_back(color);
             references.push_back({index, attachmentLayout});
         }
+        VkAttachmentReference depthReference{};
+        if (state.depth.attached) {
+            // The resident depth image keeps its contents across passes and frames.
+            const auto format = DepthAttachmentFormat(context, state.depthTarget);
+            const bool stencil = (DepthAspects(format) & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+            const bool depth = (DepthAspects(format) & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
+            VkAttachmentDescription attachment{};
+            attachment.format = format;
+            attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+            attachment.loadOp = depth ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachment.storeOp = depth ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            attachment.stencilLoadOp = stencil ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachment.stencilStoreOp = stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            attachment.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
+            attachment.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+            depthReference = {static_cast<std::uint32_t>(colors.size()), VK_IMAGE_LAYOUT_GENERAL};
+            colors.push_back(attachment);
+        }
         VkSubpassDescription subpass{};
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
         subpass.colorAttachmentCount = static_cast<std::uint32_t>(references.size());
         subpass.pColorAttachments = references.empty() ? nullptr : references.data();
+        subpass.pDepthStencilAttachment = state.depth.attached ? &depthReference : nullptr;
         VkRenderPassCreateInfo passInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
         passInfo.attachmentCount = static_cast<std::uint32_t>(colors.size());
         passInfo.pAttachments = colors.empty() ? nullptr : colors.data();
@@ -138,6 +158,22 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         raster.cullMode = state.cullMode;
         raster.frontFace = state.frontFace;
         raster.lineWidth = 1;
+        if (state.depth.attached && state.depth.depthBias) {
+            raster.depthBiasEnable = VK_TRUE;
+            raster.depthBiasConstantFactor = state.depth.depthBiasConstant;
+            raster.depthBiasSlopeFactor = state.depth.depthBiasSlope;
+            // A clamp needs the depthBiasClamp feature; without it the bias is left unclamped.
+            raster.depthBiasClamp = context.depthBiasClamp ? state.depth.depthBiasClamp : 0.0f;
+        }
+        VkPipelineDepthStencilStateCreateInfo depthStencil{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        depthStencil.depthTestEnable = state.depth.depthTest ? VK_TRUE : VK_FALSE;
+        depthStencil.depthWriteEnable = state.depth.depthWrite ? VK_TRUE : VK_FALSE;
+        depthStencil.depthCompareOp = state.depth.depthCompare;
+        depthStencil.stencilTestEnable = state.depth.stencilTest ? VK_TRUE : VK_FALSE;
+        depthStencil.front = state.depth.front;
+        depthStencil.back = state.depth.back;
+        depthStencil.minDepthBounds = 0;
+        depthStencil.maxDepthBounds = 1;
         VkPipelineMultisampleStateCreateInfo samples{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         samples.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
         VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
@@ -158,6 +194,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         pipelineInfo.pRasterizationState = &raster;
         pipelineInfo.pMultisampleState = &samples;
         pipelineInfo.pColorBlendState = &blend;
+        pipelineInfo.pDepthStencilState = state.depth.attached ? &depthStencil : nullptr;
         pipelineInfo.pDynamicState = &dynamic;
         pipelineInfo.layout = layout;
         pipelineInfo.renderPass = renderPass;
@@ -203,27 +240,31 @@ VkPipelineLayout Pipeline::Layout() const {
     return layout;
 }
 
-std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent) {
+std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, const std::shared_ptr<DepthImage>& depth) {
     Require(targets.size() == attachments && targets.size() == owners.size(), "render targets do not match the pipeline's color attachments");
+    Require((depth != nullptr) == depthAttachment, "depth target does not match the pipeline's depth attachment");
+    const auto depthView = depth != nullptr ? depth->View() : VK_NULL_HANDLE;
     const bool resident = std::all_of(owners.begin(), owners.end(), [](const auto& owner) { return owner != nullptr; });
     if (resident) {
         // Entries whose views are gone can never match again and go as soon as no recorded draw holds
         // them (Kept keeps its framebuffer until the batch completes).
         std::erase_if(framebuffers, [](const CachedFramebuffer& entry) {
-            return entry.framebuffer.use_count() == 1 && std::any_of(entry.owners.begin(), entry.owners.end(), [](const auto& owner) { return owner.expired(); });
+            return entry.framebuffer.use_count() == 1 && (std::any_of(entry.owners.begin(), entry.owners.end(), [](const auto& owner) { return owner.expired(); }) || (entry.depthView != VK_NULL_HANDLE && entry.depthOwner.expired()));
         });
         for (auto it = framebuffers.begin(); it != framebuffers.end(); ++it) {
-            if (it->extent.width != extent.width || it->extent.height != extent.height || !std::equal(it->views.begin(), it->views.end(), targets.begin(), targets.end())) continue;
+            if (it->extent.width != extent.width || it->extent.height != extent.height || it->depthView != depthView || !std::equal(it->views.begin(), it->views.end(), targets.begin(), targets.end())) continue;
             // View handles are recycled once a StorageTexture is destroyed, so the owners must be the
             // very objects the views were made for.
-            bool same = true;
+            bool same = depth == nullptr || it->depthOwner.lock() == depth;
             for (std::size_t i = 0; i < owners.size() && same; ++i) same = it->owners[i].lock().get() == owners[i].get();
             if (!same) continue;
             std::rotate(it, std::next(it), framebuffers.end());
             return framebuffers.back().framebuffer;
         }
     }
-    auto framebuffer = std::make_shared<Framebuffer>(context, renderPass, targets, extent);
+    std::vector<VkImageView> views(targets.begin(), targets.end());
+    if (depth != nullptr) views.push_back(depthView);
+    auto framebuffer = std::make_shared<Framebuffer>(context, renderPass, views, extent);
     if (!resident) return framebuffer;
     // Beyond the bound the least recently used unreferenced entry goes.
     constexpr std::size_t bound = 8;
@@ -235,6 +276,8 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     CachedFramebuffer entry;
     entry.views.assign(targets.begin(), targets.end());
     entry.owners.assign(owners.begin(), owners.end());
+    entry.depthView = depthView;
+    entry.depthOwner = depth;
     entry.extent = extent;
     entry.framebuffer = framebuffer;
     framebuffers.push_back(std::move(entry));
@@ -325,6 +368,23 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
     for (const auto value : state.blendConstants) append(key, value);
     append(key, state.colors.size());
     for (const auto& color : state.colors) append(key, color.format);
+    const auto& depth = state.depth;
+    append(key, depth.attached);
+    if (depth.attached) {
+        append(key, DepthAttachmentFormat(context, state.depthTarget));
+        append(key, depth.depthTest);
+        append(key, depth.depthWrite);
+        append(key, depth.depthCompare);
+        append(key, depth.stencilTest);
+        append(key, depth.front);
+        append(key, depth.back);
+        append(key, depth.depthBias);
+        if (depth.depthBias) {
+            append(key, depth.depthBiasConstant);
+            append(key, depth.depthBiasSlope);
+            append(key, context.depthBiasClamp ? depth.depthBiasClamp : 0.0f);
+        }
+    }
     append(key, state.stages.mesh.has_value());
     if (state.stages.mesh) {
         const auto& mesh = *state.stages.mesh;

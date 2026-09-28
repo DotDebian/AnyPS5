@@ -127,6 +127,8 @@ struct Context {
     bool descriptorIndexing = false;
     // VK_EXT_primitive_topology_list_restart: primitive restart on list topologies.
     bool primitiveListRestart = false;
+    // The depthBiasClamp feature (PA_SU_POLY_OFFSET_CLAMP).
+    bool depthBiasClamp = false;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {
