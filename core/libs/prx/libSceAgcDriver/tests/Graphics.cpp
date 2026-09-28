@@ -106,7 +106,11 @@ void stateTests() {
     queue.context[0x91] = 0x30020;
     state = AgcDriver::Graphics::DecodeState(queue);
     Require(state.scissor.offset.x == 3 && state.scissor.offset.y == 1 && state.scissor.extent.width == 29 && state.scissor.extent.height == 2, "scissor intersection changed");
+    // DCC_ENABLE: the target is rendered uncompressed and only its fast-clear keys are read.
     queue.context[0x31c] |= 0x10000000;
+    queue.context[0x325] = 0x1234;
+    Require(AgcDriver::Graphics::DecodeState(queue).color.dccAddress == 0x123400, "DCC key address changed");
+    queue.context[0x31c] |= 0x20000000;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "DCC");
     queue = makeState();
     queue.context.erase(0x3b8);
@@ -118,13 +122,20 @@ void stateTests() {
     queue.context[0x3b0] = (62u << 14u) | 3u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "pitch");
     queue = makeState();
+    // A second written slot needs its own CB_COLOR1 registers.
     queue.context[0x8e] = 0xff;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "target zero");
+    queue.context[0x8f] = 0xfff;
+    queue.context[0x1c5] = 0x999;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register");
+    queue.context[0x8e] = 0xf0f;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "gaps");
     queue = makeState();
     queue.context[0x200] = 2;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "depth");
     queue = makeState();
     queue.context[0x200] = 0x007007b4;
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
     (void)AgcDriver::Graphics::DecodeState(queue);
     Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "a depth write without the depth test was rejected");
     queue = makeState();
@@ -274,8 +285,11 @@ void DepthClipTests() {
     queue.context[0xb4] = std::bit_cast<std::uint32_t>(2.0f);
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "inverted viewport depth clamp");
     queue.context[0xb4] = 0;
+    // ZCLIP_NEAR/FAR_DISABLE (bits 26, 27) become depth clamping.
+    queue.context[0x204] = 0x0c080000u;
+    Require(AgcDriver::Graphics::DecodeState(queue).depthClamp, "near/far clip disable did not clamp depth");
     for (std::uint32_t bit = 0; bit < 32; ++bit) {
-        if (bit == 19) continue;
+        if (bit == 19 || bit == 26 || bit == 27) continue;
         queue.context[0x204] = 1u << bit;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_CLIP_CNTL");
     }
@@ -730,9 +744,10 @@ void resourceTests() {
         mutate(binding);
         return binding;
     };
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestImages; binding.kind = Kind::SampledImage; }), "sampled and storage image resources are not implemented");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestImages; binding.kind = Kind::StorageImage; }), "sampled and storage image resources are not implemented");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestSamplers; binding.kind = Kind::Sampler; }), "sampled and storage image resources are not implemented");
+    // Image and sampler descriptors are T# (8 dwords) and S# (4 dwords) words.
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestImages; binding.kind = Kind::SampledImage; }), "8 dwords");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestImages; binding.kind = Kind::StorageImage; }), "8 dwords");
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestSamplers; binding.kind = Kind::Sampler; binding.guestDescriptor.resize(3); }), "4 dwords");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::Gds; binding.guestDescriptor.clear(); }), "unsupported descriptor role Gds");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::BdaPagetable; binding.guestDescriptor.clear(); }), "BDA table and fault descriptors");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::FaultBuffer; binding.guestDescriptor.clear(); }), "BDA table and fault descriptors");
@@ -753,9 +768,16 @@ void resourceTests() {
     expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor[3] |= 0x40000000u; }), "unsupported type");
     expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor[1] |= 0x3fffu << 16u; binding.guestDescriptor[2] = 0xffffffffu; }), "descriptor range limit");
     expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor[2] = 8192; }), "descriptor range limit");
-    expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor = vsharp(reinterpret_cast<const void*>(0x1000), 8); }), "not readable");
     expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = vsharp(reinterpret_cast<const void*>(state.color.address), 64); }), "aliases the render target");
-    expectSingleFailure(changed([](auto& binding) { binding.count = 3; binding.guestDescriptor = join(join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)), vsharp(reinterpret_cast<const void*>(0x1000), 8)); }), "not readable");
+    // A descriptor over unmapped memory is a sparse region that reads as zeros (GuestBufferMemory),
+    // not a failed build.
+    {
+        mock = MockVulkan{};
+        ShaderRecompiler::RecompileResult vertex;
+        ShaderRecompiler::RecompileResult fragment;
+        vertex.bindings.push_back(changed([](auto& binding) { binding.guestDescriptor = vsharp(reinterpret_cast<const void*>(0x1000), 8); }));
+        AgcDriver::Graphics::ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+    }
     expectSingleFailure(changed([&](auto& binding) { binding.count = 2; binding.guestDescriptor = join(vsharp(guestFirst.data(), 16), vsharp(reinterpret_cast<const void*>(state.color.address), 64)); }), "aliases the render target");
     expectSingleFailure(changed([](auto& binding) { binding.count = 17; binding.guestDescriptor.assign(68, 0); }), "per-stage limits");
     {
@@ -977,7 +999,8 @@ void rectListTests() {
     expectFailure([&] { static_cast<void>(BuildRectListShaders(vertex, fragment, target)); }, "per-vertex interpolation");
     fragment.fragmentParameters[0].perVertex = false;
     vertex.parameterExports.clear();
-    expectFailure([&] { static_cast<void>(BuildRectListShaders(vertex, fragment, target)); }, "no vertex export");
+    // A parameter the vertex shader never exports reads zero, as from the hardware's parameter cache.
+    static_cast<void>(BuildRectListShaders(vertex, fragment, target));
     fragment.fragmentParameters.clear();
     target.tessellation->maxPatchSize = 3;
     expectFailure([&] { static_cast<void>(BuildRectListShaders(vertex, fragment, target)); }, "device limits");

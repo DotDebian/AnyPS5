@@ -231,6 +231,8 @@ add_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/Draw.cpp
         Graphics/src/Pipeline.cpp
         Graphics/src/State.cpp
+        Graphics/src/Recorder.cpp
+        Graphics/src/ShaderInputState.cpp
         Graphics/src/ColorTargetLayout.cpp
         Graphics/src/ColorTargetTransfer.cpp
         Graphics/src/Resources.cpp
@@ -251,6 +253,7 @@ add_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
         Execution/src/GuestMemory.cpp
+        Execution/src/Pm4.cpp
 )
 
 target_include_directories(agc_driver_graphics_tests PRIVATE
