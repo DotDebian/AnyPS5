@@ -30,8 +30,8 @@ constexpr std::int32_t EventStatePlay = 0x03;
 constexpr std::int32_t EventStatePause = 0x04;
 constexpr std::int32_t EventWarningId = 0x20;
 
-constexpr std::uint32_t StreamTypeVideo = 0;
-constexpr std::uint32_t StreamTypeAudio = 1;
+constexpr std::uint32_t StreamTypeVideo = 1;
+constexpr std::uint32_t StreamTypeAudio = 0;
 constexpr std::uint32_t StreamTypeTimedText = 2;
 
 constexpr std::uint32_t SourceTypeUnknown = 0;

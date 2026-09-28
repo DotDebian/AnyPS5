@@ -340,11 +340,11 @@ void TestPlayback() {
         AvPlayerStreamInfo info{};
         Check(sceAvPlayerGetStreamInfo(player, index, &info) == 0, "stream info failed");
         Check(info.duration >= 950 && info.duration <= 1100, "unexpected stream duration");
-        if (info.type == 0) {
+        if (info.type == 1) {
             video = static_cast<int>(index);
             Check(info.details.video.width == 112 && info.details.video.height == 64, "unexpected video stream size");
             Check(std::strcmp(info.details.video.language_code, "eng") == 0, "unexpected video language");
-        } else if (info.type == 1) {
+        } else if (info.type == 0) {
             audio = static_cast<int>(index);
             Check(info.details.audio.channel_count == 2 && info.details.audio.sample_rate == SampleRate, "unexpected audio stream");
         }
