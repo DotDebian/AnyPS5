@@ -310,6 +310,24 @@ if(BUILD_TESTING)
         set_tests_properties(guest_rtc PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceRtc>")
     endif()
+    if(AVPLAYER_HAS_FFMPEG)
+        find_package(PkgConfig QUIET)
+        pkg_check_modules(AVPLAYER_TEST_FFMPEG QUIET IMPORTED_TARGET libavformat libavcodec libavutil)
+        add_executable(guest_avplayer_tests tests/GuestAvPlayer.cpp)
+        target_include_directories(guest_avplayer_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(guest_avplayer_tests PRIVATE libSceAvPlayer PkgConfig::AVPLAYER_TEST_FFMPEG)
+        configure_windows_unwind(guest_avplayer_tests)
+        file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/guest_avplayer)
+        add_test(NAME guest_avplayer COMMAND guest_avplayer_tests)
+        set_tests_properties(guest_avplayer PROPERTIES
+            WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/guest_avplayer
+            SKIP_RETURN_CODE 77
+            TIMEOUT 60)
+        if(WIN32)
+            set_tests_properties(guest_avplayer PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAvPlayer>")
+        endif()
+    endif()
     add_executable(fiber_tests tests/Fiber.cpp)
     target_include_directories(fiber_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(fiber_tests PRIVATE libSceFiber)
