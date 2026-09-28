@@ -95,7 +95,9 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     const auto activeInputs = ena & addr;
     constexpr std::uint32_t knownMask = 0x1u | 0x2u | 0x10u | 0x20u | 0x100u | 0x200u | 0x400u | 0x800u | 0x1000u | 0x2000u;
     if ((activeInputs & ~knownMask) != 0) {
-        throw std::runtime_error("AGC graphics: unsupported SPI_PS_INPUT_ENA/ADDR bit combination");
+        char message[128];
+        std::snprintf(message, sizeof(message), "AGC graphics: unsupported SPI_PS_INPUT_ENA/ADDR bit combination (ena 0x%x addr 0x%x)", ena, addr);
+        throw std::runtime_error(message);
     }
     std::array<std::uint32_t, 32> interpolatorSettings{};
     for (std::uint32_t i = 0; i < inputNum; ++i) {

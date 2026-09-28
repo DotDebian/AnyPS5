@@ -229,7 +229,7 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
     } else if (options.stage == ShaderStageKind::Mesh) {
         const auto& mesh = options.inputInfo.vertex->mesh;
         if (options.waveSize != 64u || mesh.primitivesPerGroup == 0u || mesh.verticesPerGroup > 64u || totalThreads > 15u * 64u) {
-            throw std::runtime_error("mesh shader translation configuration is not supported");
+            throw std::runtime_error("mesh shader translation configuration is not supported (wave " + std::to_string(options.waveSize) + ", primitives per group " + std::to_string(mesh.primitivesPerGroup) + ", vertices per group " + std::to_string(mesh.verticesPerGroup) + ", threads " + std::to_string(totalThreads) + ")");
         }
         constexpr std::uint32_t kTriStripPrimitiveType = 6u;
         const auto u32 = [&entryIr](std::uint32_t value) -> IrValue& {
