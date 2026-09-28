@@ -11,6 +11,8 @@
 
 namespace AgcDriver::Graphics {
 
+void ShutdownGuestBufferWorkers();
+
 struct GuestMemorySnapshot {
     std::uint64_t address;
     std::span<const std::byte> bytes;

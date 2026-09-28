@@ -355,7 +355,9 @@ void InvalidParameterHandler(const wchar_t*, const wchar_t*, const wchar_t*, uns
 // Static destruction runs on the thread that ends the process (ExitProcess -> DLL_PROCESS_DETACH),
 // so its stack names the exit's caller when no libc exit/abort path was taken.
 struct ExitReporter {
-    ~ExitReporter() { ReportBacktrace("process exit (static destruction)"); }
+    ~ExitReporter() {
+        if (std::getenv("APS5_TRACE_EXIT") != nullptr) ReportBacktrace("process exit (static destruction)");
+    }
 } g_exitReporter;
 
 const bool g_crashReportInstalled = [] {

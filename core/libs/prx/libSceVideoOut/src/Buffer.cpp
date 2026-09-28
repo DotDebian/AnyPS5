@@ -35,7 +35,7 @@ void APS5_VABI sceVideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribut
     attribute->dcc_control = dccControl;
 }
 
-int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIndexStart, const VideoOutBuffers* buffers, int bufferNum, const VideoOutBufferAttribute2* attribute, int category, void* option) {
+int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIndexStart, const VideoOutBuffers* buffers, int bufferNum, const VideoOutBufferAttribute2* attribute, int category, void* option) try {
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -88,9 +88,11 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
         cfg->buffers[bufferIndexStart + i] = registered[i];
     }
     return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
-int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, const VideoOutBufferAttribute2* attribute, void* option) {
+int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, const VideoOutBufferAttribute2* attribute, void* option) try {
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -120,9 +122,11 @@ int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, 
     }
     cfg->groups[setIndex] = group;
     return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
-int APS5_VABI sceVideoOutUnregisterBuffers(int handle, int setIndex) {
+int APS5_VABI sceVideoOutUnregisterBuffers(int handle, int setIndex) try {
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -148,9 +152,11 @@ int APS5_VABI sceVideoOutUnregisterBuffers(int handle, int setIndex) {
         }
     }
     return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
-int APS5_VABI sceVideoOutSubmitFlip(int handle, int index, int flipMode, int64_t flipArg) {
+int APS5_VABI sceVideoOutSubmitFlip(int handle, int index, int flipMode, int64_t flipArg) try {
     auto cfg = VideoOutDriver::Get().GetConfig(handle);
     if (cfg == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
@@ -173,6 +179,8 @@ int APS5_VABI sceVideoOutSubmitFlip(int handle, int index, int flipMode, int64_t
     }
     lock.unlock();
     return VideoOutDriver::Get().SubmitFlip(handle, index, flipMode, flipArg);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
 }

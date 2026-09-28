@@ -10,6 +10,7 @@
 #include "SDL.h"
 #include "SDL_vulkan.h"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
+#include "prx/libSceVideoOut/include/MouseInput.hpp"
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
@@ -39,7 +40,7 @@ public:
         : _config(std::move(config)), _index(index), _ticket(ticket) {}
     void Wait() override {
         std::unique_lock lock(_config->mutex);
-        _config->vblankCond.wait(lock, [&] {
+        _config->vblankCond.wait(lock, _config->shutdownToken, [&] {
             return _config->failure || _config->closing || !_config->opened ||
                 _config->bufferReuse[_index].IsComplete(_ticket);
         });
@@ -75,13 +76,14 @@ public:
         if (waitWhenFull) {
             int waited = 0;
             while (queue->reservations.load() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
+                if (cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 if (++waited % 500 == 0) std::fprintf(stderr, "[flip] queue full for %d s; waiting (APS5_FLIP_QUEUE_WAIT)\n", waited / 100);
             }
         }
         std::lock_guard queueLock(queue->mutex);
         if (queue->failure) std::rethrow_exception(queue->failure);
-        require(!queue->stopping, "flip during shutdown");
+        if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
         std::lock_guard lock(cfg->mutex);
         checkConfig(*cfg);
         require(queue->reservations.load() < VIDEO_OUT_FLIP_QUEUE_CAPACITY, "flip queue full");
@@ -152,7 +154,7 @@ void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameT
         AgcDriver::PerformanceTimer readiness("VideoOut.Readiness");
         std::lock_guard queueLock(queue->mutex);
         if (queue->failure) std::rethrow_exception(queue->failure);
-        require(!queue->stopping, "GPU flip during shutdown");
+        if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
         std::lock_guard lock(cfg->mutex);
         checkConfig(*cfg);
         require(reserved && !ready && !terminal && cfg->generation == generation, "invalid flip readiness transition");
@@ -171,7 +173,7 @@ void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameT
     static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
     if (!syncFlip) return;
     std::unique_lock lock(cfg->mutex);
-    cfg->vblankCond.wait(lock, [&] { return gpuComplete || cfg->failure || cfg->closing; });
+    cfg->vblankCond.wait(lock, cfg->shutdownToken, [&] { return gpuComplete || cfg->failure || cfg->closing; });
     checkConfig(*cfg);
     require(gpuComplete, "flip preparation did not complete on GPU");
 }
@@ -231,24 +233,21 @@ void VideoOutDriver::Shutdown() {
     require(std::this_thread::get_id() != presentThread.get_id(), "presentation thread cannot stop itself");
     std::lock_guard shutdownLock(shutdownMutex);
     if (stopped) return;
+    LibcRequestShutdown_nid_postfix();
     {
-        std::lock_guard lock(mutex);
-        {
-            std::lock_guard queueLock(flipQueue->mutex);
-            flipQueue->stopping = true;
-        }
-        for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; ++handle) {
-            if (outputs[handle]) close(handle);
-        }
+        std::lock_guard queueLock(flipQueue->mutex);
+        flipQueue->stopping = true;
     }
     presentThread.request_stop();
     vblankThread.request_stop();
     flipQueue->changed.notify_all();
     presentThread.join();
     vblankThread.join();
-    if (window.Handle() != nullptr) {
-        AgcDriverReleaseWindow_nid_postfix(window.Handle());
-        window.Destroy();
+    {
+        std::lock_guard lock(mutex);
+        for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; ++handle) {
+            if (outputs[handle]) close(handle);
+        }
     }
     SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER);
     stopped = true;
@@ -261,7 +260,7 @@ int VideoOutDriver::Open(int busType) {
     {
         std::lock_guard queueLock(flipQueue->mutex);
         if (flipQueue->failure) std::rethrow_exception(flipQueue->failure);
-        require(!flipQueue->stopping, "open during shutdown");
+        if (flipQueue->stopping || LibcShutdownToken_nid_postfix().stop_requested()) throw ProcessShutdown{};
     }
     const int handle = busType + 1;
     require(handle > 0 && handle < VIDEO_OUT_NUM_MAX, "invalid output bus");
@@ -287,6 +286,7 @@ int VideoOutDriver::Open(int busType) {
 
 bool VideoOutDriver::Close(int handle) {
     std::lock_guard lock(mutex);
+    if (LibcShutdownToken_nid_postfix().stop_requested()) throw ProcessShutdown{};
     return close(handle);
 }
 
@@ -321,7 +321,7 @@ std::shared_ptr<VideoOutConfig> VideoOutDriver::GetConfig(int handle) {
     {
         std::lock_guard lock(flipQueue->mutex);
         if (flipQueue->failure) std::rethrow_exception(flipQueue->failure);
-        require(!flipQueue->stopping, "output is shutting down");
+        if (flipQueue->stopping || LibcShutdownToken_nid_postfix().stop_requested()) throw ProcessShutdown{};
     }
     std::lock_guard lock(mutex);
     require(handle > 0 && handle < VIDEO_OUT_NUM_MAX && contexts[handle] != nullptr, "invalid output handle");
@@ -336,6 +336,7 @@ bool VideoOutDriver::IsOpen(int handle) {
 }
 
 int VideoOutDriver::SubmitFlip(int handle, int index, int flipMode, int64_t flipArg) {
+    if (LibcShutdownToken_nid_postfix().stop_requested()) throw ProcessShutdown{};
     // A title that does not pace on flipPendingNum can run ahead of the presenter now that the queue
     // worker no longer waits per flip; a full queue is the documented error, not a failure.
     if (flipQueue->reservations.load() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
@@ -391,7 +392,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
         const auto target = req.cfg->lastFlipVblank + interval;
         timing.Mark("validate");
-        req.cfg->vblankCond.wait(lock, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
+        req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
         timing.Mark("vblank_wait");
         checkConfig(*req.cfg);
     }
@@ -466,6 +467,7 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
     std::shared_ptr<FlipRequest> current;
     try {
         PadInput padInput;
+        MouseInput mouseInput;
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
@@ -479,8 +481,12 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
             }
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
-                require(event.type != SDL_QUIT, "window was closed");
+                if (event.type == SDL_QUIT) {
+                    LibcRequestExit_nid_postfix(0);
+                    throw ProcessShutdown{};
+                }
                 padInput.HandleEvent(event, window);
+                if (window.Handle() != nullptr) mouseInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
             }
             padInput.Update();
             if (current) {
@@ -500,15 +506,7 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
             }
             current.reset();
         }
-        std::list<std::shared_ptr<FlipRequest>> cancelled;
-        {
-            std::lock_guard lock(flipQueue->mutex);
-            cancelled.swap(flipQueue->requests);
-        }
-        if (!cancelled.empty()) {
-            auto error = std::make_exception_ptr(std::runtime_error("VideoOut: pending flip cancelled during shutdown"));
-            for (auto& request : cancelled) request->Fail(error);
-        }
+    } catch (const ProcessShutdown&) {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[videoout] presentation failed: %s\n", error.what());
         std::fflush(stderr);
@@ -518,6 +516,16 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
         std::fflush(stderr);
         std::terminate();
     }
+    current.reset();
+    {
+        std::list<std::shared_ptr<FlipRequest>> cancelled;
+        {
+            std::lock_guard lock(flipQueue->mutex);
+            cancelled.swap(flipQueue->requests);
+        }
+    }
+    AgcDriverShutdown_nid_postfix();
+    window.Destroy();
 }
 
 void VideoOutDriver::vblankLoop(std::stop_token token) {

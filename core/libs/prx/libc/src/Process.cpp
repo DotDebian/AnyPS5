@@ -8,6 +8,8 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <atomic>
+#include <stdexcept>
 #include "prx/libc/include/Shutdown.hpp"
 
 #include "prx/libc/include/General.hpp"
@@ -22,7 +24,33 @@ std::thread::id shutdownThread;
 bool shutdownStarted = false;
 bool shutdownFinished = false;
 std::exception_ptr shutdownFailure;
+std::stop_source shutdownSource;
+std::atomic<bool> exitRequested{false};
+std::atomic<bool> exitStarted{false};
 
+}
+
+extern "C" std::stop_token LibcShutdownToken_nid_postfix() {
+    return shutdownSource.get_token();
+}
+
+extern "C" void LibcRequestShutdown_nid_postfix() {
+    shutdownSource.request_stop();
+}
+
+extern "C" void LibcRequestExit_nid_postfix(int code) {
+    if (exitRequested.exchange(true)) return;
+    LibcRequestShutdown_nid_postfix();
+    std::thread([code] { LibcExit_nid_no_patch(code); }).detach();
+}
+
+extern "C" [[noreturn]] void LibcAwaitExit_nid_postfix() {
+    if (!exitRequested.load()) throw ProcessShutdown{};
+    {
+        std::lock_guard lock(shutdownMutex);
+        if (shutdownThread == std::this_thread::get_id()) throw std::runtime_error("libc: exit thread cannot wait for itself");
+    }
+    for (;;) exitRequested.wait(true);
 }
 
 extern "C" void LibcRegisterShutdown_nid_postfix(void (*callback)()) {
@@ -43,6 +71,7 @@ extern "C" void LibcRunShutdown_nid_postfix() {
     shutdownThread = std::this_thread::get_id();
     auto callbacks = std::move(shutdownCallbacks);
     lock.unlock();
+    LibcRequestShutdown_nid_postfix();
     std::exception_ptr error;
     for (auto it = callbacks.rbegin(); it != callbacks.rend(); ++it) {
         try { (*it)(); }
@@ -68,6 +97,8 @@ extern "C" {
 }
 
 [[noreturn]] void LibcExit_nid_no_patch(int code) {
+    exitRequested.store(true);
+    if (exitStarted.exchange(true)) LibcAwaitExit_nid_postfix();
     LibcRunShutdown_nid_postfix();
     std::exit(code);
 }

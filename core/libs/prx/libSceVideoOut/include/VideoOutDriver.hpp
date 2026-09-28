@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceVideoOut/include/DisplayWindow.hpp"
 #include "prx/libSceVideoOut/include/BufferReuseTracker.hpp"
+#include "prx/libc/include/Shutdown.hpp"
 
 #include "SDL.h"
 #include "SceTypes.hpp"
@@ -101,6 +102,7 @@ struct VideoOutConfig {
     bool opened = false;
     bool closing = false;
     std::exception_ptr failure;
+    std::stop_token shutdownToken = LibcShutdownToken_nid_postfix();
     int flipRate = 0;
     uint64_t lastFlipVblank = 0;
     std::chrono::steady_clock::time_point lastTimingFlip{};
@@ -118,6 +120,7 @@ struct VideoOutConfig {
 
     void Check() const {
         if (failure) std::rethrow_exception(failure);
+        if (shutdownToken.stop_requested()) throw ProcessShutdown{};
         if (!opened || closing) throw std::runtime_error("VideoOut: port is closed");
     }
 };

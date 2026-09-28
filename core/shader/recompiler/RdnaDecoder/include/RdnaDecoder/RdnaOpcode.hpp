@@ -284,6 +284,7 @@ enum class RdnaOpcode : std::uint16_t {
     VAdd3U32,
     VLshlAddU32,
     VAddLshlU32,
+    VPermB32,
     VXadU32,
     VLshlOrB32,
     VAndOrB32,

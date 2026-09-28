@@ -4,9 +4,11 @@ Tool for automatic executables porting to Linux and Windows.
 
 Includes a [relinker](core/relinker) that converts executable to the target system's native format and implementations of [system prx libraries](core/libs/prx) suitable for dynamic linking. No emulation or separate runtime process.
 
-`relinker --to-intel` rewrites the Zen 2-only instructions a title may contain (EXTRQ, INSERTQ, MOVNTSS, MOVNTSD) at relink time, in place when an equal-length Intel encoding exists and otherwise through a jump to a generated stub section, so Intel hosts need no runtime emulation.
+[![libraries](https://boykopovar.github.io/AnyPS5/badge-libraries.svg)](https://boykopovar.github.io/AnyPS5/) [![shaders](https://boykopovar.github.io/AnyPS5/badge-shaders.svg)](https://boykopovar.github.io/AnyPS5/)
 
-By default the relinker also converts the title's own `sce_module`/`sce_modules` prx files into guest modules that take priority at link time (they require eager binding). A title whose `sce_module` ships its own `libc.prx`, such as Demon's Souls (PPSA01342), is relinked with `--skip-sce-module`: its libc would replace the project's [libc.prx](core/libs/prx/libc) (guest memory arena, heap, crash reporting) and imports kernel functions that are not implemented, so the executable fails to bind at startup.
+[![progress map](https://boykopovar.github.io/AnyPS5/progress.svg)](https://boykopovar.github.io/AnyPS5/)
+
+<sub>* System libraries: percentage of the functions known to the project so far (declared in [core/libs/prx](core/libs/prx)), not of every PS5 system function. The total grows as more functions are declared.</sub>
 
 Releases will be published after the first full successful launch of at least one game.
 

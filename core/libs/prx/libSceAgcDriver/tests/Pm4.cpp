@@ -1,6 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include "prx/libSceAgcDriver/Execution/include/MemoryAccessScope.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -308,13 +307,16 @@ void testMemorySynchronization() {
         std::uint32_t destination = 0;
         bool read = false;
         bool written = false;
-    } memory;
+    };
+    static MemoryState memory;
+    memory = {};
     AgcDriver::QueueState state;
-    const auto resolve = [](void* context, std::uint64_t address, std::size_t bytes, bool writable) {
-        auto& memory = *static_cast<MemoryState*>(context);
+    struct FlushHookReset {
+        ~FlushHookReset() { AgcDriver::GuestMemory::SetFlushHook(nullptr); }
+    } reset;
+    const auto resolve = [](std::uint64_t address, std::size_t bytes) {
         check(bytes == sizeof(std::uint32_t), "memory transfer resolved an unrelated range");
-        if (writable) {
-            check(address == reinterpret_cast<std::uintptr_t>(&memory.destination), "memory transfer resolved an unrelated destination");
+        if (address == reinterpret_cast<std::uintptr_t>(&memory.destination)) {
             memory.written = true;
         } else {
             check(address == reinterpret_cast<std::uintptr_t>(&memory.source), "memory transfer resolved an unrelated source");
@@ -322,7 +324,7 @@ void testMemorySynchronization() {
             memory.read = true;
         }
     };
-    const AgcDriver::GuestMemory::MemoryAccessScope scope(&memory, resolve);
+    AgcDriver::GuestMemory::SetFlushHook(resolve);
     execute(state, makePacket(0x37, {0x100, low(&memory.destination), high(&memory.destination), 17}));
     check(memory.written && !memory.read && memory.destination == 17, "WRITE_DATA did not synchronize its destination");
     for (const auto opcode : {0x40u, 0x50u}) {
@@ -333,7 +335,7 @@ void testMemorySynchronization() {
         execute(state, packet);
         check(memory.read && memory.written && memory.destination == 42, "memory copy used stale data before range synchronization");
     }
-    const AgcDriver::GuestMemory::MemoryAccessScope rejecting(&memory, [](void*, std::uint64_t, std::size_t, bool) {
+    AgcDriver::GuestMemory::SetFlushHook([](std::uint64_t, std::size_t) {
         throw std::runtime_error("range synchronization failed");
     });
     expectFailure([&] { execute(state, makePacket(0x37, {0x100, low(&memory.destination), high(&memory.destination), 99})); }, "range synchronization failed");

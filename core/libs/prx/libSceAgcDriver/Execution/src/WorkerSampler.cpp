@@ -9,8 +9,11 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <stop_token>
+#include <system_error>
 #include <thread>
 #include <vector>
 #endif
@@ -20,6 +23,9 @@ namespace AgcDriver {
 #ifdef _WIN32
 namespace {
 
+std::jthread processSamplerThread;
+std::jthread workerSamplerThread;
+
 // Debug aid: APS5_SAMPLE_WORKER=<file> samples the calling thread every millisecond and, every 20 s,
 // writes "module+offset self inclusive" lines to <file> for offline symbolization with nm.
 struct Sampler {
@@ -28,6 +34,10 @@ struct Sampler {
     std::mutex mutex;
     std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> counts;
     std::uint64_t samples = 0;
+
+    ~Sampler() noexcept(false) {
+        if (target != nullptr && !CloseHandle(target)) throw std::system_error(GetLastError(), std::system_category(), "Closing sampler thread handle");
+    }
 
     void sample() {
         CONTEXT context{};
@@ -137,12 +147,12 @@ struct ProcessSampler {
 void StartProcessSampler() {
     const char* path = std::getenv("APS5_SAMPLE_THREADS");
     if (path == nullptr) return;
-    std::thread([path = std::string(path)] {
-        auto* sampler = new ProcessSampler();
+    processSamplerThread = std::jthread([path = std::string(path)](std::stop_token token) {
+        auto sampler = std::make_unique<ProcessSampler>();
         sampler->path = path;
         sampler->self = GetCurrentThreadId();
         auto flushed = std::chrono::steady_clock::now();
-        for (;;) {
+        while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             sampler->sample();
             if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(20)) {
@@ -150,7 +160,8 @@ void StartProcessSampler() {
                 flushed = std::chrono::steady_clock::now();
             }
         }
-    }).detach();
+        sampler->write();
+    });
 }
 
 }
@@ -159,12 +170,12 @@ void StartWorkerSampler() {
     StartProcessSampler();
     const char* path = std::getenv("APS5_SAMPLE_WORKER");
     if (path == nullptr) return;
-    auto* sampler = new Sampler();
+    auto sampler = std::make_unique<Sampler>();
     sampler->path = path;
-    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sampler->target, THREAD_ALL_ACCESS, FALSE, 0);
-    std::thread([sampler] {
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sampler->target, THREAD_ALL_ACCESS, FALSE, 0)) throw std::system_error(GetLastError(), std::system_category(), "Duplicating sampler thread handle");
+    workerSamplerThread = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
         auto flushed = std::chrono::steady_clock::now();
-        for (;;) {
+        while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             sampler->sample();
             if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(20)) {
@@ -172,10 +183,19 @@ void StartWorkerSampler() {
                 flushed = std::chrono::steady_clock::now();
             }
         }
-    }).detach();
+        sampler->write();
+    });
+}
+
+void StopWorkerSampler() {
+    processSamplerThread.request_stop();
+    workerSamplerThread.request_stop();
+    if (processSamplerThread.joinable()) processSamplerThread.join();
+    if (workerSamplerThread.joinable()) workerSamplerThread.join();
 }
 #else
 void StartWorkerSampler() {}
+void StopWorkerSampler() {}
 #endif
 
 }
