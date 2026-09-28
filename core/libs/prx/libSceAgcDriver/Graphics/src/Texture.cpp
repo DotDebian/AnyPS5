@@ -1082,9 +1082,13 @@ bool StorageTexture::Refresh() {
     // alone (the title marking the surface uncompressed behind a pass) leaves unstamped units
     // with their results, which are stored first, as the layer model does; new keys that are a
     // clear code make every result dead on hardware too. Without a generation (no tracking) a
-    // unit's stamps say nothing, so it is stored.
+    // unit's stamps say nothing, so it is stored. The clear code the image was cleared under is no
+    // new clear: it stays in the title's metadata after draws into the image (they never update
+    // keys here), so it says nothing about results made since. Without write watching (the Linux
+    // arena) every unit reads as changed at every Refresh, and dropping under those keys threw away
+    // a draw's results at the next lookup of the target (a draw sampling it saw the clear).
     const auto droppable = [&](std::uint32_t unit) {
-        if (IsDccClear(keys)) return true;
+        if (keysChanged && IsDccClear(keys)) return true;
         return layerGeneration[unit] != 0 && unit < stampedBlocks.size() && stampedBlocks[unit] != 0;
     };
     // A clear code -> uncompressed flip on an image with results pending: an unstamped pending
@@ -1125,6 +1129,10 @@ bool StorageTexture::Refresh() {
         stored[layer] = true;
         anyStored = true;
     }
+    // Results kept under the clear code the image was cleared under are stored whole, as writeBack
+    // stores such an image: the store marks the whole surface's keys uncompressed, so every unit's
+    // texels (the clear where nothing was drawn) must reach memory with it.
+    if (anyStored && !keysChanged && descriptor.dccAddress != 0 && IsDccClear(uploadedKeys)) stored.assign(trackedLayers, true);
     if (pendingResults) {
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx: guest memory changed while GPU results were pending; keeping the CPU's blocks\n", static_cast<unsigned long long>(descriptor.baseAddress));
