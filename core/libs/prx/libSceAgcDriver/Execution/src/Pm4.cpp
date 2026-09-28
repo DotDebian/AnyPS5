@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
@@ -662,15 +663,20 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
         }
         case 0x49: {
             // Earlier work has drained by the time the driver reaches this packet, so the end-of-pipe
-            // write can happen immediately. Interrupt delivery is not modeled.
+            // write can happen immediately.
             const auto dataSelect = packet[2] >> 29u;
+            const auto interruptSelect = (packet[2] >> 24u) & 7u;
             const auto destination = address(packet[3], packet[4]);
-            if (dataSelect == 0 || destination == 0) return;
+            if (dataSelect == 0 || destination == 0) {
+                if (interruptSelect != 0) AgcDriverDeliverEopInterrupt();
+                return;
+            }
             std::uint64_t value = address(packet[5], packet[6]);
             if (dataSelect == 3) {
                 value = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
             }
             GuestMemory::Write(destination, std::as_bytes(std::span(&value, 1)).first(dataSelect == 1 ? 4 : 8), dataSelect == 1 ? 4 : 8);
+            if (interruptSelect != 0) AgcDriverDeliverEopInterrupt();
             return;
         }
         case 0x69: case 0x76: case 0x79: case 0x7a: {
