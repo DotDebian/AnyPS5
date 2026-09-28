@@ -67,7 +67,7 @@ int APS5_VABI sceAgcDriverDeleteEqEvent(KernelEqueue eq, int id) {
   std::erase_if(g_registrations, [&](const Registration& r) { return r.eq == eq && r.id == id; });
  }
  const int result = EqueueDeleteEvent_nid_postfix(eq, static_cast<uintptr_t>(id), EvfiltGraphicsCore);
- return result == EQUEUE_ERROR_ENOENT ? AgcErrorInvalidArgument : result;
+ return result == SCE_KERNEL_ERROR_ENOENT ? AgcErrorInvalidArgument : result;
 }
 
 }
