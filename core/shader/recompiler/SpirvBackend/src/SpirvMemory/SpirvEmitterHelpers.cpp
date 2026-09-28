@@ -190,7 +190,21 @@ void DefineInputs(SpirvEmitterState& state) {
             addBuiltin(StageInputKind::WorkgroupId, 3u, "gl_WorkGroupID");
         }
     }
+    const bool pixelStage = state.program.Resources().stage == IrShaderStage::Pixel;
     for (auto& input : state.inputs) {
+        if (pixelStage && input.kind == StageInputKind::Parameter) {
+            const auto location = PixelParameterLocation(state, input.location);
+            const auto shared = std::find_if(state.inputs.begin(), state.inputs.end(), [&](const SpirvInputBinding& other) {
+                return &other != &input && other.kind == StageInputKind::Parameter && other.variableId != 0u && PixelParameterLocation(state, other.location) == location;
+            });
+            if (shared != state.inputs.end()) {
+                if (shared->perVertex != input.perVertex) {
+                    throw std::runtime_error("SPIR-V module emission failed: pixel inputs sharing parameter " + std::to_string(location) + " disagree on per-vertex access");
+                }
+                input.variableId = shared->variableId;
+                continue;
+            }
+        }
         std::uint32_t type = TypeU32(state);
         switch (input.kind) {
         case StageInputKind::VertexIndex:
@@ -244,12 +258,7 @@ void DefineInputs(SpirvEmitterState& state) {
             } else if (flat) {
                 state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationFlat);
             }
-            const bool pixelStage = state.program.Resources().stage == IrShaderStage::Pixel;
-            const auto parameterBit = input.location < 32u ? 1u << input.location : 0u;
-            const auto& interpolation = state.program.Metadata();
-            const bool recorded = ((interpolation.pixelLinearInputs | interpolation.pixelPerspectiveInputs) & parameterBit) != 0u;
-            const bool linear = pixelStage && (recorded ? (interpolation.pixelLinearInputs & parameterBit) != 0u && (interpolation.pixelPerspectiveInputs & parameterBit) == 0u : PixelInfo(state).psNoPerspective);
-            if (linear && !flat && !input.perVertex) {
+            if (PixelParameterIsLinear(state, input.location) && !flat && !input.perVertex) {
                 state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationNoPerspective);
             }
             state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationLocation, PixelParameterLocation(state, input.location));

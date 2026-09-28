@@ -214,28 +214,63 @@ void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pi
     if (pixel->psFrontFace) {
         AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
     }
+    std::array<bool, 32> read {};
     std::array<bool, 32> perVertex {};
     std::array<bool, 32> interpolated {};
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {
             if (inst->Opcode() == IrOpcode::GetAttribute) {
-                interpolated[inst->Argument(0)->Resolve()->ImmediateU32()] = true;
+                const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
+                read[input] = true;
+                interpolated[input] = true;
             } else if (inst->Opcode() == IrOpcode::GetInterpolationParameter) {
                 const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
                 const auto mode = inst->Argument(2)->Resolve()->ImmediateU32();
+                read[input] = true;
                 perVertex[input] = perVertex[input] || mode < 2u || !IsPixelParameterFlat(*pixel, input);
             }
         }
     }
+    const auto& metadata = program.Metadata();
+    const auto linear = [&](std::uint32_t input) {
+        return pixel->InputIsLinear(input, metadata.pixelLinearInputs, metadata.pixelPerspectiveInputs);
+    };
+    const auto interpolation = [&](std::uint32_t input) {
+        return IsPixelParameterFlat(*pixel, input) ? 2u : linear(input) ? 1u : 0u;
+    };
+    constexpr std::uint32_t unassigned = std::numeric_limits<std::uint32_t>::max();
+    std::array<std::uint32_t, 32> slotInterpolation {};
+    slotInterpolation.fill(unassigned);
+    std::array<bool, 32> slotPerVertex {};
     for (std::uint32_t input = 0; input < pixel->inputNum; input++) {
-        AddInput(info, StageInputKind::Parameter, input, 4, "in_param_" + std::to_string(input), perVertex[input]);
-    }
-    for (std::uint32_t input = 0; input < pixel->inputNum; input++) {
-        if (interpolated[input] && perVertex[input]) {
-            const auto kind = pixel->psNoPerspective ? StageInputKind::BaryCoordNoPerspective : StageInputKind::BaryCoordSmooth;
-            AddInput(info, kind, 0, 3, pixel->psNoPerspective ? "gl_BaryCoordNoPerspKHR" : "gl_BaryCoordKHR");
-            break;
+        if (!read[input] || pixel->InputIsDefault(input)) {
+            continue;
         }
+        const auto slot = pixel->InputSlot(input);
+        if (slotInterpolation[slot] == unassigned) {
+            slotInterpolation[slot] = interpolation(input);
+        } else if (slotInterpolation[slot] != interpolation(input)) {
+            slotPerVertex[slot] = true;
+        }
+        slotPerVertex[slot] = slotPerVertex[slot] || perVertex[input];
+    }
+    bool smooth = false;
+    bool noPerspective = false;
+    for (std::uint32_t input = 0; input < pixel->inputNum; input++) {
+        if (!read[input] || pixel->InputIsDefault(input)) {
+            continue;
+        }
+        const bool vertexInput = slotPerVertex[pixel->InputSlot(input)];
+        AddInput(info, StageInputKind::Parameter, input, 4, "in_param_" + std::to_string(input), vertexInput);
+        if (vertexInput && interpolated[input] && !IsPixelParameterFlat(*pixel, input)) {
+            (linear(input) ? noPerspective : smooth) = true;
+        }
+    }
+    if (smooth) {
+        AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
+    }
+    if (noPerspective) {
+        AddInput(info, StageInputKind::BaryCoordNoPerspective, 0, 3, "gl_BaryCoordNoPerspKHR");
     }
 }
 

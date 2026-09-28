@@ -197,6 +197,26 @@ struct ShaderPixelInputInfo {
     bool HasPositionInput() const {
         return psPosX || psPosY || psPosZ || psPosW;
     }
+
+    [[nodiscard]] bool InputIsDefault(std::uint32_t input) const {
+        return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x20u) != 0u;
+    }
+
+    [[nodiscard]] std::uint32_t InputSlot(std::uint32_t input) const {
+        return input < 32u ? interpolatorSettings[input] & 0x1fu : input;
+    }
+
+    [[nodiscard]] std::uint32_t InputDefaultBits(std::uint32_t input, std::uint32_t component) const {
+        const auto value = input < 32u ? (interpolatorSettings[input] >> 8u) & 0x3u : 0u;
+        const bool one = component == 3u ? (value & 0x1u) != 0u : (value & 0x2u) != 0u;
+        return one ? 0x3f800000u : 0u;
+    }
+
+    [[nodiscard]] bool InputIsLinear(std::uint32_t input, std::uint32_t linearInputs, std::uint32_t perspectiveInputs) const {
+        const auto bit = input < 32u ? 1u << input : 0u;
+        const bool recorded = ((linearInputs | perspectiveInputs) & bit) != 0u;
+        return recorded ? (linearInputs & bit) != 0u && (perspectiveInputs & bit) == 0u : psNoPerspective;
+    }
 };
 
 struct ShaderStageInputInfo {

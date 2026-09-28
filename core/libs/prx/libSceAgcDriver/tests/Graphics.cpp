@@ -16,6 +16,8 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -1439,6 +1441,90 @@ void rectListTests() {
     expectFailure([&] { Draw(context, state, draw, {}); }, "incomplete rect-list");
 }
 
+// Recompiles `code` as a pixel shader with PERSP_CENTER loaded and one SPI_PS_INPUT_CNTL word per
+// input.
+ShaderRecompiler::RecompileResult recompilePixel(std::initializer_list<std::uint32_t> controls, std::span<const std::uint32_t> code) {
+    auto queue = makeState();
+    queue.context[0x1b3] = 0x2u;
+    queue.context[0x1b4] = 0x2u;
+    queue.context[0x1b6] = static_cast<std::uint32_t>(controls.size());
+    std::uint32_t index = 0;
+    for (const auto control : controls) queue.context[0x191 + index++] = control;
+    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, true, 0xe4u);
+    ShaderRecompiler::RecompileRequest request{};
+    request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x30000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.pixel = pixel;
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.target.fragmentShaderBarycentricEnabled = true;
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    return ShaderRecompiler::Recompile(request);
+}
+
+struct LocatedInput {
+    std::uint32_t location;
+    bool flat;
+    bool perVertex;
+};
+
+// The Location-decorated input variables of a module, in location order.
+std::vector<LocatedInput> locatedInputs(std::span<const std::uint32_t> words) {
+    std::map<std::uint32_t, LocatedInput> decorated;
+    std::set<std::uint32_t> inputs;
+    for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
+        const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+        if (op == spv::OpVariable && words[at + 3] == spv::StorageClassInput) inputs.insert(words[at + 2]);
+        if (op != spv::OpDecorate) continue;
+        auto& input = decorated[words[at + 1]];
+        if (words[at + 2] == spv::DecorationLocation) input.location = words[at + 3] + 1u;
+        if (words[at + 2] == spv::DecorationFlat) input.flat = true;
+        if (words[at + 2] == spv::DecorationPerVertexKHR) input.perVertex = true;
+    }
+    std::vector<LocatedInput> result;
+    for (const auto& [id, input] : decorated) {
+        if (input.location != 0 && inputs.contains(id)) result.push_back({input.location - 1u, input.flat, input.perVertex});
+    }
+    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return a.location < b.location; });
+    return result;
+}
+
+// SPI_PS_INPUT_CNTL_n.OFFSET names the parameter slot an input reads, so pixel inputs are declared
+// at their slots: inputs reading one slot share its variable, a slot read both flat and
+// interpolated is taken per vertex, and an input with OFFSET bit 5 set is its DEFAULT_VAL constant.
+void pixelParameterSlotTests() {
+    using AgcDriver::Graphics::CompiledShader;
+    const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    auto state = AgcDriver::Graphics::DecodeState(makeState());
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.spirv = makeModule({.parameterOutput = true});
+    // v_interp_p1/p2_f32 v4, attr0.x; v_interp_mov_f32 v5, p0, attr1.x; v_interp_mov_f32 v6, p0,
+    // attr2.x; v_interp_mov_f32 v7, p0, attr3.w; exp mrt0 v4, v5, v6, v7 done vm; s_endpgm.
+    const std::array<std::uint32_t, 8> mixed{0xc8100000u, 0xc8110001u, 0xc8160402u, 0xc81a0802u, 0xc81e0f02u, 0xf800180fu, 0x07060504u, 0xbf810000u};
+    // Astro Bot's words: slot 0 interpolated, slot 0 flat, a defaulted input that keeps offset
+    // bits (0x22) and DEFAULT_VAL (1,1,1,1).
+    auto pixel = recompilePixel({0x0u, 0x400u, 0x22u, 0x320u}, mixed);
+    auto inputs = locatedInputs(pixel.spirv.Words());
+    Require(inputs.size() == 1 && inputs[0].location == 0 && inputs[0].perVertex, "a slot read flat and interpolated did not become one per-vertex input");
+    std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}}};
+    AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, true);
+    // Two interpolated inputs of slot 3 (attr0.x, attr1.y) read one smooth variable.
+    const std::array<std::uint32_t, 7> shared{0xc8100000u, 0xc8110001u, 0xc8140500u, 0xc8150501u, 0xf800180fu, 0x05040504u, 0xbf810000u};
+    pixel = recompilePixel({0x3u, 0x3u}, shared);
+    inputs = locatedInputs(pixel.spirv.Words());
+    Require(inputs.size() == 1 && inputs[0].location == 3 && !inputs[0].perVertex && !inputs[0].flat, "inputs reading one slot were not declared once at the slot");
+    // Flat inputs of different slots keep their slots.
+    pixel = recompilePixel({0x404u, 0x0u}, shared);
+    inputs = locatedInputs(pixel.spirv.Words());
+    Require(inputs.size() == 2 && inputs[0].location == 0 && !inputs[0].flat && inputs[1].location == 4 && inputs[1].flat, "flat and interpolated inputs of different slots moved");
+    // Only defaulted inputs: no interface at all.
+    pixel = recompilePixel({0x20u, 0x2320u}, shared);
+    Require(locatedInputs(pixel.spirv.Words()).empty(), "a defaulted input was declared as a parameter");
+    AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, true);
+}
+
 void validationTests() {
     AgcDriver::Graphics::State state{};
     state.stages.path = AgcDriver::Graphics::ShaderPath::Vertex;
@@ -1642,6 +1728,7 @@ int main() {
         pushConstantTests();
         resourceTests();
         validationTests();
+        pixelParameterSlotTests();
         rectListTests();
         depthPipelineTests();
         mock = MockVulkan{};

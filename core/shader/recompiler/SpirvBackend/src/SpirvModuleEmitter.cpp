@@ -97,6 +97,9 @@ std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std:
 }
 
 std::uint32_t EmitAttributeValue(SpirvEmitterState& state, std::uint32_t attr, std::uint32_t chan) {
+    if (PixelParameterIsDefault(state, attr)) {
+        return ConstantU32(state, state.inputInfo.pixel->InputDefaultBits(attr, chan & 3u));
+    }
     const auto* input = SpirvInputBindingForParameter(state, attr);
     if (input == nullptr || input->variableId == 0) {
         return ConstantU32(state, 0u);
@@ -116,8 +119,16 @@ std::uint32_t EmitAttributeValue(SpirvEmitterState& state, std::uint32_t attr, s
         if (state.inputInfo.pixel == nullptr) {
             throw std::runtime_error("pixel input info is missing for a per-vertex attribute");
         }
-        const auto barycentricKind = state.inputInfo.pixel->psNoPerspective ? StageInputKind::BaryCoordNoPerspective : StageInputKind::BaryCoordSmooth;
+        if (PixelParameterIsFlat(state, attr)) {
+            const auto bits = state.module.AllocateId();
+            state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, loadPerVertex(0u));
+            return bits;
+        }
+        const auto barycentricKind = PixelParameterIsLinear(state, attr) ? StageInputKind::BaryCoordNoPerspective : StageInputKind::BaryCoordSmooth;
         const auto barycentric = InputVariableForKind(state, barycentricKind);
+        if (barycentric == 0u) {
+            throw std::runtime_error("per-vertex attribute interpolation lacks its barycentric input");
+        }
         std::uint32_t sum = 0;
         for (std::uint32_t vertex = 0; vertex < 3u; vertex++) {
             const auto pointer = state.module.AllocateId();
@@ -148,6 +159,9 @@ std::uint32_t EmitAttributeValue(SpirvEmitterState& state, std::uint32_t attr, s
 }
 
 std::uint32_t EmitInterpolationParameterValue(SpirvEmitterState& state, std::uint32_t attr, std::uint32_t chan, std::uint32_t mode) {
+    if (PixelParameterIsDefault(state, attr)) {
+        return mode == 2u ? EmitAttributeValue(state, attr, chan) : ConstantU32(state, 0u);
+    }
     const auto* input = SpirvInputBindingForParameter(state, attr);
     if (input == nullptr) {
         throw std::runtime_error("interpolation parameter refers to an undefined attribute");
