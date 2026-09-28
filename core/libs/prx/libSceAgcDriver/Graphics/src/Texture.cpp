@@ -871,13 +871,14 @@ bool AdjacentGenerationEnabled() {
 
 }
 
-VkImageView StorageTexture::createView(std::uint32_t mip) const {
+VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer) const {
     Require(mip < descriptor.mipCount, "storage texture mip level is outside the texture");
-    const auto viewLayerCount = geometry.imageLayers - descriptor.baseArray;
+    Require(!firstLayer || descriptor.dimension == TextureDimension::k2DArray, "a first-layer storage view needs a 2D array surface");
+    const auto viewLayerCount = firstLayer ? 1u : geometry.imageLayers - descriptor.baseArray;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = image;
     // Storage views address one mip; cube faces are written as array layers.
-    viewInfo.viewType = descriptor.dimension == TextureDimension::k1D ? VK_IMAGE_VIEW_TYPE_1D : descriptor.dimension == TextureDimension::k2D ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    viewInfo.viewType = firstLayer ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k1D ? VK_IMAGE_VIEW_TYPE_1D : descriptor.dimension == TextureDimension::k2D ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     viewInfo.format = storageFormat;
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
     viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, descriptor.baseArray, viewLayerCount};
@@ -911,6 +912,14 @@ VkImageView StorageTexture::View(std::uint32_t mip) {
     if (found != extraViews.end()) return found->second;
     const auto created = createView(mip);
     extraViews.emplace(mip, created);
+    return created;
+}
+
+VkImageView StorageTexture::FirstLayerView(std::uint32_t mip) {
+    const auto found = firstLayerViews.find(mip);
+    if (found != firstLayerViews.end()) return found->second;
+    const auto created = createView(mip, true);
+    firstLayerViews.emplace(mip, created);
     return created;
 }
 
@@ -3215,6 +3224,8 @@ StorageTexture::~StorageTexture() {
 void StorageTexture::release() noexcept {
     for (const auto& [mip, extra] : extraViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, extra, nullptr);
     extraViews.clear();
+    for (const auto& [mip, extra] : firstLayerViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, extra, nullptr);
+    firstLayerViews.clear();
     for (const auto& [format, attachment] : attachmentViews) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, attachment, nullptr);
     attachmentViews.clear();
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
