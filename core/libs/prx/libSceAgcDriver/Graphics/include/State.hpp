@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include "Recompiler.hpp"
 
@@ -40,6 +41,9 @@ struct ColorTarget {
     // DCC metadata of a compressed target (CB_COLOR_INFO DCC_ENABLE), or 0 (see DccMetadata.hpp).
     std::uint64_t dccAddress = 0;
     bool dccAlphaOnMsb = false;
+    // CB_COLOR_CLEAR_WORD0/1: the texel (in memory order, 64 bits at most) the DCC register clear code
+    // (DccKeys::ClearRegister) stands for.
+    std::array<std::uint32_t, 2> clearWords{};
 };
 
 // The depth/stencil surface a draw tests against (DB_Z_INFO, DB_STENCIL_INFO, the DB_*_BASE words,
@@ -113,6 +117,22 @@ struct State {
 
 ShaderStages DecodeShaderStages(const QueueState& queue);
 State DecodeState(const QueueState& queue);
+// One color buffer (CB_COLOR<slot>_*): its surface, format, extent of the viewed mip and DCC metadata.
+ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
+
+// A draw in one of the CB's metadata modes (CB_COLOR_CONTROL.MODE): ELIMINATE_FAST_CLEAR writes the
+// fast-clear color into the fast-cleared pixels it covers, DCC_DECOMPRESS stores the pixels it covers
+// uncompressed; either way the shader's output is not what lands, and afterwards the covered pixels'
+// texels read as the metadata said they did. Targets are the enabled color buffers with a format.
+struct ColorMetadataPass {
+    enum class Mode { EliminateFastClear, DccDecompress };
+    Mode mode;
+    std::vector<ColorTarget> targets;
+};
+// The metadata pass a draw's registers describe, or nothing for a draw in another CB mode. Throws
+// when the pass does more than the metadata operation over whole targets (depth or stencil work,
+// multisampling, a nonstandard ROP, a viewport or scissor short of a target).
+std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue);
 // The message DecodeState (or the pixel stage decode after it) would throw for the register rules
 // this precheck covers, evaluated without exceptions before the draw is decoded; empty when they
 // pass (DecodeState still checks everything). A register a rule needs that is absent is no verdict.

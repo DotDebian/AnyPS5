@@ -597,6 +597,98 @@ void DisabledColorTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register");
 }
 
+// CB metadata passes (CB_COLOR_CONTROL.MODE ELIMINATE_FAST_CLEAR / DCC_DECOMPRESS).
+alignas(256) std::array<std::uint8_t, 4> dccKeys{};
+
+void metadataPassTests() {
+    using AgcDriver::Graphics::ColorMetadataPass;
+    using AgcDriver::Graphics::DecodeColorMetadataPass;
+    auto queue = makeState();
+    queue.context[0x0] = 0;
+    Require(!DecodeColorMetadataPass(queue).has_value(), "normal color rendering decoded as a metadata pass");
+    queue.context[0x202] = 0xcc0020;
+    queue.context[0x323] = 0x11223344;
+    queue.context[0x324] = 0x55667788;
+    auto pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::EliminateFastClear && pass->targets.size() == 1, "fast-clear eliminate did not decode");
+    Require(pass->targets[0].address == reinterpret_cast<std::uintptr_t>(colorMemory.data()) && pass->targets[0].extent.width == 64 && pass->targets[0].extent.height == 4, "fast-clear eliminate target changed");
+    Require(pass->targets[0].clearWords[0] == 0x11223344 && pass->targets[0].clearWords[1] == 0x55667788, "fast-clear eliminate lost CB_COLOR_CLEAR_WORD");
+    // The pass ignores what the shader exports (a blit's export format need not be a color one).
+    queue.context[0x1c5] = 2;
+    queue.context[0x8f] = 1;
+    Require(DecodeColorMetadataPass(queue).has_value(), "the blit's export format refused a metadata pass");
+    queue.context[0x202] = 0xcc0060;
+    pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::DccDecompress, "DCC decompress did not decode");
+    queue.context[0x8e] = 0;
+    Require(DecodeColorMetadataPass(queue)->targets.empty(), "a disabled target joined the metadata pass");
+    queue.context[0x8e] = 0xf;
+    queue.context[0x202] = 0xcc0061;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "nonstandard ROP");
+    queue.context[0x202] = 0x330060;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "nonstandard ROP");
+    queue.context[0x202] = 0xcc0060;
+    queue.context[0x200] = 2;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "depth or stencil work");
+    queue.context[0x200] = 0x70;
+    Require(DecodeColorMetadataPass(queue).has_value(), "an always-pass depth function without a test refused the pass");
+    queue.context[0x91] = 0x40020;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "over part of a color target");
+    queue.context[0x91] = 0x40040;
+    queue.context[0x10f] = std::bit_cast<std::uint32_t>(16.0f);
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "over part of a color target");
+    queue.context[0x10f] = std::bit_cast<std::uint32_t>(32.0f);
+    // Modes other than the metadata passes keep the rejection, naming the mode.
+    queue.context[0x202] = 0xcc0030;
+    queue.context[0x1c5] = 9;
+    queue.context[0x8f] = 0xf;
+    Require(!DecodeColorMetadataPass(queue).has_value(), "resolve decoded as a metadata pass");
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("mode resolve") != std::string::npos, "the resolve rejection does not name the mode");
+
+    // The pass within the DCC model, on the CPU (no resident image without a detiler): register
+    // clear keys become the CB_COLOR_CLEAR_WORD texel, code keys their value, keys read uncompressed.
+    queue = makeState();
+    queue.context[0x0] = 0;
+    queue.context[0x202] = 0xcc0020;
+    queue.context[0x31c] |= 0x10000000;
+    const auto keysAddress = reinterpret_cast<std::uintptr_t>(dccKeys.data());
+    queue.context[0x325] = static_cast<std::uint32_t>(keysAddress >> 8u);
+    queue.context[0x3a8] = static_cast<std::uint32_t>(keysAddress >> 40u);
+    queue.context[0x323] = 0x11223344;
+    queue.context[0x324] = 0;
+    pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->targets.size() == 1 && pass->targets[0].dccAddress == keysAddress, "the metadata pass lost the target's DCC keys");
+    const AgcDriver::Graphics::Context context{};
+    const auto texels = [&](std::uint32_t value) {
+        for (std::size_t offset = 0; offset < colorMemory.size(); offset += 4) {
+            std::uint32_t texel = 0;
+            std::memcpy(&texel, colorMemory.data() + offset, 4);
+            if (texel != value) return false;
+        }
+        return true;
+    };
+    const auto keysAre = [&](std::uint8_t key) { return std::all_of(dccKeys.begin(), dccKeys.end(), [&](std::uint8_t value) { return value == key; }); };
+    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+    dccKeys.fill(0x20);
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0x11223344) && keysAre(0xff), "a register fast clear was not eliminated into the texels");
+    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+    dccKeys.fill(0xc0);
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0xffffffffu) && keysAre(0xff), "a 1111 fast clear was not eliminated into the texels");
+    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0x5a5a5a5au) && keysAre(0xff), "a pass over uncompressed keys changed the texels");
+    dccKeys = {0x20, 0xff, 0x20, 0x20};
+    expectFailure([&] { AgcDriver::Graphics::RunColorMetadataPass(context, *pass); }, "per-block metadata");
+    Require(texels(0x5a5a5a5au), "a refused pass changed the texels");
+    // Without DCC (a CMASK fast clear, not modeled) the target reads as its texels already.
+    pass->targets[0].dccAddress = 0;
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0x5a5a5a5au), "a pass over a target without DCC changed its texels");
+
+}
+
 void DepthClipTests() {
     auto queue = makeState();
     const auto direct = AgcDriver::Graphics::DecodeState(queue);
@@ -1781,6 +1873,7 @@ int main() {
         hardwareScreenOffsetTests();
         DepthClipTests();
         DisabledColorTests();
+        metadataPassTests();
         ShaderStageTests();
         pixelInputLayoutTests();
         InitialContextTests();

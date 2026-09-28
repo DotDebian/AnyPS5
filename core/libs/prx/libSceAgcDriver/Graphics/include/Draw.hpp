@@ -76,6 +76,18 @@ void CountDrawSkip(DrawSkip kind, double us);
 // waited for at once. Read and written under GuestMemory::GpuMutex, like the device's list.
 std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters();
 
+// A CB metadata pass (State.hpp's ColorMetadataPass) within this driver's DCC model (DccMetadata.hpp:
+// surfaces are stored uncompressed, fast-clear keys make reads see the clear value): a target whose
+// keys are a clear code gets that value as its texels, and its keys read uncompressed once the texels
+// reach memory; a target whose keys are uncompressed (or that has no DCC: CMASK fast clears are not
+// modeled) already reads as its texels, so the pass leaves it alone. The texels go into the target's
+// resident image when it has one (the clear the refresh made from the keys, or a GPU clear of the
+// register value; the image is left dirty, so its write-back stores them and marks the keys), else
+// into guest memory on the CPU; a surface whose resident image follows other metadata (draws render
+// into it over its stored texels, never under these keys) is left as the draws leave it. Throws for keys that differ across the surface (per-block metadata
+// is not modeled) and for a register clear of texels over 64 bits. Under GuestMemory::GpuMutex.
+void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
+
 }
 
 #endif

@@ -333,6 +333,15 @@ bool colorControlSupported(std::uint32_t colorControl, bool hasColorTarget) {
     return colorControl == 0xcc0010u || (!hasColorTarget && (colorControl & ~0x70u) == 0xcc0000u);
 }
 
+// CB_COLOR_CONTROL.MODE names what the CB does instead of normal rendering: the metadata passes
+// (ELIMINATE_FAST_CLEAR 2, DCC_DECOMPRESS 6) never get here (see DecodeColorMetadataPass).
+std::string colorControlMessage(std::uint32_t colorControl) {
+    static constexpr const char* modes[8] = {"disable", "normal", "eliminate fast clear", "resolve", "decompress", "FMASK decompress", "DCC decompress", "reserved"};
+    char text[160];
+    std::snprintf(text, sizeof(text), "AGC graphics: only normal color rendering with copy ROP is supported (CB_COLOR_CONTROL 0x%08x, mode %s)", colorControl, modes[(colorControl >> 4u) & 7u]);
+    return text;
+}
+
 VkBlendFactor blendFactor(std::uint32_t value) {
     switch (value) {
         case 0: return VK_BLEND_FACTOR_ZERO;
@@ -607,7 +616,7 @@ State DecodeState(const QueueState& queue) {
     APS5_LOG_OUT_DEBUG("hasColorTarget=%u slots=%u", result.hasColorTarget ? 1u : 0u, slotCount);
 
     // CB_COLOR_CONTROL mode 0 disables color writes, which only matters when a target is written.
-    Require(colorControlSupported(read(cx, 0x202), result.hasColorTarget), "only normal color rendering with copy ROP is supported");
+    if (const auto colorControl = read(cx, 0x202); !colorControlSupported(colorControl, result.hasColorTarget)) throw std::runtime_error(colorControlMessage(colorControl));
     zero(cx, 0x1c4, ~0u, "depth or sample-mask export");
     const auto exportFormat = read(cx, 0x1c5);
     APS5_LOG_OUT_DEBUG("Export format=%u", exportFormat);
@@ -618,67 +627,7 @@ State DecodeState(const QueueState& queue) {
         // Export formats only matter for the targets the draw writes.
         const auto slotExport = (exportFormat >> (4u * slot)) & 0xfu;
         Require(slotExport == 4 || slotExport == 9, "only FP16_ABGR or 32_ABGR color export is supported");
-        const auto stride = slot * 0xfu;
-        ColorTarget color{};
-        const auto info = read(cx, 0x31c + stride);
-        const auto number = (info >> 8u) & 7u;
-        const auto swap = (info >> 11u) & 3u;
-        APS5_LOG_OUT_DEBUG("Color %u info=0x%x number=%u swap=%u", slot, info, number, swap);
-        const auto format = (info >> 2u) & 0x1fu;
-        const auto decoded = DecodeColorFormat(format, number, swap);
-        // ROUND_MODE (bit 18) only affects unorm rounding. With DCC_ENABLE (bit 28) the target is written
-        // uncompressed and only its fast-clear keys matter (see DccMetadata.hpp).
-        if ((info & 0x2000u) != 0) {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
-                std::fprintf(stderr, "[gpu] color targets with CMASK fast clears (CB_COLOR_INFO.FAST_CLEAR) are rendered uncompressed; CMASK clears are not modeled\n");
-            }
-        }
-        Require((info & ~(0x00029f7cu | 0x00040000u | 0x10000000u | 0x2000u)) == 0, "color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported");
-        Require((info & 0x8000u) != 0 || number == 7, "unclamped normalized color is unsupported");
-        // CB_COLOR_VIEW: MIP_LEVEL (bits 24-27) selects the rendered mip; array slices are not modeled.
-        const auto view = read(cx, 0x31b + stride);
-        Require((view & ~0x0f000000u) == 0, "color array views are unsupported");
-        const auto viewMip = (view >> 24u) & 0xfu;
-        zero(cx, 0x31d + stride, ~0u, "color samples, fragments or destination alpha override");
-        const auto attrib2 = read(cx, 0x3b0 + slot);
-        const auto maxMip = attrib2 >> 28u;
-        Require(viewMip <= maxMip, "color view mip exceeds the surface");
-        const auto attrib3 = read(cx, 0x3b8 + slot);
-        color.tileMode = DecodeColorTileMode(attrib3);
-        color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
-        color.elementBytes = decoded.elementBytes;
-        std::uint64_t mipOffset = 0;
-        if (maxMip != 0) {
-            // A mipmapped surface is addressed like a texture; the view renders into one mip of it.
-            const auto mips = ComputeElementMipLayout(color.tileMode == ColorTileMode::Linear ? TextureTileMode::kLinear : TextureTileMode::kR64KBX, color.elementBytes, color.extent.width, color.extent.height, maxMip + 1u);
-            const auto& mip = mips.at(viewMip);
-            Require(!mip.tail, "rendering into a packed mip tail is unsupported");
-            mipOffset = mip.tiledOffset;
-            color.extent = {mip.width, mip.height};
-        }
-        const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
-        const auto high = read(cx, 0x390 + slot);
-        Require((high & ~0xffu) == 0, "invalid color address extension");
-        color.address = ((static_cast<std::uint64_t>(high) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x318 + stride)) << 8u)) + mipOffset;
-        color.bytes = colorLayout.Bytes();
-        GuestMemory::CheckRange(reinterpret_cast<const void*>(color.address), color.bytes, colorLayout.Alignment(), true);
-        color.format = decoded.format;
-        color.componentMapping = 0xe4u;
-        if ((info & 0x10000000u) != 0) {
-            if (maxMip == 0) {
-                const auto dccHigh = find(cx, 0x3a8 + slot);
-                color.dccAddress = ((dccHigh == cx.end() ? 0ull : static_cast<std::uint64_t>(dccHigh->second & 0xffu)) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x325 + stride)) << 8u);
-                color.dccAlphaOnMsb = DccAlphaOnMsb(color.format, swap);
-            } else {
-                static bool reported = false;
-                if (!reported) {
-                    reported = true;
-                    std::fprintf(stderr, "[gpu] DCC keys of mipmapped color targets are ignored\n");
-                }
-            }
-        }
+        const auto color = DecodeColorBuffer(cx, slot);
         APS5_LOG_OUT_DEBUG("Color %u address=0x%llx extent=%ux%u bytes=%llu VkFormat=%u", slot, static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.bytes), static_cast<unsigned>(color.format));
         if (slot == 0) {
             result.renderExtent = color.extent;
@@ -752,6 +701,116 @@ State DecodeState(const QueueState& queue) {
     return result;
 }
 
+// One CB_COLOR<slot> buffer: its surface, format, extent (of the viewed mip) and DCC metadata.
+ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
+    const auto stride = slot * 0xfu;
+    ColorTarget color{};
+    const auto info = read(cx, 0x31c + stride);
+    const auto number = (info >> 8u) & 7u;
+    const auto swap = (info >> 11u) & 3u;
+    APS5_LOG_OUT_DEBUG("Color %u info=0x%x number=%u swap=%u", slot, info, number, swap);
+    const auto format = (info >> 2u) & 0x1fu;
+    const auto decoded = DecodeColorFormat(format, number, swap);
+    // ROUND_MODE (bit 18) only affects unorm rounding. With DCC_ENABLE (bit 28) the target is written
+    // uncompressed and only its fast-clear keys matter (see DccMetadata.hpp).
+    if ((info & 0x2000u) != 0) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::fprintf(stderr, "[gpu] color targets with CMASK fast clears (CB_COLOR_INFO.FAST_CLEAR) are rendered uncompressed; CMASK clears are not modeled\n");
+        }
+    }
+    Require((info & ~(0x00029f7cu | 0x00040000u | 0x10000000u | 0x2000u)) == 0, "color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported");
+    Require((info & 0x8000u) != 0 || number == 7, "unclamped normalized color is unsupported");
+    // CB_COLOR_VIEW: MIP_LEVEL (bits 24-27) selects the rendered mip; array slices are not modeled.
+    const auto view = read(cx, 0x31b + stride);
+    Require((view & ~0x0f000000u) == 0, "color array views are unsupported");
+    const auto viewMip = (view >> 24u) & 0xfu;
+    zero(cx, 0x31d + stride, ~0u, "color samples, fragments or destination alpha override");
+    const auto attrib2 = read(cx, 0x3b0 + slot);
+    const auto maxMip = attrib2 >> 28u;
+    Require(viewMip <= maxMip, "color view mip exceeds the surface");
+    const auto attrib3 = read(cx, 0x3b8 + slot);
+    color.tileMode = DecodeColorTileMode(attrib3);
+    color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
+    color.elementBytes = decoded.elementBytes;
+    std::uint64_t mipOffset = 0;
+    if (maxMip != 0) {
+        // A mipmapped surface is addressed like a texture; the view renders into one mip of it.
+        const auto mips = ComputeElementMipLayout(color.tileMode == ColorTileMode::Linear ? TextureTileMode::kLinear : TextureTileMode::kR64KBX, color.elementBytes, color.extent.width, color.extent.height, maxMip + 1u);
+        const auto& mip = mips.at(viewMip);
+        Require(!mip.tail, "rendering into a packed mip tail is unsupported");
+        mipOffset = mip.tiledOffset;
+        color.extent = {mip.width, mip.height};
+    }
+    const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+    const auto high = read(cx, 0x390 + slot);
+    Require((high & ~0xffu) == 0, "invalid color address extension");
+    color.address = ((static_cast<std::uint64_t>(high) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x318 + stride)) << 8u)) + mipOffset;
+    color.bytes = colorLayout.Bytes();
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(color.address), color.bytes, colorLayout.Alignment(), true);
+    color.format = decoded.format;
+    color.componentMapping = 0xe4u;
+    for (std::uint32_t word = 0; word < 2; ++word) {
+        const auto clear = find(cx, 0x323 + word + stride);
+        color.clearWords[word] = clear == cx.end() ? 0u : clear->second;
+    }
+    if ((info & 0x10000000u) != 0) {
+        if (maxMip == 0) {
+            const auto dccHigh = find(cx, 0x3a8 + slot);
+            color.dccAddress = ((dccHigh == cx.end() ? 0ull : static_cast<std::uint64_t>(dccHigh->second & 0xffu)) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x325 + stride)) << 8u);
+            color.dccAlphaOnMsb = DccAlphaOnMsb(color.format, swap);
+        } else {
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                std::fprintf(stderr, "[gpu] DCC keys of mipmapped color targets are ignored\n");
+            }
+        }
+    }
+    return color;
+}
+
+std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue) {
+    const auto& cx = queue.context;
+    const auto control = find(cx, 0x202);
+    if (control == cx.end()) return std::nullopt;
+    const auto mode = (control->second >> 4u) & 7u;
+    if (mode != 2u && mode != 6u) return std::nullopt;
+    ColorMetadataPass pass{mode == 2u ? ColorMetadataPass::Mode::EliminateFastClear : ColorMetadataPass::Mode::DccDecompress, {}};
+    // ROP3 COPY with DISABLE_DUAL_QUAD and DEGAMMA_ENABLE clear, as the metadata blits set it.
+    Require((control->second & ~0x70u) == 0xcc0000u, "CB metadata pass with a nonstandard ROP, dual quads disabled or degamma");
+    // DB_DEPTH_CONTROL STENCIL_ENABLE, Z_ENABLE, Z_WRITE_ENABLE, DEPTH_BOUNDS_ENABLE, and DB_RENDER_CONTROL
+    // depth/stencil clears and copies: the pass must leave depth and stencil alone.
+    Require((read(cx, 0x200) & 0xfu) == 0 && (read(cx, 0x0) & 0xfu) == 0, "CB metadata pass with depth or stencil work");
+    zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
+    zero(cx, 0x80, ~0u, "window offset");
+    const auto viewportControl = read(cx, 0x206);
+    if (viewportControl != 0x43fu) throw std::runtime_error(vteMessage(viewportControl));
+    // What the pass covers: viewport 0 (the blit's triangle spans clip space) within the scissors.
+    const auto xs = std::fabs(readFloat(cx, 0x10f));
+    const auto xo = readFloat(cx, 0x110);
+    const auto ys = std::fabs(readFloat(cx, 0x111));
+    const auto yo = readFloat(cx, 0x112);
+    VkRect2D covered{{0, 0}, {0x7fffu, 0x7fffu}};
+    intersect(covered, cx, 0xc, true);
+    intersect(covered, cx, 0x81, false);
+    intersect(covered, cx, 0x90, false);
+    if ((read(cx, 0x292) & 2u) != 0) intersect(covered, cx, 0x94, false);
+    const auto targetMask = read(cx, 0x8e);
+    for (std::uint32_t slot = 0; slot < 8; ++slot) {
+        if (((targetMask >> (4u * slot)) & 0xfu) == 0 || ((read(cx, 0x31c + slot * 0xfu) >> 2u) & 0x1fu) == 0) continue;
+        const auto target = DecodeColorBuffer(cx, slot);
+        const auto width = static_cast<float>(target.extent.width);
+        const auto height = static_cast<float>(target.extent.height);
+        const bool viewportCovers = xo - xs <= 0.0f && xo + xs >= width && yo - ys <= 0.0f && yo + ys >= height;
+        const bool scissorCovers = covered.offset.x == 0 && covered.offset.y == 0 && covered.extent.width >= target.extent.width && covered.extent.height >= target.extent.height;
+        Require(viewportCovers && scissorCovers, "CB metadata pass over part of a color target");
+        pass.targets.push_back(target);
+    }
+    return pass;
+}
+
 std::string DrawRejection(const QueueState& queue, bool indexed) {
     const auto& cx = queue.context;
     // A register a rule needs that is absent gives no verdict here: DecodeState reports it.
@@ -802,7 +861,7 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (value(cx, 0x206, word) && word != 0x43fu) return vteMessage(word);
     if (auto reason = nonzero(cx, 0x204, ClipControlMask, "unsupported PA_CL_CLIP_CNTL flags"); !reason.empty()) return reason;
     std::uint32_t targetMask = 0, shaderMask = 0;
-    if (value(cx, 0x8e, targetMask) && value(cx, 0x8f, shaderMask) && value(cx, 0x202, word) && !colorControlSupported(word, (targetMask & shaderMask) != 0)) return require(false, "only normal color rendering with copy ROP is supported");
+    if (value(cx, 0x8e, targetMask) && value(cx, 0x8f, shaderMask) && value(cx, 0x202, word) && !colorControlSupported(word, (targetMask & shaderMask) != 0)) return colorControlMessage(word);
     if (auto reason = nonzero(cx, 0x1c4, ~0u, "depth or sample-mask export"); !reason.empty()) return reason;
     // The pixel stage decode (ShaderInputState.cpp) reads these after DecodeState and the program
     // prepare; a bank without them fails there with this message.

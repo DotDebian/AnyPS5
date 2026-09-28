@@ -67,6 +67,69 @@ GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
 
 namespace {
 
+// One texel of what fast-clear `keys` of a target stand for: the code's value, or the register
+// clear's CB_COLOR_CLEAR_WORD texel.
+std::array<std::byte, 16> clearTexel(const ColorTarget& color, DccKeys keys) {
+    std::array<std::byte, 16> texel{};
+    const auto elementBytes = static_cast<std::size_t>(color.elementBytes);
+    Require(elementBytes != 0 && elementBytes <= texel.size(), "unexpected color element size");
+    if (keys == DccKeys::ClearRegister) {
+        Require(elementBytes <= sizeof(color.clearWords), "the DCC register clear of a texel over 64 bits is not modeled");
+        std::memcpy(texel.data(), color.clearWords.data(), elementBytes);
+    } else {
+        Require(FillDccClear(color.format, keys, color.dccAlphaOnMsb, std::span(texel.data(), elementBytes)), "the target's format has no encoding of its DCC clear code");
+    }
+    return texel;
+}
+
+// A GPU clear of the whole image to `texel` (StorageTexture::FillClear, which leaves it dirty).
+bool clearToTexel(StorageTexture& image, const std::array<std::byte, 16>& texel, std::uint32_t elementBytes, const char*& refusal) {
+    std::array<std::byte, 16> repeated{};
+    for (std::size_t offset = 0; offset + elementBytes <= repeated.size(); offset += elementBytes) std::memcpy(repeated.data() + offset, texel.data(), elementBytes);
+    std::array<std::uint32_t, 4> pattern{};
+    std::memcpy(pattern.data(), repeated.data(), repeated.size());
+    return image.FillClear(std::span<const std::uint32_t, 4>(pattern), StorageTexture::WholeImage, refusal);
+}
+
+// The fast-cleared target's texels stored into guest memory on the CPU, its keys then marked
+// uncompressed: results pending over the surface are stored first (a write-back of an image that
+// carries the keys marks them itself) and the keys read again.
+void storeClearTexels(const Context& context, const ColorTarget& color, const std::array<std::byte, 16>& texel) {
+    StorageTexture::FlushPending(color.address, color.bytes, nullptr, "fast-clear materialization");
+    const auto keys = ReadDccKeys(color.dccAddress, color.bytes);
+    if (!IsDccClear(keys)) return;
+    const auto current = keys == DccKeys::ClearRegister ? texel : clearTexel(color, keys);
+    // Every element holds the same value, so the fill is the same whatever the tiling.
+    const auto elementBytes = static_cast<std::size_t>(color.elementBytes);
+    std::vector<std::byte> texels(color.bytes);
+    for (std::size_t offset = 0; offset + elementBytes <= texels.size(); offset += elementBytes) std::memcpy(texels.data() + offset, current.data(), elementBytes);
+    GuestMemory::Write(color.address, texels);
+    MarkDccUncompressed(context, color.dccAddress, color.bytes);
+}
+
+// A target whose DCC keys are the register clear code reads as CB_COLOR_CLEAR_WORD wherever nothing
+// drew since the clear, a value no descriptor carries (the image's refresh reads the stored texels
+// under that code): the resident image is cleared to it before the draw renders, and the keys then
+// read uncompressed, the image standing for the texels (a later clear is a change of the keys).
+// A texel over 64 bits has no register value; it keeps the stored texels, as before.
+void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
+    // Debug aid: APS5_NO_REGISTER_CLEAR=1 keeps the stored texels under register clear keys, as before.
+    static const bool disabled = std::getenv("APS5_NO_REGISTER_CLEAR") != nullptr;
+    static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
+    if (disabled) return;
+    if (color.dccAddress == 0 || color.elementBytes > sizeof(color.clearWords) || resident.Descriptor().dccAddress != color.dccAddress) return;
+    if (ReadDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
+    const auto texel = clearTexel(color, DccKeys::ClearRegister);
+    if (trace) std::fprintf(stderr, "[draw] register clear of 0x%llx (%ux%u VkFormat %d) to %08x %08x before the draw\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), color.clearWords[0], color.clearWords[1]);
+    const char* refusal = nullptr;
+    if (clearToTexel(resident, texel, color.elementBytes, refusal)) {
+        MarkDccUncompressed(context, color.dccAddress, color.bytes);
+        return;
+    }
+    storeClearTexels(context, color, texel);
+    resident.Refresh();
+}
+
 void imageBarrier(const Context& context, VkCommandBuffer commands, VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) {
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.srcAccessMask = sourceAccess;
@@ -744,12 +807,13 @@ std::uint64_t renderPassKey(std::span<const VkImageView> views, VkImageView dept
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
-std::shared_ptr<StorageTexture> refreshResidentTarget(const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
+std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::shared_ptr<StorageTexture> resident;
     try {
         resident = lookup();
+        if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
         static std::mutex reportMutex;
         static std::set<std::uint64_t> reported;
@@ -1324,7 +1388,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
-            binding.resident = refreshResidentTarget(state, color, outcome, profile, [&] {
+            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
                 auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
@@ -1353,7 +1417,15 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             const auto keys = ReadDccKeys(color.dccAddress, colorLayout.Bytes());
             if (IsDccClear(keys)) {
                 const auto pixels = binding.gpuTiling ? binding.tiled->Bytes() : binding.transfer->Bytes();
-                if (!FillDccClear(color.format, keys, color.dccAlphaOnMsb, pixels)) {
+                // The register code's value is the target's CB_COLOR_CLEAR_WORD texel (64 bits at most).
+                const auto fillRegister = [&] {
+                    static const bool disabled = std::getenv("APS5_NO_REGISTER_CLEAR") != nullptr;
+                    if (disabled || keys != DccKeys::ClearRegister || color.elementBytes > sizeof(color.clearWords)) return false;
+                    const auto texel = clearTexel(color, keys);
+                    for (std::size_t offset = 0; offset + color.elementBytes <= pixels.size(); offset += color.elementBytes) std::memcpy(pixels.data() + offset, texel.data(), color.elementBytes);
+                    return true;
+                };
+                if (!fillRegister() && !FillDccClear(color.format, keys, color.dccAlphaOnMsb, pixels)) {
                     static std::set<std::pair<std::uint64_t, int>> reported;
                     if (reported.size() < 32 && reported.insert({color.address, static_cast<int>(keys)}).second) std::fprintf(stderr, "[gpu] color target 0x%llx (VkFormat %d) has %s DCC keys; its stored texels are used\n", static_cast<unsigned long long>(color.address), static_cast<int>(color.format), DccKeysName(keys));
                     if (binding.gpuTiling) std::memcpy(pixels.data(), binding.original.data(), binding.original.size());
@@ -1796,7 +1868,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseSetup);
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get())) return miss(DrawRecipeMiss::TargetGone);
-        auto resident = refreshResidentTarget(state, state.colors[index], outcome, profile, [&] {
+        auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
             stored->Refresh();
             return stored;
         });
@@ -1865,6 +1937,52 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, " recorded from recipe");
     result.recorded = true;
     return result;
+}
+
+void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass) {
+    static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
+    for (const auto& color : pass.targets) {
+        if (color.dccAddress == 0) continue;
+        auto keys = ReadDccKeys(color.dccAddress, color.bytes);
+        if (trace) std::fprintf(stderr, "[draw] %s over 0x%llx (%ux%u VkFormat %d): DCC keys %s\n", pass.mode == ColorMetadataPass::Mode::EliminateFastClear ? "fast-clear eliminate" : "DCC decompress", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), DccKeysName(keys));
+        if (keys == DccKeys::Uncompressed) continue;
+        Require(IsDccClear(keys), std::string("CB metadata pass over DCC keys that are ") + DccKeysName(keys) + " (per-block metadata is not modeled)");
+        const auto texel = clearTexel(color, keys);
+        // The resident image of the target, when it follows these keys (its own descriptor names
+        // the same metadata): the lookup's refresh made it what a clear code says unless it holds
+        // results made since (pending), which are what the covered pixels hold; the register code
+        // is cleared on the GPU here (its value is in no descriptor).
+        std::shared_ptr<StorageTexture> resident;
+        if (color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr) {
+            try {
+                resident = CachedStorageSurface(context, SurfaceForTarget(color));
+            } catch (const std::exception&) {
+                resident = nullptr;
+            }
+            if (resident != nullptr && (resident->Descriptor().dccAddress != color.dccAddress || resident->GuestBytes() != color.bytes)) {
+                // The surface's image follows other metadata (a texture made it first): draws render
+                // into it over its stored texels, never under these keys, so the texels are what the
+                // draws left and the pass leaves them, as the draws do (the keys stay the title's).
+                if (trace) std::fprintf(stderr, "[draw] metadata pass over 0x%llx: its image follows other DCC metadata (0x%llx); left as the draws leave it\n", static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(resident->Descriptor().dccAddress));
+                continue;
+            }
+        }
+        if (resident != nullptr) {
+            const bool pending = StorageTexture::FindPending(color.address, color.bytes) == resident;
+            bool current = pending || (keys != DccKeys::ClearRegister && resident->UploadedKeys() == keys);
+            const char* refusal = nullptr;
+            if (!current && keys == DccKeys::ClearRegister) current = clearToTexel(*resident, texel, color.elementBytes, refusal);
+            if (current) {
+                // The image stands for the texels: dirty, its write-back stores them. The keys read
+                // uncompressed from now on, as the pass leaves them (a later clear is then a change).
+                resident->MarkDirty();
+                MarkDccUncompressed(context, color.dccAddress, color.bytes);
+                continue;
+            }
+            if (trace) std::fprintf(stderr, "[draw] metadata pass over 0x%llx not done in its image (%s): stored on the CPU\n", static_cast<unsigned long long>(color.address), refusal != nullptr ? refusal : "keys");
+        }
+        storeClearTexels(context, color, texel);
+    }
 }
 
 }

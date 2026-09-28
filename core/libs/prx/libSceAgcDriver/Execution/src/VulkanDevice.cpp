@@ -2202,6 +2202,10 @@ VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
     return {state->drawIndirectFirstInstance, state->multiDrawIndirect, state->drawIndirectCount};
 }
 
+void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
+    Graphics::RunColorMetadataPass(graphicsContext(), pass);
+}
+
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
     // Two stdout lines per draw cost ~1.3 ms per frame of the queue-0 worker (part of it under the
     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.

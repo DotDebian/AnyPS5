@@ -3955,6 +3955,22 @@ private:
         };
         auto drawParameters = Pm4::ResolveDraw(packet, queue);
         if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
+        // A draw in a CB metadata mode (fast-clear eliminate, DCC decompress) rewrites its targets
+        // from their metadata; what the shaders compute never lands (State.hpp's ColorMetadataPass).
+        // Debug aid: APS5_NO_METADATA_PASSES=1 leaves CB metadata passes and DB metadata blits to the
+        // decode, which refuses them, as before.
+        static const bool metadataPasses = std::getenv("APS5_NO_METADATA_PASSES") == nullptr;
+        if (const auto pass = metadataPasses ? Graphics::DecodeColorMetadataPass(queue) : std::nullopt) {
+            require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (device == nullptr) device = std::make_shared<VulkanDevice>();
+            const std::shared_ptr<VulkanDevice> localDevice = device;
+            // This queue's labels first (queue order), as at every draw's lock.
+            recordLabelsForPacket(localDevice.get(), submission.queue);
+            localDevice->ColorMetadataPass(*pass);
+            return DrawVerdict::Drawn;
+        }
         static const bool traceIndirect = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
         if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
         // A draw with no color writes and no pixel shader program ever set has nothing to render

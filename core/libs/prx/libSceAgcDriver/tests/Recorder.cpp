@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -1102,6 +1103,96 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
     recorder.Sync();
 }
 
+// A CB metadata pass over a resident render target (Draw.hpp's RunColorMetadataPass): the target's
+// image in the storage cache takes what its fast-clear keys say, a code's value from the lookup's
+// refresh or the register clear's CB_COLOR_CLEAR_WORD texel as a GPU clear, and is left dirty; the
+// keys read uncompressed at once, and the image's write-back brings the texels to guest memory.
+void metadataPassTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: resident metadata passes not tested\n";
+        return;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t surfaceBytes = side * side * 4;
+    constexpr std::size_t keyCount = surfaceBytes / 256;
+    constexpr std::size_t bytes = surfaceBytes + 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the metadata pass block");
+    auto* texels = static_cast<std::uint8_t*>(block);
+    auto* keys = texels + surfaceBytes;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr) {
+        std::cout << "host import of the metadata pass block refused: resident metadata passes not tested\n";
+        return;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    ColorTarget color{};
+    color.address = address;
+    color.extent = {side, side};
+    color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    color.bytes = surfaceBytes;
+    color.componentMapping = 0xe4u;
+    color.tileMode = ColorTileMode::RenderTarget;
+    color.elementBytes = 4;
+    color.dccAddress = address + surfaceBytes;
+    color.clearWords = {0x80402010u, 0};
+    const ColorMetadataPass pass{ColorMetadataPass::Mode::EliminateFastClear, {color}};
+    // Guest memory after everything recorded ran and the image's results were stored.
+    const auto memoryHolds = [&](std::array<std::uint8_t, 4> texel) {
+        StorageTexture::FlushPending(address, surfaceBytes, nullptr, "test");
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        for (std::size_t i = 0; i < surfaceBytes; ++i) {
+            if (texels[i] != texel[i % 4]) return false;
+        }
+        return true;
+    };
+    const auto keysUncompressed = [&] { return ReadDccKeys(color.dccAddress, surfaceBytes) == DccKeys::Uncompressed; };
+    std::memset(texels, 0x55, surfaceBytes);
+    std::memset(keys, 0x20, keyCount);
+    RunColorMetadataPass(context, pass);
+    Require(StorageTexture::FindPending(address, surfaceBytes) != nullptr && texels[0] == 0x55, "the register fast clear eliminate did not stay in the resident image");
+    Require(keysUncompressed(), "the register fast clear eliminate left the keys compressed");
+    Require(memoryHolds({0x10, 0x20, 0x40, 0x80}), "the register fast clear eliminate did not store CB_COLOR_CLEAR_WORD");
+    Require(std::all_of(keys, keys + keyCount, [](std::uint8_t key) { return key == 0xff; }), "the stored keys are not uncompressed");
+    // A code clear: the lookup's refresh clears the image to the code's value.
+    std::memset(keys, 0xc0, keyCount);
+    RunColorMetadataPass(context, {ColorMetadataPass::Mode::DccDecompress, {color}});
+    Require(StorageTexture::FindPending(address, surfaceBytes) != nullptr, "the DCC decompress did not stay in the resident image");
+    Require(keysUncompressed(), "the DCC decompress left the keys compressed");
+    Require(memoryHolds({0xff, 0xff, 0xff, 0xff}), "the DCC decompress did not store the 1111 value");
+    // Uncompressed keys: the texels are what reads see; nothing changes.
+    std::memset(texels, 0x66, surfaceBytes);
+    RunColorMetadataPass(context, pass);
+    Require(memoryHolds({0x66, 0x66, 0x66, 0x66}), "a pass over uncompressed keys changed the texels");
+    recorder.Sync();
+}
+
 // The data word positions of a dispatch-cache variant (Driver.cpp's data-only hits): leaves
 // located among the runs' words, aliased, unaligned, out-of-run and mismatched ones skipped.
 void dataWordPositionsTests() {
@@ -1338,6 +1429,7 @@ int main() {
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);
+        metadataPassTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {
