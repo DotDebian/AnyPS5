@@ -290,7 +290,7 @@ int FrameIndex(std::uint64_t timestamp) {
 void CheckVideoFrame(const AvPlayerFrameInfoEx& info) {
     const auto& video = info.details.video;
     Check(video.width == 112 && video.height == 64 && video.pitch == 128, "unexpected frame geometry");
-    Check(video.crop_left_offset == 0 && video.crop_top_offset == 0 && video.crop_right_offset == 12 && video.crop_bottom_offset == 4, "unexpected crop offsets");
+    Check(video.crop_left_offset == 0 && video.crop_top_offset == 0 && video.crop_right_offset == 28 && video.crop_bottom_offset == 4, "unexpected crop offsets");
     Check(video.luma_bit_depth == 8 && video.chroma_bit_depth == 8, "unexpected bit depth");
     Check(std::fabs(video.aspect_ratio - static_cast<float>(Width) / Height) < 0.01f, "unexpected aspect ratio");
     Check(std::memcmp(video.language_code, "eng", 4) == 0, "missing video language");

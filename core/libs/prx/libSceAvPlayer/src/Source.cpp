@@ -832,7 +832,7 @@ private:
         info.details.video.aspect_ratio = DisplayAspect(frame.width, frame.height, frame.sample_aspect_ratio);
         std::memcpy(info.details.video.language_code, streamLanguage(decoder), sizeof(info.details.video.language_code));
         info.details.video.crop_left_offset = static_cast<std::uint32_t>(frame.crop_left);
-        info.details.video.crop_right_offset = static_cast<std::uint32_t>(frame.crop_right) + alignedWidth - width;
+        info.details.video.crop_right_offset = static_cast<std::uint32_t>(frame.crop_right) + pitch - width;
         info.details.video.crop_top_offset = static_cast<std::uint32_t>(frame.crop_top);
         info.details.video.crop_bottom_offset = static_cast<std::uint32_t>(frame.crop_bottom) + alignedHeight - height;
         info.details.video.pitch = pitch;
