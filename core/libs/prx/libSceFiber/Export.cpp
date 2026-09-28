@@ -27,8 +27,6 @@ static constexpr std::size_t FIBER_OBJECT_SIZE = 0x100;
 static constexpr std::size_t FIBER_OPT_PARAM_SIZE = 0x80;
 static constexpr std::size_t FIBER_MIN_CONTEXT_SIZE = 512;
 
-#ifdef _WIN32
-
 using GuestFiberEntry = void (APS5_VABI*)(std::uint64_t argOnInitialize, std::uint64_t argOnRun);
 
 // A fiber that is switching away stays Suspending until its context is saved; whoever runs next
@@ -91,6 +89,8 @@ static void CompletePendingSuspend() {
         thread.pendingSuspend = nullptr;
     }
 }
+
+#ifdef _WIN32
 
 extern "C" void Aps5FiberSwitchStack(void** save, void* load);
 extern "C" void Aps5FiberTrampoline();
@@ -180,6 +180,68 @@ static void SetBounds(const StackBounds& bounds) {
     *reinterpret_cast<void**>(teb + 0x1478) = bounds.deallocation;
 }
 
+#else
+
+extern "C" __attribute__((visibility("hidden"))) void Aps5FiberSwitchStack(void** save, void* load);
+extern "C" __attribute__((visibility("hidden"))) void Aps5FiberTrampoline();
+
+asm(R"(
+    .text
+    .globl Aps5FiberSwitchStack
+    .hidden Aps5FiberSwitchStack
+    .type Aps5FiberSwitchStack, @function
+Aps5FiberSwitchStack:
+    push %rbp
+    push %rbx
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+    sub $8, %rsp
+    stmxcsr 0(%rsp)
+    fnstcw 4(%rsp)
+    mov %rsp, (%rdi)
+    mov %rsi, %rsp
+    ldmxcsr 0(%rsp)
+    fldcw 4(%rsp)
+    add $8, %rsp
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    pop %rbp
+    ret
+    .size Aps5FiberSwitchStack, .-Aps5FiberSwitchStack
+
+    .globl Aps5FiberTrampoline
+    .hidden Aps5FiberTrampoline
+    .type Aps5FiberTrampoline, @function
+Aps5FiberTrampoline:
+    mov %r12, %rdi
+    and $-16, %rsp
+    call Aps5FiberMain
+    ud2
+    .size Aps5FiberTrampoline, .-Aps5FiberTrampoline
+)");
+
+struct InitialFrame {
+    std::uint32_t mxcsr;
+    std::uint16_t fpuControl;
+    std::uint16_t padding;
+    std::uint64_t r15, r14, r13, r12, rbx, rbp;
+    std::uint64_t returnAddress;
+};
+static_assert(sizeof(InitialFrame) == 8 + 6 * 8 + 8, "initial fiber frame must match Aps5FiberSwitchStack");
+
+static StackBounds CurrentBounds() {
+    return {};
+}
+
+static void SetBounds(const StackBounds&) {}
+
+#endif
+
 static StackBounds FiberBounds(const Fiber* fiber) {
     return {fiber->context + fiber->contextSize, fiber->context, fiber->context};
 }
@@ -189,7 +251,7 @@ static Fiber* AsFiber(FiberObject* object) {
     return fiber && fiber->magic == FIBER_MAGIC ? fiber : nullptr;
 }
 
-extern "C" [[noreturn]] void Aps5FiberMain(Fiber* fiber) {
+extern "C" [[noreturn]] __attribute__((visibility("hidden"))) void Aps5FiberMain(Fiber* fiber) {
     CompletePendingSuspend();
     fiber->entry(fiber->argOnInitialize, ThreadState().transfer);
     throw std::runtime_error(std::string("sceFiber: entry function of fiber '") + fiber->name + "' returned");
@@ -377,23 +439,3 @@ int32_t APS5_VABI sceFiberStopContextSizeCheck(void) {
 
 }
 
-#else
-
-extern "C" {
-
-int32_t APS5_VABI _sceFiberInitializeImpl_nid_postfix() { NotImplemented_nid_no_patch(__func__); return 0; }
-int32_t APS5_VABI sceFiberFinalize(FiberObject*) { NotImplemented_nid_no_patch(__func__); return 0; }
-int32_t APS5_VABI sceFiberRun_nid_postfix(FiberObject*, uint64_t, uint64_t*) { NotImplemented_nid_no_patch(__func__); return 0; }
-int32_t APS5_VABI sceFiberSwitch(FiberObject*, uint64_t, uint64_t*) { NotImplemented_nid_no_patch(__func__); return 0; }
-int32_t APS5_VABI sceFiberReturnToThread(uint64_t, uint64_t*) { NotImplemented_nid_no_patch(__func__); return 0; }
-int32_t APS5_VABI sceFiberGetSelf(FiberObject**) { NotImplemented_nid_no_patch(__func__); return 0; }
-int32_t APS5_VABI sceFiberGetInfo(FiberObject*, FiberInfo*) { NotImplemented_nid_no_patch(__func__); return 0; }
-int32_t APS5_VABI sceFiberRename(FiberObject*, const char*) { NotImplemented_nid_no_patch(__func__); return 0; }
-int32_t APS5_VABI sceFiberOptParamInitialize(FiberOptParam*) { NotImplemented_nid_no_patch(__func__); return 0; }
-int32_t APS5_VABI sceFiberGetThreadFramePointerAddress(uint64_t*) { NotImplemented_nid_no_patch(__func__); return 0; }
-int32_t APS5_VABI sceFiberStartContextSizeCheck(uint32_t) { NotImplemented_nid_no_patch(__func__); return 0; }
-int32_t APS5_VABI sceFiberStopContextSizeCheck(void) { NotImplemented_nid_no_patch(__func__); return 0; }
-
-}
-
-#endif
