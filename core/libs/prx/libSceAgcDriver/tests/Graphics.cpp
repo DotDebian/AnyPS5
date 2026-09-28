@@ -495,6 +495,27 @@ std::vector<std::uint32_t> pixelNoPerspectiveLocations() {
     return result2;
 }
 
+// s_cbranch_cdbgsys/cdbguser/cdbgsys_or_user/cdbgsys_and_user branch only while a debugger sets
+// the conditional debug bits, so they translate as never taken.
+bool recompilesDebugBranch(std::uint32_t opcode) {
+    auto queue = makeState();
+    queue.context[0x1b3] = 0x2u;
+    queue.context[0x1b4] = 0x2u;
+    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, true, 0xe4u);
+    const std::array<std::uint32_t, 4> code{0xbf800000u | (opcode << 16u) | 1u, 0xf800180fu, 0x00000000u, 0xbf810000u};
+    ShaderRecompiler::RecompileRequest request{};
+    request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x30000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.pixel = pixel;
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.target.fragmentShaderBarycentricEnabled = true;
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    return !ShaderRecompiler::Recompile(request).spirv.Words().empty();
+}
+
 // SPI_PS_INPUT_ADDR lays the input VGPRs out (I/J pairs, then POS_X...), ENA & ADDR loads them.
 void pixelInputLayoutTests() {
     using ShaderRecompiler::PixelInput;
@@ -539,6 +560,7 @@ void pixelInputLayoutTests() {
         const auto read = pixelBuiltinsRead(0x106u, 0x106u, source);
         Require(readsBuiltin(read, spv::BuiltInBaryCoordKHR) && !readsBuiltin(read, spv::BuiltInFragCoord), "a centroid-layout I/J VGPR does not hold the barycentrics: v" + std::to_string(source));
     }
+    for (const auto opcode : {0x17u, 0x18u, 0x19u, 0x1au}) Require(recompilesDebugBranch(opcode), "a conditional debug branch did not recompile");
     const auto noPerspective = pixelNoPerspectiveLocations();
     Require(noPerspective.size() == 1 && noPerspective[0] == 1u, "only the parameter interpolated through the linear pair must be NoPerspective");
     auto read = pixelBuiltinsRead(0x106u, 0x106u, 4u);
