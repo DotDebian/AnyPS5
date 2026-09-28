@@ -36,6 +36,7 @@ static constexpr int VIDEO_OUT_ERROR_UNAVAILABLE_OUTPUT_MODE = -2144796633;
 static constexpr int VIDEO_OUT_ERROR_INVALID_EVENT = -2144796624;
 
 static constexpr int VIDEO_OUT_BUS_TYPE_MAIN = 0;
+static constexpr std::uint32_t VIDEO_OUT_OPEN_PARAM_SIZE = 16;
 static constexpr int VIDEO_OUT_BUS_TYPE_OVERLAY = 1;
 static constexpr int VIDEO_OUT_BUS_TYPE_SUB = 2;
 
