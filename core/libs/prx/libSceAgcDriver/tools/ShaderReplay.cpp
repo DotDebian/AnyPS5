@@ -42,6 +42,7 @@ bool g_assembly = false;
 bool g_memory = false;
 bool g_spirv = false;
 bool g_graph = false;
+bool g_code = false;
 
 bool Replay(const char* path) {
     const auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
@@ -71,6 +72,17 @@ bool Replay(const char* path) {
                 std::fclose(file);
             }
             std::printf("  region 0x%llx + 0x%zx -> %s\n", static_cast<unsigned long long>(region.guestAddress), region.bytes.size(), name);
+        }
+    }
+    if (g_code) {
+        // --code: the shader's code words, as <request name>.code in the working directory (raw
+        // little-endian bytes for other disassemblers, e.g. llvm-mc -triple amdgcn -mcpu=gfx1030).
+        std::string name = path;
+        if (const auto slash = name.find_last_of('/'); slash != std::string::npos) name = name.substr(slash + 1);
+        name += ".code";
+        if (std::FILE* file = std::fopen(name.c_str(), "wb")) {
+            std::fwrite(request.request.shader.code.data(), sizeof(std::uint32_t), request.request.shader.code.size(), file);
+            std::fclose(file);
         }
     }
     if (g_assembly) {
@@ -130,7 +142,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     int failures = 0;
@@ -149,6 +161,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--cfg") {
             g_graph = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--code") {
+            g_code = true;
             continue;
         }
         if (std::string(argv[i]) == "--mem") {
