@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "SDL.h"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
@@ -125,6 +126,41 @@ void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
 
 void PadInput::Update() {
     const auto now = std::chrono::steady_clock::now();
+    // Debug aid: APS5_PAD_PRESS=<seconds>:<SDL key name>[,...] presses that key's bindings for
+    // 200 ms at the given time after the first update, so unattended runs can get past prompts.
+    struct ScriptedPress {
+        std::chrono::steady_clock::time_point at;
+        SDL_Scancode key;
+        int state;
+    };
+    static std::vector<ScriptedPress> script = [&] {
+        std::vector<ScriptedPress> result;
+        const char* text = std::getenv("APS5_PAD_PRESS");
+        if (text == nullptr) return result;
+        std::string list(text);
+        std::size_t start = 0;
+        while (start < list.size()) {
+            const auto end = std::min(list.find(',', start), list.size());
+            const auto item = list.substr(start, end - start);
+            const auto colon = item.find(':');
+            if (colon != std::string::npos) {
+                const auto key = SDL_GetScancodeFromName(item.substr(colon + 1).c_str());
+                const auto at = now + std::chrono::milliseconds(static_cast<long long>(std::stod(item.substr(0, colon)) * 1000.0));
+                if (key != SDL_SCANCODE_UNKNOWN) result.push_back({at, key, 0});
+            }
+            start = end + 1;
+        }
+        return result;
+    }();
+    for (auto& press : script) {
+        const bool down = press.state == 0 && now >= press.at;
+        const bool up = press.state == 1 && now >= press.at + std::chrono::milliseconds(200);
+        if (!down && !up) continue;
+        press.state = down ? 1 : 2;
+        for (std::size_t index = 0; index < bindings.size(); ++index)
+            if (bindings[index].key == press.key) pressed[index] = down;
+        publish();
+    }
     if (controller != nullptr) {
         SDL_GameControllerUpdate();
         publish();
