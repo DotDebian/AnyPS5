@@ -1,3 +1,4 @@
+
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 
 #include <algorithm>
@@ -24,15 +25,14 @@ std::vector<Registration> g_registrations;
 
 }
 
-void AgcDriverDeliverEopInterrupt() {
-    constexpr int GraphicsEndOfPipe = 0x40;
+void AgcDriverDeliverEopInterrupt(std::uint32_t queue) {
     std::vector<Registration> registrations;
     {
         std::lock_guard lock(g_mutex);
         registrations = g_registrations;
     }
     for (const auto& registration : registrations)
-        if (registration.id == GraphicsEndOfPipe)
+        if (registration.id == static_cast<int>(queue))
             EqueueTriggerEvent_nid_postfix(registration.eq, static_cast<uintptr_t>(registration.id), EvfiltGraphicsCore, nullptr);
 }
 

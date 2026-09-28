@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -5759,7 +5760,8 @@ private:
             // Labels that store nothing (RELEASE_MEM without data select or destination:
             // interrupt-only) need no drain because Pm4::Execute is a no-op for them. The label
             // counters and the [sync] report live at namespace scope (see reportSync).
-            if (!drainAll && (opcode == 0x49 || opcode == 0x37)) {
+            const bool endOfPipeInterrupt = opcode == 0x49 && ((packet[2] >> 24u) & 7u) != 0;
+            if (!drainAll && !endOfPipeInterrupt && (opcode == 0x49 || opcode == 0x37)) {
                 if (const auto label = Pm4::DecodeLabelWrite(packet)) {
                     const auto bytes = label->Bytes();
                     if (DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
@@ -6045,6 +6047,7 @@ private:
                 finishDrawPacket(drawn);
             } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
                 if (!wroteOnGpu) Pm4::Execute(packet, queue);
+                if (endOfPipeInterrupt) AgcDriverDeliverEopInterrupt(submission.queue);
             }
             if (drawPacket) Graphics::Recorder::CountRecordedWork();
             cursor += count;
