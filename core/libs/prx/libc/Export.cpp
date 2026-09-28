@@ -81,11 +81,6 @@ int APS5_VABI fscanf_nid_postfix() {
  return 0;
 }
 
-int APS5_VABI sscanf_s_nid_postfix() {
- NotImplemented_nid_no_patch(__func__);
- return 0;
-}
-
 int APS5_VABI vswprintf_nid_postfix() {
  NotImplemented_nid_no_patch(__func__);
  return 0;
