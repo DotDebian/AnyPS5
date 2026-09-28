@@ -3925,8 +3925,21 @@ private:
         if (drawParameters.indexed) {
             const auto restart = queue.userConfig.find(0x24b);
             if (restart != queue.userConfig.end() && restart->second != 0) {
-                rejected = "AGC graphics: primitive restart (GE_MULTI_PRIM_IB_RESET_EN) is unsupported for indexed draws";
-                return DrawVerdict::Rejected;
+                const auto resetIndex = queue.context.find(0x103);
+                const auto primitive = queue.userConfig.find(0x242);
+                const std::uint32_t allOnes = drawParameters.indexSize == 2 ? 0xffffu : 0xffffffffu;
+                const auto type = primitive == queue.userConfig.end() ? 0u : primitive->second & 0x3fu;
+                const bool strip = type == 3 || type == 5 || type == 6;
+                const bool list = type == 1 || type == 2 || type == 4;
+                const auto restartDevice = device.load();
+                if (!strip && !(list && restartDevice != nullptr && restartDevice->PrimitiveListRestart())) {
+                    rejected = "AGC graphics: primitive restart is only supported for strips, and for lists with VK_EXT_primitive_topology_list_restart";
+                    return DrawVerdict::Rejected;
+                }
+                if (resetIndex == queue.context.end() || (resetIndex->second & allOnes) != allOnes) {
+                    rejected = "AGC graphics: primitive restart index other than all ones is unsupported";
+                    return DrawVerdict::Rejected;
+                }
             }
         }
         if (DrawPrecheck()) {

@@ -297,7 +297,7 @@ State DecodeState(const QueueState& queue) {
         default: throw std::runtime_error("AGC graphics: unsupported primitive type " + std::to_string(primitive));
     }
     APS5_LOG_OUT_DEBUG("Topology=%u", static_cast<unsigned>(result.topology));
-    (void)read(queue.userConfig, 0x24b, RegisterBank::UserConfig);
+    result.primitiveRestart = read(queue.userConfig, 0x24b, RegisterBank::UserConfig) != 0 && !result.rectList && result.topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
     if ((read(cx, 0x207) & LayerExports) != 0) {
         static bool reported = false;
         if (!reported) {
@@ -518,7 +518,12 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     const auto require = [&](bool condition, const char* reason) {
         return condition ? std::string() : "AGC graphics: " + std::string(reason);
     };
-    if (auto reason = indexed ? nonzero(queue.userConfig, 0x24b, ~0u, "primitive restart (GE_MULTI_PRIM_IB_RESET_EN)") : std::string(); !reason.empty()) return reason;
+    if (indexed && value(queue.userConfig, 0x24b, word) && word != 0) {
+        std::uint32_t primitive = 0;
+        std::uint32_t resetIndex = 0;
+        if (value(queue.userConfig, 0x242, primitive) && (primitive & 0x3fu) != 1 && (primitive & 0x3fu) != 2 && (primitive & 0x3fu) != 3 && (primitive & 0x3fu) != 4 && (primitive & 0x3fu) != 5 && (primitive & 0x3fu) != 6) return "AGC graphics: primitive restart is only supported for point, line and triangle topologies";
+        if (value(cx, 0x103, resetIndex) && (resetIndex & 0xffffu) != 0xffffu) return "AGC graphics: primitive restart index other than all ones is unsupported";
+    }
     if (auto reason = nonzero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
     if (value(cx, 0x200, word)) {
         if (!depthPassThrough(word) && !IgnoreDepthTest() && (effectiveDepthControl(word) & DepthControlMask) != 0) return zeroMessage(0x200, word, "depth, stencil or conditional color writes");

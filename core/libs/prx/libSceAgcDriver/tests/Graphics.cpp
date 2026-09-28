@@ -89,7 +89,14 @@ void stateTests() {
     queue.context[0x1b4] = 2;
     (void)AgcDriver::Graphics::DecodeState(queue);
     Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "primitive restart rejected a non-indexed draw");
-    Require(AgcDriver::Graphics::DrawRejection(queue, true).find("GE_MULTI_PRIM_IB_RESET_EN") != std::string::npos, "primitive restart was accepted for an indexed draw");
+    queue.userConfig[0x242] = 9;
+    Require(AgcDriver::Graphics::DrawRejection(queue, true).find("point, line and triangle") != std::string::npos, "primitive restart was accepted for patches");
+    queue.userConfig[0x242] = 6;
+    queue.context[0x103] = 0xffffffffu;
+    Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "primitive restart was rejected for an indexed strip");
+    Require(AgcDriver::Graphics::DecodeState(queue).primitiveRestart, "primitive restart was not decoded for a strip");
+    queue.context[0x103] = 5;
+    Require(AgcDriver::Graphics::DrawRejection(queue, true).find("all ones") != std::string::npos, "a restart index other than all ones was accepted");
     queue = makeState();
     queue.userConfig.erase(0x24b);
     queue.context[0x2a5] = 0;

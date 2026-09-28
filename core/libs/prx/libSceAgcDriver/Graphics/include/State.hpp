@@ -52,6 +52,7 @@ struct State {
     bool rectList = false;
     VkExtent2D renderExtent;
     VkPrimitiveTopology topology;
+    bool primitiveRestart = false;
     VkViewport viewport;
     bool negativeOneToOne;
     bool depthClamp = false;

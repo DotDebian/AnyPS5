@@ -118,6 +118,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         input.pVertexAttributeDescriptions = vertexInput.attributes.data();
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         assembly.topology = state.topology;
+        const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        assembly.primitiveRestartEnable = state.primitiveRestart && (!listTopology || context.primitiveListRestart) ? VK_TRUE : VK_FALSE;
         // Viewport and scissor are set per draw (Begin), so they do not multiply pipelines; the depth
         // clip control stays baked in.
         VkPipelineViewportStateCreateInfo viewports{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -313,6 +315,7 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
     append(key, state.hasColorTarget);
     append(key, state.rectList);
     append(key, state.topology);
+    append(key, state.primitiveRestart);
     append(key, state.cullMode);
     append(key, state.frontFace);
     append(key, state.negativeOneToOne);
