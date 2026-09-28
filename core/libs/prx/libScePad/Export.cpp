@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <cstring>
 #include <stdexcept>
 #include <chrono>
@@ -188,10 +189,10 @@ int APS5_VABI scePadSetMotionSensorState(int handle, bool enable) {
 }
 
 int APS5_VABI scePadSetTiltCorrectionState(int handle, bool enabled) {
- (void)handle;
- (void)enabled;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ static std::atomic<bool> tiltCorrection{false};
+ if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
+ tiltCorrection.store(enabled, std::memory_order_relaxed);
+ return PAD_OK;
 }
 
 // ScePadTriggerEffectParam: u8 triggerMask (bit 0 = L2, bit 1 = R2), u8 padding[7], ScePadTriggerEffectCommandData command[2] (56 bytes each).
