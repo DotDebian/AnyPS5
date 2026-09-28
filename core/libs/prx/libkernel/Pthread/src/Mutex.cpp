@@ -118,8 +118,10 @@ int APS5_VABI scePthreadMutexattrSettype(PthreadMutexattr* attr, int type) {
 int APS5_VABI scePthreadMutexattrSetprotocol(PthreadMutexattr* attr, int protocol) {
     if (!attr || !*attr)
         throw std::invalid_argument("Mutex attributes are not initialized");
-    if (protocol != 0)
-        throw std::invalid_argument("Mutex priority inheritance and protection are unsupported");
+    constexpr int PrioNone = 0;
+    constexpr int PrioInherit = 1;
+    if (protocol != PrioNone && protocol != PrioInherit)
+        throw std::invalid_argument("Mutex priority protection is unsupported");
     return 0;
 }
 
