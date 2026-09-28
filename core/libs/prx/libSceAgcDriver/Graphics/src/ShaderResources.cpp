@@ -826,7 +826,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 } else if (gdsRole) {
                     // The device's GDS buffer, the backing the CP's DMA_DATA reaches too.
                     Require(binding.count == 1, "a GDS descriptor must not be an array");
-                    Require(context.gdsBuffer != VK_NULL_HANDLE, "the device has no GDS buffer to bind");
+                    Require(context.gdsBuffer != VK_NULL_HANDLE, "the device has no GDS buffer to bind (APS5_GDS=1 makes one)");
                     item.allocations.push_back(allocations.size());
                     allocations.push_back({0, Pm4::GdsBytes, false, nullptr, binding.role});
                     usesGds = true;

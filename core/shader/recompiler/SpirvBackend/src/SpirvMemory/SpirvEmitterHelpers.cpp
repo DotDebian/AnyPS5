@@ -389,6 +389,11 @@ void DefineDescriptors(SpirvEmitterState& state) {
             break;
         case DescriptorBindingKind::Gds:
             state.gdsVariable = Define(StorageBufferBlockType(state), "gds");
+            // The GDS is one memory every wave of the device reads and writes directly: an access
+            // sees the others' at once (a wave polling a flag another workgroup or queue sets), so
+            // no access is cached or kept in registers.
+            state.module.AddAnnotation(spv::OpDecorate, state.gdsVariable, spv::DecorationCoherent);
+            state.module.AddAnnotation(spv::OpDecorate, state.gdsVariable, spv::DecorationVolatile);
             break;
         default: {
             if (ImageBindingResourceClass(binding.kind) == ImageResourceClass::None) {

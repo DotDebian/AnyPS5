@@ -991,6 +991,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
 VulkanDevice::~VulkanDevice() = default;
 
 void VulkanDevice::createGds() {
+    // Off unless APS5_GDS=1: with it, Astro Bot's GPU stops ~70 s into the intro (a batch never
+    // completes) once its GDS-appending pixel shader and GDS compute kernels run, while the draws
+    // and dispatches refused without it leave the intro intact. Without the buffer the CP keeps its
+    // GDS bytes itself and GDS bindings are refused.
+    static const bool enabled = std::getenv("APS5_GDS") != nullptr;
+    if (!enabled) return;
     // Device-local where the host can map it (the GDS takes shader atomics), else host memory.
     constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const auto context = graphicsContext();
