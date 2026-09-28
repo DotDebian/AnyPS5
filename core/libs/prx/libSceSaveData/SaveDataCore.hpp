@@ -290,7 +290,8 @@ std::filesystem::path save_blocks_path(const std::filesystem::path& directory) {
 bool write_blob(const std::filesystem::path& path, const void* data, std::size_t size) {
     std::error_code error;
     std::filesystem::create_directories(path.parent_path(), error);
-    const std::filesystem::path temporary = path.native() + L".tmp";
+    std::filesystem::path temporary = path;
+    temporary += ".tmp";
     {
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
         if (!file) {
