@@ -5,7 +5,12 @@ add_library(libSceVideodec2 SHARED EXCLUDE_FROM_ALL
 target_include_directories(libSceVideodec2 PRIVATE ${LIBS_INCLUDE_DIR})
 configure_windows_unwind(libSceVideodec2)
 
-option(ANYPS5_ENABLE_FFMPEG "Build FFmpeg from 3rdparty/FFmpeg for H.264 decoding in libSceVideodec2" ON)
+if(WIN32)
+    set(VIDEODEC2_FFMPEG_DEFAULT OFF)
+else()
+    set(VIDEODEC2_FFMPEG_DEFAULT ON)
+endif()
+option(ANYPS5_ENABLE_FFMPEG "Build FFmpeg from 3rdparty/FFmpeg for H.264 decoding in libSceVideodec2" ${VIDEODEC2_FFMPEG_DEFAULT})
 
 set(VIDEODEC2_FFMPEG_SOURCE_DIR ${CMAKE_SOURCE_DIR}/3rdparty/FFmpeg)
 find_program(VIDEODEC2_SH sh)
