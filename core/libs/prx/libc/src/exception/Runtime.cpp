@@ -240,8 +240,7 @@ void APS5_VABI __cxa_free_exception_nid_postfix(void* object) {
     header->unwind.exception_cleanup = Cleanup;
     ++globals.uncaught;
     _Unwind_RaiseException_nid_postfix(&header->unwind);
-    RawLog("[libc] unhandled exception '%s' thrown from %p (caller %p)\n", type ? type->name() : "?", __builtin_return_address(0),
-           static_cast<void**>(static_cast<void**>(__builtin_frame_address(0))[0])[1]);
+    RawLog("[libc] unhandled exception '%s' thrown from %p\n", type ? type->name() : "?", __builtin_return_address(0));
     __cxa_begin_catch_nid_postfix(&header->unwind);
     InvokeTerminate(header->terminate);
 }
