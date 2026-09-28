@@ -38,6 +38,7 @@ std::string FirstLine(const std::string& text) {
 bool g_disassemble = false;
 bool g_assembly = false;
 bool g_memory = false;
+bool g_spirv = false;
 
 bool Replay(const char* path) {
     const auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
@@ -45,6 +46,14 @@ bool Replay(const char* path) {
     if (request.request.context.compute.has_value()) {
         const auto& compute = *request.request.context.compute;
         std::printf("  compute: threads %ux%ux%u, lds %u dwords, group ids %d%d%d, tg size %d, thread id components %u\n", compute.numThreads[0], compute.numThreads[1], compute.numThreads[2], compute.ldsSizeDwords, compute.groupIdEnable[0], compute.groupIdEnable[1], compute.groupIdEnable[2], compute.tgSizeEnable, compute.threadIdComponentCount);
+    }
+    if (request.request.graphics.has_value()) {
+        const auto& graphics = *request.request.graphics;
+        std::printf("  graphics: %zu linked programs, draw %u indices of %u bytes at 0x%llx, %u instances\n", graphics.linkedPrograms.size(), graphics.draw.indexCount, graphics.draw.indexElementBytes, static_cast<unsigned long long>(graphics.draw.indexAddress), graphics.draw.instanceCount);
+        if (graphics.mesh.has_value()) {
+            const auto& mesh = *graphics.mesh;
+            std::printf("  mesh: input primitive %u, %u primitives / %u vertices per group, max %u vertices / %u primitives, %u threads, lds %u dwords, provoking %u, ESGS item %u\n", mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex, mesh.esgsItemSize);
+        }
     }
     if (g_memory) {
         // --mem: the captured inputs. User data words are printed; each memory region is written to
@@ -77,6 +86,16 @@ bool Replay(const char* path) {
     try {
         const auto result = ShaderRecompiler::Recompile(request.request);
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
+        if (g_spirv) {
+            // --spv: the module, as <request name>.spv in the working directory (for spirv-dis/-val).
+            std::string name = path;
+            if (const auto slash = name.find_last_of('/'); slash != std::string::npos) name = name.substr(slash + 1);
+            name += ".spv";
+            if (std::FILE* file = std::fopen(name.c_str(), "wb")) {
+                std::fwrite(result.spirv.data(), sizeof(std::uint32_t), result.spirv.size(), file);
+                std::fclose(file);
+            }
+        }
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         if (g_disassemble) {
             spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
@@ -97,7 +116,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--mem] [--spv] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     int failures = 0;
@@ -108,6 +127,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--asm") {
             g_assembly = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--spv") {
+            g_spirv = true;
             continue;
         }
         if (std::string(argv[i]) == "--mem") {
