@@ -491,6 +491,201 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
 
 }
 
+namespace {
+
+// The Location of every variable of `storage` that carries one (patch variables excluded).
+std::set<std::uint32_t> InterfaceLocations(std::span<const std::uint32_t> words, spv::StorageClass storage) {
+    Require(words.size() >= 5, "SPIR-V header is truncated");
+    std::map<std::uint32_t, std::uint32_t> locations;
+    std::set<std::uint32_t> patches;
+    std::set<std::uint32_t> variables;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        Require(count != 0 && count <= words.size() - cursor, "truncated SPIR-V instruction");
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        if (op == spv::OpDecorate && count == 4 && words[cursor + 2] == spv::DecorationLocation) locations[words[cursor + 1]] = words[cursor + 3];
+        if (op == spv::OpDecorate && count >= 3 && words[cursor + 2] == spv::DecorationPatch) patches.insert(words[cursor + 1]);
+        if (op == spv::OpVariable && count >= 4 && words[cursor + 3] == static_cast<std::uint32_t>(storage)) variables.insert(words[cursor + 2]);
+        if (op == spv::OpFunction) break;
+        cursor += count;
+    }
+    std::set<std::uint32_t> result;
+    for (const auto id : variables) {
+        const auto location = locations.find(id);
+        if (location != locations.end() && !patches.contains(id)) result.insert(location->second);
+    }
+    return result;
+}
+
+// Whether an instruction other than a load or an access chain passes one of `pointers` on: the
+// operands that can hold a pointer, by opcode.
+bool PointerOperand(std::span<const std::uint32_t> instruction, const std::map<std::uint32_t, std::uint32_t>& pointers) {
+    const auto any = [&](std::size_t first, std::size_t step = 1) {
+        for (std::size_t i = first; i < instruction.size(); i += step) {
+            if (pointers.contains(instruction[i])) return true;
+        }
+        return false;
+    };
+    const auto at = [&](std::size_t index) { return index < instruction.size() && pointers.contains(instruction[index]); };
+    const auto op = static_cast<spv::Op>(instruction[0] & 0xffffu);
+    switch (op) {
+        case spv::OpLoad:
+        case spv::OpAccessChain:
+        case spv::OpInBoundsAccessChain:
+            return false;
+        case spv::OpStore:
+        case spv::OpAtomicStore:
+        case spv::OpReturnValue:
+            return at(1);
+        case spv::OpCopyMemory:
+        case spv::OpCopyMemorySized:
+            return at(1) || at(2);
+        case spv::OpCopyObject:
+        case spv::OpPtrAccessChain:
+        case spv::OpInBoundsPtrAccessChain:
+        case spv::OpArrayLength:
+        case spv::OpImageTexelPointer:
+        case spv::OpBitcast:
+        case spv::OpConvertPtrToU:
+            return at(3);
+        case spv::OpPtrEqual:
+        case spv::OpPtrNotEqual:
+        case spv::OpPtrDiff:
+            return at(3) || at(4);
+        case spv::OpSelect:
+            return at(4) || at(5);
+        case spv::OpPhi:
+            return any(3, 2);
+        case spv::OpFunctionCall:
+            return any(4);
+        case spv::OpExtInst:
+            return any(5);
+        default:
+            return op >= spv::OpAtomicLoad && op <= spv::OpAtomicXor && at(3);
+    }
+}
+
+}
+
+std::set<std::uint32_t> UnwrittenFragmentInputs(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> fragment) {
+    const auto written = InterfaceLocations(previous, spv::StorageClassOutput);
+    std::set<std::uint32_t> unwritten;
+    for (const auto location : InterfaceLocations(fragment, spv::StorageClassInput)) {
+        if (!written.contains(location)) unwritten.insert(location);
+    }
+    return unwritten;
+}
+
+std::vector<std::uint32_t> ZeroFragmentInputs(std::span<const std::uint32_t> words, const std::set<std::uint32_t>& locations) {
+    Require(words.size() >= 5, "SPIR-V header is truncated");
+    struct Pointer {
+        std::uint32_t storage;
+        std::uint32_t pointee;
+    };
+    std::map<std::uint32_t, std::uint32_t> locationOf;
+    std::map<std::uint32_t, Pointer> pointers;
+    std::map<std::uint32_t, std::uint32_t> inputs;
+    std::size_t functions = words.size();
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        Require(count != 0 && count <= words.size() - cursor, "truncated SPIR-V instruction");
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        if (op == spv::OpFunction) {
+            functions = cursor;
+            break;
+        }
+        if (op == spv::OpDecorate && count == 4 && words[cursor + 2] == spv::DecorationLocation) locationOf[words[cursor + 1]] = words[cursor + 3];
+        if (op == spv::OpTypePointer && count == 4) pointers[words[cursor + 1]] = {words[cursor + 2], words[cursor + 3]};
+        if (op == spv::OpVariable && count == 4 && words[cursor + 3] == spv::StorageClassInput) inputs[words[cursor + 2]] = words[cursor + 1];
+        cursor += count;
+    }
+    // The zeroed variables and every pointer derived from them, with their pointee types.
+    std::map<std::uint32_t, std::uint32_t> derived;
+    std::set<std::uint32_t> targets;
+    for (const auto& [id, type] : inputs) {
+        const auto location = locationOf.find(id);
+        if (location == locationOf.end() || !locations.contains(location->second)) continue;
+        const auto pointer = pointers.find(type);
+        Require(pointer != pointers.end(), "fragment input has no pointer type");
+        targets.insert(id);
+        derived[id] = pointer->second.pointee;
+    }
+    Require(targets.size() == locations.size(), "a fragment input to zero is not a located input variable");
+    for (std::size_t cursor = functions; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        Require(count != 0 && count <= words.size() - cursor, "truncated SPIR-V instruction");
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        if ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain) && count >= 4 && derived.contains(words[cursor + 3])) {
+            const auto pointer = pointers.find(words[cursor + 1]);
+            Require(pointer != pointers.end(), "fragment input access chain has no pointer type");
+            derived[words[cursor + 2]] = pointer->second.pointee;
+            for (std::size_t i = 4; i < count; ++i) Require(!derived.contains(words[cursor + i]), "fragment input pointer used as an index");
+        } else {
+            Require(!PointerOperand(words.subspan(cursor, count), derived), "unsupported use of a fragment input that must be zeroed");
+        }
+        cursor += count;
+    }
+    auto bound = words[3];
+    std::vector<std::uint32_t> declarations;
+    std::map<std::uint32_t, std::uint32_t> privatePointer;
+    for (const auto& [id, pointer] : pointers) {
+        if (pointer.storage == spv::StorageClassPrivate) privatePointer.emplace(pointer.pointee, id);
+    }
+    const auto privateType = [&](std::uint32_t pointee) {
+        auto found = privatePointer.find(pointee);
+        if (found == privatePointer.end()) {
+            found = privatePointer.emplace(pointee, bound++).first;
+            declarations.insert(declarations.end(), {(4u << 16u) | spv::OpTypePointer, found->second, spv::StorageClassPrivate, pointee});
+        }
+        return found->second;
+    };
+    for (const auto& [id, pointee] : derived) static_cast<void>(privateType(pointee));
+    std::map<std::uint32_t, std::uint32_t> nulls;
+    for (const auto id : targets) {
+        const auto pointee = derived.at(id);
+        auto null = nulls.find(pointee);
+        if (null == nulls.end()) {
+            null = nulls.emplace(pointee, bound++).first;
+            declarations.insert(declarations.end(), {(3u << 16u) | spv::OpConstantNull, pointee, null->second});
+        }
+        declarations.insert(declarations.end(), {(5u << 16u) | spv::OpVariable, privatePointer.at(pointee), id, spv::StorageClassPrivate, null->second});
+    }
+    // Before SPIR-V 1.4 the entry point lists only Input and Output variables.
+    const bool listsPrivate = words[1] >= 0x00010400u;
+    std::vector<std::uint32_t> result(words.begin(), words.begin() + 5);
+    result[3] = bound;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        const auto instruction = words.subspan(cursor, count);
+        cursor += count;
+        if (op == spv::OpDecorate && targets.contains(instruction[1])) continue;
+        if (op == spv::OpVariable && count == 4 && targets.contains(instruction[2])) continue;
+        if (op == spv::OpFunction && !declarations.empty()) {
+            result.insert(result.end(), declarations.begin(), declarations.end());
+            declarations.clear();
+        }
+        if (op == spv::OpEntryPoint && !listsPrivate) {
+            // The name is a literal string: the interface IDs follow its terminating word.
+            std::size_t first = 3;
+            while (first < count && (instruction[first] >> 24u) != 0) ++first;
+            ++first;
+            std::vector<std::uint32_t> entry(instruction.begin(), instruction.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(first, count)));
+            for (std::size_t i = first; i < count; ++i) {
+                if (!targets.contains(instruction[i])) entry.push_back(instruction[i]);
+            }
+            entry[0] = (static_cast<std::uint32_t>(entry.size()) << 16u) | spv::OpEntryPoint;
+            result.insert(result.end(), entry.begin(), entry.end());
+            continue;
+        }
+        const auto at = result.size();
+        result.insert(result.end(), instruction.begin(), instruction.end());
+        if ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain) && derived.contains(instruction[3])) result[at + 1] = privatePointer.at(derived.at(instruction[2]));
+    }
+    Require(declarations.empty(), "fragment module has no function");
+    return result;
+}
+
 std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders, const State& state, const VkPhysicalDeviceSubgroupProperties& subgroup, bool fragmentShaderBarycentric, bool descriptorIndexing) {
     using Stage = ShaderRecompiler::ShaderStage;
     const bool tessellation = state.stages.path == ShaderPath::Tessellation;
@@ -509,7 +704,11 @@ std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders,
         for (const auto& binding : shaders[i].program->bindings) Require(binding.descriptorSet == 0, "graphics resource uses a descriptor set other than zero");
         const auto current = Inspect(shaders[i], state, subgroup, fragmentShaderBarycentric, descriptorIndexing);
         if (i != 0) {
+            // A parameter the pixel shader reads that the stage before it never exports holds
+            // whatever the parameter cache does; the pipeline zeroes it (ZeroFragmentInputs).
+            const auto unwritten = shaders[i].stage == Stage::Fragment ? UnwrittenFragmentInputs(shaders[i - 1].program->spirv.Words(), shaders[i].program->spirv.Words()) : std::set<std::uint32_t>{};
             for (const auto& [location, signature] : current.inputs) {
+                if (unwritten.contains(location) && !previous.outputs.contains(location)) continue;
                 const auto output = previous.outputs.find(location);
                 Require(output != previous.outputs.end() && output->second == signature, "graphics interfaces disagree at location " + std::to_string(location));
             }
@@ -517,11 +716,14 @@ std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders,
         previous = current;
     }
     // One float4 color per MRT attachment. A pixel shader may also export no color at all when it
-    // writes storage images or buffers instead; its attachments are then left untouched.
+    // writes storage images or buffers instead; its attachments are then left untouched. An export
+    // to an MRT slot past the draw's targets (CB_TARGET_MASK & CB_SHADER_MASK leave it out) is
+    // dropped by the color backend; Vulkan discards an output without an attachment the same way.
     const auto attachments = std::max<std::size_t>(state.colors.size(), 1u);
     std::set<std::uint32_t> locations;
     for (const auto& [location, signature] : previous.outputs) {
-        Require(location < attachments && signature == "vertex:f32x4", "fragment shader must export float4 colors at locations below the attachment count");
+        if (location >= attachments) continue;
+        Require(signature == "vertex:f32x4", "fragment shader must export float4 colors to its attachments");
         locations.insert(location);
     }
     return locations;

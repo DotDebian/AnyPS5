@@ -93,6 +93,12 @@ void ClearCachedPipelines(VkDevice device);
 void ValidateViewport(const Context& context, const VkViewport& viewport);
 
 void ValidateShaderPair(const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment);
+// The input locations of the pixel shader `fragment` that the stage before it (`previous`) has no
+// output for: on the GPU such a parameter reads whatever the parameter cache holds.
+std::set<std::uint32_t> UnwrittenFragmentInputs(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> fragment);
+// The pixel shader with its inputs at `locations` made zero-initialized private variables, which
+// is how the pipeline links parameters the stage before it never exports.
+std::vector<std::uint32_t> ZeroFragmentInputs(std::span<const std::uint32_t> fragment, const std::set<std::uint32_t>& locations);
 // Returns the color attachment locations the pixel shader writes.
 std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders, const State& state, const VkPhysicalDeviceSubgroupProperties& subgroup, bool fragmentShaderBarycentric, bool descriptorIndexing = false);
 

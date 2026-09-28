@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -70,9 +71,20 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         std::vector<VkPipelineShaderStageCreateInfo> stages(shaders.size());
         for (std::uint32_t i = 0; i < shaders.size(); ++i) {
             const auto& shader = *shaders[i].program;
+            // The pixel shader's parameters the stage before it never exports read zero.
+            std::vector<std::uint32_t> linked;
+            if (i != 0 && shaders[i].stage == ShaderRecompiler::ShaderStage::Fragment) {
+                const auto unwritten = UnwrittenFragmentInputs(shaders[i - 1].program->spirv.Words(), shader.spirv.Words());
+                if (!unwritten.empty()) {
+                    linked = ZeroFragmentInputs(shader.spirv.Words(), unwritten);
+                    static std::atomic<bool> reported{false};
+                    if (!reported.exchange(true)) std::fprintf(stderr, "[gpu] pixel shaders read parameters the stage before them does not export (first at location %u); they read zero\n", *unwritten.begin());
+                }
+            }
+            const auto& words = linked.empty() ? shader.spirv.Words() : linked;
             VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
-            module.pCode = shader.spirv.data();
+            module.codeSize = words.size() * sizeof(std::uint32_t);
+            module.pCode = words.data();
             Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &module, nullptr, &_modules[i]), "vkCreateShaderModule graphics");
             const auto stage = VulkanStage(shaders[i].stage);
             stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;

@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "SpirvBackend/SpirvOptimizer.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -688,6 +689,7 @@ struct MockVulkan {
     std::optional<VkAttachmentReference> renderPassDepth;
     std::optional<VkPipelineDepthStencilStateCreateInfo> depthStencil;
     VkPipelineRasterizationStateCreateInfo raster{};
+    std::vector<std::vector<std::uint32_t>> shaderModules;
     std::vector<std::byte> lastPushConstants;
     struct { std::uint32_t x = 0, y = 0, z = 0; } lastDispatchGroups;
 };
@@ -809,8 +811,9 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyPipelineLayout(VkDevice, VkPipelineLayout,
     --mock.live;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL mockCreateShaderModule(VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule* module) {
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateShaderModule(VkDevice, const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks*, VkShaderModule* module) {
     *module = makeHandle<VkShaderModule>();
+    mock.shaderModules.emplace_back(info->pCode, info->pCode + info->codeSize / sizeof(std::uint32_t));
     ++mock.live;
     return VK_SUCCESS;
 }
@@ -1443,11 +1446,12 @@ void rectListTests() {
 
 // Recompiles `code` as a pixel shader with PERSP_CENTER loaded and one SPI_PS_INPUT_CNTL word per
 // input.
-ShaderRecompiler::RecompileResult recompilePixel(std::initializer_list<std::uint32_t> controls, std::span<const std::uint32_t> code) {
+ShaderRecompiler::RecompileResult recompilePixel(std::initializer_list<std::uint32_t> controls, std::span<const std::uint32_t> code, std::uint32_t colorFormat = 9u) {
     auto queue = makeState();
     queue.context[0x1b3] = 0x2u;
     queue.context[0x1b4] = 0x2u;
     queue.context[0x1b6] = static_cast<std::uint32_t>(controls.size());
+    queue.context[0x1c5] = colorFormat;
     std::uint32_t index = 0;
     for (const auto control : controls) queue.context[0x191 + index++] = control;
     const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, true, 0xe4u);
@@ -1523,6 +1527,61 @@ void pixelParameterSlotTests() {
     pixel = recompilePixel({0x20u, 0x2320u}, shared);
     Require(locatedInputs(pixel.spirv.Words()).empty(), "a defaulted input was declared as a parameter");
     AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, true);
+    // Slot 5 is read but the vertex shader exports only slot 0: the pipeline's pixel module reads
+    // zero there, through a private variable.
+    pixel = recompilePixel({0x0u, 0x5u}, shared);
+    Require(AgcDriver::Graphics::UnwrittenFragmentInputs(vertex.spirv.Words(), pixel.spirv.Words()) == std::set<std::uint32_t>{5u}, "the unexported slot was not found");
+    AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, true);
+    {
+        mock = MockVulkan{};
+        auto context = mockContext();
+        context.limits.maxColorAttachments = 8;
+        AgcDriver::Graphics::ShaderResources resources(context, vertex, pixel, state.color, 0, 0);
+        {
+            AgcDriver::Graphics::Pipeline pipeline(context, state, AgcDriver::Graphics::VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+            Require(mock.shaderModules.size() == 2 && mock.shaderModules[0] == vertex.spirv.Words(), "the pipeline changed the vertex module");
+            inputs = locatedInputs(mock.shaderModules[1]);
+            Require(inputs.size() == 1 && inputs[0].location == 0, "the pipeline's pixel module still reads the unexported slot");
+        }
+    }
+    for (const auto version : {0x00010300u, 0x00010400u}) {
+        auto words = pixel.spirv.Words();
+        words[1] = version;
+        const auto zeroed = AgcDriver::Graphics::ZeroFragmentInputs(words, {5u});
+        inputs = locatedInputs(zeroed);
+        Require(inputs.size() == 1 && inputs[0].location == 0, "the unexported slot is still an input");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+        static_cast<void>(ShaderRecompiler::ValidateAndOptimizeSpirv(zeroed, 0x00403000u, version));
+#endif
+        ShaderRecompiler::RecompileResult linked = pixel;
+        linked.spirv = zeroed;
+        shaders[1].program = &linked;
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, true);
+        shaders[1].program = &pixel;
+    }
+    expectFailure([&] { static_cast<void>(AgcDriver::Graphics::ZeroFragmentInputs(pixel.spirv.Words(), {6u})); }, "not a located input");
+    // A per-vertex slot is read through access chains, which become private pointers too.
+    pixel = recompilePixel({0x5u, 0x405u, 0x20u, 0x20u}, mixed);
+    Require(AgcDriver::Graphics::UnwrittenFragmentInputs(vertex.spirv.Words(), pixel.spirv.Words()) == std::set<std::uint32_t>{5u}, "the unexported per-vertex slot was not found");
+    {
+        const auto zeroed = AgcDriver::Graphics::ZeroFragmentInputs(pixel.spirv.Words(), {5u});
+        Require(locatedInputs(zeroed).empty(), "the unexported per-vertex slot is still an input");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+        static_cast<void>(ShaderRecompiler::ValidateAndOptimizeSpirv(zeroed, 0x00403000u, pixel.spirv.Words()[1]));
+#endif
+        ShaderRecompiler::RecompileResult linked = pixel;
+        linked.spirv = zeroed;
+        shaders[1].program = &linked;
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, true);
+        shaders[1].program = &pixel;
+    }
+    // exp mrt0 v0 vm; exp mrt1 v0 done vm; s_endpgm: MRT1 is outside CB_TARGET_MASK & CB_SHADER_MASK
+    // (one attachment), so the color backend drops it.
+    const std::array<std::uint32_t, 5> twoTargets{0xf800100fu, 0x00000000u, 0xf800181fu, 0x00000000u, 0xbf810000u};
+    pixel = recompilePixel({}, twoTargets, 0x99u);
+    vertex.spirv = makeModule({});
+    const auto written = AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, true);
+    Require(state.colors.size() == 1 && written == std::set<std::uint32_t>{0u}, "an export past the attachments was not dropped");
 }
 
 void validationTests() {
