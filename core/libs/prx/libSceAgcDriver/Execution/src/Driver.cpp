@@ -3956,17 +3956,16 @@ private:
             const auto initializeMerged = [&](DrawProgram& program, std::uint32_t pointerBase, bool pointerRequired) {
                 program.firstUserSgpr = 0;
                 program.userData.insert(program.userData.begin(), 8, 0);
-                if (pointerRequired) {
-                    Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase);
-                    Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase + 1);
-                    const auto low = readRegister(queue.shader, pointerBase);
-                    const auto high = readRegister(queue.shader, pointerBase + 1);
-                    const auto address = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u);
-                    require(address != 0, "merged shader user-data address is null");
-                    GuestMemory::CheckRange(reinterpret_cast<const void*>(address), 8, 4);
-                    program.userData[0] = low;
-                    program.userData[1] = high;
-                }
+                Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase);
+                Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase + 1);
+                const auto low = readRegister(queue.shader, pointerBase);
+                const auto high = readRegister(queue.shader, pointerBase + 1);
+                const auto address = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u);
+                require(address != 0 || !pointerRequired, "merged shader user-data address is null");
+                if (address == 0) return;
+                GuestMemory::CheckRange(reinterpret_cast<const void*>(address), 8, 4);
+                program.userData[0] = low;
+                program.userData[1] = high;
             };
             const auto& graphics = product->state;
             if (graphics.stages.path == Graphics::ShaderPath::Tessellation) {
