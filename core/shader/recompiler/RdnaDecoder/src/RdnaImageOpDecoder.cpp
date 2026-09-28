@@ -1,7 +1,9 @@
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
 #include <bit>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -229,7 +231,9 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
     // ray queries, whose encoding requires it set, so it must not reject 0xE6.
     const auto reservedWord0 = opcode == 0xe6u ? 0x000340C0u : 0x000350C0u;
     if ((word0 & reservedWord0) != 0u || (word1 & 0x3C000000u) != 0u) {
-        throw std::runtime_error("unsupported or reserved MIMG control bits");
+        char words[64];
+        std::snprintf(words, sizeof(words), " (%08x %08x)", word0, word1);
+        throw std::runtime_error(std::string("unsupported or reserved MIMG control bits") + words);
     }
     const auto nsa = (word0 >> 1u) & 3u;
     const auto wordCount = 2u + nsa;

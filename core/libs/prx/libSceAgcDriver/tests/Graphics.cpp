@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "SpirvBackend/SpirvOptimizer.hpp"
+#include "RdnaDecoder/RdnaImageOpDecoder.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -715,6 +716,16 @@ void depthMetadataBlitTests() {
     auto absent = queue;
     absent.context.erase(0x203);
     Require(!DepthMetadataBlit(absent), "a draw missing DB_SHADER_CONTROL was taken for a DB metadata blit");
+}
+
+// MIMG words: the gfx10.3 BVH intersection opcode as Astro Bot's ray-query kernels issue it (NSA,
+// R128 and UNRM set) decodes, and reserved control bits are refused with the words.
+void mimgDecodeTests() {
+    const std::array<std::uint32_t, 5> bvh{0xf1989f07u, 0x00040505u, 0, 0, 0};
+    Require(ShaderRecompiler::DecodeRdnaMimg(0, bvh, 0).op == ShaderRecompiler::RdnaOpcode::ImageBvhIntersectRay, "Astro Bot's BVH intersection encoding was not decoded");
+    // image_sample (0x20) with TFE (bit 16): a reserved control bit, named with the words.
+    const std::array<std::uint32_t, 2> tfe{0xf0800f00u | (1u << 16u), 0x00000000u};
+    expectFailure([&] { ShaderRecompiler::DecodeRdnaMimg(0, tfe, 0); }, "reserved MIMG control bits (f0810f00 00000000)");
 }
 
 void DepthClipTests() {
@@ -1922,6 +1933,7 @@ int main() {
         DisabledColorTests();
         metadataPassTests();
         depthMetadataBlitTests();
+        mimgDecodeTests();
         ShaderStageTests();
         pixelInputLayoutTests();
         InitialContextTests();
