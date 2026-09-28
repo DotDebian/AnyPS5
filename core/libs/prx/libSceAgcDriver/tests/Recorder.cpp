@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "ViewAliases.hpp"
 #include <SDL_loadso.h>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -932,6 +933,7 @@ int main() {
         closeRaceTests(device, recorder);
         keyProofTests(device, recorder);
         resourceReadTests(device, recorder);
+        RunViewAliasTests(device.GetContext(), recorder);
         storeRunTests(device, recorder);
         unitShadowTests(device, recorder);
         dataWordPositionsTests();

@@ -161,6 +161,10 @@ public:
     void Upload(bool addressable);
     void UploadPrepare(bool addressable);
     void UploadFinish(bool addressable);
+    // The binding of [address, address + bytes) at an offset that is a multiple of
+    // minStorageBufferOffsetAlignment: in its region's buffer, or, for a view registered by
+    // AddWritable/AddReadable whose offset there would be misaligned, in the copy made for it (see
+    // the view aliases in GuestBufferMemory.cpp).
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes) const;
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
     // The BDA table of the cached address space when it serves this upload alone (an address-based
@@ -182,6 +186,10 @@ public:
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Writes() const { return writes; }
     // Whether any written range lives in a copied buffer, so a write-back must run once the GPU is done.
     bool HasCopiedWrites() const;
+    // The copies made for views whose offset in their region's buffer was misaligned (see
+    // GuestBufferMemory.cpp), and how many of them the GPU fills from an import; valid after Upload.
+    std::size_t ViewAliases() const { return aliases.size(); }
+    std::size_t GpuViewAliases() const;
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
@@ -296,6 +304,29 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    // The guest address at offset 0 of the buffer a region binds (the import's base, the mirror's
+    // base, or the region's own first byte for a buffer of its own).
+    static std::uint64_t bindingBase(const Region& region);
+    // A descriptor-bound range as AddWritable/AddReadable registered it.
+    struct View {
+        std::uint64_t begin;
+        std::uint64_t end;
+        bool written;
+    };
+    // A copy of the guest bytes behind one or more views whose offset from their owner region's
+    // binding base is not a multiple of minStorageBufferOffsetAlignment (see bindMisalignedViews):
+    // `region` starts at the first view's address, so each of them binds at an aligned offset.
+    // `writes` are the written views bound through it (never in `regionWrites`).
+    struct Alias {
+        Region region;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    };
+    // Gives every misaligned view an Alias (UploadFinish, once every region's binding is settled):
+    // GPU aliases are appended to `gpuCopies` for the caller's recordGpuCopies.
+    void bindMisalignedViews(bool addressable, Recorder* recorder, std::vector<Region*>& gpuCopies);
+    const Alias* aliasFor(std::uint64_t address, std::size_t bytes) const;
+    // The written ranges bound through the regions themselves: every write when no view is aliased.
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& boundWrites() const { return aliases.empty() ? writes : regionWrites; }
     Context context;
     bool stagingAllowed = false;
     GuestAllocations::Lease lease;
@@ -310,6 +341,9 @@ private:
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.
     bool regionsSorted = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    std::vector<View> views;
+    std::vector<Alias> aliases;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> regionWrites;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;
     bool uploaded = false;
