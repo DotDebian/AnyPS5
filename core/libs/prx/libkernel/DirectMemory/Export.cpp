@@ -268,10 +268,12 @@ int APS5_VABI sceKernelConfiguredFlexibleMemorySize(size_t* size) {
 }
 
 int APS5_VABI sceKernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name) {
- (void)addr;
- (void)len;
- (void)name;
- NotImplemented_nid_no_patch(__func__);
+ if (!addr || len == 0 || !name) return SCE_KERNEL_ERROR_EINVAL;
+ return 0;
+}
+
+int APS5_VABI sceKernelClearVirtualRangeName(const void* addr, uint64_t len) {
+ if (!addr || len == 0) return SCE_KERNEL_ERROR_EINVAL;
  return 0;
 }
 

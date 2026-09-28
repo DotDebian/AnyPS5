@@ -245,6 +245,11 @@ int APS5_VABI _nanosleep_nid_postfix(const KernelTimespec* rqtp, KernelTimespec*
     return sceKernelNanosleep(rqtp, rmtp);
 }
 
+int APS5_VABI usleep_nid_postfix(KernelUseconds microseconds) {
+    TimedWait::SleepNanos(static_cast<std::uint64_t>(microseconds) * 1000ULL);
+    return 0;
+}
+
 int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
     if (tp == nullptr) {
         APS5_INVALID_ARG_EX;
