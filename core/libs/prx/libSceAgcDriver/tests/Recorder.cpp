@@ -14,6 +14,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "ViewAliases.hpp"
+#include "SampleLod_spv.h"
 #include <SDL_loadso.h>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -24,6 +25,7 @@
 #include <sys/mman.h>
 #endif
 #include <array>
+#include <cmath>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -132,6 +134,20 @@ public:
                 VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &hostProperties};
                 function<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(context.physical, &properties);
                 context.hostImportAlignment = hostProperties.minImportedHostPointerAlignment;
+            }
+            // Sampled views apply a texture descriptor's MIN_LOD through VK_EXT_image_view_min_lod.
+            VkPhysicalDeviceImageViewMinLodFeaturesEXT minLod{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
+            if (hasExtension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &minLod};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                context.imageViewMinLod = minLod.minLod == VK_TRUE;
+            }
+            minLod = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
+            minLod.minLod = VK_TRUE;
+            if (context.imageViewMinLod) {
+                extensionsEnabled.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+                minLod.pNext = address.pNext;
+                address.pNext = &minLod;
             }
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             device.queueCreateInfoCount = 1;
@@ -1148,6 +1164,157 @@ void dataRefreshTests(const Device& device, Recorder& recorder) {
 
 }
 
+// A texture descriptor's MIN_LOD clamp, applied by the sampled view (VK_EXT_image_view_min_lod):
+// every mip of the surface holds its own constant, and a sample at an explicit LOD reads the level
+// the clamp selects. The clamp counts levels of the whole surface, may be fractional (a linear mip
+// filter blends the two levels around it) and never lowers an LOD already above it.
+void minLodTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (!context.imageViewMinLod) {
+        std::cout << "VK_EXT_image_view_min_lod unavailable: minimum LOD clamp not tested\n";
+        return;
+    }
+    TextureDetiler detiler(context);
+    GuestTextureResource resource{};
+    resource.baseAddress = 0x100000;
+    resource.width = 8;
+    resource.height = 8;
+    resource.mipCount = 4;
+    resource.baseLevel = 0;
+    resource.lastLevel = 3;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto geometry = DescribeSurface(resource);
+    Require(geometry.mips.size() == 4, "the min LOD test surface has an unexpected mip count");
+    const std::array<std::uint8_t, 4> levels{0x00, 0x40, 0x80, 0xff};
+    std::vector<std::byte> snapshot(static_cast<std::size_t>(geometry.guestBytes));
+    for (std::size_t level = 0; level < levels.size(); ++level) {
+        const auto& mip = geometry.mips[level];
+        std::fill_n(snapshot.begin() + static_cast<std::ptrdiff_t>(mip.tiledOffset), static_cast<std::size_t>(mip.tiledSize), std::byte{levels[level]});
+    }
+
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    bindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    layoutInfo.bindingCount = 2;
+    layoutInfo.pBindings = bindings;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &setLayout), "vkCreateDescriptorSetLayout");
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float)};
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &setLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &push;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &pipelineLayoutInfo, nullptr, &pipelineLayout), "vkCreatePipelineLayout");
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = sizeof(SAMPLE_LOD_SPV);
+    moduleInfo.pCode = SAMPLE_LOD_SPV;
+    VkShaderModule module = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+    pipelineInfo.layout = pipelineLayout;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines");
+    VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    samplerInfo.magFilter = VK_FILTER_NEAREST;
+    samplerInfo.minFilter = VK_FILTER_NEAREST;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateSampler>("vkCreateSampler")(context.device, &samplerInfo, nullptr, &sampler), "vkCreateSampler");
+    const VkDescriptorPoolSize sizes[2]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 2;
+    poolInfo.pPoolSizes = sizes;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool");
+    struct Release {
+        const Context& context;
+        VkDescriptorSetLayout setLayout;
+        VkPipelineLayout pipelineLayout;
+        VkShaderModule module;
+        VkPipeline pipeline;
+        VkSampler sampler;
+        VkDescriptorPool pool;
+        ~Release() {
+            context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+            context.Function<PFN_vkDestroySampler>("vkDestroySampler")(context.device, sampler, nullptr);
+            context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+            context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, pipelineLayout, nullptr);
+            context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, setLayout, nullptr);
+        }
+    } release{context, setLayout, pipelineLayout, module, pipeline, sampler, pool};
+    Buffer result(context, sizeof(float) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+
+    // The red channel a sample at `lod` reads through a view of the surface with MIN_LOD `minLod`
+    // (u4.8) and levels base..last.
+    const auto sample = [&](std::uint32_t minLod, float lod, std::uint32_t baseLevel = 0) {
+        auto described = resource;
+        described.minLod = minLod;
+        described.baseLevel = baseLevel;
+        Texture texture(context, detiler, described, identity, snapshot);
+        VkDescriptorSetAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocateInfo.descriptorPool = pool;
+        allocateInfo.descriptorSetCount = 1;
+        allocateInfo.pSetLayouts = &setLayout;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocateInfo, &set), "vkAllocateDescriptorSets");
+        const VkDescriptorImageInfo image{sampler, texture.View(), texture.Layout()};
+        const VkDescriptorBufferInfo buffer{result.Handle(), 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet writes[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        writes[0].dstSet = set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].pImageInfo = &image;
+        writes[1].dstSet = set;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &buffer;
+        context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 2, writes, 0, nullptr);
+        const auto commands = recorder.Commands();
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &set, 0, nullptr);
+        context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(lod), &lod);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Submit();
+        recorder.Sync();
+        Check(context.Function<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets")(context.device, pool, 1, &set), "vkFreeDescriptorSets");
+        float texel[4];
+        std::memcpy(texel, result.Bytes().data(), sizeof(texel));
+        return texel[0];
+    };
+    const auto expect = [&](float got, float want, const char* what) {
+        if (std::abs(got - want) > 1.5f / 255.0f) throw std::runtime_error(std::string("minimum LOD clamp: ") + what + ": read " + std::to_string(got) + ", expected " + std::to_string(want));
+    };
+    const auto unorm = [&](std::size_t level) { return levels[level] / 255.0f; };
+    expect(sample(0, 0.0f), unorm(0), "no clamp reads level 0");
+    expect(sample(0x100, 0.0f), unorm(1), "MIN_LOD 1 reads level 1 at LOD 0");
+    expect(sample(0x180, 0.0f), (unorm(1) + unorm(2)) / 2.0f, "MIN_LOD 1.5 blends levels 1 and 2");
+    expect(sample(0x100, 2.0f), unorm(2), "MIN_LOD 1 lowered LOD 2");
+    expect(sample(0xfff, 0.0f), unorm(3), "MIN_LOD past the last level reads the last level");
+    // Levels count from the surface's first mip, not the view's: MIN_LOD 2 over a view starting at
+    // level 1 reads level 2 at LOD 0, and MIN_LOD 1 there binds nothing.
+    expect(sample(0x200, 0.0f, 1), unorm(2), "MIN_LOD 2 over a view from level 1 reads level 2");
+    expect(sample(0x100, 0.0f, 1), unorm(1), "MIN_LOD at the view's base level reads its base level");
+}
+
 int main() {
     try {
         Device device;
@@ -1170,6 +1337,7 @@ int main() {
         storageRefreshTests(device, recorder, true);
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
+        minLodTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {

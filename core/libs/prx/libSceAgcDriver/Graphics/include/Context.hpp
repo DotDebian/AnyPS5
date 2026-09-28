@@ -129,6 +129,9 @@ struct Context {
     bool primitiveListRestart = false;
     // The depthBiasClamp feature (PA_SU_POLY_OFFSET_CLAMP).
     bool depthBiasClamp = false;
+    // VK_EXT_image_view_min_lod with minLod enabled: sampled views clamp their level of detail as a
+    // texture descriptor's MIN_LOD does.
+    bool imageViewMinLod = false;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

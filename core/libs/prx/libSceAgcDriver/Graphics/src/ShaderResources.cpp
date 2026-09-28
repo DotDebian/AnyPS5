@@ -2384,6 +2384,8 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
         if (binding.imageShape.has_value()) Require(MatchesGuestDimension(*binding.imageShape, resource.dimension), "guest storage texture dimension disagrees with the shader's declared image shape");
         const auto mip = std::min(resource.baseLevel + mipOffset, resource.mipCount - 1u);
+        // A storage view addresses one level; a MIN_LOD clamp at or below it cannot change the level.
+        Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());

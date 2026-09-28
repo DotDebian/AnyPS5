@@ -180,9 +180,29 @@ void RunGuestTextureResourceTests() {
     zeroAddress.base40 = 0;
     rejectFields(zeroAddress, "null base address");
 
-    Fields badMinLod = base;
-    badMinLod.minLod = 1;
-    rejectFields(badMinLod, "nonzero minimum LOD clamp");
+    // MIN_LOD (u4.8, whole-surface levels) decodes; the clamp a view applies is what can bind: above
+    // BASE_LEVEL, at most the view's last level.
+    Fields minLod = base;
+    minLod.maxMip = 4;
+    minLod.baseLevel = 1;
+    minLod.lastLevel = 3;
+    minLod.minLod = 0x180;
+    auto clamped = DecodeTextureResource(pack(minLod));
+    Require(clamped.minLod == 0x180 && EffectiveMinLod(clamped) == 1.5f, "MIN_LOD 1.5 over levels 1..3 did not clamp at 1.5");
+    minLod.minLod = 0x100;
+    clamped = DecodeTextureResource(pack(minLod));
+    Require(EffectiveMinLod(clamped) == 0.0f, "MIN_LOD at BASE_LEVEL cannot bind but was applied");
+    minLod.minLod = 0x0c0;
+    clamped = DecodeTextureResource(pack(minLod));
+    Require(EffectiveMinLod(clamped) == 0.0f, "MIN_LOD below BASE_LEVEL cannot bind but was applied");
+    minLod.minLod = 0xfff;
+    clamped = DecodeTextureResource(pack(minLod));
+    Require(EffectiveMinLod(clamped) == 3.0f, "MIN_LOD past the view's last level was not bounded by it");
+    minLod.baseLevel = 0;
+    minLod.minLod = 0x001;
+    clamped = DecodeTextureResource(pack(minLod));
+    Require(EffectiveMinLod(clamped) == 1.0f / 256.0f, "the smallest MIN_LOD step above level 0 was lost");
+    Require(DecodeTextureResource(pack(base)).minLod == 0 && EffectiveMinLod(DecodeTextureResource(pack(base))) == 0.0f, "an unclamped descriptor gained a MIN_LOD");
 
     // Streaming feedback fields decode; nothing is reported back.
     Fields feedback = base;

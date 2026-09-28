@@ -60,7 +60,14 @@ struct GuestTextureResource {
     // DCC metadata of a compressed surface, or 0 (see DccMetadata.hpp).
     std::uint64_t dccAddress = 0;
     bool dccAlphaOnMsb = false;
+    // MIN_LOD: the lowest level of detail a sample may select, unsigned 4.8 fixed point in levels of
+    // the whole surface (not of the view: level 0 is the surface's first mip, as BASE_LEVEL counts).
+    std::uint32_t minLod = 0;
 };
+
+// The MIN_LOD clamp a sampled view must apply, in surface levels, or 0 when the clamp cannot change
+// which level a sample reads: every level the view exposes is at or above it.
+float EffectiveMinLod(const GuestTextureResource& resource);
 
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words);
 bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, TextureDimension dimension);

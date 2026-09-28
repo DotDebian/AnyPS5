@@ -188,6 +188,7 @@ struct VulkanDevice::State {
     bool descriptorIndexing = false;
     bool primitiveListRestart = false;
     bool depthClipControl = false;
+    bool imageViewMinLod = false;
     bool depthClamp = false;
     bool depthBiasClamp = false;
     VkDeviceSize hostImportAlignment = 0;
@@ -742,6 +743,16 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     listRestartFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT};
     listRestartFeatures.primitiveTopologyListRestart = state->primitiveListRestart ? VK_TRUE : VK_FALSE;
+    // Texture descriptors' MIN_LOD clamp maps onto the image view's minimum LOD.
+    VkPhysicalDeviceImageViewMinLodFeaturesEXT minLodFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
+    if (hasExtension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &minLodFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        state->imageViewMinLod = minLodFeatures.minLod == VK_TRUE;
+        if (state->imageViewMinLod) deviceExtensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    }
+    minLodFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
+    minLodFeatures.minLod = VK_TRUE;
     VkPhysicalDeviceDepthClipControlFeaturesEXT depthClipFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
     if (hasExtension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &depthClipFeatures};
@@ -835,6 +846,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (state->primitiveListRestart) {
         listRestartFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &listRestartFeatures;
+    }
+    if (state->imageViewMinLod) {
+        minLodFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
+        deviceInfo.pNext = &minLodFeatures;
     }
     byteFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
     if (state->fragmentShaderBarycentric) {
@@ -2179,6 +2194,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.descriptorIndexing = state->descriptorIndexing;
     context.primitiveListRestart = state->primitiveListRestart;
     context.depthBiasClamp = state->depthBiasClamp;
+    context.imageViewMinLod = state->imageViewMinLod;
     return context;
 }
 
