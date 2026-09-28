@@ -159,9 +159,15 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 struct ShaderPixelInputInfo {
     std::uint32_t interpolatorSettings[32] = {0};
     std::uint32_t inputNum = 0;
-    std::uint32_t psSystemInputBase = 0;
     std::uint32_t customInterpolationMask = 0;
-    std::uint32_t psPerspectiveCenterVgpr = std::numeric_limits<std::uint32_t>::max();
+    // The first VGPR of each loaded SPI_PS_INPUT_ENA/ADDR input (indexed by PixelInput), or
+    // NoPixelInputVgpr for an input the SPI does not load.
+    static constexpr std::uint32_t NoPixelInputVgpr = std::numeric_limits<std::uint32_t>::max();
+    std::array<std::uint32_t, 16> psInputVgpr = [] {
+        std::array<std::uint32_t, 16> vgprs{};
+        vgprs.fill(NoPixelInputVgpr);
+        return vgprs;
+    }();
     std::uint8_t targetOutputMode[8] = {};
     std::array<ShaderColorComponentMapping, 8> targetExportMapping = {};
     std::uint32_t scratchSizeDwords = 0;

@@ -1355,7 +1355,7 @@ private:
         if (z.address != w.address || z.stencilAddress != w.stencilAddress || z.htileAddress != w.htileAddress || z.extent.width != w.extent.width || z.extent.height != w.extent.height || z.zFormat != w.zFormat || z.stencil != w.stencil || z.tileMode != w.tileMode || z.slice != w.slice) return false;
         const auto& p = a.pixel;
         const auto& q = b.pixel;
-        if (p.interpolatorCount != q.interpolatorCount || p.interpolatorSettings != q.interpolatorSettings || p.wave32 != q.wave32 || p.perspectiveCenterVgpr != q.perspectiveCenterVgpr || p.hasPerspectiveCenterVgpr != q.hasPerspectiveCenterVgpr || p.posX != q.posX || p.posY != q.posY || p.posZ != q.posZ || p.posW != q.posW || p.frontFace != q.frontFace || p.ancillary != q.ancillary || p.sampleShading != q.sampleShading || p.noPerspective != q.noPerspective || p.pixelKillEnable != q.pixelKillEnable || p.depthExportEnable != q.depthExportEnable || p.sampleMaskExportEnable != q.sampleMaskExportEnable || p.earlyZ != q.earlyZ || p.executeOnNoop != q.executeOnNoop || p.targetOutputMode != q.targetOutputMode || p.targetExportMapping != q.targetExportMapping) return false;
+        if (p.interpolatorCount != q.interpolatorCount || p.interpolatorSettings != q.interpolatorSettings || p.wave32 != q.wave32 || p.inputAddr != q.inputAddr || p.hasPerspectiveCenterVgpr != q.hasPerspectiveCenterVgpr || p.perspectiveCentroid != q.perspectiveCentroid || p.posX != q.posX || p.posY != q.posY || p.posZ != q.posZ || p.posW != q.posW || p.frontFace != q.frontFace || p.ancillary != q.ancillary || p.sampleShading != q.sampleShading || p.noPerspective != q.noPerspective || p.linearCentroid != q.linearCentroid || p.pixelKillEnable != q.pixelKillEnable || p.depthExportEnable != q.depthExportEnable || p.sampleMaskExportEnable != q.sampleMaskExportEnable || p.earlyZ != q.earlyZ || p.executeOnNoop != q.executeOnNoop || p.targetOutputMode != q.targetOutputMode || p.targetExportMapping != q.targetExportMapping) return false;
         if (a.roles != b.roles || a.programs.size() != b.programs.size()) return false;
         for (std::size_t i = 0; i < a.programs.size(); ++i) {
             const auto& x = a.programs[i];
@@ -4279,8 +4279,8 @@ private:
                 require(pixel.interpolatorCount <= pixel.interpolatorSettings.size(), "pixel stage info interpolator count exceeds its table");
                 mix(pixel.interpolatorCount);
                 for (std::uint32_t i = 0; i < pixel.interpolatorCount; ++i) mix(pixel.interpolatorSettings[i]);
-                mix(pixel.perspectiveCenterVgpr);
-                for (const bool flag : {pixel.wave32, pixel.hasPerspectiveCenterVgpr, pixel.posX, pixel.posY, pixel.posZ, pixel.posW, pixel.frontFace, pixel.ancillary, pixel.sampleShading, pixel.noPerspective, pixel.pixelKillEnable, pixel.depthExportEnable, pixel.sampleMaskExportEnable, pixel.earlyZ, pixel.executeOnNoop}) mix(flag);
+                mix(pixel.inputAddr);
+                for (const bool flag : {pixel.wave32, pixel.hasPerspectiveCenterVgpr, pixel.perspectiveCentroid, pixel.posX, pixel.posY, pixel.posZ, pixel.posW, pixel.frontFace, pixel.ancillary, pixel.sampleShading, pixel.noPerspective, pixel.linearCentroid, pixel.pixelKillEnable, pixel.depthExportEnable, pixel.sampleMaskExportEnable, pixel.earlyZ, pixel.executeOnNoop}) mix(flag);
                 for (const auto value : pixel.targetOutputMode) mix(value);
                 for (const auto value : pixel.targetExportMapping) mix(value);
                 std::lock_guard cacheLock(drawCacheMutex);

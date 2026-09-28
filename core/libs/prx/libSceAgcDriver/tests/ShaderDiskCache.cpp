@@ -358,6 +358,30 @@ void verifyKeySensitivity() {
     changes("an image cube flag", [](SampleRequest& sample) { sample.specialization.images[0].cube = true; });
     changes("an image FMASK flag", [](SampleRequest& sample) { sample.specialization.images[0].fmask = true; });
     changes("the image count", [](SampleRequest& sample) { sample.specialization.images.emplace_back(); });
+    // The pixel input layout: SPI_PS_INPUT_ADDR and the centroid inputs place the VGPRs the entry fills.
+    const auto fragment = [](SampleRequest& sample) {
+        sample.request.shader.stage = ShaderStage::Fragment;
+        sample.request.context.compute.reset();
+        ShaderPixelStageInfo pixel{};
+        pixel.inputAddr = 0x302u;
+        pixel.hasPerspectiveCenterVgpr = pixel.posX = pixel.posY = true;
+        pixel.targetOutputMode[0] = 9;
+        sample.request.context.pixel = pixel;
+    };
+    SampleRequest pixelBase;
+    fragment(pixelBase);
+    const auto pixelKey = pixelBase.Key();
+    const auto pixelChanges = [&](const std::string& what, const std::function<void(ShaderPixelStageInfo&)>& change) {
+        SampleRequest sample;
+        fragment(sample);
+        change(*sample.request.context.pixel);
+        require(sample.Key() != pixelKey, "the key ignores " + what);
+    };
+    pixelChanges("SPI_PS_INPUT_ADDR", [](ShaderPixelStageInfo& pixel) { pixel.inputAddr |= 0x4u; });
+    pixelChanges("PERSP_CENTROID", [](ShaderPixelStageInfo& pixel) { pixel.inputAddr |= 0x4u; pixel.perspectiveCentroid = true; });
+    pixelChanges("LINEAR_CENTROID", [](ShaderPixelStageInfo& pixel) { pixel.inputAddr |= 0x40u; pixel.linearCentroid = true; });
+    pixelChanges("LINEAR_CENTROID alone", [](ShaderPixelStageInfo& pixel) { pixel.linearCentroid = true; });
+    pixelChanges("PERSP_CENTROID alone", [](ShaderPixelStageInfo& pixel) { pixel.perspectiveCentroid = true; });
     changes("the bound descriptors", [](SampleRequest& sample) { sample.specialization.boundDescriptors.push_back(1); });
 
     // The captured words reach a variant only through the specialization (formats, strides, image

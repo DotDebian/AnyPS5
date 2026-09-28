@@ -1,4 +1,5 @@
 #include "Translation/InstructionTranslator.hpp"
+#include "Recompiler.hpp"
 #include "Translation/DispatchInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace ShaderRecompiler {
 
@@ -297,30 +299,37 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         entryIr.SetVectorReg(static_cast<VectorReg>(8), builtin(StageInputKind::PrimitiveId));
     } else if (options.stage == ShaderStageKind::Pixel) {
         const auto* ps = options.inputInfo.pixel;
-        if (options.fragmentShaderBarycentricEnabled && ps->psPerspectiveCenterVgpr != std::numeric_limits<std::uint32_t>::max()) {
-            entryIr.SetVectorReg(static_cast<VectorReg>(ps->psPerspectiveCenterVgpr), builtin(StageInputKind::BaryCoordSmooth, 0u));
-            entryIr.SetVectorReg(static_cast<VectorReg>(ps->psPerspectiveCenterVgpr + 1u), builtin(StageInputKind::BaryCoordSmooth, 1u));
+        const auto vgpr = [&](PixelInput input) { return ps->psInputVgpr[static_cast<std::uint32_t>(input)]; };
+        const auto loaded = [&](PixelInput input) { return vgpr(input) != ShaderPixelInputInfo::NoPixelInputVgpr; };
+        if (options.fragmentShaderBarycentricEnabled) {
+            // The I/J pairs as the barycentrics of vertices 1 and 2. Draws are single-sampled, where
+            // the centroid is the pixel center, so the centroid pairs carry the center values.
+            for (const auto [input, kind] : {std::pair{PixelInput::PerspectiveCenter, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::PerspectiveCentroid, StageInputKind::BaryCoordSmooth},
+                                             std::pair{PixelInput::LinearCenter, StageInputKind::BaryCoordNoPerspective}, std::pair{PixelInput::LinearCentroid, StageInputKind::BaryCoordNoPerspective}}) {
+                if (!loaded(input)) continue;
+                entryIr.SetVectorReg(static_cast<VectorReg>(vgpr(input)), builtin(kind, 0u));
+                entryIr.SetVectorReg(static_cast<VectorReg>(vgpr(input) + 1u), builtin(kind, 1u));
+            }
         }
-        std::uint32_t reg = ps->psSystemInputBase;
-        if (ps->psPosX) {
-            entryIr.SetVectorReg(static_cast<VectorReg>(reg++), builtin(StageInputKind::FragCoord, 0u));
+        if (loaded(PixelInput::PositionX)) {
+            entryIr.SetVectorReg(static_cast<VectorReg>(vgpr(PixelInput::PositionX)), builtin(StageInputKind::FragCoord, 0u));
         }
-        if (ps->psPosY) {
-            entryIr.SetVectorReg(static_cast<VectorReg>(reg++), builtin(StageInputKind::FragCoord, 1u));
+        if (loaded(PixelInput::PositionY)) {
+            entryIr.SetVectorReg(static_cast<VectorReg>(vgpr(PixelInput::PositionY)), builtin(StageInputKind::FragCoord, 1u));
         }
-        if (ps->psPosZ) {
-            entryIr.SetVectorReg(static_cast<VectorReg>(reg++), builtin(StageInputKind::FragCoord, 2u));
+        if (loaded(PixelInput::PositionZ)) {
+            entryIr.SetVectorReg(static_cast<VectorReg>(vgpr(PixelInput::PositionZ)), builtin(StageInputKind::FragCoord, 2u));
         }
-        if (ps->psPosW) {
+        if (loaded(PixelInput::PositionW)) {
             IrValue& reciprocalW = entryIr.BitCastF32(builtin(StageInputKind::FragCoord, 3u));
             IrValue& w = entryIr.Emit(IrOpcode::FPRecip32, IrOpcodeType(IrOpcode::FPRecip32), {&reciprocalW});
-            entryIr.SetVectorReg(static_cast<VectorReg>(reg++), entryIr.BitCastU32(w));
+            entryIr.SetVectorReg(static_cast<VectorReg>(vgpr(PixelInput::PositionW)), entryIr.BitCastU32(w));
         }
-        if (ps->psFrontFace) {
-            entryIr.SetVectorReg(static_cast<VectorReg>(reg++), builtin(StageInputKind::FrontFacing));
+        if (loaded(PixelInput::FrontFace)) {
+            entryIr.SetVectorReg(static_cast<VectorReg>(vgpr(PixelInput::FrontFace)), builtin(StageInputKind::FrontFacing));
         }
-        if (ps->psAncillary) {
-            entryIr.SetVectorReg(static_cast<VectorReg>(reg), builtin(StageInputKind::PackedAncillary));
+        if (loaded(PixelInput::Ancillary)) {
+            entryIr.SetVectorReg(static_cast<VectorReg>(vgpr(PixelInput::Ancillary)), builtin(StageInputKind::PackedAncillary));
         }
     } else if (options.stage == ShaderStageKind::Vertex) {
         entryIr.SetVectorReg(static_cast<VectorReg>(5), builtin(StageInputKind::VertexIndex));

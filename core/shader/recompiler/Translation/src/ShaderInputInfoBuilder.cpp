@@ -102,9 +102,24 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             pixelStorage.interpolatorSettings[i] = pixel.interpolatorSettings[i];
         }
         pixelStorage.inputNum = pixel.interpolatorCount;
-        if (pixel.hasPerspectiveCenterVgpr) {
-            pixelStorage.psPerspectiveCenterVgpr = pixel.perspectiveCenterVgpr;
-        }
+        // The SPI loads each input ENA & ADDR names at its place in the ADDR layout.
+        const auto place = [&](PixelInput input, bool loaded) {
+            if (!loaded) return;
+            if ((pixel.inputAddr & PixelInputBit(input)) == 0u) {
+                throw std::runtime_error("ShaderInputInfoBuilder: a loaded pixel input is missing from SPI_PS_INPUT_ADDR");
+            }
+            pixelStorage.psInputVgpr[static_cast<std::uint32_t>(input)] = PixelInputVgpr(pixel.inputAddr, input);
+        };
+        place(PixelInput::PerspectiveCenter, pixel.hasPerspectiveCenterVgpr);
+        place(PixelInput::PerspectiveCentroid, pixel.perspectiveCentroid);
+        place(PixelInput::LinearCenter, pixel.noPerspective);
+        place(PixelInput::LinearCentroid, pixel.linearCentroid);
+        place(PixelInput::PositionX, pixel.posX);
+        place(PixelInput::PositionY, pixel.posY);
+        place(PixelInput::PositionZ, pixel.posZ);
+        place(PixelInput::PositionW, pixel.posW);
+        place(PixelInput::FrontFace, pixel.frontFace);
+        place(PixelInput::Ancillary, pixel.ancillary);
         for (std::uint32_t i = 0; i < 8; ++i) {
             pixelStorage.targetOutputMode[i] = pixel.targetOutputMode[i];
             pixelStorage.targetExportMapping[i].packed = pixel.targetExportMapping[i];

@@ -108,8 +108,9 @@ private:
         if (value.interpolatorCount > value.interpolatorSettings.size()) throw std::runtime_error("Shader cache: invalid interpolator count");
         for (std::uint32_t i = 0; i < value.interpolatorCount; ++i) append(key, value.interpolatorSettings[i]);
         append(key, value.wave32);
-        append(key, value.perspectiveCenterVgpr);
+        append(key, value.inputAddr);
         append(key, value.hasPerspectiveCenterVgpr);
+        append(key, value.perspectiveCentroid);
         append(key, value.posX);
         append(key, value.posY);
         append(key, value.posZ);
@@ -118,6 +119,7 @@ private:
         append(key, value.ancillary);
         append(key, value.sampleShading);
         append(key, value.noPerspective);
+        append(key, value.linearCentroid);
         append(key, value.pixelKillEnable);
         append(key, value.depthExportEnable);
         append(key, value.sampleMaskExportEnable);

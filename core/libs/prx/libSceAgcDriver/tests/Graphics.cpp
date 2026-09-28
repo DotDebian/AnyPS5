@@ -6,7 +6,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
+#include "ControlFlow/RequestSerializer.hpp"
 #include <spirv/unified1/spirv.hpp>
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <type_traits>
@@ -413,6 +416,101 @@ void ShaderStageTests() {
     queue.context[0x2d5] = 0x2000;
     queue.context.erase(0x1b6);
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register");
+}
+
+// Recompiles a pixel shader that exports v<source> to MRT0 under SPI_PS_INPUT_ENA/ADDR and returns
+// the builtins its SPIR-V reads (the loads and access chains of builtin input variables).
+std::vector<spv::BuiltIn> pixelBuiltinsRead(std::uint32_t ena, std::uint32_t addr, std::uint32_t source) {
+    auto queue = makeState();
+    queue.context[0x1b3] = ena;
+    queue.context[0x1b4] = addr;
+    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, true, 0xe4u);
+    // exp mrt0 v<source> x4 done vm; s_endpgm.
+    const std::array<std::uint32_t, 3> code{0xf800180fu, source * 0x01010101u, 0xbf810000u};
+    ShaderRecompiler::RecompileRequest request{};
+    request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x30000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.pixel = pixel;
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.target.fragmentShaderBarycentricEnabled = true;
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    const auto result = ShaderRecompiler::Recompile(request);
+    const auto& words = result.spirv.Words();
+    std::map<std::uint32_t, spv::BuiltIn> builtins;
+    std::vector<spv::BuiltIn> read;
+    for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
+        const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+        if (op == spv::OpDecorate && words[at + 2] == spv::DecorationBuiltIn) builtins[words[at + 1]] = static_cast<spv::BuiltIn>(words[at + 3]);
+        if (op != spv::OpLoad && op != spv::OpAccessChain && op != spv::OpInBoundsAccessChain) continue;
+        const auto found = builtins.find(words[at + 3]);
+        if (found != builtins.end() && std::find(read.begin(), read.end(), found->second) == read.end()) read.push_back(found->second);
+    }
+    return read;
+}
+
+bool readsBuiltin(const std::vector<spv::BuiltIn>& read, spv::BuiltIn builtin) {
+    return std::find(read.begin(), read.end(), builtin) != read.end();
+}
+
+// SPI_PS_INPUT_ADDR lays the input VGPRs out (I/J pairs, then POS_X...), ENA & ADDR loads them.
+void pixelInputLayoutTests() {
+    using ShaderRecompiler::PixelInput;
+    using ShaderRecompiler::PixelInputVgpr;
+    auto queue = makeState();
+    const auto decode = [&](std::uint32_t ena, std::uint32_t addr) {
+        queue.context[0x1b3] = ena;
+        queue.context[0x1b4] = addr;
+        return AgcDriver::Graphics::DecodePixelStageInfo(queue.context, true, 0xe4u);
+    };
+    // Astro Bot's PERSP_CENTER | PERSP_CENTROID | LINEAR_CENTER | POS_X | POS_Y: three I/J pairs
+    // before the position.
+    auto pixel = decode(0x326u, 0x326u);
+    Require(pixel.inputAddr == 0x326u && pixel.hasPerspectiveCenterVgpr && pixel.perspectiveCentroid && pixel.noPerspective && !pixel.linearCentroid && pixel.posX && pixel.posY && !pixel.posZ, "the centroid input flags were not decoded");
+    Require(PixelInputVgpr(pixel.inputAddr, PixelInput::PerspectiveCenter) == 0u && PixelInputVgpr(pixel.inputAddr, PixelInput::PerspectiveCentroid) == 2u && PixelInputVgpr(pixel.inputAddr, PixelInput::LinearCenter) == 4u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionX) == 6u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionY) == 7u, "the centroid layout moved the inputs");
+    pixel = decode(0x1146u, 0x1146u);
+    Require(pixel.linearCentroid && !pixel.noPerspective && PixelInputVgpr(pixel.inputAddr, PixelInput::LinearCentroid) == 4u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionX) == 6u && PixelInputVgpr(pixel.inputAddr, PixelInput::FrontFace) == 7u, "the linear centroid layout moved the inputs");
+    // An input only ADDR names keeps its VGPRs unloaded, whatever it is (PERSP_SAMPLE, the 3-VGPR
+    // pull model, POS_Y).
+    pixel = decode(0x506u, 0x7afu);
+    Require(pixel.inputAddr == 0x7afu && !pixel.posY && pixel.posZ && PixelInputVgpr(pixel.inputAddr, PixelInput::PerspectiveCentroid) == 4u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionX) == 12u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionZ) == 14u, "ADDR-only inputs did not reserve their VGPRs");
+    // Loading an input with no translation is still refused.
+    for (const auto bit : {0x8u, 0x80u, 0x4000u, 0x8000u}) {
+        expectFailure([&] { static_cast<void>(decode(0x2u | bit, 0x2u | bit)); }, "unsupported SPI_PS_INPUT_ENA/ADDR");
+    }
+    // The layout survives request serialization.
+    pixel = decode(0x546u, 0x7c7u);
+    {
+        ShaderRecompiler::RecompileRequest request{};
+        const std::array<std::uint32_t, 1> code{0xbf810000u};
+        request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x30000u, code, 0, {}};
+        request.context.waveSize = 64;
+        request.context.pixel = pixel;
+        const ShaderRecompiler::RequestSerializer serializer;
+        const auto back = serializer.Deserialize(serializer.Serialize(request));
+        const auto& p = *back.request.context.pixel;
+        Require(p.inputAddr == 0x7c7u && p.hasPerspectiveCenterVgpr && p.perspectiveCentroid && p.linearCentroid && !p.noPerspective && p.posX && !p.posY && p.posZ, "the pixel input layout did not survive serialization");
+    }
+    // The recompiled entry fills the VGPRs at those places: with PERSP_CENTER | PERSP_CENTROID |
+    // POS_X, v2/v3 carry the (center) barycentrics and POS_X lands in v4, not v0.
+    for (const auto source : {0u, 2u, 3u}) {
+        const auto read = pixelBuiltinsRead(0x106u, 0x106u, source);
+        Require(readsBuiltin(read, spv::BuiltInBaryCoordKHR) && !readsBuiltin(read, spv::BuiltInFragCoord), "a centroid-layout I/J VGPR does not hold the barycentrics: v" + std::to_string(source));
+    }
+    auto read = pixelBuiltinsRead(0x106u, 0x106u, 4u);
+    Require(readsBuiltin(read, spv::BuiltInFragCoord) && !readsBuiltin(read, spv::BuiltInBaryCoordKHR), "POS_X is not in v4 after the center and centroid pairs");
+    // The game's layout: LINEAR_CENTER's pair holds the linear barycentrics, POS_X is v6.
+    read = pixelBuiltinsRead(0x326u, 0x326u, 5u);
+    Require(readsBuiltin(read, spv::BuiltInBaryCoordNoPerspKHR) && !readsBuiltin(read, spv::BuiltInFragCoord), "LINEAR_CENTER's J is not v5");
+    read = pixelBuiltinsRead(0x326u, 0x326u, 6u);
+    Require(readsBuiltin(read, spv::BuiltInFragCoord) && !readsBuiltin(read, spv::BuiltInBaryCoordKHR) && !readsBuiltin(read, spv::BuiltInBaryCoordNoPerspKHR), "POS_X is not in v6 after three I/J pairs");
+    // An ADDR-only PERSP_CENTROID still pushes POS_X to v4, and its pair stays unloaded.
+    read = pixelBuiltinsRead(0x102u, 0x106u, 4u);
+    Require(readsBuiltin(read, spv::BuiltInFragCoord), "an ADDR-only centroid pair did not reserve v2/v3");
+    read = pixelBuiltinsRead(0x102u, 0x106u, 2u);
+    Require(!readsBuiltin(read, spv::BuiltInFragCoord) && !readsBuiltin(read, spv::BuiltInBaryCoordKHR), "an ADDR-only centroid pair was loaded");
 }
 
 void DisabledColorTests() {
@@ -1475,6 +1573,7 @@ int main() {
         DepthClipTests();
         DisabledColorTests();
         ShaderStageTests();
+        pixelInputLayoutTests();
         InitialContextTests();
         pushConstantTests();
         resourceTests();

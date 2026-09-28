@@ -92,8 +92,15 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     }
     const auto ena = read(context, spiPsInputEna, RegisterBank::Context);
     const auto addr = read(context, spiPsInputAddr, RegisterBank::Context);
+    // ADDR fixes the VGPR layout and ENA & ADDR the inputs loaded into it (see PixelInputVgpr): an
+    // input only ADDR names reserves its VGPRs, whatever it is.
     const auto activeInputs = ena & addr;
-    constexpr std::uint32_t knownMask = 0x1u | 0x2u | 0x10u | 0x20u | 0x100u | 0x200u | 0x400u | 0x800u | 0x1000u | 0x2000u;
+    using ShaderRecompiler::PixelInput;
+    using ShaderRecompiler::PixelInputBit;
+    constexpr std::uint32_t knownMask = PixelInputBit(PixelInput::PerspectiveSample) | PixelInputBit(PixelInput::PerspectiveCenter) | PixelInputBit(PixelInput::PerspectiveCentroid) |
+        PixelInputBit(PixelInput::LinearSample) | PixelInputBit(PixelInput::LinearCenter) | PixelInputBit(PixelInput::LinearCentroid) |
+        PixelInputBit(PixelInput::PositionX) | PixelInputBit(PixelInput::PositionY) | PixelInputBit(PixelInput::PositionZ) | PixelInputBit(PixelInput::PositionW) |
+        PixelInputBit(PixelInput::FrontFace) | PixelInputBit(PixelInput::Ancillary);
     if ((activeInputs & ~knownMask) != 0) {
         char message[128];
         std::snprintf(message, sizeof(message), "AGC graphics: unsupported SPI_PS_INPUT_ENA/ADDR bit combination (ena 0x%x addr 0x%x)", ena, addr);
@@ -114,7 +121,6 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     for (std::uint32_t i = 0; i < 8u; ++i) {
         targetOutputMode[i] = static_cast<std::uint8_t>((colFormat >> (4u * i)) & 0xFu);
     }
-    const bool hasPerspectiveCenterVgpr = (activeInputs & 0x2u) != 0;
     const bool pixelKillEnable = ((shaderControl >> 6u) & 0x1u) != 0;
     const bool depthExportEnable = (shaderControl & 0x1u) != 0;
     const bool sampleMaskExportEnable = ((shaderControl >> 8u) & 0x1u) != 0;
@@ -124,27 +130,30 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     if (hasColorTarget) {
         targetExportMapping[0] = colorComponentMapping;
     }
+    const auto loaded = [&](PixelInput input) { return (activeInputs & PixelInputBit(input)) != 0; };
     return ShaderRecompiler::ShaderPixelStageInfo{
-        inputNum,
-        interpolatorSettings,
-        (inControl & 0x8000u) != 0,
-        hasPerspectiveCenterVgpr ? ((activeInputs & 0x1u) ? 2u : 0u) : 0u,
-        hasPerspectiveCenterVgpr,
-        (activeInputs & 0x100u) != 0,
-        (activeInputs & 0x200u) != 0,
-        (activeInputs & 0x400u) != 0,
-        (activeInputs & 0x800u) != 0,
-        (activeInputs & 0x1000u) != 0,
-        (activeInputs & 0x2000u) != 0,
-        (activeInputs & 0x11u) == 0x11u,
-        (activeInputs & 0x20u) != 0,
-        pixelKillEnable,
-        depthExportEnable,
-        sampleMaskExportEnable,
-        zOrder == 1u && !pixelKillEnable && !depthExportEnable && !sampleMaskExportEnable,
-        ((shaderControl >> 10u) & 0x1u) != 0,
-        targetOutputMode,
-        targetExportMapping
+        .interpolatorCount = inputNum,
+        .interpolatorSettings = interpolatorSettings,
+        .wave32 = (inControl & 0x8000u) != 0,
+        .inputAddr = addr,
+        .hasPerspectiveCenterVgpr = loaded(PixelInput::PerspectiveCenter),
+        .perspectiveCentroid = loaded(PixelInput::PerspectiveCentroid),
+        .posX = loaded(PixelInput::PositionX),
+        .posY = loaded(PixelInput::PositionY),
+        .posZ = loaded(PixelInput::PositionZ),
+        .posW = loaded(PixelInput::PositionW),
+        .frontFace = loaded(PixelInput::FrontFace),
+        .ancillary = loaded(PixelInput::Ancillary),
+        .sampleShading = loaded(PixelInput::PerspectiveSample) && loaded(PixelInput::LinearSample),
+        .noPerspective = loaded(PixelInput::LinearCenter),
+        .linearCentroid = loaded(PixelInput::LinearCentroid),
+        .pixelKillEnable = pixelKillEnable,
+        .depthExportEnable = depthExportEnable,
+        .sampleMaskExportEnable = sampleMaskExportEnable,
+        .earlyZ = zOrder == 1u && !pixelKillEnable && !depthExportEnable && !sampleMaskExportEnable,
+        .executeOnNoop = ((shaderControl >> 10u) & 0x1u) != 0,
+        .targetOutputMode = targetOutputMode,
+        .targetExportMapping = targetExportMapping
     };
 }
 

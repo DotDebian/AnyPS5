@@ -45,12 +45,70 @@ struct ShaderComputeStageInfo {
     std::uint32_t threadIdComponentCount;
 };
 
+// The SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR bits, in the order the SPI loads their VGPRs.
+enum class PixelInput : std::uint32_t {
+    PerspectiveSample,
+    PerspectiveCenter,
+    PerspectiveCentroid,
+    PerspectivePullModel,
+    LinearSample,
+    LinearCenter,
+    LinearCentroid,
+    LineStipple,
+    PositionX,
+    PositionY,
+    PositionZ,
+    PositionW,
+    FrontFace,
+    Ancillary,
+    SampleCoverage,
+    PositionFixedPoint,
+    Count
+};
+
+constexpr std::uint32_t PixelInputBit(PixelInput input) {
+    return 1u << static_cast<std::uint32_t>(input);
+}
+
+// The VGPRs an input takes: an I/J pair per barycentric, I/J/W for the pull model, one otherwise.
+constexpr std::uint32_t PixelInputVgprCount(PixelInput input) {
+    switch (input) {
+    case PixelInput::PerspectiveSample:
+    case PixelInput::PerspectiveCenter:
+    case PixelInput::PerspectiveCentroid:
+    case PixelInput::LinearSample:
+    case PixelInput::LinearCenter:
+    case PixelInput::LinearCentroid:
+        return 2u;
+    case PixelInput::PerspectivePullModel:
+        return 3u;
+    default:
+        return 1u;
+    }
+}
+
+// The first VGPR of an input under an SPI_PS_INPUT_ADDR layout: every input ADDR names takes its
+// VGPRs in PixelInput order, whether or not SPI_PS_INPUT_ENA has it loaded (LLVM's allocated vs
+// enabled PS inputs); only inputs in both are loaded.
+constexpr std::uint32_t PixelInputVgpr(std::uint32_t inputAddr, PixelInput input) {
+    std::uint32_t vgpr = 0;
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(input); ++i) {
+        if ((inputAddr & (1u << i)) != 0u) vgpr += PixelInputVgprCount(static_cast<PixelInput>(i));
+    }
+    return vgpr;
+}
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
     bool wave32;
-    std::uint32_t perspectiveCenterVgpr;
+    // SPI_PS_INPUT_ADDR: the input VGPR layout (PixelInputVgpr). It must name every loaded input
+    // below (the flags are ENA & ADDR); an input only ADDR names reserves its VGPRs unloaded.
+    std::uint32_t inputAddr;
     bool hasPerspectiveCenterVgpr;
+    // PERSP_CENTROID / LINEAR_CENTROID. Draws are single-sampled, where the centroid is the pixel
+    // center: their VGPRs carry the center barycentrics.
+    bool perspectiveCentroid;
     bool posX;
     bool posY;
     bool posZ;
@@ -58,7 +116,9 @@ struct ShaderPixelStageInfo {
     bool frontFace;
     bool ancillary;
     bool sampleShading;
+    // LINEAR_CENTER.
     bool noPerspective;
+    bool linearCentroid;
     bool pixelKillEnable;
     bool depthExportEnable;
     bool sampleMaskExportEnable;
