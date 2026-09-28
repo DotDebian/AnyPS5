@@ -8,6 +8,7 @@
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include <cerrno>
+#include <cstring>
 #include <cstdarg>
 #include <filesystem>
 #include <stdexcept>
@@ -78,6 +79,9 @@ static std::int64_t NativePwrite(int descriptor, const void* buf, std::size_t nb
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <dirent.h>
+#include <sys/syscall.h>
+#include <vector>
 static int NativeRmdir(const std::filesystem::path& path) {
     return ::rmdir(path.c_str());
 }
@@ -103,7 +107,10 @@ static std::int64_t NativePwrite(int descriptor, const void* buf, std::size_t nb
 
 static constexpr int GUEST_ENOENT = 2;
 static constexpr int GUEST_EIO = 5;
+static constexpr int GUEST_EFAULT = 14;
 static constexpr int GUEST_EEXIST = 17;
+static constexpr int GUEST_EINVAL = 22;
+static constexpr int GUEST_ENAMETOOLONG = 63;
 static constexpr int GUEST_ENOTDIR = 20;
 static constexpr int GUEST_ENOTEMPTY = 66;
 
@@ -283,6 +290,8 @@ int APS5_VABI sceKernelFsync(int fd) {
  return 0;
 }
 
+#ifdef _WIN32
+
 int APS5_VABI sceKernelGetdents(int fd, char* buf, int nbytes) {
  (void)fd;
  (void)buf;
@@ -300,6 +309,55 @@ int APS5_VABI sceKernelGetdirentries(int fd, char* buf, int nbytes, int64_t* bas
  return 0;
 }
 
+#else
+
+int APS5_VABI sceKernelGetdirentries(int fd, char* buf, int nbytes, int64_t* basep) {
+    constexpr std::size_t GuestHeaderBytes = 8;
+    constexpr std::size_t GuestMaxName = 255;
+    if (buf == nullptr) return SceErrorFromErrno(GUEST_EFAULT);
+    if (nbytes <= 0) return SceErrorFromErrno(GUEST_EINVAL);
+    const off_t base = ::lseek(fd, 0, SEEK_CUR);
+    if (base < 0) return SceErrorFromErrno(errno);
+    if (basep != nullptr) *basep = static_cast<int64_t>(base);
+    std::vector<char> host(static_cast<std::size_t>(nbytes) < 4096 ? 4096 : static_cast<std::size_t>(nbytes));
+    const auto read = ::syscall(SYS_getdents64, fd, host.data(), host.size());
+    if (read < 0) return SceErrorFromErrno(errno);
+    std::size_t written = 0;
+    off_t resume = base;
+    for (long offset = 0; offset < read;) {
+        const auto* entry = reinterpret_cast<const struct dirent64*>(host.data() + offset);
+        const auto nameLength = std::strlen(entry->d_name);
+        if (nameLength > GuestMaxName) return SceErrorFromErrno(GUEST_ENAMETOOLONG);
+        const auto record = (GuestHeaderBytes + nameLength + 1 + 3) & ~std::size_t{3};
+        if (written + record > static_cast<std::size_t>(nbytes)) {
+            if (written == 0) return SceErrorFromErrno(GUEST_EINVAL);
+            if (::lseek(fd, resume, SEEK_SET) < 0) return SceErrorFromErrno(errno);
+            return static_cast<int>(written);
+        }
+        char* out = buf + written;
+        std::memset(out, 0, record);
+        const auto fileNumber = static_cast<std::uint32_t>(entry->d_ino);
+        const auto recordLength = static_cast<std::uint16_t>(record);
+        const auto nameBytes = static_cast<std::uint8_t>(nameLength);
+        std::memcpy(out, &fileNumber, sizeof(fileNumber));
+        std::memcpy(out + 4, &recordLength, sizeof(recordLength));
+        out[6] = static_cast<char>(entry->d_type);
+        out[7] = static_cast<char>(nameBytes);
+        std::memcpy(out + GuestHeaderBytes, entry->d_name, nameLength);
+        written += record;
+        resume = entry->d_off;
+        offset += entry->d_reclen;
+    }
+    if (::lseek(fd, resume, SEEK_SET) < 0) return SceErrorFromErrno(errno);
+    return static_cast<int>(written);
+}
+
+int APS5_VABI sceKernelGetdents(int fd, char* buf, int nbytes) {
+    return sceKernelGetdirentries(fd, buf, nbytes, nullptr);
+}
+
+#endif
+
 int APS5_VABI sceKernelMkdir(const char* path, uint16_t mode) {
     (void)mode;
     if (path == nullptr) throw std::invalid_argument("sceKernelMkdir: path is null");
@@ -310,6 +368,8 @@ int APS5_VABI sceKernelMkdir(const char* path, uint16_t mode) {
     if (!std::filesystem::create_directory(native, error)) return SceErrorFromErrno(error.value() ? error.value() : GUEST_EIO);
     return 0;
 }
+
+#ifdef _WIN32
 
 int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
  (void)d;
@@ -328,6 +388,24 @@ int64_t APS5_VABI sceKernelPwrite(int d, const void* buf, size_t nbytes, int64_t
  NotImplemented_nid_no_patch(__func__);
  return 0;
 }
+
+#else
+
+int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
+    if (buf == nullptr && nbytes != 0) return SceErrorFromErrno(GUEST_EFAULT);
+    if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
+    const auto result = ::pread(d, buf, nbytes, static_cast<off_t>(offset));
+    return result < 0 ? SceErrorFromErrno(errno) : static_cast<int64_t>(result);
+}
+
+int64_t APS5_VABI sceKernelPwrite(int d, const void* buf, size_t nbytes, int64_t offset) {
+    if (buf == nullptr && nbytes != 0) return SceErrorFromErrno(GUEST_EFAULT);
+    if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
+    const auto result = ::pwrite(d, buf, nbytes, static_cast<off_t>(offset));
+    return result < 0 ? SceErrorFromErrno(errno) : static_cast<int64_t>(result);
+}
+
+#endif
 
 int APS5_VABI sceKernelRename(const char* from, const char* to) {
     if (from == nullptr || to == nullptr) throw std::invalid_argument("sceKernelRename: path is null");
