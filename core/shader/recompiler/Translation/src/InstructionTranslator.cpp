@@ -194,6 +194,14 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
     }
 
     IrValue* initialExec = &entryIr.ConstantBool(true);
+    if (options.stage == ShaderStageKind::Pixel) {
+        // A pixel wave starts with the covered pixels only: the GPU runs the other lanes of a partly
+        // covered quad as helpers, outside EXEC until the shader asks for them (s_wqm). Vulkan's
+        // helper invocations are the same lanes, but they take part in subgroup operations: in EXEC
+        // they would count in ballots (v_mbcnt, a ds_append's allocation), and an atomic one of
+        // them performs does nothing and returns an undefined value.
+        initialExec = &entryIr.IEqual(builtin(StageInputKind::HelperInvocation), entryIr.Constant(0u));
+    }
     std::uint32_t totalThreads = 0;
     const auto* workgroup = shaderWorkgroupInput(options.stage, options.inputInfo);
     if (workgroup != nullptr) {

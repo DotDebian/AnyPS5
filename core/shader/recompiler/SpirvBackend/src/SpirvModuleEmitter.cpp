@@ -68,6 +68,13 @@ std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std:
         state.module.AddFunction(spv::OpSelect, TypeU32(state), bits, value, ConstantU32(state, 0x3f800000u), ConstantU32(state, 0xbf800000u));
         return bits;
     }
+    if (kind == StageInputKind::HelperInvocation) {
+        const auto value = state.module.AllocateId();
+        const auto bits = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeBool(state), value, variable);
+        state.module.AddFunction(spv::OpSelect, TypeU32(state), bits, value, ConstantU32(state, 1u), ConstantU32(state, 0u));
+        return bits;
+    }
     if (kind == StageInputKind::VertexIndex || kind == StageInputKind::InstanceIndex || kind == StageInputKind::InvocationId || kind == StageInputKind::PrimitiveId || kind == StageInputKind::Layer || kind == StageInputKind::SampleId) {
         const auto value = state.module.AllocateId();
         const auto bits = state.module.AllocateId();

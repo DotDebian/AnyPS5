@@ -34,6 +34,8 @@ enum class StageInputKind {
     LocalInvocationIndex,
     GlobalInvocationId,
     Parameter,
+    // A fragment invocation the rasterizer added to complete a quad (gl_HelperInvocation).
+    HelperInvocation,
 };
 
 enum class StageOutputKind {
