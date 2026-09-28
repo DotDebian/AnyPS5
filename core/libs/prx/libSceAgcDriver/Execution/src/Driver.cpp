@@ -1484,6 +1484,53 @@ private:
     std::map<std::uint32_t, std::shared_ptr<IVideoOutput>> outputs;
     DevicePointer device;
     DeviceUseGate deviceReplacement;
+    struct LatchedRelease {
+        std::uint64_t sequence;
+        std::uint64_t value;
+    };
+    std::mutex latchMutex;
+    std::unordered_map<std::uint64_t, LatchedRelease> latchedReleases;
+    std::map<std::pair<std::uint32_t, std::uint64_t>, std::uint64_t> latchConsumed;
+    std::uint64_t latchSequence = 0;
+    static inline thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> latchPending;
+
+    static bool LatchWaits() {
+        static const bool enabled = std::getenv("APS5_LATCH_WAITS") != nullptr;
+        return enabled;
+    }
+
+    void noteLatchedRelease(std::uint64_t address, std::span<const std::byte> bytes) {
+        if (bytes.empty() || bytes.size() > 8) return;
+        std::uint64_t value = 0;
+        std::memcpy(&value, bytes.data(), bytes.size());
+        std::lock_guard lock(latchMutex);
+        latchedReleases[address] = {++latchSequence, value};
+    }
+
+    bool latchedWaitSatisfied(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t address) {
+        std::lock_guard lock(latchMutex);
+        const auto release = latchedReleases.find(address);
+        if (release == latchedReleases.end()) return false;
+        const auto consumed = latchConsumed.find({queue, address});
+        if (consumed != latchConsumed.end() && consumed->second >= release->second.sequence) return false;
+        return Pm4::WaitComparesValue(packet, release->second.value);
+    }
+
+    void noteLatchedWait(std::uint64_t address) {
+        std::lock_guard lock(latchMutex);
+        const auto release = latchedReleases.find(address);
+        if (release != latchedReleases.end()) latchPending.emplace_back(address, release->second.sequence);
+    }
+
+    void commitLatchedWaits(std::uint32_t queue) {
+        if (latchPending.empty()) return;
+        std::lock_guard lock(latchMutex);
+        for (const auto& [address, sequence] : latchPending) {
+            auto& consumed = latchConsumed[{queue, address}];
+            consumed = std::max(consumed, sequence);
+        }
+        latchPending.clear();
+    }
     std::uint64_t accepted = 0;
     std::uint64_t completed = 0;
     std::set<std::uint64_t> completedOutOfOrder;
@@ -5265,6 +5312,7 @@ private:
             ++outcomes.atEntry;
             return;
         }
+        if (LatchWaits() && latchedWaitSatisfied(packet, queue, awaited)) return;
         // Debug aids: APS5_NO_LABEL_SHORTCUT=1 never satisfies a wait from the pending-label table;
         // APS5_NO_WAIT_OVERLAP_SUBMIT=1 submits the open batch at every wait, as before, instead of
         // only when it writes the awaited range.
@@ -5510,6 +5558,7 @@ private:
         bool spinning = pauseSpin;
         std::uint32_t polls = 0;
         while (!Pm4::WaitSatisfiedUnchecked(packet)) {
+            if (LatchWaits() && latchedWaitSatisfied(packet, queue, awaited)) return;
             ++polls;
             if (spinning) {
                 _mm_pause();
@@ -5562,6 +5611,11 @@ private:
     }
 
     void execute(const Submission& submission) {
+        struct CommitLatch {
+            Driver& driver;
+            std::uint32_t queue;
+            ~CommitLatch() { driver.commitLatchedWaits(queue); }
+        } commitLatch{*this, submission.queue};
         if (submission.suspend) {
             // A suspend point only marks where the system may suspend the title (the system, not the
             // title, waits for the GPU there); this drained the device under the mutex once per
@@ -5761,6 +5815,9 @@ private:
             // interrupt-only) need no drain because Pm4::Execute is a no-op for them. The label
             // counters and the [sync] report live at namespace scope (see reportSync).
             const bool endOfPipeInterrupt = opcode == 0x49 && ((packet[2] >> 24u) & 7u) != 0;
+            if (LatchWaits() && (opcode == 0x49 || opcode == 0x37)) {
+                if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLatchedRelease(label->address, label->Bytes());
+            }
             if (!drainAll && !endOfPipeInterrupt && (opcode == 0x49 || opcode == 0x37)) {
                 if (const auto label = Pm4::DecodeLabelWrite(packet)) {
                     const auto bytes = label->Bytes();
@@ -5980,6 +6037,7 @@ private:
                 static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
                 const auto waitStart = std::chrono::steady_clock::now();
                 timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received); });
+                if (LatchWaits()) noteLatchedWait(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u));
                 if (traceGpu && std::chrono::steady_clock::now() - waitStart > std::chrono::milliseconds(200)) {
                     // List the rest of the submission to show what the stalled queue would have done next.
                     for (std::size_t next = cursor + count, shown = 0; next < submission.commands.size() && shown < 48; ++shown) {
@@ -6048,6 +6106,8 @@ private:
             } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
                 if (!wroteOnGpu) Pm4::Execute(packet, queue);
                 if (endOfPipeInterrupt) AgcDriverDeliverEopInterrupt(submission.queue);
+            } else if (opcode == 0x46 && (packet[1] & 0x3fu) == 0x39) {
+                Pm4::DumpPixelPipeStatistics(packet);
             }
             if (drawPacket) Graphics::Recorder::CountRecordedWork();
             cursor += count;

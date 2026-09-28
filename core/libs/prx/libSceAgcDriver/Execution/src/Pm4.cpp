@@ -5,6 +5,8 @@
 #include <thread>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -295,12 +297,26 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
                     require(eventIndex == 4, "invalid partial-flush event index");
                     if (eventType != 0x07) graphics();
                     break;
+                case 0x38: case 0x3a:
+                    graphics();
+                    size(2);
+                    break;
+                case 0x39:
+                    graphics();
+                    size(4);
+                    require(eventIndex == 1, "invalid PIXEL_PIPE_STAT_DUMP event index");
+                    require((packet[2] & 7u) == 0, "misaligned PIXEL_PIPE_STAT_DUMP destination");
+                    break;
                 case 0x16: case 0x31: case 0x2a: case 0x2c: case 0x2e:
                     graphics();
                     size(2);
                     require(eventIndex == 0 || eventIndex == 7, "invalid cache-flush event index");
                     break;
-                default: throw std::runtime_error("EVENT_WRITE event type " + std::to_string(eventType) + " is not implemented");
+                default: {
+                    std::string words;
+                    for (const auto word : packet) { char text[12]; std::snprintf(text, sizeof(text), " %08x", word); words += text; }
+                    throw std::runtime_error("EVENT_WRITE event type " + std::to_string(eventType) + " is not implemented:" + words);
+                }
             }
             break;
         }
@@ -358,7 +374,11 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
             break;
         case 0x37: {
             require(packet.size() >= 5, "WRITE_DATA has no data");
-            require((packet[1] & ~0x00110f00u) == 0, "WRITE_DATA engine, cache or reserved fields are not implemented");
+            if ((packet[1] & ~0x40110f00u) != 0) {
+                char message[96];
+                std::snprintf(message, sizeof(message), "WRITE_DATA engine, cache or reserved fields are not implemented (control 0x%08x)", packet[1]);
+                require(false, message);
+            }
             const auto destination = (packet[1] >> 8u) & 0xfu;
             require(destination == 1 || destination == 2 || (queue != 0 && destination == 5), "WRITE_DATA register or GDS destination is not implemented");
             require((packet[2] & 3u) == 0, "misaligned WRITE_DATA destination");
@@ -433,6 +453,17 @@ bool WaitSatisfiedUnchecked(std::span<const std::uint32_t> packet) {
 bool WaitComparesValue(std::span<const std::uint32_t> packet, std::uint64_t value) {
     const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
     return waitCompares(packet, wide, value);
+}
+
+void DumpPixelPipeStatistics(std::span<const std::uint32_t> packet) {
+    static const std::uint32_t backends = [] {
+        const char* text = std::getenv("APS5_RENDER_BACKENDS");
+        return text ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 0)) : 16u;
+    }();
+    static std::atomic<std::uint64_t> samples{0};
+    const auto destination = address(packet[2], packet[3]);
+    const std::uint64_t value = (samples.fetch_add(0x100000u) + 0x100000u) | (1ull << 63u);
+    for (std::uint32_t backend = 0; backend < backends; ++backend) GuestMemory::Write(destination + backend * 16u, std::as_bytes(std::span(&value, 1)), 8);
 }
 
 std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet) {
