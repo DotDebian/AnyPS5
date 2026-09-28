@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include "CacheKey.hpp"
+#include "CompiledVariant.hpp"
+#include "ShaderDiskCache.hpp"
 #include <list>
 #include <mutex>
 #include <shared_mutex>
@@ -160,14 +162,6 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     return program;
 }
 
-struct CompiledVariant {
-    ResourceSpecialization specialization;
-    BindingLayout layout;
-    CompiledShaderInfo info;
-    BindingAllocationResult bindings;
-    RecompileResult result;
-};
-
 // A materialized result of one variant over one snapshot (Recompile(request, capture)): the
 // shared immutable object every later capture that reproduces the snapshot receives, so Populate
 // and the per-request copy run once per distinct snapshot.
@@ -272,6 +266,12 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request) {
     return source;
 }
 
+// A process-wide id per compiled (or disk-loaded) variant; the driver keys pipeline objects on it.
+std::uint64_t nextVariantId() {
+    static std::atomic<std::uint64_t> variants{0};
+    return variants.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, const ResourceSnapshot& resourceSnapshot, const ResourceSpecialization& resourceSpecialization) {
     const auto inputInfo = BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request));
     constexpr DeadCodeEliminator deadCodeEliminator;
@@ -300,8 +300,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
 
     constexpr SpirvEmitter spirvEmitter;
     RecompileResult result;
-    static std::atomic<std::uint64_t> variants{0};
-    result.variantId = variants.fetch_add(1, std::memory_order_relaxed) + 1;
+    result.variantId = nextVariantId();
     result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
@@ -356,24 +355,48 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
 
+// The variant of `source` for the request's layout and the specialization (under the source's
+// mutex): the one in memory (`cacheHit`), else the one the shader disk cache stored in an earlier
+// run (ShaderDiskCache.hpp), else a fresh compile, which is queued for the disk cache. A request
+// under the debug probe neither reads nor writes the disk cache (the probe is only in the
+// in-memory key).
+std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization, bool& cacheHit) {
+    for (const auto& candidate : source.variants) {
+        if (sameLayout(candidate->layout, request.layout) && candidate->specialization == specialization) {
+            cacheHit = true;
+            return candidate;
+        }
+    }
+    cacheHit = false;
+    const bool disk = ShaderDiskCache::Enabled() && !DebugProbeActive();
+    std::vector<std::byte> diskKey;
+    std::shared_ptr<const CompiledVariant> variant;
+    if (disk) {
+        ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), specialization, diskKey);
+        CompiledVariant loaded;
+        if (ShaderDiskCache::Load(diskKey, loaded)) {
+            loaded.specialization = specialization;
+            loaded.layout = request.layout;
+            loaded.result.variantId = nextVariantId();
+            variant = std::make_shared<const CompiledVariant>(std::move(loaded));
+        }
+    }
+    if (variant == nullptr) {
+        auto program = PrepareResourceProgram(request);
+        variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), snapshot, specialization));
+        if (disk) ShaderDiskCache::Store(std::move(diskKey), variant);
+    }
+    source.variants.push_back(variant);
+    return variant;
+}
+
 // The cached variant of `source` for the specialization, compiled on first use.
 RecompileResult materializeVariant(SourceEntry& source, const RecompileRequest& request, const ResourceSnapshot& snapshot, const ResourceSpecialization& specialization) {
     std::shared_ptr<const CompiledVariant> variant;
     bool cacheHit = false;
     {
         std::lock_guard lock(source.mutex);
-        for (const auto& candidate : source.variants) {
-            if (sameLayout(candidate->layout, request.layout) && candidate->specialization == specialization) {
-                variant = candidate;
-                cacheHit = true;
-                break;
-            }
-        }
-        if (variant == nullptr) {
-            auto program = PrepareResourceProgram(request);
-            variant = std::make_shared<CompiledVariant>(compileVariant(request, std::move(program), snapshot, specialization));
-            source.variants.push_back(variant);
-        }
+        variant = findOrCompileVariant(source, request, snapshot, specialization, cacheHit);
     }
     auto result = materializeResult(*variant, request, snapshot);
     result.cacheHit = cacheHit;
@@ -490,18 +513,7 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
     auto& counters = resultMemoCounters();
     {
         std::lock_guard lock(source.mutex);
-        for (const auto& candidate : source.variants) {
-            if (sameLayout(candidate->layout, request.layout) && candidate->specialization == specialization) {
-                variant = candidate;
-                cacheHit = true;
-                break;
-            }
-        }
-        if (variant == nullptr) {
-            auto program = PrepareResourceProgram(request);
-            variant = std::make_shared<CompiledVariant>(compileVariant(request, std::move(program), snapshot, specialization));
-            source.variants.push_back(variant);
-        }
+        variant = findOrCompileVariant(source, request, snapshot, specialization, cacheHit);
         index = (variant->result.variantId * 0x9e3779b97f4a7c15ull) ^ hash;
         const auto found = source.memoIndex.find(index);
         if (found != source.memoIndex.end() && found->second->variantId == variant->result.variantId && found->second->hash == hash) {

@@ -62,6 +62,7 @@ add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorTargetLayout.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ColorTargetTransfer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Pipeline.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
@@ -157,6 +158,14 @@ target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
+
+add_executable(agc_shader_disk_cache_tests EXCLUDE_FROM_ALL
+        tests/ShaderDiskCache.cpp
+)
+target_include_directories(agc_shader_disk_cache_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_shader_disk_cache_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_shader_disk_cache_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_shader_disk_cache_tests)
 
 add_executable(agc_driver_flip_tests EXCLUDE_FROM_ALL
         tests/Flip.cpp
@@ -283,10 +292,12 @@ set_target_properties(agc_driver_bda_device_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_bda_device_tests)
 
 if(BUILD_TESTING)
-    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_driver_flip_tests agc_driver_pm4_tests)
+    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_shader_disk_cache_tests agc_driver_flip_tests agc_driver_pm4_tests)
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})
+        # Tests do not fill the user's shader disk cache (the disk cache test uses its own directory).
+        set_tests_properties(${agcTestName} PROPERTIES ENVIRONMENT "APS5_NO_SHADER_DISK_CACHE=1")
         if(WIN32)
             set_tests_properties(${agcTestName} PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
@@ -331,6 +342,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/ColorTargetLayout.cpp
             Graphics/src/ColorTargetTransfer.cpp
             Graphics/src/Pipeline.cpp
+            Graphics/src/PipelineCache.cpp
             Graphics/src/Resources.cpp
             Graphics/src/ShaderResources.cpp
             Graphics/src/ShaderAddressResources.cpp
