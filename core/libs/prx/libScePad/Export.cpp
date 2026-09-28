@@ -9,6 +9,27 @@
 #include "prx//libc/include/General.hpp"
 #include "prx/libScePad/include/Pad.hpp"
 #include "prx/libScePad/include/PadState.hpp"
+#include <array>
+#include <mutex>
+
+namespace {
+
+constexpr std::size_t PadTriggerEffectParamBytes = 0x88;
+
+struct PadOutputs {
+    std::mutex mutex;
+    bool tiltCorrection = false;
+    PadVibrationParam vibration{};
+    PadLightBarParam lightBar{};
+    std::array<std::uint8_t, PadTriggerEffectParamBytes> triggerEffect{};
+};
+
+PadOutputs& Outputs() {
+    static PadOutputs outputs;
+    return outputs;
+}
+
+}
 
 extern "C" {
 
@@ -63,10 +84,12 @@ int APS5_VABI scePadGetHandle(int user_id, int type, int index) {
 }
 
 int APS5_VABI scePadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info) {
- (void)handle;
- (void)info;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
+ if (info == nullptr) return PAD_ERROR_INVALID_ARG;
+ constexpr std::int32_t NoEffectRunning = 0;
+ info->state[0] = NoEffectRunning;
+ info->state[1] = NoEffectRunning;
+ return PAD_OK;
 }
 
 int APS5_VABI scePadInit_nid_postfix(void) {
@@ -126,10 +149,12 @@ int APS5_VABI scePadSetAngularVelocityDeadbandState(int handle, bool enable) {
 }
 
 int APS5_VABI scePadSetLightBar(int handle, const PadLightBarParam* param) {
- (void)handle;
- (void)param;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
+ if (param == nullptr) return PAD_ERROR_INVALID_ARG;
+ auto& outputs = Outputs();
+ std::lock_guard lock(outputs.mutex);
+ outputs.lightBar = *param;
+ return PAD_OK;
 }
 
 int APS5_VABI scePadSetMotionSensorState(int handle, bool enable) {
@@ -142,24 +167,29 @@ int APS5_VABI scePadSetMotionSensorState(int handle, bool enable) {
 }
 
 int APS5_VABI scePadSetTiltCorrectionState(int handle, bool enabled) {
- (void)handle;
- (void)enabled;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
+ auto& outputs = Outputs();
+ std::lock_guard lock(outputs.mutex);
+ outputs.tiltCorrection = enabled;
+ return PAD_OK;
 }
 
 int APS5_VABI scePadSetTriggerEffect(int handle, const void* param) {
- (void)handle;
- (void)param;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
+ if (param == nullptr) return PAD_ERROR_INVALID_ARG;
+ auto& outputs = Outputs();
+ std::lock_guard lock(outputs.mutex);
+ std::memcpy(outputs.triggerEffect.data(), param, outputs.triggerEffect.size());
+ return PAD_OK;
 }
 
 int APS5_VABI scePadSetVibration(int handle, const PadVibrationParam* param) {
- (void)handle;
- (void)param;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
+ if (param == nullptr) return PAD_ERROR_INVALID_ARG;
+ auto& outputs = Outputs();
+ std::lock_guard lock(outputs.mutex);
+ outputs.vibration = *param;
+ return PAD_OK;
 }
 
 int APS5_VABI scePadSetVibrationMode(int handle, int mode) {

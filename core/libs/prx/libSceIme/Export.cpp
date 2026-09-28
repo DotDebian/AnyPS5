@@ -2,6 +2,24 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include <map>
+#include <mutex>
+#include <stdexcept>
+
+namespace {
+
+constexpr int ImeErrorBusy = static_cast<int>(0x80BC0001);
+constexpr int ImeErrorNotOpened = static_cast<int>(0x80BC0002);
+
+struct KeyboardListener {
+    EventHandler handler;
+    void* arg;
+};
+
+std::mutex g_keyboardMutex;
+std::map<int32_t, KeyboardListener> g_keyboards;
+
+}
 
 extern "C" {
 
@@ -19,9 +37,8 @@ int APS5_VABI sceImeGetPanelSize(const Param* param, uint32_t* width, uint32_t* 
 }
 
 int APS5_VABI sceImeKeyboardClose(int32_t user_id) {
- (void)user_id;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ std::lock_guard lock(g_keyboardMutex);
+ return g_keyboards.erase(user_id) != 0 ? 0 : ImeErrorNotOpened;
 }
 
 int APS5_VABI sceImeKeyboardGetInfo(uint32_t resource_id, KeyboardInfo* info) {
@@ -39,9 +56,9 @@ int APS5_VABI sceImeKeyboardGetResourceId(int32_t user_id, KeyboardResourceIdArr
 }
 
 int APS5_VABI sceImeKeyboardOpen(int32_t user_id, const KeyboardParam* param) {
- (void)user_id;
- (void)param;
- NotImplemented_nid_no_patch(__func__);
+ if (param == nullptr || param->handler == nullptr) throw std::invalid_argument("sceImeKeyboardOpen: missing parameter or event handler");
+ std::lock_guard lock(g_keyboardMutex);
+ if (!g_keyboards.emplace(user_id, KeyboardListener{param->handler, param->arg}).second) return ImeErrorBusy;
  return 0;
 }
 
@@ -85,9 +102,9 @@ int APS5_VABI sceImeSetTextGeometry(TextAreaMode mode, const TextGeometry* geome
 }
 
 int APS5_VABI sceImeUpdate(EventHandler handler) {
- (void)handler;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (handler == nullptr) throw std::invalid_argument("sceImeUpdate: null event handler");
+ std::lock_guard lock(g_keyboardMutex);
+ return g_keyboards.empty() ? ImeErrorNotOpened : 0;
 }
 
 }
