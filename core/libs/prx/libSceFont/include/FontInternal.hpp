@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <vector>
 
 #include <ft2build.h>
@@ -44,6 +45,7 @@ struct GeneratedGlyph {
     std::vector<FontGlyphOutlinePoint> outlinePoints;
     std::vector<std::uint8_t> outlineTags;
     std::vector<std::uint16_t> outlineContours;
+    std::map<std::uint32_t, std::uint32_t> attributes;
     bool metricsInitialized = false;
     bool outlineInitialized = false;
 };

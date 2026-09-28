@@ -12,6 +12,7 @@ namespace {
 
 constexpr std::uint32_t SystemMemoryDescriptorId = 0x010107d4;
 constexpr std::size_t SystemCpuMemoryBytes = 64;
+constexpr std::uint32_t RenderParamDescriptorId = 0x010107d6;
 
 enum class ObjectKind { System, Material, Room, Portal, Source };
 
@@ -163,44 +164,97 @@ int32_t APS5_VABI sceAudioPropagationSourceSetAttributes(AudioPropagationHandle 
     return SetAttributes(source, ObjectKind::Source, attributes, count, __func__);
 }
 
-int32_t APS5_VABI sceAudioPropagationSystemGetRays(void) {
-    NotImplemented_nid_no_patch(__func__);
+int32_t APS5_VABI sceAudioPropagationSystemGetRays(AudioPropagationHandle system, void* rays, uint32_t* count) {
+    if (rays == nullptr || count == nullptr) Fail(__func__, "null argument");
+    auto& state = Objects();
+    std::lock_guard lock(state.mutex);
+    Find(state, system, ObjectKind::System, __func__);
+    *count = 0;
     return 0;
 }
 
-int32_t APS5_VABI sceAudioPropagationSystemSetRays(void) {
-    NotImplemented_nid_no_patch(__func__);
+int32_t APS5_VABI sceAudioPropagationSystemSetRays(AudioPropagationHandle system, const void* rays, uint32_t count) {
+    if (count != 0) Fail(__func__, "rays were returned that were never requested");
+    (void)rays;
+    auto& state = Objects();
+    std::lock_guard lock(state.mutex);
+    Find(state, system, ObjectKind::System, __func__);
     return 0;
 }
 
-int32_t APS5_VABI sceAudioPropagationSourceCalculateAudioPaths(void) {
-    NotImplemented_nid_no_patch(__func__);
+int32_t APS5_VABI sceAudioPropagationSourceGetRays(AudioPropagationHandle source, void* rays, uint32_t* count) {
+    if (rays == nullptr || count == nullptr) Fail(__func__, "null argument");
+    auto& state = Objects();
+    std::lock_guard lock(state.mutex);
+    Find(state, source, ObjectKind::Source, __func__);
+    *count = 0;
     return 0;
 }
 
-int32_t APS5_VABI sceAudioPropagationSourceGetAudioPath(void) {
-    NotImplemented_nid_no_patch(__func__);
+int32_t APS5_VABI sceAudioPropagationSourceGetAudioPathCount(AudioPropagationHandle source, uint32_t* count) {
+    if (count == nullptr) Fail(__func__, "null argument");
+    auto& state = Objects();
+    std::lock_guard lock(state.mutex);
+    Find(state, source, ObjectKind::Source, __func__);
+    *count = 0;
     return 0;
 }
 
-int32_t APS5_VABI sceAudioPropagationSourceGetAudioPathCount(void) {
-    NotImplemented_nid_no_patch(__func__);
+int32_t APS5_VABI sceAudioPropagationSourceGetAudioPath(AudioPropagationHandle source, uint32_t index, AudioPropagationHandle* out_path) {
+    (void)index;
+    (void)out_path;
+    auto& state = Objects();
+    std::lock_guard lock(state.mutex);
+    Find(state, source, ObjectKind::Source, __func__);
+    Fail(__func__, "path index out of range");
+}
+
+int32_t APS5_VABI sceAudioPropagationSourceCalculateAudioPaths(AudioPropagationHandle source, const void* rays, uint32_t ray_count, uint32_t flags, void* paths, uint32_t path_count) {
+    (void)rays;
+    (void)flags;
+    (void)paths;
+    if (ray_count != 0 || path_count != 0) Fail(__func__, "rays or paths were passed that were never requested");
+    auto& state = Objects();
+    std::lock_guard lock(state.mutex);
+    Find(state, source, ObjectKind::Source, __func__);
     return 0;
 }
 
-int32_t APS5_VABI sceAudioPropagationSourceGetRays(void) {
-    NotImplemented_nid_no_patch(__func__);
+int32_t APS5_VABI sceAudioPropagationSourceSetAudioPaths(AudioPropagationHandle source, const void* paths, uint32_t count) {
+    (void)paths;
+    if (count != 0) Fail(__func__, "paths were passed that were never requested");
+    auto& state = Objects();
+    std::lock_guard lock(state.mutex);
+    Find(state, source, ObjectKind::Source, __func__);
     return 0;
 }
 
-int32_t APS5_VABI sceAudioPropagationSourceRender(void) {
-    NotImplemented_nid_no_patch(__func__);
+struct RenderParam {
+    std::uint32_t id;
+    std::uint32_t reserved;
+    std::uint64_t size;
+    AudioPropagationHandle source;
+    void* output;
+    std::uint64_t outputBytes;
+    std::uint32_t format;
+    std::uint32_t padding;
+};
+static_assert(sizeof(RenderParam) == 0x30);
+
+int32_t APS5_VABI sceAudioPropagationSourceRender(AudioPropagationHandle system, const RenderParam* params, uint32_t count) {
+    if (params == nullptr && count != 0) Fail(__func__, "null parameters");
+    auto& state = Objects();
+    std::lock_guard lock(state.mutex);
+    Find(state, system, ObjectKind::System, __func__);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& param = params[i];
+        if (param.id != RenderParamDescriptorId || param.size != sizeof(RenderParam)) Fail(__func__, "unknown render descriptor");
+        if (Find(state, param.source, ObjectKind::Source, __func__).system != system) Fail(__func__, "source belongs to another system");
+        if (param.output == nullptr && param.outputBytes != 0) Fail(__func__, "null output");
+        std::memset(param.output, 0, param.outputBytes);
+    }
     return 0;
 }
 
-int32_t APS5_VABI sceAudioPropagationSourceSetAudioPaths(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
 
 }
