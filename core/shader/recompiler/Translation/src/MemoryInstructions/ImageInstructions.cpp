@@ -1,5 +1,6 @@
 #include "Translation/MemoryInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "Recompiler.hpp"
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -41,6 +42,9 @@ MemoryInfo imageMemoryInfoFromInstruction(const RdnaInstruction& inst) {
 }
 
 bool TranslationContext::imageBvhIntersectRay(const RdnaInstruction& inst) {
+    if (RayTracingStrict()) {
+        throw std::runtime_error("ray tracing is not implemented");
+    }
     IrValue& miss = ir.Constant(0xffffffffu);
     for (std::uint32_t i = 0u; i < inst.dataDwordCount; ++i) {
         writeOperand(offsetOperand(inst.destination, i), &miss);
