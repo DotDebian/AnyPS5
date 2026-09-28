@@ -623,7 +623,14 @@ State DecodeState(const QueueState& queue) {
         const auto decoded = DecodeColorFormat(format, number, swap);
         // ROUND_MODE (bit 18) only affects unorm rounding. With DCC_ENABLE (bit 28) the target is written
         // uncompressed and only its fast-clear keys matter (see DccMetadata.hpp).
-        Require((info & ~(0x00029f7cu | 0x00040000u | 0x10000000u)) == 0, "color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported");
+        if ((info & 0x2000u) != 0) {
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                std::fprintf(stderr, "[gpu] color targets with CMASK fast clears (CB_COLOR_INFO.FAST_CLEAR) are rendered uncompressed; CMASK clears are not modeled\n");
+            }
+        }
+        Require((info & ~(0x00029f7cu | 0x00040000u | 0x10000000u | 0x2000u)) == 0, "color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported");
         Require((info & 0x8000u) != 0 || number == 7, "unclamped normalized color is unsupported");
         // CB_COLOR_VIEW: MIP_LEVEL (bits 24-27) selects the rendered mip; array slices are not modeled.
         const auto view = read(cx, 0x31b + stride);

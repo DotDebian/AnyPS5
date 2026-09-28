@@ -1329,6 +1329,10 @@ void validationTests() {
         expectFailure([&] { AgcDriver::Graphics::VertexBufferReadSize(attribute, 0, 1); }, "byte range");
         attribute.resource.fields[3] = 113u << 12u;
         expectFailure([&] { AgcDriver::Graphics::DecodeVertexFormat(attribute); }, "unsupported vertex format");
+        attribute.resource.fields[3] = 50u << 12u;
+        Require(AgcDriver::Graphics::DecodeVertexFormat(attribute).format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && AgcDriver::Graphics::DecodeVertexFormat(attribute).bytes == 4, "2_10_10_10 vertex format was not decoded");
+        attribute.resource.fields[3] = 43u << 12u;
+        Require(AgcDriver::Graphics::DecodeVertexFormat(attribute).format == VK_FORMAT_B10G11R11_UFLOAT_PACK32, "11_11_10 float vertex format was not decoded");
         attribute.resource.fields = {0x1000, 32u << 16u, 3, 77u << 12u};
         attribute.components = 2;
         AgcDriver::Graphics::Context context{};
