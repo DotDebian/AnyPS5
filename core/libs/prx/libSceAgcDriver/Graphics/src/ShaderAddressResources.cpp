@@ -34,6 +34,7 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
 
 VkDescriptorBufferInfo ShaderResources::descriptor(const Allocation& allocation) const {
     if (allocation.guest) return guestMemory.Descriptor(allocation.address, allocation.size);
+    if (allocation.role == ShaderRecompiler::DescriptorRole::Gds) return {context.gdsBuffer, 0, allocation.size};
     if (allocation.role == ShaderRecompiler::DescriptorRole::BdaPagetable || allocation.role == ShaderRecompiler::DescriptorRole::FaultBuffer) {
         Require(bda != nullptr, "BDA descriptors have no memory owner");
         return allocation.role == ShaderRecompiler::DescriptorRole::BdaPagetable ? bda->Table() : bda->Fault();

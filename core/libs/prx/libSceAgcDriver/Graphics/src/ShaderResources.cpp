@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
 #include <algorithm>
@@ -795,7 +796,8 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 Require(binding.descriptorSet == 0, "unexpected descriptor set: every shader resource must use descriptor set zero");
                 Require(occupied.insert(binding.binding).second, "duplicate shader binding");
                 const bool addressRole = binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer;
-                const bool bufferRole = addressRole || binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers || binding.role == ShaderRecompiler::DescriptorRole::ShaderData || binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt;
+                const bool gdsRole = binding.role == ShaderRecompiler::DescriptorRole::Gds;
+                const bool bufferRole = addressRole || gdsRole || binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers || binding.role == ShaderRecompiler::DescriptorRole::ShaderData || binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt;
                 const bool imageRole = binding.role == ShaderRecompiler::DescriptorRole::GuestImages || binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers;
                 if (imageRole) {
                     addImageBinding(binding, flags);
@@ -821,6 +823,13 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 } else if (addressRole) {
                     item.allocations.push_back(allocations.size());
                     allocations.push_back({0, 0, false, nullptr, binding.role});
+                } else if (gdsRole) {
+                    // The device's GDS buffer, the backing the CP's DMA_DATA reaches too.
+                    Require(binding.count == 1, "a GDS descriptor must not be an array");
+                    Require(context.gdsBuffer != VK_NULL_HANDLE, "the device has no GDS buffer to bind");
+                    item.allocations.push_back(allocations.size());
+                    allocations.push_back({0, Pm4::GdsBytes, false, nullptr, binding.role});
+                    usesGds = true;
                 } else {
                     Require(binding.count == 1, "shader data and flattened SRT descriptors must not be arrays");
                     Require(!binding.guestDescriptor.empty(), "empty shader data descriptor");
@@ -2555,6 +2564,8 @@ void ShaderResources::WriteBack() {
 }
 
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+    // The CP's next read of the GDS is ordered after this work (Pm4::InstallGdsBacking).
+    if (usesGds) Pm4::NoteGdsShaderUse();
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
@@ -2591,7 +2602,7 @@ void ShaderResources::WriteBackBuffers() {
 }
 
 bool ShaderResources::WritesMemory() const {
-    return HoldsLease() || NeedsCompletion() || !guestMemory.Writes().empty() || std::any_of(storageWritten.begin(), storageWritten.end(), [](bool written) { return written; });
+    return usesGds || HoldsLease() || NeedsCompletion() || !guestMemory.Writes().empty() || std::any_of(storageWritten.begin(), storageWritten.end(), [](bool written) { return written; });
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {

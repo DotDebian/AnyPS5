@@ -189,6 +189,9 @@ struct VulkanDevice::State {
     bool primitiveListRestart = false;
     bool depthClipControl = false;
     bool imageViewMinLod = false;
+    // The GDS shaders bind and the CP's DMA_DATA reaches (Pm4::InstallGdsBacking), when this device
+    // installed the backing.
+    std::unique_ptr<Graphics::Buffer> gds;
     bool depthClamp = false;
     bool depthBiasClamp = false;
     VkDeviceSize hostImportAlignment = 0;
@@ -510,6 +513,12 @@ struct VulkanDevice::State {
             colorTransfer.reset();
             scaler.reset();
             pipelineCache.reset();
+            // The CP keeps the GDS bytes (its DMA_DATA) once this device's buffer is gone (the GPU
+            // is idle: the wait above).
+            if (gds != nullptr) {
+                Pm4::ReleaseGdsBacking(this);
+                gds.reset();
+            }
             context.bufferPool.reset();
             bufferPool.reset();
             const auto destroyFence = reinterpret_cast<PFN_vkDestroyFence>(deviceProc(device, "vkDestroyFence"));
@@ -895,6 +904,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     poolInfo.queueFamilyIndex = family;
     check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &poolInfo, nullptr, &state->pool), "vkCreateCommandPool");
     state->bufferPool = std::make_shared<Graphics::BufferPool>(graphicsContext());
+    createGds();
     state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties);
     state->detiler = std::make_unique<Graphics::TextureDetiler>(graphicsContext());
     state->textureCache = std::make_unique<Graphics::TextureCache>(graphicsContext());
@@ -980,12 +990,33 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
 
 VulkanDevice::~VulkanDevice() = default;
 
+void VulkanDevice::createGds() {
+    // Device-local where the host can map it (the GDS takes shader atomics), else host memory.
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    const auto context = graphicsContext();
+    std::unique_ptr<Graphics::Buffer> buffer;
+    try {
+        buffer = std::make_unique<Graphics::Buffer>(context, Pm4::GdsBytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    } catch (const std::exception&) {
+        buffer = std::make_unique<Graphics::Buffer>(context, Pm4::GdsBytes, usage);
+    }
+    require(buffer->Mapped() && buffer->Bytes().size() >= Pm4::GdsBytes, "the GDS buffer has no host mapping");
+    if (!Pm4::InstallGdsBacking(state.get(), buffer->Bytes().first<Pm4::GdsBytes>())) {
+        std::fprintf(stderr, "[gpu] another device holds the GDS; this device's shaders cannot bind it\n");
+        return;
+    }
+    state->gds = std::move(buffer);
+}
+
 void VulkanDevice::PrepareForReplacement() {
     GuestMemory::AssertGpuLockHeld("VulkanDevice::PrepareForReplacement");
     require(state->recorder != nullptr && Graphics::Recorder::Active() == state->recorder.get(), "device replacement requires its active recorder");
     Graphics::FlushCachedTextures(state->device);
     Graphics::PublishAllShadows(state->context, Graphics::PublishReason::Teardown);
     WaitIdle();
+    // The replaced device lives on (its objects are never used again): the CP's GDS bytes return
+    // to the driver so the next device installs its own buffer with them.
+    if (state->gds != nullptr) Pm4::ReleaseGdsBacking(state.get());
 }
 
 void VulkanDevice::WaitIdle() {
@@ -2195,6 +2226,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.primitiveListRestart = state->primitiveListRestart;
     context.depthBiasClamp = state->depthBiasClamp;
     context.imageViewMinLod = state->imageViewMinLod;
+    context.gdsBuffer = state->gds != nullptr ? state->gds->Handle() : VK_NULL_HANDLE;
     return context;
 }
 

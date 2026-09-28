@@ -132,6 +132,9 @@ struct Context {
     // VK_EXT_image_view_min_lod with minLod enabled: sampled views clamp their level of detail as a
     // texture descriptor's MIN_LOD does.
     bool imageViewMinLod = false;
+    // The device's GDS buffer (Pm4::GdsBytes, the CP's GDS backing, see Pm4::InstallGdsBacking), which
+    // shaders' GDS bindings name; null when the device has none (tests).
+    VkBuffer gdsBuffer = VK_NULL_HANDLE;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

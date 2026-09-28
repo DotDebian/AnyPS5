@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -97,11 +98,15 @@ std::vector<std::byte> copySource(std::uint64_t source, std::size_t bytes, bool 
 }
 
 constexpr std::uint32_t DmaSelectGds = 1;
-constexpr std::size_t GdsBytes = 0x10000;
 
+// See InstallGdsBacking: the driver's own bytes, or the installed backing.
 struct GdsStorage {
     std::mutex mutex;
     std::array<std::byte, GdsBytes> bytes{};
+    const void* owner = nullptr;
+    std::byte* backing = nullptr;
+    // Shaders used GDS since the CP's last access (the recorded work may still be running).
+    std::atomic<bool> shaderUse{false};
 };
 
 GdsStorage& Gds() {
@@ -113,11 +118,25 @@ bool gdsRange(std::uint64_t offset, std::size_t bytes) {
     return offset <= GdsBytes && bytes <= GdsBytes - offset;
 }
 
+// The CP's view of the GDS for one access (the device drained before it: see InstallGdsBacking);
+// the lock is held while the view is used.
+struct GdsAccess {
+    std::unique_lock<std::mutex> lock;
+    std::span<std::byte> bytes;
+};
+
+GdsAccess accessGds() {
+    auto& gds = Gds();
+    std::unique_lock lock(gds.mutex);
+    gds.shaderUse.store(false);
+    const std::span<std::byte> bytes = gds.backing != nullptr ? std::span<std::byte>(gds.backing, GdsBytes) : std::span<std::byte>(gds.bytes);
+    return {std::move(lock), bytes};
+}
+
 std::vector<std::byte> dmaSourceBytes(std::span<const std::uint32_t> packet) {
     const std::size_t bytes = packet[6] & 0x3ffffffu;
     if (dmaSource(packet) != DmaSelectGds) return copySource(address(packet[2], packet[3]), bytes, dmaSource(packet) == 2);
-    auto& gds = Gds();
-    std::lock_guard lock(gds.mutex);
+    const auto gds = accessGds();
     return {gds.bytes.begin() + packet[2], gds.bytes.begin() + packet[2] + bytes};
 }
 
@@ -513,6 +532,8 @@ std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, co
         }
         case 0x50: {
             if (packet.size() < 7 || dmaDestination(packet) == DmaSelectGds) return std::nullopt;
+            // Shader results in the GDS may still be on the way: the packet drains first.
+            if (dmaSource(packet) == DmaSelectGds && Gds().shaderUse.load()) return std::nullopt;
             const std::size_t bytes = packet[6] & 0x3ffffffu;
             const auto destination = address(packet[4], packet[5]);
             if (!fits(destination, bytes)) return std::nullopt;
@@ -775,8 +796,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             if (bytes == 0) return;
             auto data = dmaSourceBytes(packet);
             if (dmaDestination(packet) == DmaSelectGds) {
-                auto& gds = Gds();
-                std::lock_guard lock(gds.mutex);
+                const auto gds = accessGds();
                 std::copy(data.begin(), data.end(), gds.bytes.begin() + packet[4]);
                 return;
             }
@@ -787,6 +807,30 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
         }
         default: throw std::runtime_error("packet requires driver execution");
     }
+}
+
+bool InstallGdsBacking(const void* owner, std::span<std::byte, GdsBytes> backing) {
+    auto& gds = Gds();
+    std::lock_guard lock(gds.mutex);
+    if (gds.owner != nullptr) return false;
+    std::copy(gds.bytes.begin(), gds.bytes.end(), backing.begin());
+    gds.owner = owner;
+    gds.backing = backing.data();
+    return true;
+}
+
+void ReleaseGdsBacking(const void* owner) {
+    auto& gds = Gds();
+    std::lock_guard lock(gds.mutex);
+    if (gds.owner != owner || owner == nullptr) return;
+    std::copy(gds.backing, gds.backing + GdsBytes, gds.bytes.begin());
+    gds.owner = nullptr;
+    gds.backing = nullptr;
+    gds.shaderUse.store(false);
+}
+
+void NoteGdsShaderUse() {
+    Gds().shaderUse.store(true);
 }
 
 }

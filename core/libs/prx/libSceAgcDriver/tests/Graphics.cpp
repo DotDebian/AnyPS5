@@ -1247,7 +1247,26 @@ void resourceTests() {
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestImages; binding.kind = Kind::SampledImage; }), "8 dwords");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestImages; binding.kind = Kind::StorageImage; }), "8 dwords");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::GuestSamplers; binding.kind = Kind::Sampler; binding.guestDescriptor.resize(3); }), "4 dwords");
-    expectSingleFailure(changed([](auto& binding) { binding.role = Role::Gds; binding.guestDescriptor.clear(); }), "unsupported descriptor role Gds");
+    // GDS binds the device's GDS buffer, which a context without one cannot.
+    expectSingleFailure(changed([](auto& binding) { binding.role = Role::Gds; binding.guestDescriptor.clear(); }), "no GDS buffer");
+    {
+        mock = MockVulkan{};
+        auto gdsContext = context;
+        gdsContext.gdsBuffer = reinterpret_cast<VkBuffer>(static_cast<std::uintptr_t>(0x6d5));
+        ShaderRecompiler::RecompileResult vertex;
+        ShaderRecompiler::RecompileResult fragment;
+        vertex.bindings.push_back(changed([](auto& binding) { binding.role = Role::Gds; binding.binding = 7; binding.guestDescriptor.clear(); }));
+        AgcDriver::Graphics::ShaderResources resources(gdsContext, vertex, fragment, state.color, 0, 0);
+        const auto& write = findWrite(7);
+        Require(write.buffers.size() == 1 && write.buffers[0].buffer == gdsContext.gdsBuffer && write.buffers[0].offset == 0 && write.buffers[0].range == AgcDriver::Pm4::GdsBytes, "the GDS binding does not name the device's GDS buffer");
+        Require(resources.WritesMemory(), "a GDS binding does not count as a memory write");
+        auto array = changed([](auto& binding) { binding.role = Role::Gds; binding.count = 2; binding.guestDescriptor.clear(); });
+        ShaderRecompiler::RecompileResult arrayed;
+        arrayed.bindings.push_back(array);
+        expectFailure([&] { AgcDriver::Graphics::ShaderResources failed(gdsContext, arrayed, fragment, state.color, 0, 0); }, "must not be an array");
+    }
+    Require(mock.live == 0, "GDS resources leaked Vulkan objects");
+    mock = MockVulkan{};
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::BdaPagetable; binding.guestDescriptor.clear(); }), "BDA table and fault descriptors");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::FaultBuffer; binding.guestDescriptor.clear(); }), "BDA table and fault descriptors");
     expectSingleFailure(changed([](auto& binding) { binding.kind = Kind::UniformBuffer; }), "unsupported descriptor kind UniformBuffer");

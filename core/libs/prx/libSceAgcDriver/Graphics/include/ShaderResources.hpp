@@ -370,6 +370,9 @@ private:
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
     bool usesFaultBuffer = false;
+    // A GDS binding (the device's GDS buffer, Context::gdsBuffer): every use is noted for the CP
+    // (Pm4::NoteGdsShaderUse) and counts as a memory write.
+    bool usesGds = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     // Whether the layout is this object's own (no cache) and destroyed with it.
     bool ownsLayout = false;

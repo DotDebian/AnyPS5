@@ -301,6 +301,46 @@ void testCopies() {
 #endif
 }
 
+// The CP's GDS behind a device's backing (Pm4::InstallGdsBacking): the bytes move into the backing
+// and back, DMA_DATA reads and writes the backing, and after a shader use a store from the GDS is
+// not resolved ahead of the drain (its bytes may still be on the way), until the CP's next access.
+std::array<std::byte, AgcDriver::Pm4::GdsBytes> gdsBacking{};
+std::array<std::byte, AgcDriver::Pm4::GdsBytes> otherBacking{};
+
+void testGdsBacking() {
+    using namespace AgcDriver::Pm4;
+    AgcDriver::QueueState state;
+    alignas(8) std::array<std::uint32_t, 4> source{21, 22, 23, 24};
+    alignas(8) std::array<std::uint32_t, 4> destination{};
+    execute(state, makePacket(0x50, {0x60100000, low(source.data()), high(source.data()), 0x200, 0, 16}));
+    const int owner = 0;
+    const int other = 0;
+    check(InstallGdsBacking(&owner, gdsBacking), "the GDS backing was refused");
+    check(std::memcmp(gdsBacking.data() + 0x200, source.data(), 16) == 0, "the backing did not take the GDS bytes");
+    check(!InstallGdsBacking(&other, otherBacking), "a second GDS backing was installed");
+    execute(state, makePacket(0x50, {0x60100000, low(source.data()), high(source.data()), 0x300, 0, 8}));
+    check(std::memcmp(gdsBacking.data() + 0x300, source.data(), 8) == 0, "DMA_DATA to GDS missed the backing");
+    // A shader's store into the device's buffer: a store from the GDS waits for the drain.
+    const std::uint32_t stored = 0xcafe;
+    std::memcpy(gdsBacking.data() + 0x300, &stored, 4);
+    NoteGdsShaderUse();
+    const auto fromGds = makePacket(0x50, {0x20000000, 0x300, 0, low(destination.data()), high(destination.data()), 8});
+    check(!ResolveStore(fromGds, state, 64).has_value(), "a store from the GDS was resolved while shader results may be on the way");
+    execute(state, fromGds);
+    check(destination[0] == stored && destination[1] == 22, "DMA_DATA from GDS did not read the backing");
+    const auto store = ResolveStore(fromGds, state, 64);
+    check(store.has_value() && std::memcmp(store->Bytes().data(), &stored, 4) == 0, "a store from the GDS was not resolved after the CP's access");
+    ReleaseGdsBacking(&other);
+    check(std::memcmp(gdsBacking.data() + 0x200, source.data(), 16) == 0, "a release by another owner changed the backing");
+    ReleaseGdsBacking(&owner);
+    std::memset(gdsBacking.data(), 0, gdsBacking.size());
+    destination = {};
+    execute(state, makePacket(0x50, {0x20000000, 0x300, 0, low(destination.data()), high(destination.data()), 8}));
+    check(destination[0] == stored, "the released backing's bytes did not return to the CP");
+    check(InstallGdsBacking(&other, otherBacking), "a backing was refused after the release");
+    ReleaseGdsBacking(&other);
+}
+
 void testMemorySynchronization() {
     struct MemoryState {
         std::uint32_t source = 0;
@@ -488,6 +528,7 @@ int main(int argc, char** argv) {
         testIndirectDraw();
         testMemory();
         testCopies();
+        testGdsBacking();
         testMemorySynchronization();
         testEventWrite();
         testAcquireMem();

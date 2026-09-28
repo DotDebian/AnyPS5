@@ -75,6 +75,20 @@ std::uint32_t ReadDrawCount(const DrawParameters::IndirectDraw& indirect);
 inline bool IndirectDrawOpcode(std::uint32_t opcode) { return opcode == 0x24 || opcode == 0x25 || opcode == 0x2c || opcode == 0x38; }
 inline bool DrawOpcode(std::uint32_t opcode) { return opcode == 0x27 || opcode == 0x2d || opcode == 0x35 || IndirectDrawOpcode(opcode); }
 
+// The 64 KiB global data share the CP's DMA_DATA reads and writes and shaders reach through their
+// GDS binding. It lives in the driver's storage until a device installs a backing (the mapping of
+// its GDS buffer, which draws and dispatches bind): the current bytes are copied into the backing,
+// and the CP reads and writes the backing from then on. ReleaseGdsBacking copies the bytes back (the
+// owner's device must be idle); only the owner that installed the backing releases it, and a second
+// backing is refused (false). A CP access to the GDS comes after the device drained (Execute of a
+// DMA_DATA follows the drain); ResolveStore, which reads its source before the store is recorded,
+// declines a GDS source while shaders used the GDS since the CP's last access (NoteGdsShaderUse), so
+// the packet drains first.
+inline constexpr std::size_t GdsBytes = 0x10000;
+bool InstallGdsBacking(const void* owner, std::span<std::byte, GdsBytes> backing);
+void ReleaseGdsBacking(const void* owner);
+void NoteGdsShaderUse();
+
 std::string Name(std::uint32_t header);
 // A PM4 type-2 packet is a one-dword filler (command-buffer padding); type 3 and type 0 carry a
 // dword count in bits 29:16. Type 1 is undefined.
