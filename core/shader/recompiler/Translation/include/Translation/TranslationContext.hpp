@@ -12,6 +12,7 @@ public:
     TranslationContext(IrProgram& program, IrBlock& block, std::uint32_t vectorLimit);
 
     void TranslateInstruction(const RdnaInstruction& instruction);
+    void SetPixelInput(const ShaderPixelInputInfo* info) { pixelInput = info; }
     void TranslateEmbeddedFetch(const RdnaInstruction& instruction, std::uint32_t attribute, std::uint32_t componentCount, const ShaderBufferResource& resource);
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
 
@@ -227,6 +228,7 @@ private:
     bool emitMemory(const RdnaInstruction& inst);
 
     IrProgram& program;
+    const ShaderPixelInputInfo* pixelInput = nullptr;
     IrBuilder ir;
     IrBlock& block;
     IrU1 instructionBranchCondition;
