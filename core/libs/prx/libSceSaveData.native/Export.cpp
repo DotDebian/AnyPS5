@@ -24,23 +24,10 @@ static std::string save_root() {
     return std::string(SAVE_DIR);
 }
 
-// Events the title polls with sceSaveDataGetEventResult (a backup completes at once here), and the
-// "save data memory" blobs (small per-slot memories the title reads and writes without mounting),
-// persisted as files under the save root so they survive restarts.
+// Events the title polls with sceSaveDataGetEventResult; a backup completes at once here.
 static std::mutex g_state_mutex;
 static std::deque<SaveDataEvent> g_events;
-static std::map<std::uint32_t, std::vector<std::uint8_t>> g_memories;
 constexpr std::uint32_t SAVE_DATA_EVENT_TYPE_BACKUP = 2;
-
-static std::string memory_path(std::uint32_t slot) {
-    return save_root() + "/_memory_" + std::to_string(slot) + ".bin";
-}
-
-static void store_memory(std::uint32_t slot, const std::vector<std::uint8_t>& memory) {
-    std::filesystem::create_directories(save_root());
-    std::ofstream file(memory_path(slot), std::ios::binary | std::ios::trunc);
-    file.write(reinterpret_cast<const char*>(memory.data()), static_cast<std::streamsize>(memory.size()));
-}
 
 static bool dir_name_match(const char* str, const char* pattern) {
     if (pattern == nullptr || pattern[0] == '\0') {
@@ -71,6 +58,78 @@ static bool dir_name_match(const char* str, const char* pattern) {
     }
     return *str == '\0' && *pattern == '\0';
 }
+
+namespace {
+
+// Save-data memory: one blob per user and slot, kept next to the save directory (_sd_mem/u<user>/slot<n>.bin),
+// with a small .param sidecar holding the last SaveDataParam the title wrote. Keying by user as well as slot
+// keeps two users' in-memory saves from colliding on the same console.
+constexpr char MEM_DIR[] = "_sd_mem";
+constexpr std::size_t MEM_MAX_SIZE = 0x1000000;  // 16 MiB
+std::mutex g_mem_mutex;
+
+std::string mem_path(std::int32_t user_id, std::uint32_t slot, const char* ext) {
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%s/u%d/slot%u.%s", MEM_DIR, static_cast<int>(user_id), static_cast<unsigned>(slot), ext);
+    return buf;
+}
+
+bool file_size_of(const std::string& path, std::size_t* out) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) {
+        return false;
+    }
+    const auto sz = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return false;
+    }
+    *out = static_cast<std::size_t>(sz);
+    return true;
+}
+
+// Atomic-ish write: write to a temp file then rename over the target, so a kill mid-write never
+// leaves a torn save behind.
+bool write_file_replace(const std::string& path, const std::vector<char>& data) {
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            return false;
+        }
+        if (!data.empty()) {
+            f.write(data.data(), static_cast<std::streamsize>(data.size()));
+        }
+        f.flush();
+        if (!f) {
+            return false;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(tmp, path, ec);
+    }
+    return !ec;
+}
+
+bool read_file_all(const std::string& path, std::vector<char>& out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return false;
+    }
+    f.seekg(0, std::ios::end);
+    const auto n = static_cast<std::size_t>(f.tellg());
+    f.seekg(0);
+    out.resize(n);
+    if (n != 0) {
+        f.read(out.data(), static_cast<std::streamsize>(n));
+    }
+    return static_cast<bool>(f);
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -196,29 +255,47 @@ int APS5_VABI sceSaveDataGetParam(const SaveDataMountPoint* mount_point, uint32_
 
 int APS5_VABI sceSaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
     if (get_param == nullptr) {
-        throw std::runtime_error("sceSaveDataGetSaveDataMemory2: null argument");
+        return SAVE_DATA_ERROR_PARAMETER;
     }
-    std::lock_guard lock(g_state_mutex);
-    const auto it = g_memories.find(get_param->slot_id);
-    if (it == g_memories.end()) {
-        return SAVE_DATA_ERROR_NOT_FOUND;
+    if (!g_initialized) {
+        return SAVE_DATA_ERROR_NOT_INITIALIZED;
     }
-    if (get_param->data != nullptr && get_param->data->buf != nullptr) {
-        const auto& memory = it->second;
-        if (get_param->data->offset > memory.size()) {
+    std::lock_guard<std::mutex> lk(g_mem_mutex);
+    const std::string path = mem_path(get_param->user_id, get_param->slot_id, "bin");
+    std::size_t size = 0;
+    if (!file_size_of(path, &size)) {
+        return SAVE_DATA_ERROR_MEMORY_NOT_READY;
+    }
+    const SaveDataMemoryData* d = get_param->data;
+    if (d != nullptr && d->buf_size != 0) {
+        if (d->buf == nullptr || d->offset > size || d->buf_size > size - d->offset) {
             return SAVE_DATA_ERROR_PARAMETER;
         }
-        const auto bytes = std::min(get_param->data->buf_size, memory.size() - get_param->data->offset);
-        std::memcpy(get_param->data->buf, memory.data() + get_param->data->offset, bytes);
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            return SAVE_DATA_ERROR_INTERNAL;
+        }
+        f.seekg(static_cast<std::streamoff>(d->offset));
+        f.read(static_cast<char*>(d->buf), static_cast<std::streamsize>(d->buf_size));
+        if (!f) {
+            return SAVE_DATA_ERROR_INTERNAL;
+        }
     }
-    if (get_param->param != nullptr) std::memset(get_param->param, 0, sizeof(SaveDataParam));
-    if (get_param->icon != nullptr) get_param->icon->data_size = 0;
+    if (get_param->param != nullptr) {
+        std::memset(get_param->param, 0, sizeof(SaveDataParam));
+        std::vector<char> pd;
+        if (read_file_all(mem_path(get_param->user_id, get_param->slot_id, "param"), pd)) {
+            std::memcpy(get_param->param, pd.data(), std::min(pd.size(), sizeof(SaveDataParam)));
+        }
+    }
+    if (get_param->icon != nullptr) {
+        get_param->icon->data_size = 0;
+    }
     return SAVE_DATA_OK;
 }
 
 int APS5_VABI sceSaveDataInitialize3(const void* init) {
     (void)init;
-    // NotImplemented_nid_no_patch(__func__);
     if (g_initialized) {
         return SAVE_DATA_ERROR_ALREADY_INITIALIZED;
     }
@@ -332,59 +409,108 @@ int APS5_VABI sceSaveDataSetParam(const SaveDataMountPoint* mount_point, uint32_
 
 int APS5_VABI sceSaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param) {
     if (set_param == nullptr) {
-        throw std::runtime_error("sceSaveDataSetSaveDataMemory2: null argument");
+        return SAVE_DATA_ERROR_PARAMETER;
     }
-    std::lock_guard lock(g_state_mutex);
-    const auto it = g_memories.find(set_param->slot_id);
-    if (it == g_memories.end()) {
-        return SAVE_DATA_ERROR_NOT_FOUND;
+    if (!g_initialized) {
+        return SAVE_DATA_ERROR_NOT_INITIALIZED;
     }
-    auto& memory = it->second;
-    if (set_param->data != nullptr) {
-        const auto count = set_param->data_num == 0 ? 1u : set_param->data_num;
-        for (std::uint32_t i = 0; i < count; ++i) {
-            const auto& data = set_param->data[i];
-            if (data.buf == nullptr) continue;
-            if (data.offset > memory.size() || data.buf_size > memory.size() - data.offset) {
-                return SAVE_DATA_ERROR_PARAMETER;
-            }
-            std::memcpy(memory.data() + data.offset, data.buf, data.buf_size);
+    std::lock_guard<std::mutex> lk(g_mem_mutex);
+    const std::string path = mem_path(set_param->user_id, set_param->slot_id, "bin");
+    std::size_t size = 0;
+    if (!file_size_of(path, &size)) {
+        return SAVE_DATA_ERROR_MEMORY_NOT_READY;
+    }
+    // Validate every range first so a bad entry never leaves a partial write.
+    const std::uint32_t n = set_param->data != nullptr ? (set_param->data_num != 0 ? set_param->data_num : 1u) : 0u;
+    for (std::uint32_t i = 0; i < n; i++) {
+        const SaveDataMemoryData& d = set_param->data[i];
+        if (d.buf_size == 0) {
+            continue;
+        }
+        if (d.buf == nullptr || d.offset > size || d.buf_size > size - d.offset) {
+            return SAVE_DATA_ERROR_PARAMETER;
         }
     }
-    store_memory(set_param->slot_id, memory);
+    if (n != 0) {
+        std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+        if (!f) {
+            return SAVE_DATA_ERROR_INTERNAL;
+        }
+        for (std::uint32_t i = 0; i < n; i++) {
+            const SaveDataMemoryData& d = set_param->data[i];
+            if (d.buf_size == 0) {
+                continue;
+            }
+            f.seekp(static_cast<std::streamoff>(d.offset));
+            f.write(static_cast<const char*>(d.buf), static_cast<std::streamsize>(d.buf_size));
+        }
+        f.flush();
+        if (!f) {
+            return SAVE_DATA_ERROR_INTERNAL;
+        }
+    }
+    if (set_param->param != nullptr) {
+        std::vector<char> pd(sizeof(SaveDataParam));
+        std::memcpy(pd.data(), set_param->param, sizeof(SaveDataParam));
+        write_file_replace(mem_path(set_param->user_id, set_param->slot_id, "param"), pd);
+    }
     return SAVE_DATA_OK;
 }
 
 int APS5_VABI sceSaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param, SaveDataMemorySetupResult* result) {
     if (setup_param == nullptr) {
-        throw std::runtime_error("sceSaveDataSetupSaveDataMemory2: null argument");
+        return SAVE_DATA_ERROR_PARAMETER;
     }
-    std::lock_guard lock(g_state_mutex);
-    auto& memory = g_memories[setup_param->slot_id];
+    if (!g_initialized) {
+        return SAVE_DATA_ERROR_NOT_INITIALIZED;
+    }
+    if (setup_param->memory_size == 0 || setup_param->memory_size > MEM_MAX_SIZE) {
+        return SAVE_DATA_ERROR_PARAMETER;
+    }
+    std::lock_guard<std::mutex> lk(g_mem_mutex);
+    const std::string path = mem_path(setup_param->user_id, setup_param->slot_id, "bin");
     std::size_t existed = 0;
-    if (memory.empty()) {
-        std::ifstream file(memory_path(setup_param->slot_id), std::ios::binary);
-        if (file) {
-            memory.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-            existed = memory.size();
+    const bool have = file_size_of(path, &existed);
+    if (!have) {
+        existed = 0;
+    }
+    // First run: create a zero-filled blob and report existed size 0 so the title treats it as a new save.
+    if (!have || existed < setup_param->memory_size) {
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+        std::vector<char> data;
+        if (have) {
+            read_file_all(path, data);
         }
-    } else {
-        existed = memory.size();
+        data.resize(setup_param->memory_size, 0);
+        if (!write_file_replace(path, data)) {
+            return SAVE_DATA_ERROR_INTERNAL;
+        }
+        if (setup_param->init_param != nullptr && (setup_param->option & 1u) != 0) {
+            std::vector<char> pd(sizeof(SaveDataParam));
+            std::memcpy(pd.data(), setup_param->init_param, sizeof(SaveDataParam));
+            write_file_replace(mem_path(setup_param->user_id, setup_param->slot_id, "param"), pd);
+        }
     }
-    if (memory.size() < setup_param->memory_size) {
-        memory.resize(setup_param->memory_size, 0);
-    }
-    if (existed == 0) store_memory(setup_param->slot_id, memory);
     if (result != nullptr) {
         std::memset(result, 0, sizeof(*result));
-        result->existed_memory_size = existed;
+        result->existed_memory_size = have ? existed : 0;
     }
     return SAVE_DATA_OK;
 }
 
 int APS5_VABI sceSaveDataSyncSaveDataMemory(const void* sync_param) {
-    (void)sync_param;
-    // Every Set already reached the file; nothing is buffered.
+    if (sync_param == nullptr) {
+        return SAVE_DATA_ERROR_PARAMETER;
+    }
+    // Every Set already writes straight through to disk; sync only has to confirm the memory exists.
+    const std::int32_t user_id = *static_cast<const std::int32_t*>(sync_param);
+    const std::uint32_t slot_id = reinterpret_cast<const std::uint32_t*>(sync_param)[1];
+    std::lock_guard<std::mutex> lk(g_mem_mutex);
+    std::size_t size = 0;
+    if (!file_size_of(mem_path(user_id, slot_id, "bin"), &size)) {
+        return SAVE_DATA_ERROR_MEMORY_NOT_READY;
+    }
     return SAVE_DATA_OK;
 }
 
@@ -400,10 +526,11 @@ int APS5_VABI sceSaveDataTerminate(void) {
 }
 
 int APS5_VABI sceSaveDataTransferringMount(const SaveDataTransferringMount* mount, SaveDataMountResult* mount_result) {
-    if (mount == nullptr || mount_result == nullptr || mount->title_id == nullptr || mount->dir_name == nullptr) {
-        throw std::runtime_error("sceSaveDataTransferringMount: null argument");
+    (void)mount;
+    if (mount_result != nullptr) {
+        std::memset(mount_result, 0, sizeof(*mount_result));
     }
-    std::memset(mount_result, 0, sizeof(*mount_result));
+    // No PS4-to-PS5 transfer data exists on this console.
     return SAVE_DATA_ERROR_NOT_FOUND;
 }
 
