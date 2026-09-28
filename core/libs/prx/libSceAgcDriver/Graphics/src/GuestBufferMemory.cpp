@@ -1903,7 +1903,11 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
     Require(address >= region.begin && address + bytes <= region.end && (region.buffer != nullptr || region.direct != nullptr || region.mirror != nullptr), "guest buffer view exceeds its GPU owner");
     const auto base = region.direct != nullptr ? region.direct->base : region.mirror != nullptr ? region.mirror->base : region.begin;
     const auto offset = address - base;
-    Require(context.limits.minStorageBufferOffsetAlignment != 0 && offset % context.limits.minStorageBufferOffsetAlignment == 0, "guest buffer view violates storage buffer offset alignment");
+    if (context.limits.minStorageBufferOffsetAlignment == 0 || offset % context.limits.minStorageBufferOffsetAlignment != 0) {
+        char message[200];
+        std::snprintf(message, sizeof(message), "guest buffer view violates storage buffer offset alignment (view 0x%llx+0x%zx, owner 0x%llx..0x%llx, base 0x%llx, %s)", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end), static_cast<unsigned long long>(base), region.direct != nullptr ? "direct" : region.mirror != nullptr ? "mirror" : "buffer");
+        Require(false, message);
+    }
     Require(bytes <= context.limits.maxStorageBufferRange, "guest buffer view exceeds descriptor range limit");
     const auto handle = region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? region.mirror->buffer->Handle() : region.buffer->Handle();
     return {handle, offset, bytes};
