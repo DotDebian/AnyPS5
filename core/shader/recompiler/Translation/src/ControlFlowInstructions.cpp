@@ -193,8 +193,14 @@ void TranslationContext::sInstPrefetch() {
     (void)ir.Emit(IrOpcode::InstPrefetch, IrType::Void, {});
 }
 
+// The address of the next instruction. Instruction program counters count from the start of the
+// shader, so the shader's guest base is added: code that reads data placed after it (a quad's
+// vertices behind an NGG shader, s_getpc_b64 + s_add_u32 into a V#) needs the absolute address.
+// GetShaderBase stays a runtime value, which the resource walk evaluates per request (the same code
+// at another address shares the compiled variant).
 void TranslationContext::sGetpcB64(const RdnaInstruction& inst) {
-    const IrU64 pc(ir.ConstantU64(static_cast<std::uint64_t>(currentProgramCounter) + 4u));
+    IrValue& base = ir.Emit(IrOpcode::GetShaderBase, IrType::U64, {});
+    const IrU64 pc(ir.Emit(IrOpcode::IAdd64, IrType::U64, {&base, &ir.ConstantU64(static_cast<std::uint64_t>(currentProgramCounter) + 4u)}));
     writeU32Pair(inst.destination, extractU64(pc));
 }
 
