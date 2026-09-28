@@ -11,6 +11,10 @@
 #include <elfpatcher/linux/LinuxElfPatcher.hpp>
 #include <io/ByteWriter.hpp>
 #include <cstring>
+#include <cstdint>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -138,7 +142,9 @@ void matcherSubstitutions() {
     const auto monitorx = match({0x0F, 0x01, 0xFA});
     require(monitorx && monitorx->Lowering == Codegen::Amd64OnlyLowering::Unsupported && monitorx->InstructionName == "MONITORX", "MONITORX was not reported as unsupported");
     const auto registerForm = match({0x66, 0x0F, 0x79, 0xCA});
-    require(registerForm && registerForm->Lowering == Codegen::Amd64OnlyLowering::Unsupported, "EXTRQ register form was not reported as unsupported");
+    require(registerForm && registerForm->Lowering == Codegen::Amd64OnlyLowering::Trampoline && registerForm->InstructionName == "EXTRQ register form", "EXTRQ register form was not lowered through a stub");
+    const auto insertqRegisterForm = match({0xF2, 0x0F, 0x79, 0xCA});
+    require(insertqRegisterForm && insertqRegisterForm->Lowering == Codegen::Amd64OnlyLowering::Unsupported, "INSERTQ register form was not reported as unsupported");
     require(!match({0x66, 0x0F, 0x2B, 0x07}) && !match({0x0F, 0x2B, 0x07}) && !match({0x48, 0x8B, 0x05, 0, 0, 0, 0}), "Ordinary instruction was matched");
     const auto stub = match(kInsertqHighSite);
     require(stub && stub->Lowering == Codegen::Amd64OnlyLowering::Trampoline && stub->StubBody == kInsertqHighBody && stub->ReturnBranchOffset == 15 && stub->InstructionName == "INSERTQ", "INSERTQ was not lowered through a stub");
@@ -221,7 +227,14 @@ void converterSegment() {
     auto registerForm = file;
     const Bytes extrqRegister = {0x66, 0x0F, 0x79, 0xCA};
     std::copy(extrqRegister.begin(), extrqRegister.end(), registerForm.begin() + 0x20F);
-    requireFailure([&] { (void)converter->Convert(registerForm, {segmentHeader(20)}); }, "EXTRQ register form was silently kept");
+    requireFailure([&] { (void)converter->Convert(registerForm, {segmentHeader(20)}); }, "Short EXTRQ followed by a return was relocated");
+    registerForm[0x213] = 0x90;
+    const auto relocated = converter->Convert(registerForm, {segmentHeader(20)});
+    require(relocated.Trampolines.size() == 2, "Short EXTRQ register form was not lowered through a stub");
+    const auto& shortSite = relocated.Trampolines[1];
+    const Bytes shortOriginal = {0x66, 0x0F, 0x79, 0xCA, 0x90};
+    require(shortSite.Offset == 0x20F && shortSite.Length == 5 && shortSite.OriginalBytes == shortOriginal, "Short EXTRQ site did not absorb the following instruction");
+    require(shortSite.Body[shortSite.ReturnBranchOffset - 1] == 0x90 && shortSite.Body[shortSite.ReturnBranchOffset] == 0xE9, "Absorbed instruction does not run before the return jump");
     requireFailure([&] { (void)converter->Convert(file, {segmentHeader(0x200)}); }, "Segment exceeding the file was accepted");
 }
 
@@ -322,12 +335,70 @@ void linuxPlacement() {
 
 }
 
+#if defined(__linux__) && defined(__x86_64__)
+std::uint64_t extrqReference(std::uint64_t value, std::uint64_t control) {
+    const auto length = static_cast<unsigned>(control & 0x3f);
+    const auto index = static_cast<unsigned>((control >> 8) & 0x3f);
+    const auto shifted = value >> index;
+    return length == 0 ? shifted : shifted & ((std::uint64_t{1} << length) - 1);
+}
+
+std::uint64_t runExtrqStub(const Bytes& site, std::uint64_t destination, std::uint64_t control) {
+    const auto matcher = Codegen::MakeAmd64OnlyInstructionMatcher();
+    const auto match = matcher->Match(site.data(), site.size());
+    require(match && match->Lowering == Codegen::Amd64OnlyLowering::Trampoline, "EXTRQ register form stub was not produced");
+    auto body = match->StubBody;
+    const auto ret = body.size();
+    body.push_back(0xC3);
+    const auto displacement = static_cast<std::int32_t>(ret - (match->ReturnBranchOffset + 5));
+    std::memcpy(body.data() + match->ReturnBranchOffset + 1, &displacement, sizeof(displacement));
+    void* code = mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    require(code != MAP_FAILED, "cannot map executable memory for the stub");
+    std::memcpy(code, body.data(), body.size());
+    alignas(16) std::uint64_t destinationIn[2] = {destination, 0x1122334455667788ull};
+    alignas(16) std::uint64_t controlIn[2] = {control, 0};
+    alignas(16) std::uint64_t out[2] = {};
+    alignas(16) std::uint64_t scratchIn[2] = {0x0123456789abcdefull, 0xfedcba9876543210ull};
+    alignas(16) std::uint64_t scratchOut[2] = {};
+    const bool same = site[3] == 0xD2;
+    asm volatile(
+        "movdqu (%[scratch]), %%xmm0\n\t"
+        "movdqu (%[dst]), %%xmm2\n\t"
+        "movdqu (%[ctl]), %%xmm5\n\t"
+        "sub $128, %%rsp\n\t"
+        "call *%[code]\n\t"
+        "add $128, %%rsp\n\t"
+        "movdqu %%xmm2, (%[out])\n\t"
+        "movdqu %%xmm0, (%[scratchOut])\n\t"
+        :
+        : [scratch] "r"(scratchIn), [dst] "r"(same ? controlIn : destinationIn), [ctl] "r"(controlIn), [code] "r"(code), [out] "r"(out), [scratchOut] "r"(scratchOut)
+        : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "memory", "cc");
+    munmap(code, 4096);
+    require(scratchOut[0] == scratchIn[0] && scratchOut[1] == scratchIn[1], "EXTRQ stub clobbered a scratch register");
+    return out[0];
+}
+
+void registerFormExecution() {
+    const Bytes distinct = {0x66, 0x0F, 0x79, 0xD5};
+    const Bytes same = {0x66, 0x0F, 0x79, 0xD2};
+    const std::uint64_t value = 0x9e3779b97f4a7c15ull;
+    for (const auto [length, index] : {std::pair{8u, 4u}, {0u, 0u}, {40u, 20u}, {63u, 1u}, {1u, 63u}, {16u, 48u}}) {
+        const auto control = static_cast<std::uint64_t>(length) | (static_cast<std::uint64_t>(index) << 8) | 0xffffc000ull;
+        require(runExtrqStub(distinct, value, control) == extrqReference(value, control), "EXTRQ register form stub computed the wrong field");
+        require(runExtrqStub(same, control, control) == extrqReference(control, control), "EXTRQ register form stub with equal operands computed the wrong field");
+    }
+}
+#else
+void registerFormExecution() {}
+#endif
+
 int main() {
     try {
         decoderLengths();
         sse4aOperands();
         matcherSubstitutions();
         goldenBodies();
+        registerFormExecution();
         converterSegment();
         converterFailureOffsets();
         linuxPlacement();

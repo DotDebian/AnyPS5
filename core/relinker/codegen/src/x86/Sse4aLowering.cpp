@@ -3,6 +3,7 @@
 #include <codegen/CodegenException.hpp>
 #include <algorithm>
 #include <array>
+#include <span>
 #include <initializer_list>
 
 namespace Codegen {
@@ -89,6 +90,10 @@ public:
         _bytes.insert(_bytes.end(), kLeaRspRestore.Bytes, kLeaRspRestore.Bytes + kLeaRspRestore.Size);
     }
 
+    void Raw(std::span<const std::uint8_t> bytes) {
+        _bytes.insert(_bytes.end(), bytes.begin(), bytes.end());
+    }
+
     LoweredBody Finish() {
         const auto returnBranchOffset = _bytes.size();
         _bytes.insert(_bytes.end(), kJmpRel32.Bytes, kJmpRel32.Bytes + kJmpRel32.Size);
@@ -120,52 +125,41 @@ private:
     std::vector<Constant> _constants;
 };
 
-}
-
-std::optional<std::vector<std::uint8_t>> Sse4aLowering::LowerInPlace(const Sse4aOperands& operands, const std::size_t originalLength) const {
-    if (operands.RegisterForm)
-        return std::nullopt;
-    const auto length = operands.Length;
-    const auto index = operands.Index;
-    const auto dst = operands.Destination;
-    const auto src = operands.Source;
-    std::vector<std::uint8_t> sequence;
-    if (operands.Insertq) {
-        if (dst == src && index == 0) {
-        } else if (length == kFieldBits && index == 0) {
-            _sse(sequence, kPrefixScalar, {0x0F, 0x7E}, dst, src);
-        } else if (index == 0 && length % 16 == 0) {
-            _sse(sequence, kPrefixPacked, {0x0F, 0x3A, 0x0E}, dst, src);
-            sequence.push_back(static_cast<std::uint8_t>((1u << (length / 16)) - 1));
-        } else {
-            return std::nullopt;
-        }
-    } else {
-        if (index == 0 && length == kFieldBits) {
-        } else if (index + length == kFieldBits) {
-            _shiftImm(sequence, kShiftRight, dst, index);
-        } else if (index == 0 && (length == 8 || length == 16 || length == 32)) {
-            const std::uint8_t opcode = length == 8 ? 0x32 : (length == 16 ? 0x34 : 0x35);
-            _sse(sequence, kPrefixPacked, {0x0F, 0x38, opcode}, dst, dst);
-        } else {
-            return std::nullopt;
-        }
+void _emitOutOfLine(BodyBuilder& body, const Sse4aOperands& operands) {
+    if (operands.RegisterForm) {
+        if (operands.Insertq)
+            throw CodegenException("INSERTQ register form has no Intel lowering");
+        const auto dst = operands.Destination;
+        const auto src = operands.Source;
+        std::array<std::uint8_t, 2> scratch{};
+        for (std::uint8_t reg = 0, found = 0; found < scratch.size(); ++reg)
+            if (reg != dst && reg != src) scratch[found++] = reg;
+        Constant fieldMask{};
+        fieldMask[0] = kFieldBits - 1;
+        Constant one{};
+        one[0] = 1;
+        body.Spill(scratch[0]);
+        body.Spill(scratch[1]);
+        body.Sse(kPrefixPacked, {0x0F, 0x6F}, scratch[0], src);
+        body.ShiftImm(kShiftRight, scratch[0], 8);
+        body.RipOperand({0x0F, 0xDB}, scratch[0], fieldMask);
+        body.Sse(kPrefixPacked, {0x0F, 0x6F}, scratch[1], src);
+        body.RipOperand({0x0F, 0xDB}, scratch[1], fieldMask);
+        body.RipOperand({0x0F, 0xEF}, scratch[1], fieldMask);
+        body.RipOperand({0x0F, 0xD4}, scratch[1], one);
+        body.RipOperand({0x0F, 0xDB}, scratch[1], fieldMask);
+        body.Sse(kPrefixPacked, {0x0F, 0xD3}, dst, scratch[0]);
+        body.Sse(kPrefixPacked, {0x0F, 0xF3}, dst, scratch[1]);
+        body.Sse(kPrefixPacked, {0x0F, 0xD3}, dst, scratch[1]);
+        body.Restore(scratch[1]);
+        body.Restore(scratch[0]);
+        return;
     }
-    if (sequence.size() > originalLength)
-        return std::nullopt;
-    _nopFill(sequence, originalLength - sequence.size());
-    return sequence;
-}
-
-LoweredBody Sse4aLowering::LowerOutOfLine(const Sse4aOperands& operands) const {
-    if (operands.RegisterForm)
-        throw CodegenException("EXTRQ/INSERTQ register form has no Intel lowering");
     const auto length = operands.Length;
     const auto index = operands.Index;
     const auto dst = operands.Destination;
     const auto src = operands.Source;
     const bool byteAligned = length % 8 == 0 && index % 8 == 0;
-    BodyBuilder body;
     if (!operands.Insertq) {
         if (byteAligned) {
             Constant mask;
@@ -208,6 +202,54 @@ LoweredBody Sse4aLowering::LowerOutOfLine(const Sse4aOperands& operands) const {
         body.Sse(kPrefixPacked, {0x0F, 0xEF}, dst, scratch);
         body.Restore(scratch);
     }
+}
+
+}
+
+std::optional<std::vector<std::uint8_t>> Sse4aLowering::LowerInPlace(const Sse4aOperands& operands, const std::size_t originalLength) const {
+    if (operands.RegisterForm)
+        return std::nullopt;
+    const auto length = operands.Length;
+    const auto index = operands.Index;
+    const auto dst = operands.Destination;
+    const auto src = operands.Source;
+    std::vector<std::uint8_t> sequence;
+    if (operands.Insertq) {
+        if (dst == src && index == 0) {
+        } else if (length == kFieldBits && index == 0) {
+            _sse(sequence, kPrefixScalar, {0x0F, 0x7E}, dst, src);
+        } else if (index == 0 && length % 16 == 0) {
+            _sse(sequence, kPrefixPacked, {0x0F, 0x3A, 0x0E}, dst, src);
+            sequence.push_back(static_cast<std::uint8_t>((1u << (length / 16)) - 1));
+        } else {
+            return std::nullopt;
+        }
+    } else {
+        if (index == 0 && length == kFieldBits) {
+        } else if (index + length == kFieldBits) {
+            _shiftImm(sequence, kShiftRight, dst, index);
+        } else if (index == 0 && (length == 8 || length == 16 || length == 32)) {
+            const std::uint8_t opcode = length == 8 ? 0x32 : (length == 16 ? 0x34 : 0x35);
+            _sse(sequence, kPrefixPacked, {0x0F, 0x38, opcode}, dst, dst);
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (sequence.size() > originalLength)
+        return std::nullopt;
+    _nopFill(sequence, originalLength - sequence.size());
+    return sequence;
+}
+
+LoweredBody Sse4aLowering::LowerOutOfLine(const Sse4aOperands& operands, std::span<const std::uint8_t> trailing) const {
+    return LowerOutOfLine(std::span<const Sse4aOperands>(&operands, 1), trailing);
+}
+
+LoweredBody Sse4aLowering::LowerOutOfLine(std::span<const Sse4aOperands> sequence, std::span<const std::uint8_t> trailing) const {
+    BodyBuilder body;
+    for (const auto& operands : sequence)
+        _emitOutOfLine(body, operands);
+    body.Raw(trailing);
     return body.Finish();
 }
 
