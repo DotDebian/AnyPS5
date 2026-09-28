@@ -1,6 +1,7 @@
 #include "prx/libSceAgc/Misc/include/ShaderFusion.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -42,11 +43,15 @@ struct Layout {
  std::size_t codeBytes;
  std::vector<ShaderRegister> sh;
  std::vector<ShaderRegister> cx;
+ std::size_t headerOffset;
  std::size_t shOffset;
  std::size_t cxOffset;
  std::size_t specialsOffset;
  std::size_t inputsOffset;
  std::size_t outputsOffset;
+ std::size_t userDataOffset;
+ std::size_t directOffset;
+ std::array<std::size_t, 4> sharpOffsets;
  std::size_t totalBytes;
 };
 
@@ -136,12 +141,21 @@ Layout ComputeLayout(const char* function, const Shader* front, const Shader* ba
   if (std::none_of(layout.cx.begin(), layout.cx.end(), [&](const ShaderRegister& other) { return other.offset == reg.offset; })) layout.cx.push_back(reg);
  }
  if (layout.sh.size() > 0xff || layout.cx.size() > 0xff) Fail(function, "fused register count exceeds the shader header");
- layout.shOffset = AlignUp(layout.codeBytes, alignof(ShaderRegister));
+ layout.headerOffset = AlignUp(layout.codeBytes, alignof(Shader));
+ layout.shOffset = AlignUp(layout.headerOffset + sizeof(Shader), alignof(ShaderRegister));
  layout.cxOffset = layout.shOffset + layout.sh.size() * sizeof(ShaderRegister);
  layout.specialsOffset = AlignUp(layout.cxOffset + layout.cx.size() * sizeof(ShaderRegister), alignof(ShaderSpecialRegs));
  layout.inputsOffset = AlignUp(layout.specialsOffset + back->special_sizes_bytes, alignof(ShaderSemantic));
  layout.outputsOffset = layout.inputsOffset + front->num_input_semantics * sizeof(ShaderSemantic);
- layout.totalBytes = layout.outputsOffset + back->num_output_semantics * sizeof(ShaderSemantic);
+ layout.userDataOffset = AlignUp(layout.outputsOffset + back->num_output_semantics * sizeof(ShaderSemantic), alignof(ShaderUserData));
+ auto end = layout.userDataOffset + (back->user_data != nullptr ? sizeof(ShaderUserData) : 0);
+ layout.directOffset = AlignUp(end, alignof(std::uint16_t));
+ if (back->user_data != nullptr) end = layout.directOffset + back->user_data->direct_resource_count * sizeof(std::uint16_t);
+ for (std::size_t i = 0; i < layout.sharpOffsets.size(); ++i) {
+  layout.sharpOffsets[i] = AlignUp(end, alignof(ShaderSharp));
+  if (back->user_data != nullptr) end = layout.sharpOffsets[i] + back->user_data->sharp_resource_count[i] * sizeof(ShaderSharp);
+ }
+ layout.totalBytes = end;
  return layout;
 }
 
@@ -183,6 +197,20 @@ int APS5_VABI sceAgcUnknownFuseShaderHalves(Shader* fused_result, const Shader* 
     if (front->num_input_semantics != 0) std::memcpy(inputs, front->input_semantics, front->num_input_semantics * sizeof(ShaderSemantic));
     if (back->num_output_semantics != 0) std::memcpy(outputs, back->output_semantics, back->num_output_semantics * sizeof(ShaderSemantic));
     Shader fused = *back;
+    if (back->user_data != nullptr) {
+        auto* userData = reinterpret_cast<ShaderUserData*>(memory + layout.userDataOffset);
+        *userData = *back->user_data;
+        auto* direct = reinterpret_cast<std::uint16_t*>(memory + layout.directOffset);
+        if (userData->direct_resource_count != 0) std::memcpy(direct, back->user_data->direct_resource_offset, userData->direct_resource_count * sizeof(std::uint16_t));
+        userData->direct_resource_offset = userData->direct_resource_count != 0 ? direct : nullptr;
+        for (std::size_t i = 0; i < layout.sharpOffsets.size(); ++i) {
+            auto* sharps = reinterpret_cast<ShaderSharp*>(memory + layout.sharpOffsets[i]);
+            if (userData->sharp_resource_count[i] != 0) std::memcpy(sharps, back->user_data->sharp_resource_offset[i], userData->sharp_resource_count[i] * sizeof(ShaderSharp));
+            userData->sharp_resource_offset[i] = userData->sharp_resource_count[i] != 0 ? sharps : nullptr;
+        }
+        fused.user_data = userData;
+    }
+    fused.header_size = static_cast<std::uint32_t>(layout.totalBytes - layout.headerOffset);
     fused.code = memory;
     fused.sh_registers = sh;
     fused.cx_registers = layout.cx.empty() ? nullptr : cx;
@@ -195,8 +223,10 @@ int APS5_VABI sceAgcUnknownFuseShaderHalves(Shader* fused_result, const Shader* 
     fused.type = static_cast<std::uint8_t>(ShaderBinaryType::Gs);
     fused.num_sh_registers = static_cast<std::uint8_t>(layout.sh.size());
     fused.num_cx_registers = static_cast<std::uint8_t>(layout.cx.size());
+    auto* header = reinterpret_cast<Shader*>(memory + layout.headerOffset);
+    *header = fused;
     *fused_result = fused;
-    AgcDriverRegisterShader_nid_postfix(fused_result);
+    AgcDriverRegisterShader_nid_postfix(header);
     return 0;
 }
 
