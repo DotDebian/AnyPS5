@@ -327,12 +327,11 @@ int APS5_VABI sceKernelGetdirentries(int fd, char* buf, int nbytes, int64_t* bas
     for (long offset = 0; offset < read;) {
         const auto* entry = reinterpret_cast<const struct dirent64*>(host.data() + offset);
         const auto nameLength = std::strlen(entry->d_name);
-        if (nameLength > GuestMaxName) return SceErrorFromErrno(GUEST_ENAMETOOLONG);
         const auto record = (GuestHeaderBytes + nameLength + 1 + 3) & ~std::size_t{3};
-        if (written + record > static_cast<std::size_t>(nbytes)) {
-            if (written == 0) return SceErrorFromErrno(GUEST_EINVAL);
+        if (nameLength > GuestMaxName || written + record > static_cast<std::size_t>(nbytes)) {
             if (::lseek(fd, resume, SEEK_SET) < 0) return SceErrorFromErrno(errno);
-            return static_cast<int>(written);
+            if (written != 0) return static_cast<int>(written);
+            return nameLength > GuestMaxName ? static_cast<int>(0x80020000u | GUEST_ENAMETOOLONG) : SceErrorFromErrno(GUEST_EINVAL);
         }
         char* out = buf + written;
         std::memset(out, 0, record);
@@ -394,15 +393,15 @@ int64_t APS5_VABI sceKernelPwrite(int d, const void* buf, size_t nbytes, int64_t
 int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
     if (buf == nullptr && nbytes != 0) return SceErrorFromErrno(GUEST_EFAULT);
     if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
-    const auto result = ::pread(d, buf, nbytes, static_cast<off_t>(offset));
-    return result < 0 ? SceErrorFromErrno(errno) : static_cast<int64_t>(result);
+    const auto result = NativePread(d, buf, nbytes, offset);
+    return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
 int64_t APS5_VABI sceKernelPwrite(int d, const void* buf, size_t nbytes, int64_t offset) {
     if (buf == nullptr && nbytes != 0) return SceErrorFromErrno(GUEST_EFAULT);
     if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
-    const auto result = ::pwrite(d, buf, nbytes, static_cast<off_t>(offset));
-    return result < 0 ? SceErrorFromErrno(errno) : static_cast<int64_t>(result);
+    const auto result = NativePwrite(d, buf, nbytes, offset);
+    return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 
 #endif
