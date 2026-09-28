@@ -265,6 +265,13 @@ private:
     std::atomic<std::shared_ptr<VulkanDevice>> pointer;
 };
 
+// Debug aid: APS5_TOLERATE_DISPATCH_FAILURES=1 skips a dispatch the driver cannot run (reported once
+// per message) instead of failing the queue, so a title can be explored past unsupported work.
+bool TolerateDispatchFailures() {
+    static const bool tolerate = std::getenv("APS5_TOLERATE_DISPATCH_FAILURES") != nullptr;
+    return tolerate;
+}
+
 class DeviceUseGate {
 public:
     void lock_shared() {
@@ -6097,11 +6104,11 @@ private:
                 CaptureTrace::Log("flip frame=%llu submission=%llu offset=%zu batch=%llu unsignaled=%llu", static_cast<unsigned long long>(frameSerial), static_cast<unsigned long long>(submission.serial), cursor, static_cast<unsigned long long>(batchesAtFlip), static_cast<unsigned long long>(unsignaledAtFlip));
                 submission.flips.at(cursor)->GpuReady(frame);
             } else if (opcode == 0x15) {
-                timed(&WorkerProfile::dispatchMs, [&] { dispatch(queue, packet, submission); });
+                timed(&WorkerProfile::dispatchMs, [&] { if (TolerateDispatchFailures()) tolerate("dispatch", [&] { dispatch(queue, packet, submission); }); else dispatch(queue, packet, submission); });
                 Graphics::Recorder::CountRecordedWork();
                 finishDispatchPacket(false);
             } else if (opcode == 0x16) {
-                timed(&WorkerProfile::dispatchMs, [&] { dispatchIndirect(queue, packet, submission); });
+                timed(&WorkerProfile::dispatchMs, [&] { if (TolerateDispatchFailures()) tolerate("indirect dispatch", [&] { dispatchIndirect(queue, packet, submission); }); else dispatchIndirect(queue, packet, submission); });
                 Graphics::Recorder::CountRecordedWork();
                 finishDispatchPacket(true);
             } else if (opcode == 0x3c || opcode == 0x93) {
