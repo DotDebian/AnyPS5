@@ -406,6 +406,17 @@ DccKeys ReadDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
     return readDccKeys(metaAddress, surfaceBytes, memoized);
 }
 
+DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
+    const auto count = static_cast<std::size_t>(surfaceBytes / KeyBytes);
+    if (metaAddress != 0 && count != 0 && GuestMemory::GpuMutex().HeldByThisThread()) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
+            Recorder::CountSync(2);
+            recorder->SyncThrough(metaAddress, count);
+        }
+    }
+    return ReadDccKeys(metaAddress, surfaceBytes);
+}
+
 bool IsDccClear(DccKeys keys) {
     return keys == DccKeys::Clear0000 || keys == DccKeys::Clear0001 || keys == DccKeys::Clear1110 || keys == DccKeys::Clear1111 || keys == DccKeys::ClearRegister;
 }

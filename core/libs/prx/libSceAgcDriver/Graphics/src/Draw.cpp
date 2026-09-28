@@ -118,7 +118,9 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (disabled) return;
     if (color.dccAddress == 0 || color.elementBytes > sizeof(color.clearWords) || resident.Descriptor().dccAddress != color.dccAddress) return;
-    if (ReadDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
+    // The keys as the title's recorded work leaves them: a fast-clear fill still pending would make
+    // a later draw clear over this one's results.
+    if (CurrentDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     if (trace) std::fprintf(stderr, "[draw] register clear of 0x%llx (%ux%u VkFormat %d) to %08x %08x before the draw\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), color.clearWords[0], color.clearWords[1]);
     const char* refusal = nullptr;
@@ -1414,7 +1416,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         // A fast-cleared DCC target holds its clear value wherever the draw does not write.
         if (color.dccAddress != 0) {
-            const auto keys = ReadDccKeys(color.dccAddress, colorLayout.Bytes());
+            const auto keys = CurrentDccKeys(color.dccAddress, colorLayout.Bytes());
             if (IsDccClear(keys)) {
                 const auto pixels = binding.gpuTiling ? binding.tiled->Bytes() : binding.transfer->Bytes();
                 // The register code's value is the target's CB_COLOR_CLEAR_WORD texel (64 bits at most).
@@ -1943,7 +1945,7 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     for (const auto& color : pass.targets) {
         if (color.dccAddress == 0) continue;
-        auto keys = ReadDccKeys(color.dccAddress, color.bytes);
+        auto keys = CurrentDccKeys(color.dccAddress, color.bytes);
         if (trace) std::fprintf(stderr, "[draw] %s over 0x%llx (%ux%u VkFormat %d): DCC keys %s\n", pass.mode == ColorMetadataPass::Mode::EliminateFastClear ? "fast-clear eliminate" : "DCC decompress", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), DccKeysName(keys));
         if (keys == DccKeys::Uncompressed) continue;
         Require(IsDccClear(keys), std::string("CB metadata pass over DCC keys that are ") + DccKeysName(keys) + " (per-block metadata is not modeled)");

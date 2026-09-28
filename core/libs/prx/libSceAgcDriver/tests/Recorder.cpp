@@ -1186,6 +1186,20 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
     Require(StorageTexture::FindPending(address, surfaceBytes) != nullptr, "the DCC decompress did not stay in the resident image");
     Require(keysUncompressed(), "the DCC decompress left the keys compressed");
     Require(memoryHolds({0xff, 0xff, 0xff, 0xff}), "the DCC decompress did not store the 1111 value");
+    // A fast-clear fill of the keys still recorded (not yet in memory): the materializing reads see
+    // the keys it leaves, not the stale bytes.
+    {
+        const auto* import = HostImportFor(base, address, bytes);
+        Require(import != nullptr, "the metadata pass block lost its import");
+        const auto commands = recorder.Commands();
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, color.dccAddress - import->base, keyCount, 0x20202020u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        recorder.NotePendingWrite(color.dccAddress, keyCount);
+        Require(keys[0] == 0xff, "the recorded key fill landed before its batch ran");
+        Require(CurrentDccKeys(color.dccAddress, surfaceBytes) == DccKeys::ClearRegister, "the keys read past a pending fast-clear fill");
+    }
+    RunColorMetadataPass(context, pass);
+    Require(keysUncompressed() && memoryHolds({0x10, 0x20, 0x40, 0x80}), "a fast clear recorded before the pass was not eliminated");
     // Uncompressed keys: the texels are what reads see; nothing changes.
     std::memset(texels, 0x66, surfaceBytes);
     RunColorMetadataPass(context, pass);
