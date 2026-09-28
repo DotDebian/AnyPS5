@@ -1,6 +1,8 @@
 // agc_shader_replay <shader_*.req>...: replays compute recompile requests the driver saved with
 // APS5_DUMP_SHADERS=1, running the same resource analysis and recompile steps without the game.
+#include "ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "ControlFlow/Structurizer.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Recompiler.hpp"
@@ -39,6 +41,7 @@ bool g_disassemble = false;
 bool g_assembly = false;
 bool g_memory = false;
 bool g_spirv = false;
+bool g_graph = false;
 
 bool Replay(const char* path) {
     const auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
@@ -74,6 +77,17 @@ bool Replay(const char* path) {
         const auto program = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(request.request.shader.code);
         // Raw first words carry what the text omits (branch offsets, waitcnt fields).
         for (const auto& instruction : program.instructions) std::printf("raw=%08x %s\n", instruction.rawWords[0], ShaderRecompiler::RdnaInstructionToString(instruction).c_str());
+    }
+    if (g_graph) {
+        const auto program = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(request.request.shader.code);
+        auto graph = ShaderRecompiler::GraphBuilder{}.Build(program);
+        std::printf("control flow graph:\n%s", ShaderRecompiler::GraphToString(graph).c_str());
+        try {
+            ShaderRecompiler::Structurizer{}.Structurize(graph);
+            std::printf("structured control flow graph:\n%s", ShaderRecompiler::GraphToString(graph).c_str());
+        } catch (const std::exception& error) {
+            std::printf("  structurization failed: %s\n", error.what());
+        }
     }
     try {
         auto program = ShaderRecompiler::PrepareResourceProgram(request.request);
@@ -116,7 +130,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--mem] [--spv] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     int failures = 0;
@@ -131,6 +145,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--spv") {
             g_spirv = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--cfg") {
+            g_graph = true;
             continue;
         }
         if (std::string(argv[i]) == "--mem") {

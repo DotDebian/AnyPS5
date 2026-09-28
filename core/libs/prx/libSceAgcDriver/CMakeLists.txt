@@ -164,6 +164,14 @@ target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driv
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
 
+add_executable(agc_shader_control_flow_tests EXCLUDE_FROM_ALL
+        tests/ControlFlow.cpp
+)
+target_include_directories(agc_shader_control_flow_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_shader_control_flow_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_shader_control_flow_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_shader_control_flow_tests)
+
 add_executable(agc_shader_disk_cache_tests EXCLUDE_FROM_ALL
         tests/ShaderDiskCache.cpp
 )
@@ -318,7 +326,7 @@ set_target_properties(agc_driver_mesh_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_mesh_tests)
 
 if(BUILD_TESTING)
-    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_shader_disk_cache_tests agc_driver_flip_tests agc_driver_pm4_tests)
+    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_shader_control_flow_tests agc_shader_disk_cache_tests agc_driver_flip_tests agc_driver_pm4_tests)
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})

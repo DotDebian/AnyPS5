@@ -3,6 +3,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -435,7 +436,226 @@ std::vector<std::uint32_t> selectionRegion(const ControlFlowGraph& graph, const 
     return region;
 }
 
-bool splitOneSelectionMerge(ControlFlowGraph& graph) {
+struct CloneBudget {
+    std::uint32_t remainingInstructions = 0;
+};
+
+void redirectEdge(BasicBlock& block, std::uint32_t oldTarget, std::uint32_t newTarget) {
+    replaceValue(block.successors, oldTarget, newTarget);
+    replaceTerminatorTarget(block.terminator, oldTarget, newTarget);
+    for (auto& target : block.terminator.indirectTargets) {
+        if (target == oldTarget) {
+            target = newTarget;
+        }
+    }
+    for (auto& target : block.terminator.indirectSelectorTargets) {
+        if (target == oldTarget) {
+            target = newTarget;
+        }
+    }
+}
+
+std::vector<std::uint32_t> reversePostOrder(const ControlFlowGraph& graph) {
+    std::vector<std::uint32_t> postOrder;
+    std::vector<bool> visited(graph.blocks.size(), false);
+    std::vector<std::pair<std::uint32_t, std::size_t>> stack = {{graph.entryBlock, 0u}};
+    visited[graph.entryBlock] = true;
+    while (!stack.empty()) {
+        auto& [blockId, next] = stack.back();
+        const auto& successors = graph.FindBlock(blockId).successors;
+        if (next < successors.size()) {
+            const auto successor = successors[next++];
+            if (!visited[successor]) {
+                visited[successor] = true;
+                stack.emplace_back(successor, 0u);
+            }
+            continue;
+        }
+        postOrder.push_back(blockId);
+        stack.pop_back();
+    }
+    return {postOrder.rbegin(), postOrder.rend()};
+}
+
+using Edge = std::pair<std::uint32_t, std::uint32_t>;
+
+std::vector<Edge> externalEntryEdges(const ControlFlowGraph& graph, std::uint32_t header, const std::vector<std::uint32_t>& region) {
+    std::vector<Edge> edges;
+    for (const auto member : region) {
+        for (const auto predecessor : graph.FindBlock(member).predecessors) {
+            if (predecessor == header || contains(region, predecessor)) {
+                continue;
+            }
+            if (graph.Dominates(member, predecessor)) {
+                throw std::runtime_error("selection header block " + std::to_string(header) + " region block " + std::to_string(member) + " is entered by a back edge from block " + std::to_string(predecessor));
+            }
+            edges.emplace_back(predecessor, member);
+        }
+    }
+    return edges;
+}
+
+std::vector<std::uint32_t> reachableWithin(const ControlFlowGraph& graph, const std::vector<Edge>& entryEdges, const std::vector<std::uint32_t>& region) {
+    std::vector<std::uint32_t> reached;
+    std::vector<std::uint32_t> pending;
+    for (const auto& edge : entryEdges) {
+        pending.push_back(edge.second);
+    }
+    while (!pending.empty()) {
+        const auto blockId = pending.back();
+        pending.pop_back();
+        if (contains(reached, blockId)) {
+            continue;
+        }
+        reached.push_back(blockId);
+        for (const auto successor : graph.FindBlock(blockId).successors) {
+            if (contains(region, successor)) {
+                pending.push_back(successor);
+            }
+        }
+    }
+    sortUnique(reached);
+    return reached;
+}
+
+std::vector<std::uint32_t> linearTail(const ControlFlowGraph& graph, std::uint32_t start) {
+    std::vector<std::uint32_t> tail;
+    for (auto blockId = start; !contains(tail, blockId);) {
+        tail.push_back(blockId);
+        const auto& block = graph.FindBlock(blockId);
+        if (block.successors.size() != 1u) {
+            break;
+        }
+        blockId = block.successors.front();
+    }
+    return tail;
+}
+
+std::uint32_t instructionCount(const ControlFlowGraph& graph, const std::vector<std::uint32_t>& blocks) {
+    std::uint32_t count = 0;
+    for (const auto blockId : blocks) {
+        const auto& block = graph.FindBlock(blockId);
+        count += block.instructionEnd - block.instructionBegin;
+    }
+    return count;
+}
+
+std::string cloneRefusal(const ControlFlowGraph& graph, std::uint32_t header, const std::vector<std::uint32_t>& blocks) {
+    for (const auto blockId : blocks) {
+        const auto& block = graph.FindBlock(blockId);
+        if (graph.Dominates(blockId, header)) {
+            return "the region wraps around to dominating block " + std::to_string(blockId);
+        }
+        if (block.terminator.kind == TerminatorKind::IndirectBranch || block.terminator.kind == TerminatorKind::Unsupported) {
+            return "block " + std::to_string(blockId) + " ends in an indirect or unsupported branch";
+        }
+    }
+    for (const auto& loop : graph.naturalLoops) {
+        const bool headerCloned = contains(blocks, loop.headerBlock);
+        for (const auto member : loop.blocks) {
+            if (headerCloned && !contains(blocks, member)) {
+                return "loop " + std::to_string(loop.headerBlock) + " would be cloned without its body block " + std::to_string(member);
+            }
+        }
+        if (!headerCloned && contains(blocks, loop.continueBlock)) {
+            return "the continue block " + std::to_string(loop.continueBlock) + " of loop " + std::to_string(loop.headerBlock) + " would be cloned without its header";
+        }
+    }
+    return {};
+}
+
+void cloneBlocks(ControlFlowGraph& graph, const std::vector<std::uint32_t>& blocks, const std::vector<Edge>& entryEdges) {
+    std::map<std::uint32_t, std::uint32_t> cloneOf;
+    for (const auto blockId : blocks) {
+        cloneOf.emplace(blockId, static_cast<std::uint32_t>(graph.blocks.size() + cloneOf.size()));
+    }
+    std::vector<BasicBlock> clones;
+    clones.reserve(blocks.size());
+    for (const auto blockId : blocks) {
+        BasicBlock copy = graph.FindBlock(blockId);
+        copy.id = cloneOf.at(blockId);
+        copy.predecessors.clear();
+        copy.dominators.clear();
+        copy.postDominators.clear();
+        for (const auto& [original, clone] : cloneOf) {
+            redirectEdge(copy, original, clone);
+        }
+        clones.push_back(std::move(copy));
+    }
+    for (auto& clone : clones) {
+        graph.blocks.push_back(std::move(clone));
+    }
+    for (const auto& [predecessor, entry] : entryEdges) {
+        redirectEdge(graph.FindBlock(predecessor), entry, cloneOf.at(entry));
+    }
+    rebuildPredecessors(graph);
+
+    const auto firstClone = static_cast<std::uint32_t>(graph.blocks.size() - blocks.size());
+    std::vector<BasicBlock> ordered;
+    ordered.reserve(graph.blocks.size());
+    for (std::uint32_t blockId = 0; blockId < firstClone; ++blockId) {
+        ordered.push_back(graph.blocks[blockId]);
+    }
+    for (const auto blockId : reversePostOrder(graph)) {
+        if (blockId >= firstClone) {
+            ordered.push_back(graph.blocks[blockId]);
+        }
+    }
+    if (ordered.size() != graph.blocks.size()) {
+        throw std::runtime_error("a cloned control flow block is unreachable");
+    }
+    applyBlockOrder(graph, std::move(ordered));
+}
+
+std::optional<ControlFlowGraph> privatizeMergeTail(const ControlFlowGraph& graph, std::uint32_t header, std::uint32_t merge, std::uint32_t& cost, const std::function<void(ControlFlowGraph&)>& recompute) {
+    const auto& headerBlock = graph.FindBlock(header);
+    if ((headerBlock.terminator.trueBlock != merge && headerBlock.terminator.falseBlock != merge) || graph.FindBlock(merge).predecessors.size() < 2u || !hasLinearPathToTerminal(graph, merge)) {
+        return std::nullopt;
+    }
+    const auto tail = linearTail(graph, merge);
+    if (!cloneRefusal(graph, header, tail).empty()) {
+        return std::nullopt;
+    }
+    auto candidate = graph;
+    cloneBlocks(candidate, tail, {{header, merge}});
+    recompute(candidate);
+    if (candidate.irreducible || findSelectionMerge(candidate, candidate.FindBlock(header)) == InvalidControlFlowId) {
+        return std::nullopt;
+    }
+    cost = instructionCount(graph, tail);
+    return candidate;
+}
+
+bool cloneEnteredRegion(ControlFlowGraph& graph, std::uint32_t header, std::uint32_t merge, const std::vector<std::uint32_t>& region, CloneBudget& budget, const std::function<void(ControlFlowGraph&)>& recompute) {
+    const auto entryEdges = externalEntryEdges(graph, header, region);
+    if (entryEdges.empty()) {
+        return false;
+    }
+    const auto entered = reachableWithin(graph, entryEdges, region);
+    const auto refusal = cloneRefusal(graph, header, entered);
+    const auto enteredCost = instructionCount(graph, entered);
+    const auto describe = [&](const std::string& reason) {
+        return "selection header block " + std::to_string(header) + " has externally entered region block " + std::to_string(entryEdges.front().second) + " (from block " + std::to_string(entryEdges.front().first) + "): " + reason;
+    };
+
+    std::uint32_t tailCost = 0;
+    if (auto privatized = privatizeMergeTail(graph, header, merge, tailCost, recompute); privatized && (!refusal.empty() || tailCost <= enteredCost) && tailCost <= budget.remainingInstructions) {
+        budget.remainingInstructions -= tailCost;
+        graph = std::move(*privatized);
+        return true;
+    }
+    if (!refusal.empty()) {
+        throw std::runtime_error(describe(refusal));
+    }
+    if (enteredCost > budget.remainingInstructions) {
+        throw std::runtime_error(describe("cloning " + std::to_string(entered.size()) + " blocks (" + std::to_string(enteredCost) + " instructions) exceeds the remaining clone budget of " + std::to_string(budget.remainingInstructions) + " instructions"));
+    }
+    budget.remainingInstructions -= enteredCost;
+    cloneBlocks(graph, entered, entryEdges);
+    return true;
+}
+
+bool splitOneSelectionMerge(ControlFlowGraph& graph, CloneBudget& budget, const std::function<void(ControlFlowGraph&)>& recompute) {
     std::vector<std::uint32_t> loopHeaders;
     loopHeaders.reserve(graph.naturalLoops.size());
     for (const auto& loop : graph.naturalLoops) {
@@ -466,14 +686,8 @@ bool splitOneSelectionMerge(ControlFlowGraph& graph) {
         }
 
         const auto region = selectionRegion(graph, block, merge);
-        const auto external = std::find_if(region.begin(), region.end(), [&](std::uint32_t member) {
-            const auto& memberBlock = graph.FindBlock(member);
-            return std::any_of(memberBlock.predecessors.begin(), memberBlock.predecessors.end(), [&](std::uint32_t predecessor) {
-                return predecessor != blockId && !contains(region, predecessor);
-            });
-        });
-        if (external != region.end()) {
-            throw std::runtime_error("selection header block " + std::to_string(blockId) + " has externally entered region block " + std::to_string(*external) + "; semantic block cloning is disabled");
+        if (cloneEnteredRegion(graph, blockId, merge, region, budget, recompute)) {
+            return true;
         }
 
         const auto constructBlocks = dominatedBlocks(graph, blockId, merge);
@@ -584,6 +798,7 @@ void Structurizer::Structurize(ControlFlowGraph& graph) const {
     canonicalizeNaturalLoops(graph);
     splitSharedMergeBlocks(graph);
     isolateSemanticLoopHeaders(graph);
+    orderByDominance(graph);
     clearStructuredTerminators(graph);
 
     std::map<std::uint32_t, std::uint32_t> mergeHeaders;
@@ -832,12 +1047,14 @@ void Structurizer::canonicalizeNaturalLoops(ControlFlowGraph& graph) const {
 void Structurizer::splitSharedMergeBlocks(ControlFlowGraph& graph) const {
     const auto originalBlockCount = static_cast<std::uint32_t>(graph.blocks.size());
     const auto splitBudget = std::max<std::uint32_t>(16u, originalBlockCount * 4u);
+    CloneBudget cloneBudget{std::max<std::uint32_t>(256u, instructionCount(graph, allBlockIds(originalBlockCount)) * 2u)};
     for (std::uint32_t splits = 0; splits < splitBudget; ++splits) {
-        if (!splitOneLoopMerge(graph) && !splitOneSelectionMerge(graph)) {
+        if (!splitOneLoopMerge(graph) && !splitOneSelectionMerge(graph, cloneBudget, [this](ControlFlowGraph& candidate) { recomputeAnalyses(candidate); })) {
             return;
         }
         rebuildPredecessors(graph);
         recomputeAnalyses(graph);
+        verifyReducibility(graph);
     }
 
     throw std::runtime_error("CFG shared merge splitting exceeded budget: originalBlocks=" + std::to_string(originalBlockCount) + " currentBlocks=" + std::to_string(graph.blocks.size()) + " splitBudget=" + std::to_string(splitBudget));
@@ -860,6 +1077,26 @@ void Structurizer::isolateSemanticLoopHeaders(ControlFlowGraph& graph) const {
     }
 
     throw std::runtime_error("CFG semantic loop-header isolation exceeded rewrite budget");
+}
+
+void Structurizer::orderByDominance(ControlFlowGraph& graph) const {
+    const bool ordered = std::all_of(graph.blocks.begin(), graph.blocks.end(), [](const BasicBlock& block) {
+        return std::all_of(block.dominators.begin(), block.dominators.end(), [&](std::uint32_t dominator) { return dominator <= block.id; });
+    });
+    if (ordered) {
+        return;
+    }
+    const auto order = reversePostOrder(graph);
+    if (order.size() != graph.blocks.size()) {
+        throw std::runtime_error("control flow graph has unreachable blocks");
+    }
+    std::vector<BasicBlock> blocks;
+    blocks.reserve(order.size());
+    for (const auto blockId : order) {
+        blocks.push_back(graph.blocks[blockId]);
+    }
+    applyBlockOrder(graph, std::move(blocks));
+    recomputeAnalyses(graph);
 }
 
 void Structurizer::clearStructuredTerminators(ControlFlowGraph& graph) const {
