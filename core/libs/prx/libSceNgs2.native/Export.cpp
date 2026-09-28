@@ -27,14 +27,17 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#endif
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
@@ -210,6 +213,7 @@ std::string Hex(const void* p, size_t n) {
     return s;
 }
 
+#ifdef _WIN32
 bool Readable(const void* p, size_t n) {
     if (p == nullptr) return false;
     if (n == 0) return true;
@@ -238,6 +242,58 @@ bool Writable(void* p, size_t n) {
     }
     return true;
 }
+
+#else
+struct MappedRange {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+    bool readable;
+    bool writable;
+};
+
+bool MappingAllows(const void* p, size_t n, bool write) {
+    if (p == nullptr) return false;
+    if (n == 0) return true;
+    const auto begin = reinterpret_cast<std::uintptr_t>(p);
+    if (begin + n < begin) return false;
+    static std::mutex mutex;
+    static std::vector<MappedRange> ranges;
+    static std::chrono::steady_clock::time_point loaded{};
+    std::lock_guard lock(mutex);
+    const auto check = [&] {
+        auto cursor = begin;
+        const auto end = begin + n;
+        while (cursor < end) {
+            auto it = std::upper_bound(ranges.begin(), ranges.end(), cursor, [](std::uintptr_t value, const MappedRange& range) { return value < range.begin; });
+            if (it == ranges.begin()) return false;
+            --it;
+            if (cursor >= it->end || !(write ? it->writable : it->readable)) return false;
+            cursor = it->end;
+        }
+        return true;
+    };
+    const auto reload = [&] {
+        ranges.clear();
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line)) {
+            unsigned long long first = 0, last = 0;
+            char perms[5] = {};
+            if (std::sscanf(line.c_str(), "%llx-%llx %4s", &first, &last, perms) != 3) continue;
+            ranges.push_back({static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(last), perms[0] == 'r', perms[1] == 'w'});
+        }
+        loaded = std::chrono::steady_clock::now();
+    };
+    if (std::chrono::steady_clock::now() - loaded > std::chrono::milliseconds(50)) reload();
+    if (check()) return true;
+    reload();
+    return check();
+}
+
+bool Readable(const void* p, size_t n) { return MappingAllows(p, n, false); }
+bool Writable(void* p, size_t n) { return MappingAllows(p, n, true); }
+
+#endif
 
 template <class T> T Rd(const uint8_t* p) { T v; std::memcpy(&v, p, sizeof(T)); return v; }
 
