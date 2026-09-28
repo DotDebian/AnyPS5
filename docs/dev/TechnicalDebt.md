@@ -13,6 +13,7 @@
 Throughout the project, every function at every stage either **does exactly what it's supposed to or throws an exception**. Everywhere... except:
 - [libSceSaveDataDialog.native](../../core/libs/prx/libSceSaveDataDialog.native/Export.cpp)
 - [libSceCommonDialog](../../core/libs/prx/libSceCommonDialog/Export.cpp)
+- [libSceVideodec2](../../core/libs/prx/libSceVideodec2/Export.cpp) returns black pictures for every codec except H.264, and for H.264 too when [FFmpeg](../../3rdparty/FFmpeg) is not built (`ANYPS5_ENABLE_FFMPEG=OFF`, or no `sh`/`make`, as with a plain MinGW setup)
 - The shader recompiler [skips baryctric coordinates](../../core/shader/recompiler/Recompiler.cpp) (is not even passed to SpirvTargetOptions at row 212).
 
 ### Unknown function info
