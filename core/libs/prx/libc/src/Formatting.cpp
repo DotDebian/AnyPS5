@@ -169,6 +169,56 @@ int APS5_VABI vsnprintf_nid_postfix(char* str, size_t size, const char* format, 
 #endif
 }
 
+#ifdef _WIN32
+
+int APS5_VABI snprintf_s_nid_postfix(char* buffer, size_t size, const char* format, ...) {
+    __builtin_sysv_va_list args;
+    __builtin_sysv_va_start(args, format);
+    const int result = LibcDetail::FormatWindows(buffer, size, format, args);
+    __builtin_sysv_va_end(args);
+    return result;
+}
+
+int APS5_VABI printf_s_nid_postfix(const char* format, ...) {
+    __builtin_sysv_va_list args;
+    __builtin_sysv_va_start(args, format);
+    const int result = LibcDetail::PrintWindows(format, args);
+    __builtin_sysv_va_end(args);
+    return result;
+}
+
+#else
+
+int APS5_VABI vsprintf_s_nid_postfix(char* buffer, size_t size, const char* format, VaList* args) {
+    return std::vsnprintf(buffer, size, format, *reinterpret_cast<std::va_list*>(args));
+}
+
+int APS5_VABI sprintf_s_nid_postfix(char* buffer, size_t size, const char* format, ...) {
+    std::va_list args;
+    va_start(args, format);
+    const int result = std::vsnprintf(buffer, size, format, args);
+    va_end(args);
+    return result;
+}
+
+int APS5_VABI snprintf_s_nid_postfix(char* buffer, size_t size, const char* format, ...) {
+    std::va_list args;
+    va_start(args, format);
+    const int result = std::vsnprintf(buffer, size, format, args);
+    va_end(args);
+    return result;
+}
+
+int APS5_VABI printf_s_nid_postfix(const char* format, ...) {
+    std::va_list args;
+    va_start(args, format);
+    const int result = std::vprintf(format, args);
+    va_end(args);
+    return result;
+}
+
+#endif
+
 int APS5_VABI puts_nid_postfix(const char* s) {
     return std::puts(s);
 }
