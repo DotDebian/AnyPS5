@@ -244,11 +244,12 @@ void DefineInputs(SpirvEmitterState& state) {
             } else if (flat) {
                 state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationFlat);
             }
+            const bool pixelStage = state.program.Resources().stage == IrShaderStage::Pixel;
             const auto parameterBit = input.location < 32u ? 1u << input.location : 0u;
             const auto& interpolation = state.program.Metadata();
             const bool recorded = ((interpolation.pixelLinearInputs | interpolation.pixelPerspectiveInputs) & parameterBit) != 0u;
-            const bool linear = recorded ? (interpolation.pixelLinearInputs & parameterBit) != 0u && (interpolation.pixelPerspectiveInputs & parameterBit) == 0u : PixelInfo(state).psNoPerspective;
-            if (state.program.Resources().stage == IrShaderStage::Pixel && linear && !flat && !input.perVertex) {
+            const bool linear = pixelStage && (recorded ? (interpolation.pixelLinearInputs & parameterBit) != 0u && (interpolation.pixelPerspectiveInputs & parameterBit) == 0u : PixelInfo(state).psNoPerspective);
+            if (linear && !flat && !input.perVertex) {
                 state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationNoPerspective);
             }
             state.module.AddAnnotation(spv::OpDecorate, input.variableId, spv::DecorationLocation, PixelParameterLocation(state, input.location));
