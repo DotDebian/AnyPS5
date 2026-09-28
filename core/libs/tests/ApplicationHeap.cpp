@@ -77,7 +77,7 @@ void write(std::array<std::byte, TSize>& data, std::size_t offset, TValue value)
 
 }
 
-int main(int argc, char**) {
+int main(int argc, char** argv) {
     reject([] { ApplicationHeapAllocate_nid_no_patch(64); });
     reject([] { ApplicationHeapRegister_nid_no_patch(nullptr); });
     std::array<std::byte, 0x40> process{};
@@ -99,6 +99,40 @@ int main(int argc, char**) {
     write(replacement, 0x40, &align);
     write(replacement, 0x48, &reallocate);
     write(replacement, 0x50, &posixAlign);
+    if (argc > 1 && std::strcmp(argv[1], "default") == 0) {
+        std::array<void*, 10> partial{};
+        partial[0] = reinterpret_cast<void*>(&allocate);
+        reject([&] { ApplicationHeapRegister_nid_no_patch(partial.data()); });
+        std::memset(replacement.data() + 0x20, 0, sizeof(partial));
+        ApplicationHeapInitialize_nid_no_patch(process.data());
+        require(initializes == 1);
+        auto* pointer = static_cast<unsigned char*>(ApplicationHeapCalloc_nid_no_patch(7, 9));
+        for (unsigned i = 0; i < 63; ++i) require(pointer[i] == 0);
+        std::memset(pointer, 0x5a, 63);
+        pointer = static_cast<unsigned char*>(ApplicationHeapReallocate_nid_no_patch(pointer, 150));
+        for (unsigned i = 0; i < 63; ++i) require(pointer[i] == 0x5a);
+        pointer = static_cast<unsigned char*>(ApplicationHeapReallocate_nid_no_patch(pointer, 11));
+        for (unsigned i = 0; i < 11; ++i) require(pointer[i] == 0x5a);
+        require(ApplicationHeapReallocate_nid_no_patch(pointer, 0) == nullptr);
+        pointer = static_cast<unsigned char*>(ApplicationHeapReallocate_nid_no_patch(nullptr, 32));
+        require(pointer != nullptr);
+        ApplicationHeapFree_nid_no_patch(pointer);
+        for (std::size_t alignment : {16, 64, 4096}) {
+            auto* aligned = ApplicationHeapAlign_nid_no_patch(alignment, 37);
+            require(reinterpret_cast<std::uintptr_t>(aligned) % alignment == 0);
+            ApplicationHeapFree_nid_no_patch(aligned);
+        }
+        void* aligned = nullptr;
+        require(ApplicationHeapPosixAlign_nid_no_patch(&aligned, 256, 99) == 0);
+        require(reinterpret_cast<std::uintptr_t>(aligned) % 256 == 0);
+        ApplicationHeapFree_nid_no_patch(aligned);
+        ApplicationHeapFree_nid_no_patch(nullptr);
+        reject([] { ApplicationHeapCalloc_nid_no_patch(SIZE_MAX, 2); });
+        reject([] { ApplicationHeapAlign_nid_no_patch(3, 16); });
+        ApplicationHeapInitialize_nid_no_patch(process.data());
+        require(initializes == 1);
+        return 0;
+    }
     if (argc > 1) {
         write(replacement, 8, std::uint64_t{99});
         reject([&] { ApplicationHeapInitialize_nid_no_patch(process.data()); });

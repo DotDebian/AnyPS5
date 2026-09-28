@@ -28,6 +28,10 @@ The relinker uses only the C++20 standard library and should build with any conf
 
 The project targets maximum compiler portability. Support for additional compilers will be addressed after the first successful game launch.
 
+## Input mapping
+
+SDL-mapped game controllers are supported, including analog sticks and triggers. Keyboard and mouse controls can be configured with an `anyps5-input.ini` file. See [input mapping](docs/INPUT_MAPPING.md) for the supported devices and configuration format.
+
 ## Disclaimer
 
 This project is intended for interoperability, research, preservation, and compatibility purposes. It does not include, distribute, or require copyrighted software, firmware, cryptographic keys, or proprietary libraries. Users are responsible for ensuring that any binaries used with this project are obtained and used in accordance with applicable laws and their respective license terms.

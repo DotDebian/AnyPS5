@@ -1,3 +1,4 @@
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -276,7 +277,8 @@ struct DeferredBatch {
     std::vector<std::shared_ptr<void>> kept;
     std::vector<std::function<void()>> completions;
 };
-thread_local std::vector<DeferredBatch> deferredBatches;
+struct DeferredBatchesTag {};
+auto& DeferredBatches() { return HostThreadLocal<std::vector<DeferredBatch>, DeferredBatchesTag>(); }
 std::atomic<std::uint64_t> deferredPending{0};
 // APS5_PROFILE_DRAW, for the [recorder] line: batches and objects released after an unlock and the
 // time that took, on the release thread and inline (on the unlocking thread: the kill switch, a
@@ -392,11 +394,11 @@ void JoinReleaseThread() {
 // The unlock hook: hands what this thread deferred to the release thread, or destroys it here
 // (APS5_RELEASE_ON_UNLOCK=1, the queue is full or stopping, or the hand-off cannot be made).
 void ReleaseDeferredKeeps() {
-    if (deferredBatches.empty()) return;
+    if (DeferredBatches().empty()) return;
     // Taken off the thread's list first: a destructor that took and released the mutex (none is
     // known to) would re-enter here and must find nothing.
-    auto releasing = std::move(deferredBatches);
-    deferredBatches.clear();
+    auto releasing = std::move(DeferredBatches());
+    DeferredBatches().clear();
     if (ReleaseOnUnlock()) {
         DestroyDeferred(std::move(releasing), false);
         return;
@@ -475,10 +477,12 @@ Recorder* labelTableOwner = nullptr;
 // The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by
 // ForgetQueuedLabels): the flush hook, on the same thread, has them recorded before an access that
 // overlaps one, through the function the driver installed.
-thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> queuedLabelRanges;
+struct QueuedLabelRangesTag {};
+auto& QueuedLabelRanges() { return HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, QueuedLabelRangesTag>(); }
 std::atomic<void (*)()> queuedLabelRecorder{nullptr};
 // The dwords (with their stamps) this thread noted since its last CloseLabelGroup (see Recorder::CloseLabelGroup).
-thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> labelGroupDwords;
+struct LabelGroupDwordsTag {};
+auto& LabelGroupDwords() { return HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, LabelGroupDwordsTag>(); }
 // Late-rule counters (Recorder::LateCounts), per thread: lookups run on the waiting worker.
 thread_local Recorder::LateStatistics lateCounts{};
 
@@ -548,7 +552,7 @@ bool SeparateQueuedLabels() {
 
 bool QueuedLabelOverlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
-    for (const auto& [begin, finish] : queuedLabelRanges) {
+    for (const auto& [begin, finish] : QueuedLabelRanges()) {
         if (address < finish && begin < end) return true;
     }
     return false;
@@ -943,7 +947,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     // would reap nested in the reap in progress, landing later batches' write-backs before the
     // rest of this one's, and this queue's queued label follows every batch of its own in flight
     // anyway, so the write-back landing first is the order the hardware gives.
-    if (!queuedLabelRanges.empty() && QueuedLabelOverlaps(address, bytes)) {
+    if (!QueuedLabelRanges().empty() && QueuedLabelOverlaps(address, bytes)) {
         if (completionDepth != 0 && HookCompletionGuard()) {
             queuedLabelHookInCompletion.fetch_add(1, std::memory_order_relaxed);
         } else if (auto* record = queuedLabelRecorder.load(std::memory_order_acquire); record != nullptr) {
@@ -1074,9 +1078,9 @@ Recorder::~Recorder() {
     // other threads (an unlock hook that found the queue stopping or full) are waited for before
     // the caller destroys the device. The count is global: a newer recorder's batches (device
     // replacement) are waited for too, which only prolongs the spin.
-    if (!deferredBatches.empty()) {
-        auto own = std::move(deferredBatches);
-        deferredBatches.clear();
+    if (!DeferredBatches().empty()) {
+        auto own = std::move(DeferredBatches());
+        DeferredBatches().clear();
         DestroyDeferred(std::move(own), false);
     }
     JoinReleaseThread();
@@ -1160,9 +1164,9 @@ Recorder::LateStatistics Recorder::LateCounts() {
 }
 
 void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
-    if (labelGroupDwords.empty()) return;
-    auto group = std::move(labelGroupDwords);
-    labelGroupDwords.clear();
+    if (LabelGroupDwords().empty()) return;
+    auto group = std::move(LabelGroupDwords());
+    LabelGroupDwords().clear();
     if (trackerGeneration == 0) return;
     std::lock_guard tableLock(labelTableMutex);
     if (labelTableOwner == nullptr) return;
@@ -1183,7 +1187,7 @@ void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte>
     if (bytes.size() < 4 || address % 4 != 0) return;
     // The range before the table: the hook covers the group whether or not a table exists to
     // enter it in (no owner: the callback records it outright, by a CPU store when need be).
-    queuedLabelRanges.emplace_back(address, address + bytes.size());
+    QueuedLabelRanges().emplace_back(address, address + bytes.size());
     queuedLabelsNoted.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard tableLock(labelTableMutex);
     if (labelTableOwner == nullptr) return;
@@ -1199,9 +1203,9 @@ void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte>
 }
 
 void Recorder::ForgetQueuedLabels() {
-    if (queuedLabelRanges.empty()) return;
-    auto ranges = std::move(queuedLabelRanges);
-    queuedLabelRanges.clear();
+    if (QueuedLabelRanges().empty()) return;
+    auto ranges = std::move(QueuedLabelRanges());
+    QueuedLabelRanges().clear();
     std::lock_guard tableLock(labelTableMutex);
     if (labelTableOwner == nullptr) return;
     auto& recorded = labelTableOwner->labels;
@@ -2124,7 +2128,7 @@ void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const 
         const auto dword = address + offset;
         labels.insert_or_assign(dword, LabelEntry{value, queue, stamp, &batch, 0, false, behindCompletion});
         batch.labelDwords.push_back(dword);
-        labelGroupDwords.emplace_back(dword, stamp);
+        LabelGroupDwords().emplace_back(dword, stamp);
     }
     recordedLabels.store(labels.size(), std::memory_order_relaxed);
 }
@@ -2855,7 +2859,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
         // destroys the batch's objects here, under the mutex, counts nothing the destructor would
         // wait for and must not escape (the rest of finish() releases the fence and command buffer).
         try {
-            deferredBatches.push_back({std::move(batch->kept), std::move(batch->completions)});
+            DeferredBatches().push_back({std::move(batch->kept), std::move(batch->completions)});
             deferredPending.fetch_add(1, std::memory_order_acq_rel);
         } catch (...) {
         }

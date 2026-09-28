@@ -54,20 +54,27 @@ static void CheckBoundsCheckedFunctions() {
     Require(strnstr_nid_postfix(haystack, "st", 6) == haystack + 3);
     char formatted[8];
     Require(snprintf_s_nid_postfix(formatted, sizeof(formatted), "%d-%s", 42, "x") == 4 && std::strcmp(formatted, "42-x") == 0);
+}
+
+static void CheckSscanfS() {
+#ifndef _WIN32
     int number = 0;
     char word[4] = "zz";
     char letter = 0;
+    char value[8] = {};
     Require(sscanf_s_nid_postfix(" 12 abc x", "%d %s %c", &number, word, 4u, &letter, 1u) == 3 && number == 12 && std::strcmp(word, "abc") == 0 && letter == 'x');
     Require(sscanf_s_nid_postfix("12 abcd", "%d %s", &number, word, 4u) == 1 && word[0] == '\0');
-    Require(sscanf_s_nid_postfix("key=val", "%3[a-z]=%3s", word, 4u, formatted, 8u) == 2 && std::strcmp(word, "key") == 0 && std::strcmp(formatted, "val") == 0);
+    Require(sscanf_s_nid_postfix("key=val", "%3[a-z]=%3s", word, 4u, value, 8u) == 2 && std::strcmp(word, "key") == 0 && std::strcmp(value, "val") == 0);
     int position = 0;
     Require(sscanf_s_nid_postfix("7 %", "%d %%%n", &number, &position) == 1 && position == 3);
     Require(sscanf_s_nid_postfix("   ", "%d", &number) == EOF);
     Require(sscanf_s_nid_postfix("x", "%d", &number) == 0);
+#endif
 }
 
 int main() {
     CheckBoundsCheckedFunctions();
+    CheckSscanfS();
     Require(std::strcmp(basename_nid_postfix(nullptr), ".") == 0);
     Require(std::strcmp(basename_nid_postfix(""), ".") == 0);
     Require(std::strcmp(basename_nid_postfix("////"), "/") == 0);

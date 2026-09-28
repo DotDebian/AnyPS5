@@ -1650,6 +1650,10 @@ FrameDumps& Dumps() {
 }
 
 bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
+    if (buffer.tilingMode == 1) {
+        const auto pixels = ReadDisplayBuffer(buffer);
+        return present(buffer.width, buffer.height, true, pixels);
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // The display buffer is usually a resident render target whose results are still on the GPU: it
     // is blitted from that image, which skips the write-back retile, the 33 MB read of guest memory,
@@ -1955,6 +1959,7 @@ VulkanDevice::PresentStatistics VulkanDevice::PresentCounts() {
 
 bool VulkanDevice::PresentWaitsForSlots(const DisplayBuffer* buffer) const {
     if (buffer == nullptr || !state->SharedSlotInFlight()) return false;
+    if (buffer->tilingMode == 1) return true;
     const auto& dumps = Dumps();
     if ((dumps.dumped < dumps.limit && !dumps.cpu) || NoResidentPresent()) return true;
     VkFilter filter = VK_FILTER_LINEAR;

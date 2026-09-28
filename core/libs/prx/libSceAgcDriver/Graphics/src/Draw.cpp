@@ -35,19 +35,7 @@ namespace {
 
 // A guest texture format code with the same Vulkan format and texel size as a color buffer.
 std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
-    static std::mutex mutex;
-    static std::map<std::pair<VkFormat, std::uint32_t>, std::uint32_t> known;
-    std::lock_guard lock(mutex);
-    if (const auto found = known.find({format, elementBytes}); found != known.end()) return found->second;
-    for (std::uint32_t code = 0; code < 256; ++code) {
-        try {
-            if (!IsBlockCompressed(code) && ResolveTextureFormat(code) == format && BytesPerElement(code) == elementBytes) {
-                known.emplace(std::make_pair(format, elementBytes), code);
-                return code;
-            }
-        } catch (const std::exception&) {
-        }
-    }
+    if (const auto guest = FindGuestTextureFormat(format, elementBytes)) return *guest;
     throw std::runtime_error("AGC graphics: no guest texture format matches the color buffer format " + std::to_string(static_cast<int>(format)));
 }
 

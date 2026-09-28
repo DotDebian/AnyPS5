@@ -108,6 +108,13 @@ VkFormat ResolveTextureFormat(std::uint32_t guestFormat) {
     return findFormatEntry(guestFormat).vkFormat;
 }
 
+std::optional<std::uint32_t> FindGuestTextureFormat(VkFormat format, std::uint32_t elementBytes) {
+    for (const auto& entry : kFormatLookup) {
+        if (!entry.blockCompressed && entry.vkFormat == format && entry.bytesPerElement == elementBytes) return entry.guestFormat;
+    }
+    return std::nullopt;
+}
+
 std::uint32_t BytesPerElement(std::uint32_t guestFormat) {
     return findFormatEntry(guestFormat).bytesPerElement;
 }

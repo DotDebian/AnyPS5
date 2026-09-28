@@ -2,6 +2,7 @@
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>

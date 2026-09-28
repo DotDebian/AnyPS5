@@ -474,7 +474,7 @@ bool NeedsRecordedLabels(std::uint32_t header) {
 bool PacketLocksItself(std::uint32_t header) {
     if (header == FlipPacketHeader) return true;
     switch ((header >> 8u) & 0xffu) {
-        case 0x15: case 0x16: case 0x2d: case 0x35: case 0x24: case 0x25: case 0x2c: case 0x38: return true;
+        case 0x15: case 0x16: case 0x27: case 0x2d: case 0x35: case 0x24: case 0x25: case 0x2c: case 0x38: return true;
         default: return false;
     }
 }

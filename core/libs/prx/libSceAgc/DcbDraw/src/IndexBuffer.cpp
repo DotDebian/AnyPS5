@@ -18,12 +18,12 @@ std::uint32_t APS5_VABI sceAgcDcbSetIndexBufferGetSize() {
     return 0;
 }
 
-uint32_t* APS5_VABI sceAgcDcbSetIndexCount(CommandBuffer* buf, uint32_t index_count) {
-    return Agc::Command::Emit(buf, 0x13u, {index_count}, __func__);
+std::uint32_t* APS5_VABI sceAgcDcbSetIndexCount(CommandBuffer* buf, std::uint32_t indexCount) {
+    return Agc::Command::Emit(buf, 0x13u, {indexCount}, __func__);
 }
 
 std::uint32_t APS5_VABI sceAgcDcbSetIndexCountGetSize() {
-    return 2;
+    return 8;
 }
 
 std::uint32_t* APS5_VABI sceAgcDcbSetIndexSize(CommandBuffer* buf, std::uint8_t indexSize, std::uint8_t cachePolicy) {

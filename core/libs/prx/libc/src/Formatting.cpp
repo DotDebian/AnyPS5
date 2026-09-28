@@ -6,6 +6,8 @@
 #include <cctype>
 #include <cstring>
 #include <string>
+
+#include "prx/libc/include/General.hpp"
 #include "SceTypes.hpp"
 #include "prx/libc/include/VarArgsAbi.hpp"
 #include "prx/libc/include/FileStream.hpp"
