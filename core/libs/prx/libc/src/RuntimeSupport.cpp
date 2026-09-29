@@ -21,7 +21,7 @@ namespace {
 std::recursive_mutex g_sysLock;
 
 struct ExitDestructor {
-    void (*func)(void*);
+    void (APS5_VABI *func)(void*);
     void* arg;
     void* dsoHandle;
 };
@@ -38,7 +38,7 @@ FileStream _Stderr_nid_postfix{stderr};
 FileStream _Stdout_nid_postfix{stdout};
 FileStream _Stdin_nid_postfix{stdin};
 
-int APS5_VABI __cxa_atexit_nid_postfix(void (*func)(void*), void* arg, void* dsoHandle) {
+int APS5_VABI __cxa_atexit_nid_postfix(void (APS5_VABI *func)(void*), void* arg, void* dsoHandle) {
     std::lock_guard lock(g_exitMutex);
     g_exitDestructors.push_back({func, arg, dsoHandle});
     if (!g_exitRunnerRegistered) {
@@ -62,6 +62,14 @@ void CxaFinalize_nid_no_patch(void* dsoHandle) {
         }
         destructor.func(destructor.arg);
     }
+}
+
+int APS5_VABI cxa_atexit_nid_postfix(void (APS5_VABI *func)(void*), void* arg, void* dsoHandle) {
+    return __cxa_atexit_nid_postfix(func, arg, dsoHandle);
+}
+
+void APS5_VABI cxa_finalize_nid_postfix(void* dsoHandle) {
+    CxaFinalize_nid_no_patch(dsoHandle);
 }
 
 unsigned int APS5_VABI _Atomic_fetch_add_4_nid_postfix(volatile unsigned int* target, unsigned int value, int memoryOrder) {
