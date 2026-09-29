@@ -517,6 +517,7 @@ private:
             for (auto& [queue, worker] : workers) {
                 worker.pending.clear();
                 worker.queued.store(0, std::memory_order_release);
+                worker.queuedFlips.store(0, std::memory_order_release);
             }
         }
         changed.notify_all();
@@ -554,6 +555,7 @@ public:
         static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
         if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
         const auto validated = profile ? std::chrono::steady_clock::now() : start;
+        throttleSubmit(queue);
         {
             std::lock_guard lock(mutex);
             rethrowFailure();
@@ -664,6 +666,7 @@ public:
                 }
                 worker.pending.clear();
                 worker.queued.store(0, std::memory_order_release);
+                worker.queuedFlips.store(0, std::memory_order_release);
             }
         }
         changed.notify_all();
@@ -864,6 +867,10 @@ private:
         std::deque<Submission> pending;
         // pending.size(), readable without `mutex` (the worker's submission-end decision).
         std::atomic<std::uint64_t> queued{0};
+        // The queued submissions that carry a flip, and the submissions the worker has started
+        // (Driver::throttleSubmit).
+        std::atomic<std::uint64_t> queuedFlips{0};
+        std::atomic<std::uint64_t> started{0};
         std::thread thread;
     };
     std::map<std::uint32_t, QueueWorker> workers;
@@ -1584,9 +1591,62 @@ private:
     }
 
     // Caller holds `mutex`.
+    // The title may run at most APS5_MAX_QUEUED_FLIPS (default 1; "off" disables) frames ahead of
+    // a queue's worker: a submission waits while that many submissions carrying a flip are queued
+    // and not started. The GPU starts a submission as soon as it is made, so a title can reuse a
+    // frame's memory once the frame it waited for has flipped; the worker records later (a
+    // dispatch's capture reads guest memory then) and at Astro Bot's title stage ran two frames
+    // behind, by which time the title had written frame N+3's constants over those frame N's
+    // light-list consumer (compute 0x500597a00) counts its lights with, and the consumer looped
+    // ~1e9 times (a GPU hang once the GDS made the light lists non-empty). A worker making no progress for 500 ms (waiting for a
+    // CPU store the title makes later) releases the wait, so the throttle cannot deadlock.
+    static long MaxQueuedFlips() {
+        static const long limit = [] {
+            const char* value = std::getenv("APS5_MAX_QUEUED_FLIPS");
+            if (value == nullptr) return 1L;
+            if (std::string_view(value) == "off") return -1L;
+            char* end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end == value || *end != '\0' || parsed < 1) {
+                std::fprintf(stderr, "[gpu] APS5_MAX_QUEUED_FLIPS=%s refused (a count of 1 or more, or off); using 1\n", value);
+                return 1L;
+            }
+            return parsed;
+        }();
+        return limit;
+    }
+
+    void throttleSubmit(std::uint32_t queue) {
+        const long limit = MaxQueuedFlips();
+        if (limit < 0) return;
+        QueueWorker* worker = nullptr;
+        {
+            std::lock_guard lock(mutex);
+            // Workers live in a map and are never erased while the driver runs.
+            if (const auto found = workers.find(queue); found != workers.end()) worker = &found->second;
+        }
+        if (worker == nullptr || worker->queuedFlips.load(std::memory_order_acquire) < static_cast<std::uint64_t>(limit)) return;
+        auto started = worker->started.load(std::memory_order_acquire);
+        auto progressAt = std::chrono::steady_clock::now();
+        while (worker->queuedFlips.load(std::memory_order_acquire) >= static_cast<std::uint64_t>(limit)) {
+            checkStopping();
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            const auto now = std::chrono::steady_clock::now();
+            if (const auto current = worker->started.load(std::memory_order_acquire); current != started) {
+                started = current;
+                progressAt = now;
+            } else if (now - progressAt > std::chrono::milliseconds(500)) {
+                static std::atomic<std::uint64_t> released{0};
+                if (released.fetch_add(1, std::memory_order_relaxed) % 100 == 0) std::fprintf(stderr, "[gpu] queue 0x%x made no progress for 500 ms with %llu flips queued; the title submits past the throttle (APS5_MAX_QUEUED_FLIPS)\n", queue, static_cast<unsigned long long>(worker->queuedFlips.load()));
+                return;
+            }
+        }
+    }
+
     void enqueue(Submission submission) {
         const auto queue = submission.queue;
         auto& worker = workers[queue];
+        if (!submission.flips.empty()) worker.queuedFlips.fetch_add(1, std::memory_order_acq_rel);
         worker.pending.push_back(std::move(submission));
         worker.queued.fetch_add(1, std::memory_order_acq_rel);
         if (!worker.thread.joinable()) worker.thread = std::thread([this, queue] { run(queue); });
@@ -6371,6 +6431,8 @@ private:
                     submission = std::move(pending.front());
                     pending.pop_front();
                     worker.queued.fetch_sub(1, std::memory_order_acq_rel);
+                    if (!submission.flips.empty()) worker.queuedFlips.fetch_sub(1, std::memory_order_acq_rel);
+                    worker.started.fetch_add(1, std::memory_order_acq_rel);
                     if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
                 }
                 execute(submission);
