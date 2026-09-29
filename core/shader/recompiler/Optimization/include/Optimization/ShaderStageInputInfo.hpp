@@ -198,8 +198,21 @@ struct ShaderPixelInputInfo {
         return psPosX || psPosY || psPosZ || psPosW;
     }
 
+    // SPI_PS_INPUT_CNTL_n OFFSET bit 5 without FLAT_SHADE: the input is its DEFAULT_VAL constant.
     [[nodiscard]] bool InputIsDefault(std::uint32_t input) const {
-        return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x20u) != 0u;
+        return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x420u) == 0x20u;
+    }
+
+    // OFFSET bit 5 with FLAT_SHADE: the slot in OFFSET's low bits is passed through with its three
+    // vertices unchanged, v_interp_mov P0, P10 and P20 reading vertices 0, 1 and 2 rather than P0,
+    // P1-P0 and P2-P0 (GetAttributeAtVertex). The PS5 compiler writes 0x422 and 0x423.
+    [[nodiscard]] bool InputIsPassthrough(std::uint32_t input) const {
+        return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x420u) == 0x420u;
+    }
+
+    // Inputs whose vertices are read unchanged: pass-through ones, and those the caller marks custom.
+    [[nodiscard]] bool InputIsCustom(std::uint32_t input) const {
+        return input < 32u && ((customInterpolationMask & (1u << input)) != 0u || InputIsPassthrough(input));
     }
 
     [[nodiscard]] std::uint32_t InputSlot(std::uint32_t input) const {

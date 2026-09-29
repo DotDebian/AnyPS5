@@ -7,6 +7,7 @@
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
+#include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
 #include <iostream>
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -412,6 +414,66 @@ void verifyProgramCounterRelativeData() {
     require(moved.cacheHit, "program counter data: relocating the shader recompiled it");
     require(dataBase(moved) == codeAddress + 0x1000u + 56u, "program counter data: the relocated shader bound the old address");
 }
+
+// SPI_PS_INPUT_CNTL_n OFFSET bit 5 selects DEFAULT_VAL only without FLAT_SHADE. Astro Bot's 0x423
+// passes slot 3 through with its vertices unchanged, read with v_interp_mov p0, p10 and p20
+// (GetAttributeAtVertex): the input is slot 3 per vertex, and p10/p20 are vertices 1 and 2, not
+// their differences to vertex 0.
+void verifyPassthroughPixelInputs() {
+    using namespace ShaderRecompiler;
+    // v_interp_mov v4, p0, attr0.x; v_interp_mov v5, p10, attr0.x; v_interp_mov v6, p20, attr0.x;
+    // v_interp_mov v7, p0, attr0.w; exp mrt0 v4, v5, v6, v7 done vm; s_endpgm.
+    static constexpr std::array<std::uint32_t, 7> code{0xc8120002u, 0xc8160000u, 0xc81a0001u, 0xc81e0302u, 0xf800180fu, 0x07060504u, 0xbf810000u};
+    struct Module {
+        std::vector<std::uint32_t> locations;
+        bool perVertex = false;
+        std::size_t subtracts = 0;
+    };
+    const auto recompile = [](std::uint32_t control) {
+        ShaderPixelStageInfo pixel{};
+        pixel.interpolatorCount = 1u;
+        pixel.interpolatorSettings[0] = control;
+        pixel.inputAddr = PixelInputBit(PixelInput::PerspectiveCenter);
+        pixel.hasPerspectiveCenterVgpr = true;
+        pixel.targetOutputMode[0] = 9u;
+        pixel.targetExportMapping[0] = 0xe4u;
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Fragment, 0x30000u, code, 0, {}};
+        request.context.waveSize = 64;
+        request.context.pixel = pixel;
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 64;
+        request.target.fragmentShaderBarycentricEnabled = true;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = false;
+        const auto result = Recompile(request);
+        const auto& words = result.spirv.Words();
+        std::vector<std::uint32_t> inputs;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> locations;
+        std::vector<std::uint32_t> perVertex;
+        Module module;
+        for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
+            const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+            if (op == spv::OpVariable && words[at + 3] == spv::StorageClassInput) inputs.push_back(words[at + 2]);
+            if (op == spv::OpDecorate && words[at + 2] == spv::DecorationLocation) locations.emplace_back(words[at + 1], words[at + 3]);
+            if (op == spv::OpDecorate && words[at + 2] == spv::DecorationPerVertexKHR) perVertex.push_back(words[at + 1]);
+            if (op == spv::OpFSub) ++module.subtracts;
+        }
+        for (const auto& [id, location] : locations) {
+            if (std::find(inputs.begin(), inputs.end(), id) == inputs.end()) continue;
+            module.locations.push_back(location);
+            module.perVertex = module.perVertex || std::find(perVertex.begin(), perVertex.end(), id) != perVertex.end();
+        }
+        return module;
+    };
+    const auto passthrough = recompile(0x423u);
+    require(passthrough.locations == std::vector<std::uint32_t>{3u} && passthrough.perVertex, "a pass-through input (OFFSET bit 5 with FLAT_SHADE) was not read per vertex at its slot");
+    require(passthrough.subtracts == 0u, "v_interp_mov p10/p20 of a pass-through input subtracted vertex 0");
+    const auto flat = recompile(0x403u);
+    require(flat.locations == std::vector<std::uint32_t>{3u} && flat.perVertex && flat.subtracts == 2u, "v_interp_mov p10/p20 of a flat input did not read differences to vertex 0");
+    require(recompile(0x23u).locations.empty(), "a defaulted input (OFFSET bit 5 without FLAT_SHADE) was declared as a parameter");
+}
 }
 
 int main() {
@@ -421,6 +483,7 @@ int main() {
         verifyPureFlatSlots();
         verifyBindlessTable();
         verifyProgramCounterRelativeData();
+        verifyPassthroughPixelInputs();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,

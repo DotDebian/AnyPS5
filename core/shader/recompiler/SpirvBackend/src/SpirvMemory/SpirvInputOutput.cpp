@@ -55,7 +55,7 @@ namespace ShaderRecompiler
         }
 
         bool PixelInputIsCustom(const ShaderPixelInputInfo& info, std::uint32_t input) {
-            return input < PixelParameterLimit && (info.customInterpolationMask & (1u << input)) != 0u;
+            return info.InputIsCustom(input);
         }
 
         bool PixelInputIsFlat(const ShaderPixelInputInfo& info, std::uint32_t input) {

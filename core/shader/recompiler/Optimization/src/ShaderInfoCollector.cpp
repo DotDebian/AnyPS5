@@ -200,7 +200,7 @@ void CollectVertexInputs(const IrProgram& program, const ShaderVertexInputInfo* 
 }
 
 bool IsPixelParameterCustom(const ShaderPixelInputInfo& pixel, std::uint32_t input) {
-    return input < 32u && (pixel.customInterpolationMask & (1u << input)) != 0u;
+    return pixel.InputIsCustom(input);
 }
 
 bool IsPixelParameterFlat(const ShaderPixelInputInfo& pixel, std::uint32_t input) {
@@ -222,6 +222,10 @@ void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pi
         for (const IrValue* inst : block->Instructions()) {
             if (inst->Opcode() == IrOpcode::GetAttribute) {
                 const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
+                if (IsPixelParameterCustom(*pixel, input)) {
+                    // P0 + i*P10 + j*P20 of vertices passed through unchanged is no interpolation.
+                    throw std::runtime_error("pixel input " + std::to_string(input) + " passes its vertices through unchanged but is read with v_interp_p1/p2");
+                }
                 read[input] = true;
                 interpolated[input] = true;
             } else if (inst->Opcode() == IrOpcode::GetInterpolationParameter) {

@@ -1335,6 +1335,7 @@ struct ModuleShape {
     bool perVertex = false;
     std::uint32_t perVertexLength = 3;
     bool parameterOutput = false;
+    std::uint32_t parameterLocation = 0;
     bool rectParameters = false;
 };
 
@@ -1371,7 +1372,7 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     if (shape.parameterOutput) {
         const auto parameter = id();
         emit(declarations, spv::OpVariable, {outputPointer, parameter, spv::StorageClassOutput});
-        emit(annotations, spv::OpDecorate, {parameter, spv::DecorationLocation, 0});
+        emit(annotations, spv::OpDecorate, {parameter, spv::DecorationLocation, shape.parameterLocation});
         extraInterface.push_back(parameter);
     }
     if (shape.rectParameters) {
@@ -1647,7 +1648,8 @@ std::vector<LocatedInput> locatedInputs(std::span<const std::uint32_t> words) {
 
 // SPI_PS_INPUT_CNTL_n.OFFSET names the parameter slot an input reads, so pixel inputs are declared
 // at their slots: inputs reading one slot share its variable, a slot read both flat and
-// interpolated is taken per vertex, and an input with OFFSET bit 5 set is its DEFAULT_VAL constant.
+// interpolated is taken per vertex, and an input with OFFSET bit 5 set is its DEFAULT_VAL constant
+// unless FLAT_SHADE is set too, which passes the slot's vertices through unchanged.
 void pixelParameterSlotTests() {
     using AgcDriver::Graphics::CompiledShader;
     const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
@@ -1657,8 +1659,8 @@ void pixelParameterSlotTests() {
     // v_interp_p1/p2_f32 v4, attr0.x; v_interp_mov_f32 v5, p0, attr1.x; v_interp_mov_f32 v6, p0,
     // attr2.x; v_interp_mov_f32 v7, p0, attr3.w; exp mrt0 v4, v5, v6, v7 done vm; s_endpgm.
     const std::array<std::uint32_t, 8> mixed{0xc8100000u, 0xc8110001u, 0xc8160402u, 0xc81a0802u, 0xc81e0f02u, 0xf800180fu, 0x07060504u, 0xbf810000u};
-    // Astro Bot's words: slot 0 interpolated, slot 0 flat, a defaulted input that keeps offset
-    // bits (0x22) and DEFAULT_VAL (1,1,1,1).
+    // Slot 0 interpolated, slot 0 flat, and defaulted inputs (OFFSET bit 5 without FLAT_SHADE), one
+    // keeping offset bits (0x22), one DEFAULT_VAL (1,1,1,1).
     auto pixel = recompilePixel({0x0u, 0x400u, 0x22u, 0x320u}, mixed);
     auto inputs = locatedInputs(pixel.spirv.Words());
     Require(inputs.size() == 1 && inputs[0].location == 0 && inputs[0].perVertex, "a slot read flat and interpolated did not become one per-vertex input");
@@ -1677,6 +1679,31 @@ void pixelParameterSlotTests() {
     pixel = recompilePixel({0x20u, 0x2320u}, shared);
     Require(locatedInputs(pixel.spirv.Words()).empty(), "a defaulted input was declared as a parameter");
     AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, true);
+    // OFFSET bit 5 with FLAT_SHADE is no default: Astro Bot's 0x423 passes slot 3 through with its
+    // three vertices unchanged, which the program reads with v_interp_mov p0, p10 and p20
+    // (GetAttributeAtVertex): v_interp_mov v4, p0, attr0.x; v_interp_mov v5, p10, attr0.x;
+    // v_interp_mov v6, p20, attr0.x; v_interp_mov v7, p0, attr0.w; exp mrt0 v4, v5, v6, v7 done vm.
+    const std::array<std::uint32_t, 7> vertices{0xc8120002u, 0xc8160000u, 0xc81a0001u, 0xc81e0302u, 0xf800180fu, 0x07060504u, 0xbf810000u};
+    const auto subtracts = [](std::span<const std::uint32_t> words) {
+        std::size_t count = 0;
+        for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) count += (words[at] & 0xffffu) == spv::OpFSub;
+        return count;
+    };
+    pixel = recompilePixel({0x423u}, vertices);
+    inputs = locatedInputs(pixel.spirv.Words());
+    Require(inputs.size() == 1 && inputs[0].location == 3 && inputs[0].perVertex, "a pass-through input (OFFSET bit 5 with FLAT_SHADE) was not read per vertex at its slot");
+    Require(subtracts(pixel.spirv.Words()) == 0, "v_interp_mov p10/p20 of a pass-through input subtracted vertex 0");
+    ShaderRecompiler::RecompileResult slotVertex;
+    slotVertex.spirv = makeModule({.parameterOutput = true, .parameterLocation = 3});
+    Require(AgcDriver::Graphics::UnwrittenFragmentInputs(slotVertex.spirv.Words(), pixel.spirv.Words()).empty(), "a pass-through input does not read the slot the vertex stage exports");
+    const std::array<CompiledShader, 2> slotShaders{{{ShaderRecompiler::ShaderStage::Vertex, &slotVertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}}};
+    AgcDriver::Graphics::ValidateShaders(slotShaders, state, subgroup, true);
+    // A plain flat input's p10 and p20 are differences to vertex 0.
+    pixel = recompilePixel({0x403u}, vertices);
+    inputs = locatedInputs(pixel.spirv.Words());
+    Require(inputs.size() == 1 && inputs[0].location == 3 && inputs[0].perVertex && subtracts(pixel.spirv.Words()) == 2, "v_interp_mov p10/p20 of a flat input did not read differences to vertex 0");
+    // Interpolating pass-through vertices with v_interp_p1/p2 has no exact translation.
+    expectFailure([&] { recompilePixel({0x423u, 0x3u}, shared); }, "passes its vertices through unchanged");
     // Slot 5 is read but the vertex shader exports only slot 0: the pipeline's pixel module reads
     // zero there, through a private variable.
     pixel = recompilePixel({0x0u, 0x5u}, shared);
