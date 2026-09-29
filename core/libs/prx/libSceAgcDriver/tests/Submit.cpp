@@ -156,6 +156,11 @@ std::array<std::uint32_t, 7> waitEqual(volatile std::uint32_t* address, std::uin
     return {0xc0053c00, 0x13, static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(static_cast<std::uint64_t>(target) >> 32u), value, 0xffffffffu, 0x19};
 }
 
+std::array<std::uint32_t, 9> waitEqual64(volatile std::uint32_t* address, std::uint64_t value, std::uint64_t mask) {
+    const auto target = reinterpret_cast<std::uintptr_t>(address);
+    return {0xc0079300, 0x13, static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(static_cast<std::uint64_t>(target) >> 32u), static_cast<std::uint32_t>(value), static_cast<std::uint32_t>(value >> 32u), static_cast<std::uint32_t>(mask), static_cast<std::uint32_t>(mask >> 32u), 0x19};
+}
+
 void submit(std::uint32_t queue, const std::vector<std::uint32_t>& words) {
     Packet packet{const_cast<std::uint32_t*>(words.data()), static_cast<std::uint32_t>(words.size()), 0, {}};
     check((queue == 0 ? sceAgcDriverSubmitDcb(&packet) : sceAgcDriverSubmitAcb(queue, &packet)) == 0, "label submit failed");
@@ -190,6 +195,29 @@ void testLabelStoredSinceSubmission() {
     AgcDriverWaitIdle_nid_postfix();
     submit(0x20, commands(waitEqual(&label, 1), writeData(&late, 1)));
     check(waitFor(&late, 1, "consumer never passed its wait") >= std::chrono::milliseconds(900), "a label stored before the wait's submission satisfied it");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+// A 64-bit wait whose mask leaves the high dword out is satisfied by a 32-bit label stored after
+// its submission (the title reset the label again before the queue reached it); with the high
+// dword in its mask, the 32-bit store alone does not decide it (memory's high dword never matches).
+void testWideLabelStoredSinceSubmission() {
+    alignas(64) static volatile std::uint32_t gate = 0, done = 0, late = 0;
+    alignas(64) static volatile std::uint32_t label[2] = {0, 0x5eed};
+    submit(0x20, commands(waitEqual(&gate, 1), waitEqual64(label, 1, 0xffffffffu), writeData(&done, 1)));
+    submit(0, commands(writeData(label, 1)));
+    waitFor(label, 1, "producer label never landed");
+    label[0] = 0;
+    gate = 1;
+    check(waitFor(&done, 1, "consumer never passed its waits") < std::chrono::milliseconds(500), "a 32-bit label stored after a low-dword 64-bit wait's submission did not satisfy it");
+    AgcDriverWaitIdle_nid_postfix();
+    gate = 0;
+    submit(0x20, commands(waitEqual(&gate, 1), waitEqual64(label, 1, ~0ull), writeData(&late, 1)));
+    submit(0, commands(writeData(label, 1)));
+    waitFor(label, 1, "producer label never landed");
+    label[0] = 0;
+    gate = 1;
+    check(waitFor(&late, 1, "consumer never passed its wait") >= std::chrono::milliseconds(900), "a 32-bit store satisfied a 64-bit wait whose high dword never matched");
     AgcDriverWaitIdle_nid_postfix();
 }
 
@@ -236,6 +264,7 @@ int main() {
         testSubmissions();
         testLabelStoredSinceSubmission();
         testLabelHeldAtSubmission();
+        testWideLabelStoredSinceSubmission();
         testWorkerFailure();
         check(expectFailure([] { LibcRunShutdown_nid_postfix(); }).find("required shader register") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC driver submit tests passed");

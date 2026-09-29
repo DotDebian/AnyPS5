@@ -110,6 +110,10 @@ bool WaitSatisfiedUnchecked(std::span<const std::uint32_t> packet);
 // Whether a WAIT_REG_MEM's compare holds for `value` (the 4 or 8 bytes a label the recorder still
 // holds will store), without reading memory.
 bool WaitComparesValue(std::span<const std::uint32_t> packet, std::uint64_t value);
+// The bytes from a memory WAIT_REG_MEM's address whose value decides its compare: 4 for the 32-bit
+// packet, and for WAIT_REG_MEM_64 4 when its mask leaves the high dword out (a 64-bit wait on a
+// label its producer stores 32 bits of), 8 otherwise.
+std::size_t WaitAwaitedBytes(std::span<const std::uint32_t> packet);
 // A label write (RELEASE_MEM with a data select, WRITE_DATA to memory): the destination and the
 // bytes it stores, so the write can be recorded on the GPU behind the work it signals. Packets
 // without a memory destination decode to nothing. No allocation per label (tens of thousands per

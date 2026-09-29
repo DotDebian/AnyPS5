@@ -1678,7 +1678,7 @@ private:
         }
         if ((opcode != 0x3c && opcode != 0x93) || packet.size() < 7 || ((packet[1] >> 4u) & 3u) != 1u) return;
         const auto address = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
-        const std::size_t bytes = opcode == 0x93 ? 8 : 4;
+        const std::size_t bytes = Pm4::WaitAwaitedBytes(packet);
         if (address % 4 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return;
         const auto worker = workers.find(submission.queue);
         for (std::size_t offset = 0; offset < bytes; offset += 4) {
@@ -5507,9 +5507,8 @@ private:
         // Names this worker's thread in the [lock] GpuMutex wait report.
         GuestMemory::TagGpuLockThread(queue);
         auto& outcomes = waitOutcomes();
-        const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
         const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
-        const std::size_t awaitedBytes = wide ? 8 : 4;
+        const std::size_t awaitedBytes = Pm4::WaitAwaitedBytes(packet);
         static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
         if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)), packet[4],
                                    *reinterpret_cast<const volatile std::uint32_t*>(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)));
@@ -5820,9 +5819,12 @@ private:
                 static std::uint64_t timeouts = 0;
                 if (++timeouts % 20 == 0) std::fprintf(stderr, "[gpu] %llu GPU waits have timed out\n", static_cast<unsigned long long>(timeouts));
                 if (!reported.insert(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)).second) return;
-                std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM at 0x%llx timed out after %dms (function %u ref 0x%x mask 0x%x value 0x%x)\n", queue,
-                             static_cast<unsigned long long>(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)), WaitTimeoutMs(), packet[1] & 7u, packet[4], packet[5],
-                             *reinterpret_cast<const volatile std::uint32_t*>(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)));
+                const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
+                const std::uint64_t reference = wide ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet[4];
+                const std::uint64_t mask = wide ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet[5];
+                const std::uint64_t current = wide ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+                std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM%s at 0x%llx timed out after %dms (function %u ref 0x%llx mask 0x%llx value 0x%llx)\n", queue, wide ? "_64" : "",
+                             static_cast<unsigned long long>(awaited), WaitTimeoutMs(), packet[1] & 7u, static_cast<unsigned long long>(reference), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(current));
                 const auto address = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
                 for (const auto& record : writeHistory()) {
                     if (record.length != 0 && record.target <= address && address < record.target + std::max<std::uint64_t>(record.length, 4))

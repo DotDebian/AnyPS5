@@ -481,6 +481,11 @@ bool WaitComparesValue(std::span<const std::uint32_t> packet, std::uint64_t valu
     return waitCompares(packet, wide, value);
 }
 
+std::size_t WaitAwaitedBytes(std::span<const std::uint32_t> packet) {
+    const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
+    return wide && (packet.size() < 8 || packet[7] != 0) ? 8 : 4;
+}
+
 void DumpPixelPipeStatistics(std::span<const std::uint32_t> packet) {
     static const std::uint32_t backends = [] {
         const char* text = std::getenv("APS5_RENDER_BACKENDS");
