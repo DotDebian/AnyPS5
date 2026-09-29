@@ -245,7 +245,8 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         const auto& mesh = options.inputInfo.vertex->mesh;
         const std::uint32_t size = mesh.InputPrimitiveSize();
         const std::uint32_t stepCount = mesh.InputPrimitiveStep();
-        if (options.waveSize != 64u || mesh.primitivesPerGroup == 0u || mesh.verticesPerGroup != mesh.InputVertexCount(mesh.primitivesPerGroup) || mesh.verticesPerGroup > totalThreads || mesh.primitivesPerGroup > totalThreads || totalThreads % 64u != 0u || totalThreads > 15u * 64u || mesh.esgsItemSize == 0u || mesh.esgsItemSize * mesh.verticesPerGroup > 0xffffu) {
+        const std::uint32_t waveSize = options.waveSize;
+        if (mesh.primitivesPerGroup == 0u || mesh.verticesPerGroup != mesh.InputVertexCount(mesh.primitivesPerGroup) || mesh.verticesPerGroup > totalThreads || mesh.primitivesPerGroup > totalThreads || totalThreads % waveSize != 0u || totalThreads > 15u * waveSize || mesh.esgsItemSize == 0u || mesh.esgsItemSize * mesh.verticesPerGroup > 0xffffu) {
             throw std::runtime_error("mesh shader translation configuration is not supported (wave " + std::to_string(options.waveSize) + ", primitives per group " + std::to_string(mesh.primitivesPerGroup) + ", vertices per group " + std::to_string(mesh.verticesPerGroup) + ", threads " + std::to_string(totalThreads) + ", ESGS item size " + std::to_string(mesh.esgsItemSize) + ")");
         }
         constexpr std::uint32_t kTriStripPrimitiveType = 6u;
@@ -271,11 +272,11 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         // s2 GS_TG_INFO (the subgroup's vertex and primitive counts), s3 the merged wave info: this
         // wave's ES vertex and GS primitive counts, its index in the subgroup and the wave count.
         entryIr.SetScalarReg(static_cast<ScalarReg>(2), entryIr.BitwiseOr(entryIr.ShiftLeftLogical(vertices, u32(12u)), entryIr.ShiftLeftLogical(primitives, u32(22u))));
-        IrValue& wave = entryIr.ShiftRightLogical(local, u32(6u));
-        IrValue& waveBase = entryIr.BitwiseAnd(local, u32(~63u));
-        IrValue& vertexCount = minimum(subtractSaturate(vertices, waveBase), u32(64u));
-        IrValue& primitiveCount = minimum(subtractSaturate(primitives, waveBase), u32(64u));
-        IrValue& waveInfo = entryIr.BitwiseOr(entryIr.ShiftLeftLogical(wave, u32(24u)), u32((totalThreads / 64u) << 28u));
+        IrValue& wave = entryIr.ShiftRightLogical(local, u32(waveSize == 32u ? 5u : 6u));
+        IrValue& waveBase = entryIr.BitwiseAnd(local, u32(~(waveSize - 1u)));
+        IrValue& vertexCount = minimum(subtractSaturate(vertices, waveBase), u32(waveSize));
+        IrValue& primitiveCount = minimum(subtractSaturate(primitives, waveBase), u32(waveSize));
+        IrValue& waveInfo = entryIr.BitwiseOr(entryIr.ShiftLeftLogical(wave, u32(24u)), u32((totalThreads / waveSize) << 28u));
         entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.BitwiseOr(waveInfo, entryIr.BitwiseOr(entryIr.ShiftLeftLogical(primitiveCount, u32(8u)), vertexCount)));
         // The GS inputs: v0/v1 the 16-bit vertex offsets (ES thread index times VGT_ESGS_RING_ITEMSIZE)
         // of the thread's primitive, an odd strip triangle's first two swapped; v2 the primitive id;
