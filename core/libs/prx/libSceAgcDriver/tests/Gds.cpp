@@ -1,5 +1,5 @@
 // agc_driver_gds_tests: GDS instructions recompiled and run on the GPU through VulkanDevice with
-// the device's GDS buffer (APS5_GDS=1), which the CP's DMA_DATA reads and writes as well (see
+// the device's GDS buffer (made unless APS5_NO_GDS=1), which the CP's DMA_DATA reads and writes as well (see
 // Pm4::InstallGdsBacking). Run by hand.
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -312,7 +312,7 @@ int main() {
     try {
         // Tests do not fill the user's shader disk cache; the device makes its GDS buffer.
         setenv("APS5_NO_SHADER_DISK_CACHE", "1", 1);
-        setenv("APS5_GDS", "1", 1);
+        unsetenv("APS5_NO_GDS");
         AgcDriver::VulkanDevice device;
 
         // M0: base 0x100 (bits 31:16), size 0x20. The append counter is GDS dword 0x104.
