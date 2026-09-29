@@ -1607,7 +1607,7 @@ void rectListTests() {
 
 // Recompiles `code` as a pixel shader with PERSP_CENTER loaded and one SPI_PS_INPUT_CNTL word per
 // input.
-ShaderRecompiler::RecompileResult recompilePixel(std::initializer_list<std::uint32_t> controls, std::span<const std::uint32_t> code, std::uint32_t colorFormat = 9u) {
+ShaderRecompiler::RecompileResult recompilePixel(std::initializer_list<std::uint32_t> controls, std::span<const std::uint32_t> code, std::uint32_t colorFormat = 9u, bool barycentric = true) {
     auto queue = makeState();
     queue.context[0x1b3] = 0x2u;
     queue.context[0x1b4] = 0x2u;
@@ -1623,7 +1623,7 @@ ShaderRecompiler::RecompileResult recompilePixel(std::initializer_list<std::uint
     request.target.vulkanVersion = 0x00401000u;
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 64;
-    request.target.fragmentShaderBarycentricEnabled = true;
+    request.target.fragmentShaderBarycentricEnabled = barycentric;
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
     return ShaderRecompiler::Recompile(request);
@@ -1678,13 +1678,21 @@ void pixelParameterSlotTests() {
     AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, true);
     // Two interpolated inputs of slot 3 (attr0.x, attr1.y) read one smooth variable.
     const std::array<std::uint32_t, 7> shared{0xc8100000u, 0xc8110001u, 0xc8140500u, 0xc8150501u, 0xf800180fu, 0x05040504u, 0xbf810000u};
-    pixel = recompilePixel({0x3u, 0x3u}, shared);
+    // Without fragment barycentrics the interpolation is Vulkan's, by the variable's decoration.
+    pixel = recompilePixel({0x3u, 0x3u}, shared, 9u, false);
     inputs = locatedInputs(pixel.spirv.Words());
     Require(inputs.size() == 1 && inputs[0].location == 3 && !inputs[0].perVertex && !inputs[0].flat, "inputs reading one slot were not declared once at the slot");
+    // With them, v_interp_p1/p2 compute P0 + I*P10 + J*P20 from the slot's vertices.
+    pixel = recompilePixel({0x3u, 0x3u}, shared);
+    inputs = locatedInputs(pixel.spirv.Words());
+    Require(inputs.size() == 1 && inputs[0].location == 3 && inputs[0].perVertex, "inputs interpolated explicitly from one slot were not declared once at the slot, per vertex");
     // Flat inputs of different slots keep their slots.
-    pixel = recompilePixel({0x404u, 0x0u}, shared);
+    pixel = recompilePixel({0x404u, 0x0u}, shared, 9u, false);
     inputs = locatedInputs(pixel.spirv.Words());
     Require(inputs.size() == 2 && inputs[0].location == 0 && !inputs[0].flat && inputs[1].location == 4 && inputs[1].flat, "flat and interpolated inputs of different slots moved");
+    pixel = recompilePixel({0x404u, 0x0u}, shared);
+    inputs = locatedInputs(pixel.spirv.Words());
+    Require(inputs.size() == 2 && inputs[0].location == 0 && inputs[1].location == 4, "explicitly interpolated inputs of different slots moved");
     // Only defaulted inputs: no interface at all.
     pixel = recompilePixel({0x20u, 0x2320u}, shared);
     Require(locatedInputs(pixel.spirv.Words()).empty(), "a defaulted input was declared as a parameter");
@@ -1712,8 +1720,13 @@ void pixelParameterSlotTests() {
     pixel = recompilePixel({0x403u}, vertices);
     inputs = locatedInputs(pixel.spirv.Words());
     Require(inputs.size() == 1 && inputs[0].location == 3 && inputs[0].perVertex && subtracts(pixel.spirv.Words()) == 2, "v_interp_mov p10/p20 of a flat input did not read differences to vertex 0");
-    // Interpolating pass-through vertices with v_interp_p1/p2 has no exact translation.
-    expectFailure([&] { recompilePixel({0x423u, 0x3u}, shared); }, "passes its vertices through unchanged");
+    // Interpolating pass-through vertices with v_interp_p1/p2 has no exact translation through a
+    // Vulkan-interpolated variable; with fragment barycentrics it is P0 + I*P10 + J*P20 of the
+    // vertices as they were passed through.
+    expectFailure([&] { recompilePixel({0x423u, 0x3u}, shared, 9u, false); }, "passes its vertices through unchanged");
+    pixel = recompilePixel({0x423u, 0x3u}, shared);
+    inputs = locatedInputs(pixel.spirv.Words());
+    Require(inputs.size() == 1 && inputs[0].location == 3 && inputs[0].perVertex, "pass-through vertices interpolated explicitly were not read per vertex");
     // Slot 5 is read but the vertex shader exports only slot 0: the pipeline's pixel module reads
     // zero there, through a private variable.
     pixel = recompilePixel({0x0u, 0x5u}, shared);
