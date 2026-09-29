@@ -33,6 +33,7 @@ public:
         appendMesh(key, request);
         append(key, request.target);
         append(key, DebugProbeActive());
+        append(key, RayTracingStrict());
     }
 
     // A hash over every field Build appends except the code, the target and the probe flag: the

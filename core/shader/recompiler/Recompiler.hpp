@@ -424,6 +424,7 @@ struct ResourceCapture;
 // cache keys on it.
 void SetDebugProbeActive(bool active);
 [[nodiscard]] bool DebugProbeActive();
+[[nodiscard]] bool RayTracingStrict();
 
 struct RectListShaders {
     RecompileResult control;
