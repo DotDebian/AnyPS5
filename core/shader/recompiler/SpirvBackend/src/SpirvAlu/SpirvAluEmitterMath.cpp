@@ -526,19 +526,29 @@ std::uint32_t EmitBallot(SpirvValueEmitContext& ctx, const IrValue* predicate) {
 }
 
 std::uint32_t EmitReadFirstLane(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    auto& state = ctx.state;
+    // With no lane active the hardware reads lane 0.
     const auto ballot = ctx.Ballot(inst.Argument(1));
-    return ctx.Shuffle(inst, 0, ctx.FirstLane(ballot));
+    const auto low = state.module.AllocateId();
+    const auto high = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0u);
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1u);
+    const auto any = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high), ConstantU32(state, 0u));
+    return ctx.Shuffle(inst, 0, Select(state, TypeU32(state), any, ctx.FirstLane(ballot), ConstantU32(state, 0u)));
 }
 
 std::uint32_t EmitReadLane(SpirvValueEmitContext& ctx, const IrValue& inst) {
     return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
 }
 
+// WriteLane(value, lane, previous): the lane (modulo the wave size) takes the value, the others
+// keep their previous one.
 std::uint32_t EmitWriteLane(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
+    const auto lane = EmitBinaryU32(state, spv::OpBitwiseAnd, ctx.Arg(inst, 1), ConstantU32(state, state.program.WaveSize() - 1u));
     const auto hit = state.module.AllocateId();
-    state.module.AddFunction(spv::OpIEqual, TypeBool(state), hit, EmitSubgroupLocalInvocationId(state), ctx.Arg(inst, 2));
-    return EmitNative<spv::OpSelect, IrType::U32>(state, hit, ctx.Arg(inst, 1), ctx.Arg(inst, 0));
+    state.module.AddFunction(spv::OpIEqual, TypeBool(state), hit, EmitSubgroupLocalInvocationId(state), lane);
+    return EmitNative<spv::OpSelect, IrType::U32>(state, hit, ctx.Arg(inst, 0), ctx.Arg(inst, 2));
 }
 
 std::uint32_t EmitPermlane16U32(SpirvValueEmitContext& ctx, const IrValue& inst) {
