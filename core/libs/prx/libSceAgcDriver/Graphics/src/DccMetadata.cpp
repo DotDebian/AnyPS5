@@ -128,6 +128,7 @@ void CountStore(std::atomic<std::uint64_t>& counter) {
 struct GpuKeyStore {
     std::uint64_t begin;
     std::uint64_t end;
+    DccKeys keys = DccKeys::Uncompressed;
 };
 
 struct KeyStoreMemo {
@@ -157,7 +158,6 @@ void ForgetStores(std::uint64_t begin, std::uint64_t end) {
     std::erase_if(memo.entries, [&](const GpuKeyStore& store) { return begin < store.end && store.begin < end; });
 }
 
-// Uncompressed when a GPU store still pending covers the whole range, else nullopt (the bytes decide).
 std::optional<DccKeys> MemoizedKeys(std::uint64_t begin, std::uint64_t end) {
     auto& memo = Memo();
     std::lock_guard lock(memo.mutex);
@@ -181,7 +181,7 @@ std::optional<DccKeys> MemoizedKeys(std::uint64_t begin, std::uint64_t end) {
             return std::nullopt;
         }
         if (ScanProfileEnabled()) Scans().memoHits.fetch_add(1, std::memory_order_relaxed);
-        return DccKeys::Uncompressed;
+        return it->keys;
     }
     return std::nullopt;
 }
@@ -247,6 +247,20 @@ void StoreUncompressedOnCpu(std::uint64_t begin, std::size_t count) {
     GuestMemory::Write(begin, uncompressed);
     CountStore(Scans().cpuStores);
 }
+
+}
+
+void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys) {
+    static const bool disabled = std::getenv("APS5_NO_KEYS_FILL_MEMO") != nullptr;
+    if (disabled || count == 0) return;
+    auto& memo = Memo();
+    std::lock_guard lock(memo.mutex);
+    const auto end = begin + count;
+    std::erase_if(memo.entries, [&](const GpuKeyStore& store) { return begin < store.end && store.begin < end; });
+    if (MemoRecorder(memo) != nullptr) memo.entries.push_back({begin, end, keys});
+}
+
+namespace {
 
 // Whether the keys already read as uncompressed: scans the same bytes as ReadDccKeys, so it counts
 // as a scan too.
