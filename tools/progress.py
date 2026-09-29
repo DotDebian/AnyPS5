@@ -24,6 +24,15 @@ OPCODE_ALIASES = {
     "VMadMixloF16": "V_FMA_MIXLO_F16",
     "VMadMixhiF16": "V_FMA_MIXHI_F16",
 }
+OPCODE_VARIANTS = {
+    "SAddI32": ("S_ADDK_I32",),
+    "SCmpLeU32": ("S_CMPK_LE_U32",),
+    "SCmpLtI32": ("S_CMPK_LT_I32",),
+    "SWaitcnt": ("S_WAITCNT_VSCNT",),
+    "VAddI32": ("V_ADD_CO_U32",),
+    "VSubrevI32": ("V_SUBREV_CO_U32",),
+    "ImageSample": ("IMAGE_SAMPLE_L", "IMAGE_SAMPLE_B", "IMAGE_SAMPLE_C_LZ", "IMAGE_SAMPLE_L_O"),
+}
 REPORT_ROWS = 100
 PANEL_WIDTH, GAP, MAP_HEIGHT, HEADER = 495, 10, 280, 30
 DONE_COLOR, TODO_COLOR, BORDER, TEXT = "#2ea043", "#6e7681", "#0d1117", "#ffffff"
@@ -81,6 +90,7 @@ def collect_shaders():
     opcodes = [o for o in re.findall(r"^\s*([A-Z]\w*)\s*[,=]", enum, re.M) if o not in OPCODE_SENTINELS]
     supported, extra = set(), []
     for opcode in opcodes:
+        supported.update(name for name in OPCODE_VARIANTS.get(opcode, ()) if name in isa)
         name = OPCODE_ALIASES.get(opcode) or by_camel.get(opcode)
         if name in isa:
             supported.add(name)

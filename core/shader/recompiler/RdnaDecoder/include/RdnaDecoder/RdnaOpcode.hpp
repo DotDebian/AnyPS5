@@ -581,6 +581,8 @@ enum class RdnaOpcode : std::uint16_t {
     SCbranchCdbg,
     SClause,
     Exp,
+    VMulHiI32I24,
+    VMulHiU32U24,
     Count
 };
 
