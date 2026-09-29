@@ -1266,8 +1266,32 @@ std::uint64_t Recorder::ReapsWithWork() {
     return holdCounters.reapsWithWork;
 }
 
+namespace {
+// Debug aid (APS5_TRACE_RECORD=1): each submit prints the programs (NoteProgram) whose work its
+// batch recorded, so a batch reported as still running names its dispatches and draws.
+bool TraceRecord() {
+    static const bool enabled = std::getenv("APS5_TRACE_RECORD") != nullptr;
+    return enabled;
+}
+
+thread_local std::uint64_t notedProgram = 0;
+}
+
+void Recorder::NoteProgram(std::uint64_t address) {
+    notedProgram = address;
+}
+
+std::uint64_t Recorder::NotedProgram() {
+    return notedProgram;
+}
+
+void Recorder::traceProgram() {
+    if (TraceRecord() && (open->tracePrograms.empty() || open->tracePrograms.back() != notedProgram)) open->tracePrograms.push_back(notedProgram);
+}
+
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
+    traceProgram();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -1288,6 +1312,7 @@ bool Recorder::ContinuesRenderPass(std::uint64_t key) const {
 
 VkCommandBuffer Recorder::CommandsInRenderPass() {
     Require(open != nullptr && open->renderPass.open, "no render pass is open in the recorder");
+    traceProgram();
     return open->commands;
 }
 
@@ -2414,6 +2439,16 @@ void Recorder::Submit() {
     Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
+    if (TraceRecord()) {
+        std::string line;
+        for (const auto program : batch->tracePrograms) {
+            char item[24];
+            std::snprintf(item, sizeof(item), " %llx", static_cast<unsigned long long>(program));
+            line += item;
+        }
+        std::fprintf(stderr, "[submit] serial %llu programs%s\n", static_cast<unsigned long long>(batch->serial), line.c_str());
+        batch->tracePrograms.clear();
+    }
     batch->submittedAt = std::chrono::steady_clock::now();
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
@@ -2467,7 +2502,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     auto result = waitSemaphores(device, &wait, 5'000'000'000ull);
     for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
         // As for the fence wait in finish(): a hung batch is reported every 5 s.
-        std::fprintf(stderr, "[gpu] recorded batch %llu still running on the GPU after %d s (timeline wait)\n", static_cast<unsigned long long>(serial), waited);
+        std::fprintf(stderr, "[gpu] recorded batch %llu still running on the GPU after %d s (timeline wait; the waiting thread last recorded program 0x%llx)\n", static_cast<unsigned long long>(serial), waited, static_cast<unsigned long long>(notedProgram));
         result = waitSemaphores(device, &wait, 5'000'000'000ull);
     }
     return result;
@@ -2858,7 +2893,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
-            std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
+            std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s (the waiting thread last recorded program 0x%llx)\n", waited, static_cast<unsigned long long>(notedProgram));
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {

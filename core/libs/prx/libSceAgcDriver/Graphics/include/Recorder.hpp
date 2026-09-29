@@ -53,6 +53,11 @@ public:
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
     VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    // The guest program (a dispatch's or a draw's pixel shader address) whose work this thread
+    // records from now on: a hung batch's "still running" line names the waiting thread's last one,
+    // and with APS5_TRACE_RECORD=1 each submit lists its batch's programs.
+    static void NoteProgram(std::uint64_t address);
+    static std::uint64_t NotedProgram();
     // After a trailing barrier with ALL_COMMANDS as its destination stage: `access` is its
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
@@ -490,6 +495,7 @@ public:
     static bool FlipReadCheck();
 
 private:
+    void traceProgram();
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
@@ -505,6 +511,8 @@ private:
         std::vector<Read> reads;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
+        // The programs whose work was recorded (APS5_TRACE_RECORD=1), printed at submit.
+        std::vector<std::uint64_t> tracePrograms;
         bool submitted = false;
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).

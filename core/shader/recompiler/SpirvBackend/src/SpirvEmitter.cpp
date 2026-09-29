@@ -258,6 +258,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     }
     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
+    state.loopGuardProgram = target.codeAddress;
     // Stopped invocations would leave the wave LDS barriers incomplete.
     // A mesh-stage program's epilogue (EmitMeshEntryPoint) has a workgroup barrier of its own.
     state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;

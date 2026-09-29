@@ -3176,6 +3176,7 @@ private:
     // are not read here; `packet` then carries only the initiator (see dispatchIndirect).
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0) {
         const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
+        Graphics::Recorder::NoteProgram(address);
         auto it = submission.shaders->upper_bound(address);
         require(it != submission.shaders->begin(), "compute program does not belong to a registered shader");
         --it;
@@ -3930,6 +3931,12 @@ private:
         return precheck;
     }
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
+        {
+            // The pixel shader names the draw's work (Recorder::NoteProgram).
+            const auto low = queue.shader.find(0x8);
+            const auto high = queue.shader.find(0x9);
+            Graphics::Recorder::NoteProgram(low == queue.shader.end() || high == queue.shader.end() ? 0 : (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u));
+        }
         PerformanceTimer timing("Driver.Draw");
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         std::array<double, DrawDriverPhaseCount> phaseMs{};

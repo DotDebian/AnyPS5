@@ -304,6 +304,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.bdaAbiVersion = request.target.bdaAbiVersion;
     targetOptions.supportedCapabilities = request.target.supportedCapabilities;
     targetOptions.supportedExtensions = request.target.supportedExtensions;
+    targetOptions.codeAddress = request.shader.codeAddress;
 
     constexpr SpirvEmitter spirvEmitter;
     RecompileResult result;

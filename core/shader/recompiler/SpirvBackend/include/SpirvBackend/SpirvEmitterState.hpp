@@ -105,6 +105,8 @@ struct SpirvEmitterState {
     // Debug aid (APS5_LOOP_GUARD=<exits>): after that many evaluated loop exits an invocation leaves its
     // loops, and the first loop that ran out is reported as a LoopLimit fault instead of hanging the GPU.
     std::uint32_t loopGuardLimit = 0;
+    // The program's guest address, recorded as the fault address of a tripped guard.
+    std::uint64_t loopGuardProgram = 0;
     std::uint32_t loopGuardVisits = 0;
     std::uint32_t loopGuardPc = 0;
     std::uint32_t gdsVariable = 0;
