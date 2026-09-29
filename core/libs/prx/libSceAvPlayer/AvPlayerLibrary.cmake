@@ -14,6 +14,14 @@ function(add_sce_avplayer_library target)
     )
     configure_windows_unwind(${target})
 
+    # FFmpeg from 3rdparty/FFmpeg (FFmpeg.cmake), shared with libSceVideodec2; a system FFmpeg found
+    # through pkg-config when the submodule is not there.
+    if(TARGET anyps5_ffmpeg)
+        target_link_libraries(${target} PRIVATE anyps5_ffmpeg)
+        message(STATUS "${target}: playback with FFmpeg from 3rdparty/FFmpeg")
+        set(AVPLAYER_HAS_FFMPEG ON PARENT_SCOPE)
+        return()
+    endif()
     find_package(PkgConfig QUIET)
     if(PKG_CONFIG_FOUND)
         pkg_check_modules(AVPLAYER_FFMPEG QUIET IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)

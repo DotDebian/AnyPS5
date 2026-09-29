@@ -242,8 +242,10 @@ public:
         } else {
             url = ResolvePath_nid_no_patch(path.c_str()).string();
         }
-        if (avformat_open_input(&format, replacement ? nullptr : url.c_str(), nullptr, nullptr) < 0) {
-            APS5_LOG_ERR("Could not open %s", path.c_str());
+        if (const int error = avformat_open_input(&format, replacement ? nullptr : url.c_str(), nullptr, nullptr); error < 0) {
+            char reason[AV_ERROR_MAX_STRING_SIZE]{};
+            av_strerror(error, reason, sizeof(reason));
+            APS5_LOG_ERR("Could not open %s: %s", path.c_str(), reason);
             return false;
         }
         if (avformat_find_stream_info(format, nullptr) < 0) return true;

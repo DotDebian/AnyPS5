@@ -62,6 +62,8 @@ add_custom_command(
         COMMENT "Patching NIDs for libc"
 )
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg.cmake)
+
 file(GLOB LIBS_DIRS LIST_DIRECTORIES true ${CMAKE_CURRENT_SOURCE_DIR}/prx/*)
 list(REMOVE_ITEM LIBS_DIRS ${LIBC_DIR})
 
@@ -456,9 +458,14 @@ if(BUILD_TESTING)
         set_tests_properties(guest_rtc PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceRtc>")
     endif()
+    # The test writes its movies with a system FFmpeg's encoders (libx264, aac, the mp4 muxer).
     if(AVPLAYER_HAS_FFMPEG)
         find_package(PkgConfig QUIET)
-        pkg_check_modules(AVPLAYER_TEST_FFMPEG QUIET IMPORTED_TARGET libavformat libavcodec libavutil)
+        if(PKG_CONFIG_FOUND)
+            pkg_check_modules(AVPLAYER_TEST_FFMPEG QUIET IMPORTED_TARGET libavformat libavcodec libavutil)
+        endif()
+    endif()
+    if(AVPLAYER_HAS_FFMPEG AND AVPLAYER_TEST_FFMPEG_FOUND)
         add_executable(guest_avplayer_tests tests/GuestAvPlayer.cpp)
         target_include_directories(guest_avplayer_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(guest_avplayer_tests PRIVATE libSceAvPlayer PkgConfig::AVPLAYER_TEST_FFMPEG)
