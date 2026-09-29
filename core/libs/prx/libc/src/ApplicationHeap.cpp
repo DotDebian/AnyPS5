@@ -19,6 +19,7 @@ using Free = void (APS5_VABI *)(void*);
 using Reallocate = void* (APS5_VABI *)(void*, std::size_t);
 using Calloc = void* (APS5_VABI *)(std::size_t, std::size_t);
 using Align = void* (APS5_VABI *)(std::size_t, std::size_t);
+using Realign = void* (APS5_VABI *)(void*, std::size_t, std::size_t);
 using PosixAlign = int (APS5_VABI *)(void**, std::size_t, std::size_t);
 using Initialize = void (APS5_VABI *)();
 
@@ -40,6 +41,7 @@ void* APS5_VABI defaultCalloc(std::size_t count, std::size_t bytes) {
     return pointer;
 }
 void* APS5_VABI defaultAlign(std::size_t alignment, std::size_t bytes) { return GuestHeap::GuestHeapAlign_nid_postfix(alignment, bytes); }
+void* APS5_VABI defaultRealign(void* pointer, std::size_t bytes, std::size_t alignment) { return GuestHeap::GuestHeapRealign_nid_postfix(pointer, bytes, alignment); }
 int APS5_VABI defaultPosixAlign(void** pointer, std::size_t alignment, std::size_t bytes) {
     if (pointer == nullptr || alignment < sizeof(void*) || (alignment & (alignment - 1)) != 0) return 22;
     try { *pointer = defaultAlign(alignment, bytes); return 0; }
@@ -182,6 +184,27 @@ void* ApplicationHeapAlign_nid_no_patch(std::size_t alignment, std::size_t bytes
     void* pointer = requireAllocation(align(alignment, bytes));
     if (reinterpret_cast<std::uintptr_t>(pointer) % alignment != 0) throw std::runtime_error("application heap: allocator returned a misaligned pointer");
     return pointer;
+}
+
+void* ApplicationHeapRealign_nid_no_patch(void* pointer, std::size_t bytes, std::size_t alignment) {
+    if (bytes == 0) {
+        ApplicationHeapFree_nid_no_patch(pointer);
+        return nullptr;
+    }
+    requireAlignment(alignment);
+    Realign realign;
+    {
+        std::lock_guard lock(heapMutex);
+        if (heapFailure) std::rethrow_exception(heapFailure);
+        if (heapFinalized) throw std::runtime_error("application heap: allocator has been finalized");
+        if (heapApi[0] == nullptr) throw std::runtime_error("application heap: allocator API is not registered");
+        if (heapApi[5] != nullptr) std::memcpy(&realign, &heapApi[5], sizeof(realign));
+        else realign = defaultRealign;
+    }
+    CallbackScope scope;
+    void* result = requireAllocation(realign(pointer, bytes, alignment));
+    if (reinterpret_cast<std::uintptr_t>(result) % alignment != 0) throw std::runtime_error("application heap: allocator returned a misaligned pointer");
+    return result;
 }
 
 void* ApplicationHeapCalloc_nid_no_patch(std::size_t count, std::size_t bytes) {

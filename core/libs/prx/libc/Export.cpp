@@ -13,11 +13,6 @@ extern "C" {
         NotImplemented_nid_no_patch(__func__);
     }
 
-    void APS5_VABI catchReturnFromMain_nid_postfix(int status) {
-        (void)status;
-        NotImplemented_nid_no_patch(__func__);
-    }
-
     int APS5_VABI cxa_atexit_nid_postfix(void (*func)(void*), void* arg, void* d) {
         (void)func;
         (void)arg;
@@ -60,11 +55,6 @@ extern "C" {
         NotImplemented_nid_no_patch(__func__);
         return 0;
     }
-
-int APS5_VABI _ZNKSt9exception6_RaiseEv_nid_postfix() {
- NotImplemented_nid_no_patch(__func__);
- return 0;
-}
 
 int APS5_VABI fputwc_nid_postfix() {
  NotImplemented_nid_no_patch(__func__);
