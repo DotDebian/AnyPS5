@@ -173,8 +173,7 @@ void* APS5_VABI aligned_alloc_nid_postfix(size_t alignment, size_t size) {
 }
 
 void* APS5_VABI reallocalign_nid_postfix(void* ptr, size_t size, size_t alignment) {
-    if (ptr != nullptr) NotImplemented_nid_no_patch("reallocalign of an existing block");
-    return ApplicationHeapAlign_nid_no_patch(alignment, size);
+    return ApplicationHeapRealign_nid_no_patch(ptr, size, alignment);
 }
 
 void* APS5_VABI calloc_nid_postfix(size_t count, size_t size) {
