@@ -329,22 +329,38 @@ void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, st
     registry().ranges.swap(replacement);
 }
 
-void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, bool)>& apply) {
+void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply) {
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
     recordChange(mutation, pointer, bytes);
-    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
-    const auto found = registry().ranges.upper_bound(address);
-    require(found != registry().ranges.begin(), "unmap address is not registered");
-    const auto& range = *std::prev(found)->second;
-    require(range.releasable, "guest image memory cannot be unmapped");
-    require(address >= range.address && address - range.allocationAddress <= range.allocationBytes && bytes <= range.allocationBytes - (address - range.allocationAddress), "unmap crosses allocation boundaries");
-    auto replacement = replaceRange(pointer, bytes, true, false, false);
-    bool last = true;
-    for (const auto& [base, entry] : replacement) {
-        if (entry->allocationAddress == range.allocationAddress) last = false;
+    const auto end = reinterpret_cast<std::uintptr_t>(pointer) + bytes;
+    auto cursor = reinterpret_cast<std::uintptr_t>(pointer);
+    bool any = false;
+    while (cursor < end) {
+        const auto found = registry().ranges.upper_bound(cursor);
+        const Range* containing = nullptr;
+        if (found != registry().ranges.begin()) {
+            const auto& candidate = *std::prev(found)->second;
+            if (cursor < candidate.allocationAddress + candidate.allocationBytes) containing = &candidate;
+        }
+        if (containing == nullptr) {
+            if (found == registry().ranges.end() || found->first >= end) break;
+            cursor = found->first;
+            continue;
+        }
+        const auto range = *containing;
+        require(range.releasable, "guest image memory cannot be unmapped");
+        const auto pieceEnd = std::min<std::uint64_t>(end, range.allocationAddress + range.allocationBytes);
+        auto replacement = replaceRange(reinterpret_cast<const void*>(cursor), pieceEnd - cursor, true, false, false);
+        bool last = true;
+        for (const auto& [base, entry] : replacement) {
+            if (entry->allocationAddress == range.allocationAddress) last = false;
+        }
+        apply(reinterpret_cast<const void*>(cursor), pieceEnd - cursor, reinterpret_cast<const void*>(range.allocationAddress), last);
+        registry().ranges.swap(replacement);
+        any = true;
+        cursor = pieceEnd;
     }
-    apply(reinterpret_cast<const void*>(range.allocationAddress), last);
-    registry().ranges.swap(replacement);
+    require(any, "unmap address is not registered");
 }
 
 Lease GuestAllocationsAcquire_nid_postfix() {
