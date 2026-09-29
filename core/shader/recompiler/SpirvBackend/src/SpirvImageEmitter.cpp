@@ -765,6 +765,24 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
         operandMask |= spv::ImageOperandsBiasMask;
         operands.push_back(AddressF32(ctx, access, setup.layout.bias));
     }
+    if (setup.layout.offset != NoImageComponent) {
+        const auto* packed = access.address.Argument(setup.layout.offset);
+        if (packed == nullptr || !packed->HasImmediate()) {
+            ctx.Fail(access.inst, "requires a constant texel offset for image sampling");
+        }
+        const auto bits = packed->ImmediateU32();
+        std::array<std::uint32_t, 3> values{};
+        for (std::uint32_t index = 0; index < setup.dimensionInfo.spatialComponents; index++) {
+            const auto field = (bits >> (index * 8u)) & 0x3fu;
+            values[index] = ConstantI32(state, static_cast<std::int32_t>(field ^ 0x20u) - 0x20);
+        }
+        const auto count = setup.dimensionInfo.spatialComponents;
+        const auto offset = count == 1u ? values[0] : count == 2u
+            ? state.module.Constant(spv::OpConstantComposite, TypeI32Vector(state, 2), values[0], values[1])
+            : state.module.Constant(spv::OpConstantComposite, TypeI32Vector(state, 3), values[0], values[1], values[2]);
+        operandMask |= spv::ImageOperandsConstOffsetMask;
+        operands.push_back(offset);
+    }
     const auto sampled = MakeSampledImage(state, mem.resource, mem.sampler, access.slot);
     const auto sample = state.module.AllocateId();
     std::vector<std::uint32_t> words = {opcode, resultType, sample, sampled, setup.coord};
