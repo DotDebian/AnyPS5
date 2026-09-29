@@ -178,9 +178,10 @@ int APS5_VABI sceAgcUnknownFuseShaderHalves(Shader* fused_result, const Shader* 
     constexpr auto fn = "sceAgcUnknownFuseShaderHalves";
     if (fused_result == nullptr || front == nullptr || back == nullptr || scratch_mem == nullptr) Fail(fn, "null argument");
     auto layout = ComputeLayout(fn, front, back);
-    const auto base = reinterpret_cast<std::uintptr_t>(scratch_mem);
-    if ((base & (FusedCodeAlignment - 1)) != 0 || (base & SHADER_BASE_ALIGN_MASK) != 0) Fail(fn, "fused shader memory is not a valid program address");
-    auto* memory = static_cast<std::uint8_t*>(scratch_mem);
+    const auto scratch = reinterpret_cast<std::uintptr_t>(scratch_mem);
+    const auto base = AlignUp(scratch, FusedCodeAlignment);
+    if ((base & SHADER_BASE_ALIGN_MASK) != 0) Fail(fn, "fused shader memory is not a valid program address");
+    auto* memory = static_cast<std::uint8_t*>(scratch_mem) + (base - scratch);
     std::memcpy(memory, const_cast<const void*>(front->code), layout.frontBytes);
     for (std::size_t offset = layout.frontBytes; offset < layout.backOffset; offset += sizeof(SNop)) std::memcpy(memory + offset, &SNop, sizeof(SNop));
     std::memcpy(memory + layout.backOffset, const_cast<const void*>(back->code), back->shader_size);
@@ -235,7 +236,7 @@ int APS5_VABI sceAgcUnknownGetFusedShaderSize(SizeAlign* dst, const Shader* fron
     constexpr auto fn = "sceAgcUnknownGetFusedShaderSize";
     if (dst == nullptr || front == nullptr || back == nullptr) Fail(fn, "null argument");
     const auto layout = ComputeLayout(fn, front, back);
-    dst->m_size = layout.totalBytes;
+    dst->m_size = layout.totalBytes + FusedCodeAlignment - 1;
     dst->m_align = FusedCodeAlignmentLog2;
     return 0;
 }
