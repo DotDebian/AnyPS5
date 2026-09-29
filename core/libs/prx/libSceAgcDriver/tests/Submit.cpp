@@ -5,6 +5,8 @@
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Query.hpp"
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
@@ -144,6 +146,70 @@ void testSubmissions() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
+std::array<std::uint32_t, 5> writeData(volatile std::uint32_t* address, std::uint32_t value) {
+    const auto target = reinterpret_cast<std::uintptr_t>(address);
+    return {0xc0033700, 0x00100200, static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(static_cast<std::uint64_t>(target) >> 32u), value};
+}
+
+std::array<std::uint32_t, 7> waitEqual(volatile std::uint32_t* address, std::uint32_t value) {
+    const auto target = reinterpret_cast<std::uintptr_t>(address);
+    return {0xc0053c00, 0x13, static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(static_cast<std::uint64_t>(target) >> 32u), value, 0xffffffffu, 0x19};
+}
+
+void submit(std::uint32_t queue, const std::vector<std::uint32_t>& words) {
+    Packet packet{const_cast<std::uint32_t*>(words.data()), static_cast<std::uint32_t>(words.size()), 0, {}};
+    check((queue == 0 ? sceAgcDriverSubmitDcb(&packet) : sceAgcDriverSubmitAcb(queue, &packet)) == 0, "label submit failed");
+}
+
+std::chrono::milliseconds waitFor(volatile std::uint32_t* address, std::uint32_t value, const char* message) {
+    const auto start = std::chrono::steady_clock::now();
+    while (*address != value) {
+        check(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), message);
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+}
+
+template<std::size_t... N>
+std::vector<std::uint32_t> commands(const std::array<std::uint32_t, N>&... packets) {
+    std::vector<std::uint32_t> words;
+    (words.insert(words.end(), packets.begin(), packets.end()), ...);
+    return words;
+}
+
+// A label stored after a wait's submission satisfies the wait although the title wrote the label
+// again before the queue reached it; one stored before the submission never does.
+void testLabelStoredSinceSubmission() {
+    alignas(64) static volatile std::uint32_t gate = 0, label = 0, done = 0, late = 0;
+    submit(0x20, commands(waitEqual(&gate, 1), waitEqual(&label, 1), writeData(&done, 1)));
+    submit(0, commands(writeData(&label, 1)));
+    waitFor(&label, 1, "producer label never landed");
+    label = 0;
+    gate = 1;
+    check(waitFor(&done, 1, "consumer never passed its waits") < std::chrono::milliseconds(500), "a label stored after the wait's submission did not satisfy it");
+    AgcDriverWaitIdle_nid_postfix();
+    submit(0x20, commands(waitEqual(&label, 1), writeData(&late, 1)));
+    check(waitFor(&late, 1, "consumer never passed its wait") >= std::chrono::milliseconds(900), "a label stored before the wait's submission satisfied it");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+// A wait whose value memory holds when it is submitted is satisfied although the title resets the
+// label before the queue gets there, unless an earlier packet of its queue stores to the label.
+void testLabelHeldAtSubmission() {
+    alignas(64) static volatile std::uint32_t gate = 0, label = 1, done = 0, reset = 0;
+    submit(0x20, commands(waitEqual(&gate, 1), waitEqual(&label, 1), writeData(&done, 1)));
+    label = 0;
+    gate = 1;
+    check(waitFor(&done, 1, "consumer never passed its waits") < std::chrono::milliseconds(500), "a label held when the wait was submitted did not satisfy it");
+    AgcDriverWaitIdle_nid_postfix();
+    gate = 0;
+    label = 1;
+    submit(0x20, commands(waitEqual(&gate, 1), writeData(&label, 0), waitEqual(&label, 1), writeData(&reset, 1)));
+    gate = 1;
+    check(waitFor(&reset, 1, "consumer never passed its wait") >= std::chrono::milliseconds(900), "a label its own queue stored first counted as held at the submission");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
 void testWorkerFailure() {
     std::array<std::uint32_t, 5> words{0xc0031500, 1, 1, 1, 0x41};
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
@@ -168,6 +234,8 @@ int main() {
         testValidation();
         testClearState();
         testSubmissions();
+        testLabelStoredSinceSubmission();
+        testLabelHeldAtSubmission();
         testWorkerFailure();
         check(expectFailure([] { LibcRunShutdown_nid_postfix(); }).find("required shader register") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC driver submit tests passed");

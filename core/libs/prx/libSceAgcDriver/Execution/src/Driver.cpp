@@ -204,6 +204,11 @@ struct Submission {
     // Record-order stamp (Driver::eventSerial) taken when the game submitted: a WAIT_REG_MEM of this
     // submission trusts only labels the recorder noted with a newer stamp (see Recorder::NoteLabel).
     std::uint64_t received = 0;
+    // The dwords this submission's label packets store (Driver::noteLabelStore's packets), and the
+    // offsets of its WAIT_REG_MEMs whose value the awaited memory already held when the game
+    // submitted, with no earlier packet of the queue storing to it (Driver::heldAtSubmit).
+    std::vector<std::uint64_t> labelWrites;
+    std::set<std::size_t> heldAtSubmit;
     std::chrono::steady_clock::time_point enqueuedAt{};
 };
 
@@ -516,6 +521,7 @@ private:
             stopping = true;
             for (auto& [queue, worker] : workers) {
                 worker.pending.clear();
+                worker.unfinishedWrites.clear();
                 worker.queued.store(0, std::memory_order_release);
                 worker.queuedFlips.store(0, std::memory_order_release);
             }
@@ -570,6 +576,7 @@ public:
                     require(wait != nullptr, "video output returned a null rendering wait");
                     submission.renderingWaits.emplace(cursor, std::move(wait));
                 }
+                noteHeldAtSubmit(submission, cursor);
                 if (words[0] == FlipPacketHeader) {
                     const auto output = outputs.find(words[1]);
                     require(output != outputs.end(), "flip references an unregistered video output");
@@ -665,6 +672,7 @@ public:
                     for (const auto& [offset, flip] : item.flips) flip->Fail(failure);
                 }
                 worker.pending.clear();
+                worker.unfinishedWrites.clear();
                 worker.queued.store(0, std::memory_order_release);
                 worker.queuedFlips.store(0, std::memory_order_release);
             }
@@ -871,6 +879,9 @@ private:
         // (Driver::throttleSubmit).
         std::atomic<std::uint64_t> queuedFlips{0};
         std::atomic<std::uint64_t> started{0};
+        // Submission::labelWrites of the submissions queued or running, counted per dword (under
+        // `mutex`).
+        std::unordered_map<std::uint64_t, std::uint32_t> unfinishedWrites;
         std::thread thread;
     };
     std::map<std::uint32_t, QueueWorker> workers;
@@ -1524,52 +1535,53 @@ private:
     std::map<std::uint32_t, std::shared_ptr<IVideoOutput>> outputs;
     DevicePointer device;
     DeviceUseGate deviceReplacement;
-    struct LatchedRelease {
-        std::uint64_t sequence;
-        std::uint64_t value;
+    // The label stores the driver made (RELEASE_MEM, WRITE_DATA and packet stores of 64 bytes or
+    // less; recorded on the GPU, as a completion action or on the CPU), per dword: the last few with
+    // the stamp (Driver::eventSerial) taken when the store was committed in queue order. The CP
+    // polls a WAIT_REG_MEM from the moment it reaches it, so a store made after the wait's
+    // submission satisfies the wait even when the title has written the label again by the time
+    // this worker gets to it: titles reclaim a label once its producer's submission is done,
+    // trusting the consumers' CPs to have reached their waits within microseconds, while a worker
+    // that records slowly reaches them hundreds of milliseconds later. A store made before the
+    // submission never satisfies it: the title reset the label for this use after that store.
+    struct LabelStore {
+        std::uint64_t stamp = 0;
+        std::uint32_t value = 0;
     };
-    std::mutex latchMutex;
-    std::unordered_map<std::uint64_t, LatchedRelease> latchedReleases;
-    std::map<std::pair<std::uint32_t, std::uint64_t>, std::uint64_t> latchConsumed;
-    std::uint64_t latchSequence = 0;
-    static inline thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> latchPending;
+    static constexpr std::size_t LabelStoreHistory = 4;
+    std::mutex labelStoresMutex;
+    std::unordered_map<std::uint64_t, std::array<LabelStore, LabelStoreHistory>> labelStores;
 
-    static bool LatchWaits() {
-        static const bool enabled = std::getenv("APS5_LATCH_WAITS") != nullptr;
-        return enabled;
-    }
-
-    void noteLatchedRelease(std::uint64_t address, std::span<const std::byte> bytes) {
-        if (bytes.empty() || bytes.size() > 8) return;
-        std::uint64_t value = 0;
-        std::memcpy(&value, bytes.data(), bytes.size());
-        std::lock_guard lock(latchMutex);
-        latchedReleases[address] = {++latchSequence, value};
-    }
-
-    bool latchedWaitSatisfied(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t address) {
-        std::lock_guard lock(latchMutex);
-        const auto release = latchedReleases.find(address);
-        if (release == latchedReleases.end()) return false;
-        const auto consumed = latchConsumed.find({queue, address});
-        if (consumed != latchConsumed.end() && consumed->second >= release->second.sequence) return false;
-        return Pm4::WaitComparesValue(packet, release->second.value);
-    }
-
-    void noteLatchedWait(std::uint64_t address) {
-        std::lock_guard lock(latchMutex);
-        const auto release = latchedReleases.find(address);
-        if (release != latchedReleases.end()) latchPending.emplace_back(address, release->second.sequence);
-    }
-
-    void commitLatchedWaits(std::uint32_t queue) {
-        if (latchPending.empty()) return;
-        std::lock_guard lock(latchMutex);
-        for (const auto& [address, sequence] : latchPending) {
-            auto& consumed = latchConsumed[{queue, address}];
-            consumed = std::max(consumed, sequence);
+    void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp) {
+        if (bytes.empty() || bytes.size() > 64 || bytes.size() % 4 != 0 || address % 4 != 0) return;
+        std::lock_guard lock(labelStoresMutex);
+        for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
+            auto& history = labelStores[address + offset];
+            std::shift_right(history.begin(), history.end(), 1);
+            history[0].stamp = stamp;
+            std::memcpy(&history[0].value, bytes.data() + offset, 4);
         }
-        latchPending.clear();
+    }
+
+    // Whether a store committed after the stamp `received` gave the awaited bytes a value the wait
+    // accepts. Only a store covering all of them counts (the other dword's value is unknown then).
+    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received) {
+        std::lock_guard lock(labelStoresMutex);
+        const auto low = labelStores.find(address);
+        if (low == labelStores.end()) return false;
+        const auto high = bytes == 8 ? labelStores.find(address + 4) : labelStores.end();
+        if (bytes == 8 && high == labelStores.end()) return false;
+        for (const auto& store : low->second) {
+            if (store.stamp <= received) continue;
+            std::uint64_t value = store.value;
+            if (bytes == 8) {
+                const auto upper = std::find_if(high->second.begin(), high->second.end(), [&](const LabelStore& other) { return other.stamp == store.stamp; });
+                if (upper == high->second.end()) continue;
+                value |= static_cast<std::uint64_t>(upper->value) << 32u;
+            }
+            if (Pm4::WaitComparesValue(packet, value)) return true;
+        }
+        return false;
     }
     std::vector<std::shared_ptr<VulkanDevice>> replacedDevices;
     std::stop_token shutdownToken = LibcShutdownToken_nid_postfix();
@@ -1643,9 +1655,55 @@ private:
         }
     }
 
+    // Caller holds `mutex`. The packet at `cursor` of a submission being accepted: a label store
+    // is listed in labelWrites; a WAIT_REG_MEM on memory is heldAtSubmit when the awaited bytes
+    // hold a value it accepts now, before the game can write them again, and no packet before it
+    // on its queue (earlier in this submission, or in one queued or running) stores to them. The
+    // CP polls from the moment it reaches the wait, which is at once for a queue that keeps up:
+    // titles reclaim and reset a label once its producer's submission is done, trusting the
+    // consumers to have passed their waits, while a worker that records slowly gets there much
+    // later (storedSince covers the stores made after the submission).
+    void noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
+        const auto packet = std::span<const std::uint32_t>(submission.commands).subspan(cursor, std::min<std::size_t>(Pm4::PacketWords(submission.commands[cursor]), submission.commands.size() - cursor));
+        const auto opcode = (packet[0] >> 8u) & 0xffu;
+        if ((packet[0] >> 30u) != 3u) return;
+        if (opcode == 0x49 || opcode == 0x37) {
+            if (const auto label = Pm4::DecodeLabelWrite(packet)) {
+                const auto bytes = label->Bytes();
+                if (label->address % 4 == 0 && bytes.size() <= 64) {
+                    for (std::size_t offset = 0; offset < bytes.size(); offset += 4) submission.labelWrites.push_back(label->address + offset);
+                }
+            }
+            return;
+        }
+        if ((opcode != 0x3c && opcode != 0x93) || packet.size() < 7 || ((packet[1] >> 4u) & 3u) != 1u) return;
+        const auto address = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+        const std::size_t bytes = opcode == 0x93 ? 8 : 4;
+        if (address % 4 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return;
+        const auto worker = workers.find(submission.queue);
+        for (std::size_t offset = 0; offset < bytes; offset += 4) {
+            const auto dword = address + offset;
+            if (std::find(submission.labelWrites.begin(), submission.labelWrites.end(), dword) != submission.labelWrites.end()) return;
+            if (worker != workers.end() && worker->second.unfinishedWrites.contains(dword)) return;
+        }
+        std::uint64_t value = *reinterpret_cast<const volatile std::uint32_t*>(address);
+        if (bytes == 8) value |= static_cast<std::uint64_t>(*reinterpret_cast<const volatile std::uint32_t*>(address + 4)) << 32u;
+        if (Pm4::WaitComparesValue(packet, value)) submission.heldAtSubmit.insert(cursor);
+    }
+
+    // Caller holds `mutex`: a finished submission's label stores no longer precede later waits.
+    static void forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission) {
+        for (const auto dword : submission.labelWrites) {
+            const auto found = worker.unfinishedWrites.find(dword);
+            if (found == worker.unfinishedWrites.end()) continue;
+            if (--found->second == 0) worker.unfinishedWrites.erase(found);
+        }
+    }
+
     void enqueue(Submission submission) {
         const auto queue = submission.queue;
         auto& worker = workers[queue];
+        for (const auto dword : submission.labelWrites) ++worker.unfinishedWrites[dword];
         if (!submission.flips.empty()) worker.queuedFlips.fetch_add(1, std::memory_order_acq_rel);
         worker.pending.push_back(std::move(submission));
         worker.queued.fetch_add(1, std::memory_order_acq_rel);
@@ -5057,8 +5115,11 @@ private:
     // entryTriesFailed: overlapping entries whose try of the mutex failed and went to polling
     // instead of waiting for it (see waitMemory). fromRecorderLate: table hits taken under the late
     // rule (Recorder::NoteLabel); lateRefusedCpuStore: late hits refused because a CPU store
-    // touched the dwords since the label's group closed.
+    // touched the dwords since the label's group closed. storedSinceSubmit: waits a label store made
+    // after their submission satisfied although memory holds another value by now (storedSince);
+    // heldAtSubmit: waits whose value memory held when they were submitted (heldAtSubmit).
     struct WaitOutcomes {
+        std::uint64_t storedSinceSubmit = 0, heldAtSubmit = 0;
         std::uint64_t atEntry = 0, fromRecorder = 0, fromRecorderSameQueue = 0, fromRecorderPolling = 0, polled = 0, timedOut = 0, pollSubmits = 0, pollReaps = 0;
         std::uint64_t fromRecorderUnlocked = 0, entriesUnlocked = 0, entryTriesFailed = 0, fromRecorderLate = 0, lateRefusedCpuStore = 0;
     };
@@ -5182,12 +5243,15 @@ private:
         bool first = true;
         for (const auto& label : labels) {
             const auto bytes = std::span<const std::byte>(label.bytes).first(label.size);
-            const int reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label.address, bytes, ++eventSerial, queue, first) : 4;
+            const auto stamp = ++eventSerial;
+            const int reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label.address, bytes, stamp, queue, first) : 4;
             first = false;
             countLabelOutcome(reason);
-            if (reason == 0 || reason == 5 || reason == 6) continue;
-            if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
-            GuestMemory::Write(label.address, bytes, 4);
+            if (reason != 0 && reason != 5 && reason != 6) {
+                if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+                GuestMemory::Write(label.address, bytes, 4);
+            }
+            noteLabelStore(label.address, bytes, stamp);
         }
         ++labelGroups;
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -5435,7 +5499,7 @@ private:
     }
 
     // WAIT_REG_MEM: another queue or the CPU produces the value; the other queues run on their own threads.
-    void waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received) {
+    void waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit) {
         // The timeout counts from the last sign of GPU progress: while any queue is executing packets,
         // the producer may still be on its way (shader compiles alone take hundreds of milliseconds).
         auto start = std::chrono::steady_clock::now();
@@ -5474,7 +5538,14 @@ private:
             ++outcomes.atEntry;
             return;
         }
-        if (LatchWaits() && latchedWaitSatisfied(packet, queue, awaited)) return;
+        if (heldAtSubmit) {
+            ++outcomes.heldAtSubmit;
+            return;
+        }
+        if (storedSince(packet, awaited, awaitedBytes, received)) {
+            ++outcomes.storedSinceSubmit;
+            return;
+        }
         // Debug aids: APS5_NO_LABEL_SHORTCUT=1 never satisfies a wait from the pending-label table;
         // APS5_NO_WAIT_OVERLAP_SUBMIT=1 submits the open batch at every wait, as before, instead of
         // only when it writes the awaited range.
@@ -5720,7 +5791,10 @@ private:
         bool spinning = pauseSpin;
         std::uint32_t polls = 0;
         while (!Pm4::WaitSatisfiedUnchecked(packet)) {
-            if (LatchWaits() && latchedWaitSatisfied(packet, queue, awaited)) return;
+            if (storedSince(packet, awaited, awaitedBytes, received)) {
+                ++outcomes.storedSinceSubmit;
+                return;
+            }
             ++polls;
             if (spinning) {
                 _mm_pause();
@@ -5773,11 +5847,6 @@ private:
     }
 
     void execute(const Submission& submission) {
-        struct CommitLatch {
-            Driver& driver;
-            std::uint32_t queue;
-            ~CommitLatch() { driver.commitLatchedWaits(queue); }
-        } commitLatch{*this, submission.queue};
         if (submission.suspend) {
             // A suspend point only marks where the system may suspend the title (the system, not the
             // title, waits for the GPU there); this drained the device under the mutex once per
@@ -5919,7 +5988,7 @@ private:
                     auto& poll = pollStats();
                     std::fprintf(stderr, "[poll] queue 0x%x (10 s): ticks %llu, table hits %llu, tries %llu / failed %llu, submits %llu, reaps %llu (%llu with work; by reason: behind completion %llu / other %llu), refusals: %s %llu, %s %llu, %s %llu, %s %llu, %s %llu; longest try hold %.1f us, try holds %.1f ms\n", queue, static_cast<unsigned long long>(poll.ticks), static_cast<unsigned long long>(poll.tableHits), static_cast<unsigned long long>(poll.tries), static_cast<unsigned long long>(poll.triesFailed), static_cast<unsigned long long>(poll.submits), static_cast<unsigned long long>(poll.reaps), static_cast<unsigned long long>(poll.reapsWithWork), static_cast<unsigned long long>(poll.reapsBehindCompletion), static_cast<unsigned long long>(poll.reapsOther), LabelRefusalNames[1], static_cast<unsigned long long>(poll.refusals[1]), LabelRefusalNames[2], static_cast<unsigned long long>(poll.refusals[2]), LabelRefusalNames[3], static_cast<unsigned long long>(poll.refusals[3]), LabelRefusalNames[4], static_cast<unsigned long long>(poll.refusals[4]), LabelRefusalNames[5], static_cast<unsigned long long>(poll.refusals[5]), poll.longestTryHoldUs, poll.tryHoldUs / 1000.0);
                     poll = PollStats{};
-                    std::fprintf(stderr, "[packets] queue 0x%x %llu submissions, time by packet (10 s):%s, flush %.0fms; DISPATCH_DIRECT by outcome:%s; per submission (%llu submitted): validate %.1f us, copy %.1f us, dequeue %.1f us, complete %.1f us; suspend points %llu x %.1f us, %llu skipped (nothing open); end submits %llu made, %llu skipped, %llu notifies skipped; waits satisfied: at entry %llu, from recorder %llu (%llu while polling, same queue %llu, %llu without the GPU mutex, %llu late-trusted), polled %llu (%llu entered without the GPU mutex, %llu entry tries failed; late candidates %llu: refused cpu-store %llu, overwritten %llu, unclosed %llu, queued %llu), timed out %llu; poll submits %llu, poll reaps %llu; epoch bumps: submissions %llu, waits %llu, drains %llu, reaps %llu, packets %llu\n", queue, static_cast<unsigned long long>(profile.submissions), report.c_str(), profile.flushMs, outcomes.c_str(), static_cast<unsigned long long>(submitted), validateUs, copyUs, dequeueUs, completeUs, static_cast<unsigned long long>(suspends), suspendUs, static_cast<unsigned long long>(costs.suspendsSkipped.exchange(0)), static_cast<unsigned long long>(costs.endSubmits.exchange(0)), static_cast<unsigned long long>(costs.endSkipped.exchange(0)), static_cast<unsigned long long>(costs.notifiesSkipped.exchange(0)), static_cast<unsigned long long>(waits.atEntry), static_cast<unsigned long long>(waits.fromRecorder + waits.fromRecorderPolling), static_cast<unsigned long long>(waits.fromRecorderPolling), static_cast<unsigned long long>(waits.fromRecorderSameQueue), static_cast<unsigned long long>(waits.fromRecorderUnlocked), static_cast<unsigned long long>(waits.fromRecorderLate), static_cast<unsigned long long>(waits.polled), static_cast<unsigned long long>(waits.entriesUnlocked), static_cast<unsigned long long>(waits.entryTriesFailed), static_cast<unsigned long long>(late.candidates - lateSeen.candidates), static_cast<unsigned long long>(waits.lateRefusedCpuStore), static_cast<unsigned long long>(late.overwritten - lateSeen.overwritten), static_cast<unsigned long long>(late.unclosed - lateSeen.unclosed), static_cast<unsigned long long>(late.queued - lateSeen.queued), static_cast<unsigned long long>(waits.timedOut), static_cast<unsigned long long>(waits.pollSubmits), static_cast<unsigned long long>(waits.pollReaps), static_cast<unsigned long long>(epochs.submissions), static_cast<unsigned long long>(epochs.waits), static_cast<unsigned long long>(epochs.drains), static_cast<unsigned long long>(epochs.reaps), static_cast<unsigned long long>(epochs.packets));
+                    std::fprintf(stderr, "[packets] queue 0x%x %llu submissions, time by packet (10 s):%s, flush %.0fms; DISPATCH_DIRECT by outcome:%s; per submission (%llu submitted): validate %.1f us, copy %.1f us, dequeue %.1f us, complete %.1f us; suspend points %llu x %.1f us, %llu skipped (nothing open); end submits %llu made, %llu skipped, %llu notifies skipped; waits satisfied: at entry %llu, from recorder %llu (%llu while polling, same queue %llu, %llu without the GPU mutex, %llu late-trusted), polled %llu (%llu entered without the GPU mutex, %llu entry tries failed; late candidates %llu: refused cpu-store %llu, overwritten %llu, unclosed %llu, queued %llu), timed out %llu, from a store since their submission %llu, held at submission %llu; poll submits %llu, poll reaps %llu; epoch bumps: submissions %llu, waits %llu, drains %llu, reaps %llu, packets %llu\n", queue, static_cast<unsigned long long>(profile.submissions), report.c_str(), profile.flushMs, outcomes.c_str(), static_cast<unsigned long long>(submitted), validateUs, copyUs, dequeueUs, completeUs, static_cast<unsigned long long>(suspends), suspendUs, static_cast<unsigned long long>(costs.suspendsSkipped.exchange(0)), static_cast<unsigned long long>(costs.endSubmits.exchange(0)), static_cast<unsigned long long>(costs.endSkipped.exchange(0)), static_cast<unsigned long long>(costs.notifiesSkipped.exchange(0)), static_cast<unsigned long long>(waits.atEntry), static_cast<unsigned long long>(waits.fromRecorder + waits.fromRecorderPolling), static_cast<unsigned long long>(waits.fromRecorderPolling), static_cast<unsigned long long>(waits.fromRecorderSameQueue), static_cast<unsigned long long>(waits.fromRecorderUnlocked), static_cast<unsigned long long>(waits.fromRecorderLate), static_cast<unsigned long long>(waits.polled), static_cast<unsigned long long>(waits.entriesUnlocked), static_cast<unsigned long long>(waits.entryTriesFailed), static_cast<unsigned long long>(late.candidates - lateSeen.candidates), static_cast<unsigned long long>(waits.lateRefusedCpuStore), static_cast<unsigned long long>(late.overwritten - lateSeen.overwritten), static_cast<unsigned long long>(late.unclosed - lateSeen.unclosed), static_cast<unsigned long long>(late.queued - lateSeen.queued), static_cast<unsigned long long>(waits.timedOut), static_cast<unsigned long long>(waits.storedSinceSubmit), static_cast<unsigned long long>(waits.heldAtSubmit), static_cast<unsigned long long>(waits.pollSubmits), static_cast<unsigned long long>(waits.pollReaps), static_cast<unsigned long long>(epochs.submissions), static_cast<unsigned long long>(epochs.waits), static_cast<unsigned long long>(epochs.drains), static_cast<unsigned long long>(epochs.reaps), static_cast<unsigned long long>(epochs.packets));
                     lateSeen = late;
                     waits = WaitOutcomes{};
                     epochs = EpochBumps{};
@@ -5978,9 +6047,6 @@ private:
             // interrupt-only) need no drain because Pm4::Execute is a no-op for them. The label
             // counters and the [sync] report live at namespace scope (see reportSync).
             const bool endOfPipeInterrupt = opcode == 0x49 && ((packet[2] >> 24u) & 7u) != 0;
-            if (LatchWaits() && (opcode == 0x49 || opcode == 0x37)) {
-                if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLatchedRelease(label->address, label->Bytes());
-            }
             // An end-of-pipe interrupt (RELEASE_MEM with an interrupt select) reaches the issuing
             // queue's event once the work before it completed and its label (if any) landed; by
             // default the packet drains the device for that (a CPU wait for all recorded work, then
@@ -6012,8 +6078,10 @@ private:
                     int reason = localDevice != nullptr ? 0 : 1;
                     if (label.has_value()) {
                         const auto bytes = label->Bytes();
-                        reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, ++eventSerial, submission.queue) : 4;
+                        const auto stamp = ++eventSerial;
+                        reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue) : 4;
                         if (reason == 1) GuestMemory::Write(label->address, bytes, 4);
+                        if (reason == 0 || reason == 1 || reason == 5 || reason == 6) noteLabelStore(label->address, bytes, stamp);
                         if (reason == 0 || reason == 1 || reason == 5 || reason == 6) Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                         countLabelOutcome(reason);
                         ++immediateLabels;
@@ -6055,7 +6123,8 @@ private:
                         // submission the game made before this point. Without a device (reason 4)
                         // the packet drains nothing and Pm4::Execute stores it, as before.
                         recordDeferredLabels(localDevice.get(), submission.queue);
-                        const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, ++eventSerial, submission.queue) : 4;
+                        const auto stamp = ++eventSerial;
+                        const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue) : 4;
                         wroteOnGpu = reason == 0 || reason == 5 || reason == 6;
                         if (reason == 1) {
                             // Idle recorder: stored here, still under the mutex, as
@@ -6065,6 +6134,7 @@ private:
                             GuestMemory::Write(label->address, bytes, 4);
                             wroteOnGpu = true;
                         }
+                        if (wroteOnGpu) noteLabelStore(label->address, bytes, stamp);
                         Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                         countLabelOutcome(reason);
                         ++immediateLabels;
@@ -6111,7 +6181,9 @@ private:
                         // Earlier labels of this queue go first (queue order); the stamp is taken
                         // under the mutex like a label's.
                         recordDeferredLabels(localDevice.get(), submission.queue);
-                        const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, ++eventSerial, submission.queue) : 4;
+                        const auto stamp = ++eventSerial;
+                        const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
+                        if (reason == 0 || reason == 1 || reason == 5 || reason == 6) noteLabelStore(store->address, bytes, stamp);
                         if (reason == 0 || reason == 5 || reason == 6) {
                             if (reason == 0) ++storesOnGpu;
                             else ++storesBehindCompletions;
@@ -6250,8 +6322,7 @@ private:
             } else if (opcode == 0x3c || opcode == 0x93) {
                 static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
                 const auto waitStart = std::chrono::steady_clock::now();
-                timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received); });
-                if (LatchWaits()) noteLatchedWait(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u));
+                timed(&WorkerProfile::waitMs, [&] { waitMemory(packet, submission.queue, recent, submission.received, submission.heldAtSubmit.contains(cursor)); });
                 if (traceGpu && std::chrono::steady_clock::now() - waitStart > std::chrono::milliseconds(200)) {
                     // List the rest of the submission to show what the stalled queue would have done next.
                     for (std::size_t next = cursor + count, shown = 0; next < submission.commands.size() && shown < 48; ++shown) {
@@ -6320,7 +6391,12 @@ private:
                 }); });
                 finishDrawPacket(drawn);
             } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
-                if (!wroteOnGpu) Pm4::Execute(packet, queue);
+                if (!wroteOnGpu) {
+                    Pm4::Execute(packet, queue);
+                    if (opcode == 0x49 || opcode == 0x37) {
+                        if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial);
+                    }
+                }
                 if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
             } else if (opcode == 0x46 && (packet[1] & 0x3fu) == 0x39) {
                 Pm4::DumpPixelPipeStatistics(packet);
@@ -6443,6 +6519,7 @@ private:
                     std::lock_guard lock(mutex);
                     rethrowFailure();
                     markCompleted(submission.serial);
+                    forgetUnfinishedWrites(workers.at(id), submission);
                     // Only WaitIdle waits for a completion (idle workers wait for work, notified at
                     // its enqueue): the notify is skipped while nobody is in it.
                     notify = idleWaiters != 0;
