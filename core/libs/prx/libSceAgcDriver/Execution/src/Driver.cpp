@@ -4284,6 +4284,7 @@ private:
                 program.userData.insert(program.userData.begin(), 8, 0);
                 Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase);
                 Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, pointerBase + 1);
+                if (!pointerRequired && !queue.shader.contains(pointerBase) && !queue.shader.contains(pointerBase + 1)) return;
                 const auto low = readRegister(queue.shader, pointerBase);
                 const auto high = readRegister(queue.shader, pointerBase + 1);
                 const auto address = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32u);
