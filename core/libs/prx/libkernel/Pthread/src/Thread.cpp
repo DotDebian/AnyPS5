@@ -443,8 +443,7 @@ int APS5_VABI scePthreadOnce(int32_t* once, void (APS5_VABI* init)(void)) {
 extern "C" {
 
 void APS5_VABI __pthread_cxa_finalize_nid_postfix(void* argument) {
-    (void)argument;
-    NotImplemented_nid_no_patch(__func__);
+    CxaFinalize_nid_no_patch(argument);
 }
 
 }
