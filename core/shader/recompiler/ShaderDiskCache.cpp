@@ -25,7 +25,7 @@ namespace ShaderRecompiler::ShaderDiskCache {
 // are only checked where they were measured.
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(RecompileResult) == 176, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 224, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 264, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 28, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
 static_assert(sizeof(CompiledShaderInfo) == 304, "CompiledShaderInfo changed: update the info encoder");
