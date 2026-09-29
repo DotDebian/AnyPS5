@@ -1834,6 +1834,11 @@ private:
             // Debug aid (APS5_TRACE_DCC_KEYS=1): the title's fills of a surface's DCC metadata.
             static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
             if (traceKeys && coverage.cover == Graphics::StorageTexture::FillCover::Keys) std::fprintf(stderr, "[dcc-keys] title fills keys 0x%llx+0x%zx with %08x %08x %08x %08x (queue 0x%x)\n", static_cast<unsigned long long>(base), bytes, pattern[0], pattern[1], pattern[2], pattern[3], queueId);
+            const bool uniformKeysFill = coverage.cover == Graphics::StorageTexture::FillCover::Keys && std::all_of(pattern.begin(), pattern.end(), [&](std::uint32_t word) { return word == (pattern[0] & 0xffu) * 0x01010101u; });
+            if (uniformKeysFill) {
+                Graphics::StorageTexture::NoteKeysFill(base, bytes, static_cast<std::uint8_t>(pattern[0]));
+                Graphics::StorageTexture::ClearByKeysFill(base, bytes, static_cast<std::uint8_t>(pattern[0]));
+            }
             // Results pending in images wholly inside the range are dead whichever way the fill is
             // done (it overwrites every byte of them): dropped rather than stored first.
             const auto discarded = fillClearEnabled() ? Graphics::StorageTexture::DiscardPendingInside(base, bytes) : 0u;
@@ -1865,6 +1870,19 @@ private:
             phase(FillFlush);
             const bool stored = cleared || localDevice->FillBuffer(base, bytes, pattern);
             phase(FillDevice);
+            if (uniformKeysFill && stored && !cleared) {
+                Graphics::DccKeys filled = Graphics::DccKeys::Mixed;
+                switch (pattern[0] & 0xffu) {
+                    case 0x00: filled = Graphics::DccKeys::Clear0000; break;
+                    case 0x40: filled = Graphics::DccKeys::Clear0001; break;
+                    case 0x80: filled = Graphics::DccKeys::Clear1110; break;
+                    case 0xc0: filled = Graphics::DccKeys::Clear1111; break;
+                    case 0x20: filled = Graphics::DccKeys::ClearRegister; break;
+                    case 0xff: filled = Graphics::DccKeys::Uncompressed; break;
+                    default: break;
+                }
+                if (filled != Graphics::DccKeys::Mixed) Graphics::NoteKeysFillOnGpu(base, bytes, filled);
+            }
             if (profile && stored && !cleared) {
                 const bool uniform = pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3];
                 ++(uniform ? uniformFills : patternFills);
