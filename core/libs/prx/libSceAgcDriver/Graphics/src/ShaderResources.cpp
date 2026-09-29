@@ -305,13 +305,29 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
     // memory first.
     auto source = StorageTexture::FindPending(address, guestBytes);
     if (source != nullptr && (depthAspect != 0 || depthCompare || !Texture::CanCopyFrom(*source, resource) || MetadataMoved(*source, resource))) source.reset();
+    std::optional<DccKeys> keys;
+    bool clearThroughKeys = false;
+    if (source != nullptr && resource.dccAddress != 0 && IsDccClear(source->FilledKeys())) {
+        keys = scanKeys();
+        if (*keys == source->FilledKeys()) {
+            std::array<std::byte, 16> probe{};
+            if (!FillDccClear(ResolveTextureFormat(resource.format), *keys, resource.dccAlphaOnMsb, probe)) {
+                char text[256];
+                std::snprintf(text, sizeof(text), "AGC graphics: sampled texture 0x%llx (%ux%u format %u, dcc 0x%llx) reads %s DCC keys filled over its pending image, a clear value the format has no encoding for", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned long long>(resource.dccAddress), DccKeysName(*keys));
+                throw std::runtime_error(text);
+            }
+            static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
+            if (traceKeys) std::fprintf(stderr, "[dcc-keys] sampled 0x%llx through keys 0x%llx reads the %s fill, not the pending image\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(resource.dccAddress), DccKeysName(*keys));
+            source.reset();
+            clearThroughKeys = true;
+        }
+    }
     // Otherwise a surface in host-imported memory is viewed through its cached storage image (made
     // here when there is none): its refresh after a CPU or GPU write is a GPU-direct detile from the
     // import, recorded behind the producer, so no bytes are read or compared on the CPU and nothing
     // waits for the producer. A fast-cleared surface (keys) is viewed only through an image whose own
     // descriptor carries the DCC address (below); it stays a snapshot otherwise, its texels not read.
-    std::optional<DccKeys> keys;
-    if (depthAspect == 0 && !depthCompare && source == nullptr && SampledFromStorageEligible(context, resource, guestBytes)) {
+    if (depthAspect == 0 && !depthCompare && source == nullptr && !clearThroughKeys && SampledFromStorageEligible(context, resource, guestBytes)) {
         keys = scanKeys();
         if (*keys == DccKeys::Uncompressed) {
             source = sampledStorageSource(context, resource, guestBytes);
@@ -343,7 +359,7 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
     // after them is current at the generation of a second (memoized) collect. The store marks the
     // surface's DCC keys uncompressed, so the keys are read after it.
     const auto flushStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (source == nullptr && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
+    if (source == nullptr && !clearThroughKeys && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::PendingFlush, flushStart);
         generation = GuestMemory::CollectWrites(address, bytes);
         keys.reset();
