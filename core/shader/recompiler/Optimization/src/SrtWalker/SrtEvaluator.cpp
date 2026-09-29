@@ -10,6 +10,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 namespace ShaderRecompiler::Detail {
 
@@ -111,6 +112,16 @@ bool Evaluator::EvaluateExtract(IrValue& inst, std::uint64_t& result) {
     return false;
 }
 
+bool Evaluator::IsConditionalSlotRead(const IrValue& inst) {
+    if (!_conditionalReadsBuilt) {
+        _conditionalReadsBuilt = true;
+        for (const auto& read : _program.srtReads) {
+            if (read.conditional && read.value != nullptr) _conditionalReads.insert(read.value->Resolve());
+        }
+    }
+    return _conditionalReads.contains(&inst);
+}
+
 bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
     const auto flags = inst.Flags<MemoryFlags>();
     if (flags.index >= _program.memoryInfo.size()) {
@@ -158,8 +169,22 @@ bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {
         else trace->otherReads.push_back(address);
     }
     std::uint32_t word = 0;
+    if (_unmappedAsZero && _runtime.isReadable != nullptr && IsConditionalSlotRead(inst) && !_runtime.isReadable(_runtime.userContext, address)) {
+        ++_unmappedReads;
+        result = 0;
+        return true;
+    }
     if (_runtime.readMemory != nullptr) {
-        if (!_runtime.readMemory(_runtime.userContext, address, &word)) {
+        // A read the guest memory layer rejects names the shader instruction it came from.
+        bool read = false;
+        try {
+            read = _runtime.readMemory(_runtime.userContext, address, &word);
+        } catch (const std::exception& error) {
+            char where[64];
+            std::snprintf(where, sizeof(where), " (scalar read at pc 0x%x)", flags.pc);
+            throw std::runtime_error(error.what() + std::string(where));
+        }
+        if (!read) {
             return false;
         }
     } else {

@@ -4,12 +4,14 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
+#include "BdaAbi.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <iostream>
 #include <future>
 #include <memory>
@@ -474,9 +476,93 @@ void verifyPassthroughPixelInputs() {
     require(flat.locations == std::vector<std::uint32_t>{3u} && flat.perVertex && flat.subtracts == 2u, "v_interp_mov p10/p20 of a flat input did not read differences to vertex 0");
     require(recompile(0x23u).locations.empty(), "a defaulted input (OFFSET bit 5 without FLAT_SHADE) was declared as a parameter");
 }
+
+// A vertex program whose second scalar load sits under a branch on user data (s10): the loaded
+// pointer's target is a conditional flattened slot, so a null pointer (whose target is unmapped)
+// captures as zero instead of failing the dispatch. The pointer load itself is unconditional (a
+// null user-data pointer still fails the capture, see main).
+void verifyConditionalUnmappedSlot() {
+    using namespace ShaderRecompiler;
+    // s_load_dwordx2 s[0:1], s[8:9], 0; v_mov_b32 v0, 0; s_cmp_eq_u32 s10, 0; s_cbranch_scc1 skip;
+    // s_load_dword s2, s[0:1], 0; s_waitcnt; v_mov_b32 v0, s2; skip: exp pos0 v0..v0 done; s_endpgm
+    const std::array<std::uint32_t, 12> code{0xf4040004u, 0xfa000000u, 0x7e000280u, 0xbf06800au, 0xbf850004u, 0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0x7e000202u, 0xf80008cfu, 0u, 0xbf810000u};
+    std::uint32_t payload = 0x3f800000u;
+    std::uint64_t table = reinterpret_cast<std::uintptr_t>(&payload);
+    const auto address = reinterpret_cast<std::uintptr_t>(&table);
+    const std::array<std::uint32_t, 3> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 1u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Vertex, 0x20000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 8;
+    request.context.userData = userData;
+    request.context.vertex = ShaderVertexStageInfo{};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    AgcDriver::ShaderMemory mapped({});
+    const auto capture = mapped.Capture(request);
+    const auto& reads = capture->plan->srtReads;
+    require(std::count_if(reads.begin(), reads.end(), [](const SrtRead& read) { return read.conditional; }) == 1, "the branch's load is not the one conditional slot");
+    std::uint32_t payloadSlot = 0;
+    for (const auto& read : reads) {
+        if (read.conditional) payloadSlot = read.flatOffset;
+    }
+    require(capture->snapshot.flattenedSrt.at(payloadSlot) == payload, "a mapped conditional slot did not read its value");
+    table = 0;
+    AgcDriver::ShaderMemory null({});
+    const auto nullCapture = null.Capture(request);
+    require(nullCapture->snapshot.flattenedSrt.at(payloadSlot) == 0u, "an unmapped conditional slot did not read zero");
+}
+
+// A V# the program loads itself at a loop-carried offset (a table walk) cannot be evaluated by the
+// dispatch: with APS5_RUNTIME_DESCRIPTORS=1 its scalar buffer read goes through the BDA table
+// with the V#'s base and range evaluated in the shader (EmitReadConstBuffer), not a binding.
+void verifyRuntimeScalarDescriptor() {
+    using namespace ShaderRecompiler;
+    // s_load_dwordx2 s[0:1], s[8:9], 0; s_mov_b32 s4, 0; s_mov_b32 s3, 0; s_waitcnt;
+    // loop: s_load_dwordx4 s[12:15], s[0:1], s4; s_waitcnt; s_buffer_load_dword s2, s[12:15], 4;
+    // s_waitcnt; s_add_u32 s3, s3, s2; s_add_u32 s4, s4, 16; s_cmp_lt_u32 s4, 64; s_cbranch_scc1 loop;
+    // v_mov_b32 v0, s3; exp pos0 v0..v0 done; s_endpgm
+    const std::array<std::uint32_t, 19> code{0xf4040004u, 0xfa000000u, 0xbe840380u, 0xbe830380u, 0xbf8cc07fu, 0xf4080300u, 0x08000000u, 0xbf8cc07fu, 0xf4200086u, 0xfa000004u, 0xbf8cc07fu, 0x80030203u, 0x80049004u, 0xbf0ac004u, 0xbf85fff6u, 0x7e000203u, 0xf80008cfu, 0u, 0xbf810000u};
+    std::array<std::uint32_t, 16> descriptors{};
+    std::uint64_t table = reinterpret_cast<std::uintptr_t>(descriptors.data());
+    const auto address = reinterpret_cast<std::uintptr_t>(&table);
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
+    const std::array<std::uint32_t, 3> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Vertex, 0x30000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 8;
+    request.context.userData = userData;
+    request.context.vertex = ShaderVertexStageInfo{};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    const auto program = PrepareResourceProgram(request);
+    require(program.Info().usesDma, "a runtime descriptor did not make the program address-based");
+    require(program.Info().buffers.empty(), "a runtime descriptor was bound as a buffer");
+    const auto runtime = std::count_if(program.Resources().memoryInfo.begin(), program.Resources().memoryInfo.end(), [](const MemoryInfo& memory) { return memory.runtimeDescriptor; });
+    require(runtime == 1, "the scalar buffer read was not marked as a runtime descriptor read");
+    AgcDriver::ShaderMemory memory({});
+    const auto capture = memory.Capture(request);
+    const auto regions = memory.Regions();
+    request.context.memory = regions;
+    const auto result = Recompile(request);
+    require(!result.spirv.empty() && result.bdaAbiVersion == BdaAbi::Version, "the runtime descriptor program did not compile to a BDA program");
+}
 }
 
 int main() {
+    // Before any program is tracked: the switch is read once (ResourceTracker).
+    setenv("APS5_RUNTIME_DESCRIPTORS", "1", 1);
     try {
         using namespace ShaderRecompiler;
         verifyRegisterSources();
@@ -484,6 +570,8 @@ int main() {
         verifyBindlessTable();
         verifyProgramCounterRelativeData();
         verifyPassthroughPixelInputs();
+        verifyConditionalUnmappedSlot();
+        verifyRuntimeScalarDescriptor();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,

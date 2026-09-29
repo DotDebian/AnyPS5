@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <atomic>
 #include <string>
 
 namespace ShaderRecompiler::Detail {
@@ -118,6 +119,8 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
     }
     std::vector<std::uint32_t> flattened;
     if (evaluateFlat) {
+        evaluator.ReadUnmappedAsZero();
+        cleanEvaluator.ReadUnmappedAsZero();
         flattened.resize(program.srtReads.size());
         for (const auto& read : program.srtReads) {
             const bool clean = read.flatOffset < cleanFlatSlots.size() && cleanFlatSlots[read.flatOffset] != 0u;
@@ -137,6 +140,10 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
                 return Fail(std::string(clean ? "clean " : "") + "SRT read at flat offset " + std::to_string(read.flatOffset) + ": " + DescribeValue(read.value, 4));
             }
         }
+    }
+    if (evaluator.UnmappedReads() + cleanEvaluator.UnmappedReads() != 0u) {
+        static std::atomic<bool> reported {false};
+        if (!reported.exchange(true)) std::fprintf(stderr, "[srt] flattened SRT slots read unmapped guest memory (%u dwords); they read as zero (reported once)\n", evaluator.UnmappedReads() + cleanEvaluator.UnmappedReads());
     }
     results = std::move(evaluated);
     activeSources = std::move(active);

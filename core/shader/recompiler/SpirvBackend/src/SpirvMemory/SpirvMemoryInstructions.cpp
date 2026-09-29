@@ -904,6 +904,40 @@ std::uint32_t AppendConsume(SpirvValueEmitContext& ctx, const IrValue& inst, boo
     return result;
 }
 
+// A scalar buffer read through a V# the program computed (MemoryInfo::runtimeDescriptor), with the
+// SRT evaluator's semantics for a scalar buffer read (Detail::Evaluator::EvaluateRawRead): the
+// 48-bit base and the byte offset are dword-aligned, the V#'s range is num_records bytes (or
+// num_records records of `stride` bytes), and a dword not wholly inside it reads as zero.
+std::uint32_t RuntimeDescriptorScalarRead(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem) {
+    auto& state = ctx.state;
+    const IrValue* handle = inst.Argument(0)->Resolve();
+    if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) {
+        ctx.Fail(inst, "has a runtime descriptor that is not a four-dword GetBufferResource");
+    }
+    if (static_cast<std::int32_t>(mem.offset) < 0) {
+        ctx.Fail(inst, "reads a runtime descriptor at a negative immediate offset");
+    }
+    if (state.bdaPointerFunction == 0) {
+        ctx.Fail(inst, "reads a runtime descriptor without the BDA lookup function");
+    }
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto low = Binary(state, spv::OpBitwiseAnd, u32, ctx.Arg(*handle, 0), ConstantU32(state, ~3u));
+    const auto word1 = ctx.Arg(*handle, 1);
+    const auto base = DeviceAddressFromWords(state, low, Binary(state, spv::OpBitwiseAnd, u32, word1, ConstantU32(state, 0xffffu)));
+    const auto stride = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, word1, ConstantU32(state, 16u)), ConstantU32(state, 0x3fffu));
+    const auto records = Unary(state, spv::OpUConvert, u64, ctx.Arg(*handle, 2));
+    const auto strided = Binary(state, spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, stride), records);
+    const auto size = Select(state, u64, Binary(state, spv::OpIEqual, TypeBool(state), stride, ConstantU32(state, 0u)), records, strided);
+    const auto byteOffset = Binary(state, spv::OpIAdd, u64, Unary(state, spv::OpUConvert, u64, ctx.Arg(inst, 1)), ConstantDeviceAddress(state, mem.offset));
+    const auto aligned = Binary(state, spv::OpBitwiseAnd, u64, byteOffset, ConstantDeviceAddress(state, ~std::uint64_t {3}));
+    const auto end = Binary(state, spv::OpIAdd, u64, aligned, ConstantDeviceAddress(state, sizeof(std::uint32_t)));
+    const auto inBounds = Binary(state, spv::OpULessThanEqual, TypeBool(state), end, size);
+    return EmitValueOrZeroIfCondition(state, inBounds, [&]() {
+        return EmitBdaDwordReads(ctx, inst, AddBdaAddress(ctx, inst, base, aligned, false), 0u, 1u)[0];
+    });
+}
+
 }
 
 std::uint32_t EmitReadConst(SpirvValueEmitContext& ctx, const IrValue& inst) {
@@ -927,6 +961,10 @@ void EmitReadConstBuffer(SpirvValueEmitContext& ctx, const IrValue& inst) {
         ctx.Fail(inst, "must read a scalar buffer resource");
     }
     auto& state = ctx.state;
+    if (mem.runtimeDescriptor) {
+        ctx.Define(inst, RuntimeDescriptorScalarRead(ctx, inst, mem));
+        return;
+    }
     const auto address = Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, mem.offset));
     const auto rawIndex = Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2u));
     const auto access = PrepareMemoryResourceAccess(state, mem);

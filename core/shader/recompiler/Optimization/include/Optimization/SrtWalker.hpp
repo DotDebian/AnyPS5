@@ -11,6 +11,8 @@
 namespace ShaderRecompiler {
 
 using SrtMemoryReader = bool (*)(void* userData, std::uint64_t address, std::uint32_t* value);
+// Whether the dword at `address` is mapped readable guest memory (SrtRuntime::isReadable).
+using SrtMemoryProbe = bool (*)(void* userData, std::uint64_t address);
 
 // The guest addresses a walk dereferenced (Detail::Evaluator::EvaluateRawRead): the leaf read of
 // each pure flat slot (IrResourcePlan::pureFlatSlots) as (flat offset, address), set by the
@@ -30,6 +32,14 @@ struct SrtRuntime {
     void* userContext = nullptr;
     SrtMemoryReader readSpecializationMemory = nullptr;
     SrtReadTrace* readTrace = nullptr;
+    // Set by a runtime over live guest memory. A flattened SRT slot (IrResourcePlan::srtReads) is a
+    // scalar load the plan hoisted out of the program, wherever the program executes it: a
+    // conditional one (SrtRead::conditional) is often under a branch taken only when its address
+    // is valid (a BVH walk's instance pointer is null when the scene has no ray-traced instances).
+    // Such a slot whose dword is unmapped reads as zero: the program cannot execute that load (it
+    // would take a GPU page fault), so it cannot observe the value. An unconditional slot and the
+    // descriptor sources are not covered; an unmapped read there still fails the walk.
+    SrtMemoryProbe isReadable = nullptr;
 };
 
 enum class RuntimeValueType {

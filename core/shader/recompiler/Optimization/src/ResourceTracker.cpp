@@ -523,6 +523,39 @@ private:
         source = InternSource(descriptor);
     }
 
+    // A scalar buffer read whose V# is no runtime value the dispatch can evaluate (the program
+    // loads it itself, e.g. per node of a BVH walk) is read through the BDA table instead of a
+    // binding: the SPIR-V evaluates the V#'s base and range per read, as the hardware does, so a
+    // read past the V#'s range returns zero (EmitReadConstBuffer).
+    // Opt-in (APS5_RUNTIME_DESCRIPTORS=1): the programs that need it are Astro Bot's ray-traced
+    // passes (image_bvh_intersect_ray walks, whose instance V#s come from the BVH), and an
+    // address-based program leases every registered guest allocation for its BDA table; in that
+    // title that is ~12 GiB, whose imports and copies exhaust device memory on the first dispatch.
+    bool TryRuntimeScalarDescriptor(IrValue& inst, std::uint32_t memoryIndex) {
+        static const bool enabled = std::getenv("APS5_RUNTIME_DESCRIPTORS") != nullptr;
+        if (!enabled) {
+            return false;
+        }
+        IrValue* handle = inst.Argument(0)->Resolve();
+        if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) {
+            return false;
+        }
+        DescriptorSource descriptor;
+        MakeSource(*handle, 4u, false, false, descriptor);
+        std::uint32_t badDword = 0;
+        if (ValidateSource(descriptor, badDword)) {
+            return false;
+        }
+        for (std::uint32_t dword = 0; dword < 4u; dword++) {
+            if (descriptor.dwords[dword]->Resolve()->Type() != IrType::U32) {
+                return false;
+            }
+        }
+        m_program.Resources().memoryInfo[memoryIndex].runtimeDescriptor = true;
+        m_info.usesDma = true;
+        return true;
+    }
+
     void ValidateAddressHandle(IrValue* value) const {
         const IrValue* handle = value->Resolve();
         if (handle->Opcode() != IrOpcode::GetAddressResource) {
@@ -681,6 +714,9 @@ private:
         std::uint32_t resource = 0;
 
         if (buffer != BufferAccess::None) {
+            if (op == IrOpcode::ReadConstBuffer && TryRuntimeScalarDescriptor(inst, flags.index)) {
+                return;
+            }
             GetHandle(inst.Argument(0), IrOpcode::GetBufferResource, 4, handle, source);
             resource = AddBuffer(source, memory, op, flags.pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) {

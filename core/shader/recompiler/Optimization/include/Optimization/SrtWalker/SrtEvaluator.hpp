@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
@@ -17,6 +18,12 @@ public:
 
     bool Evaluate(IrValue* value, std::uint32_t& result);
     bool EvaluateWide(IrValue* raw, std::uint64_t& result);
+    // From now on the raw read of a conditional flattened slot (SrtRead::conditional) whose dword
+    // is unmapped (SrtRuntime::isReadable) evaluates to zero. For the flattened slots, which are
+    // evaluated after every descriptor source.
+    void ReadUnmappedAsZero() { _unmappedAsZero = true; }
+    // The raw reads that found their dword unmapped and read zero.
+    [[nodiscard]] std::uint32_t UnmappedReads() const { return _unmappedReads; }
 
 private:
     static float Float32(std::uint64_t bits);
@@ -35,6 +42,12 @@ private:
     IrValue* _activeMask = nullptr;
     std::unordered_map<IrValue*, std::uint64_t> _cache;
     std::vector<IrValue*> _visiting;
+    bool IsConditionalSlotRead(const IrValue& inst);
+
+    bool _unmappedAsZero = false;
+    bool _conditionalReadsBuilt = false;
+    std::unordered_set<const IrValue*> _conditionalReads;
+    std::uint32_t _unmappedReads = 0;
 };
 
 }

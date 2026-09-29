@@ -6,6 +6,9 @@
 #include "IntermediateRepresentation/IrBuilder.hpp"
 
 #include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <stdexcept>
 
 namespace ShaderRecompiler::Detail {
@@ -40,7 +43,48 @@ void PlanBuilder::Run() {
             }
         }
     }
+    MarkConditionalReads();
     PatchReads();
+}
+
+// A slot is conditional when every load it replaces is in a block that some path from the entry
+// block to an exit block (one without successors) avoids.
+void PlanBuilder::MarkConditionalReads() {
+    auto& reads = _program.Resources().srtReads;
+    // The entry is the first block in program order (IrProgram validation: it has no predecessors).
+    if (reads.empty() || _program.BlockOrder().empty()) return;
+    const IrBlock* entry = _program.BlockOrder().front();
+    std::unordered_map<const IrBlock*, bool> avoidable;
+    const auto isAvoidable = [&](const IrBlock* block) {
+        if (block == nullptr) return false;
+        if (const auto found = avoidable.find(block); found != avoidable.end()) return found->second;
+        bool result = false;
+        if (block != entry) {
+            std::unordered_set<const IrBlock*> seen {entry};
+            std::vector<const IrBlock*> pending {entry};
+            while (!pending.empty() && !result) {
+                const IrBlock* current = pending.back();
+                pending.pop_back();
+                if (current->Successors().empty()) {
+                    result = true;
+                    break;
+                }
+                for (const IrBlock* next : current->Successors()) {
+                    if (next != block && seen.insert(next).second) pending.push_back(next);
+                }
+            }
+        }
+        avoidable.emplace(block, result);
+        return result;
+    };
+    std::vector<std::uint8_t> conditional(reads.size(), 1u);
+    std::vector<std::uint8_t> patched(reads.size(), 0u);
+    for (const auto& patch : _patches) {
+        if (patch.slot >= reads.size()) continue;
+        patched[patch.slot] = 1u;
+        if (!isAvoidable(patch.inst->Parent())) conditional[patch.slot] = 0u;
+    }
+    for (std::uint32_t slot = 0; slot < reads.size(); ++slot) reads[slot].conditional = patched[slot] != 0u && conditional[slot] != 0u;
 }
 
 void PlanBuilder::Collect(IrValue* raw, std::uint32_t usePc) {

@@ -46,6 +46,10 @@ struct DescriptorSource {
 struct SrtRead {
     IrValue* value = nullptr;
     std::uint32_t flatOffset = 0;
+    // Every load the slot replaces sits in a block some path from the entry to an exit avoids
+    // (SrtPlanBuilder): the program may never execute it, so a dispatch-time read of an unmapped
+    // address is no fault of the program (SrtRuntime::isReadable).
+    bool conditional = false;
 
     bool operator==(const SrtRead& other) const = default;
 };
