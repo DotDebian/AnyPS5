@@ -387,12 +387,6 @@ RectListShaders BuildRectListShaders(const RecompileResult& vertex, const Recomp
         parameters.push_back({input.sourceLocation, input.location, input.flat, !exported});
     }
     const auto& limits = *target.tessellation;
-    // The generated stages carry one float4 per fragment parameter plus gl_Position's, and the tightest
-    // of the device's per-vertex bounds turns that into a hard ceiling on how many interpolants a
-    // rect-list pixel shader can have. A rect-list draw is a tile clear: the pixel shader's result comes
-    // from its constants and its render target, so truncating the excess interpolants (rather than
-    // refusing the whole draw) is correct here -- the fragment inputs above the ceiling are simply left
-    // unwritten, which is no worse than the `missing` (unexported) case already handled above.
     const std::uint32_t perVertexComponents = std::min({limits.maxControlPerVertexInputComponents, limits.maxControlPerVertexOutputComponents, limits.maxEvaluationInputComponents, limits.maxEvaluationOutputComponents});
     if (const std::size_t capacity = perVertexComponents / 4u > 0u ? perVertexComponents / 4u - 1u : 0u; parameters.size() > capacity) {
         parameters.resize(capacity);

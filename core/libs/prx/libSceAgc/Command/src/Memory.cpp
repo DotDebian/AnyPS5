@@ -31,7 +31,6 @@ std::uint32_t* WriteCopyData(CommandBuffer* buffer, bool compute, std::uint8_t d
     CheckBits(srcCachePolicy, 3, function);
     CheckBits(itemSize, 1, function);
     CheckBits(writeConfirm, 1, function);
-    // Graphics selectors are (select << 1) | engine, compute selectors are the raw 4-bit COPY_DATA select values.
     const auto srcSelect = compute ? static_cast<std::uint32_t>(src) & 0xfu : (static_cast<std::uint32_t>(src) >> 1u) & 0xfu;
     const auto dstSelect = compute ? static_cast<std::uint32_t>(dst) & 0xfu : (static_cast<std::uint32_t>(dst) >> 1u) & 0xfu;
     const auto engine = compute ? 0u : static_cast<std::uint32_t>(src) & 1u;
@@ -46,9 +45,7 @@ std::uint32_t* WriteAtomicMem(CommandBuffer* buffer, std::uint8_t atomicOp, std:
     CheckBits(cachePolicy, 3, function);
     CheckBits(loopInterval, 0x1fffu, function);
     const auto guestAddress = reinterpret_cast<std::uintptr_t>(address);
-    // Opcodes 96..127 are the 64-bit forms of 64..95.
     CheckAddress(guestAddress, (atomicOp & 0x60u) == 0x60u ? 8 : 4, function);
-    // ATOMIC_MEM: control, address, source data, compare data, loop interval (9 dwords with the header).
     return Emit(buffer, 0x1eu, {atomicOp | (static_cast<std::uint32_t>(command) << 8u) | (static_cast<std::uint32_t>(cachePolicy) << 25u), static_cast<std::uint32_t>(guestAddress), static_cast<std::uint32_t>(guestAddress >> 32u), static_cast<std::uint32_t>(srcData), static_cast<std::uint32_t>(srcData >> 32u), static_cast<std::uint32_t>(compareData), static_cast<std::uint32_t>(compareData >> 32u), loopInterval}, function);
 }
 

@@ -227,8 +227,6 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
         throw std::runtime_error("instruction is not MIMG");
     }
     const auto opcode = ((word0 >> 18u) & 0x7Fu) | ((word0 & 1u) << 7u);
-    // Word0 bit 12 is UNORM. It is reserved on every gfx10 image op except the RTIP
-    // ray queries, whose encoding requires it set, so it must not reject 0xE6.
     const auto reservedWord0 = opcode == 0xe6u ? 0x000340C0u : 0x000350C0u;
     if ((word0 & reservedWord0) != 0u || (word1 & 0x3C000000u) != 0u) {
         char words[64];

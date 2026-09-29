@@ -25,7 +25,7 @@ std::uint32_t* APS5_VABI sceAgcDcbAcquireMem(CommandBuffer* buf, std::uint8_t en
 }
 
 uint32_t APS5_VABI sceAgcDcbAcquireMemGetSize(void) {
-    return 32; // ACQUIRE_MEM: header + 7 dwords
+    return 32;
 }
 
 uint32_t* APS5_VABI sceAgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy, uint64_t dst_address, uint8_t src, uint8_t src_cache_policy, uint64_t src_address_or_immediate, uint8_t item_size, uint8_t write_confirm) {
@@ -33,7 +33,7 @@ uint32_t* APS5_VABI sceAgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t d
 }
 
 std::uint64_t APS5_VABI sceAgcDcbCopyDataGetSize() {
-    return 24; // COPY_DATA: header + 5 dwords
+    return 24;
 }
 
 std::uint32_t* APS5_VABI sceAgcDcbDmaData(CommandBuffer* buf, std::uint8_t engine, std::uint8_t dst, std::uint8_t dstCachePolicy, std::uint64_t dstAddress, std::uint8_t src, std::uint8_t srcCachePolicy, std::uint64_t srcAddress, std::uint32_t numBytes, std::uint8_t waitForPrevious, std::uint8_t writeConfirm, std::uint8_t blockEngine) {
@@ -41,7 +41,7 @@ std::uint32_t* APS5_VABI sceAgcDcbDmaData(CommandBuffer* buf, std::uint8_t engin
 }
 
 std::uint32_t APS5_VABI sceAgcDcbDmaDataGetSize() {
-    return 28; // DMA_DATA: header + 6 dwords
+    return 28;
 }
 
 std::uint32_t* APS5_VABI sceAgcDcbAtomicMem(CommandBuffer* buf, std::uint8_t atomicOp, std::uint8_t command, std::uint8_t cachePolicy, const volatile void* address, std::uint64_t srcData, std::uint64_t compareData, std::uint16_t loopInterval) {
@@ -49,11 +49,11 @@ std::uint32_t* APS5_VABI sceAgcDcbAtomicMem(CommandBuffer* buf, std::uint8_t ato
 }
 
 std::uint32_t APS5_VABI sceAgcDcbAtomicMemGetSize() {
-    return 36; // ATOMIC_MEM: header + 8 dwords
+    return 36;
 }
 
 std::uint32_t APS5_VABI sceAgcDcbAtomicGdsGetSize() {
-    return 36; // upper bound: ATOMIC_GDS is not emitted by this port (header + 8 dwords reserved)
+    return 36;
 }
 
 std::uint32_t* APS5_VABI sceAgcDcbWriteData(CommandBuffer* buf, std::uint8_t dst, std::uint8_t cachePolicy, std::uint64_t address, const void* data, std::uint32_t numDwords, std::uint8_t increment, std::uint8_t writeConfirm) {
@@ -61,7 +61,7 @@ std::uint32_t* APS5_VABI sceAgcDcbWriteData(CommandBuffer* buf, std::uint8_t dst
 }
 
 uint32_t APS5_VABI sceAgcDcbWriteDataGetSize(uint32_t num_dwords) {
-    return 4u * num_dwords + 16u; // WRITE_DATA: header + control + address lo/hi + payload
+    return 4u * num_dwords + 16u;
 }
 
 }

@@ -1,6 +1,3 @@
-// Wide-character (UTF-16 guest wchar_t) printf-family support. Upstream's Formatting.cpp implements the
-// narrow checked/unchecked printf and scanf families but has no real wide-char formatter; vswprintf and
-// wprintf are otherwise left as unimplemented stubs.
 #include <cerrno>
 #include <cstdint>
 #include <cstddef>
@@ -74,7 +71,7 @@ std::string ToUtf8(const std::u16string& text) {
     return out;
 }
 
-template<class T> void AppendNumber(std::u16string& out, const std::string& spec, T value) {
+template<class TValue> void AppendNumber(std::u16string& out, const std::string& spec, TValue value) {
     const int size = std::snprintf(nullptr, 0, spec.c_str(), value);
     if (size < 0) throw std::runtime_error("Formatting conversion failed");
     std::string text(static_cast<std::size_t>(size) + 1, '\0');
@@ -89,7 +86,6 @@ void AppendPadded(std::u16string& out, const std::u16string& text, bool left, in
     if (left) out.append(pad, u' ');
 }
 
-// Wide printf: %s is a narrow string and %ls a wide one; numeric conversions reuse the host formatter.
 std::u16string FormatWide(const char16_t* format, VaList* source) {
     if (format == nullptr || source == nullptr) throw std::invalid_argument("Null formatting argument");
     LibcDetail::FormatArguments args(source);
@@ -191,7 +187,6 @@ std::u16string FormatWide(const char16_t* format, VaList* source) {
 
 extern "C" {
 
-// Returns the character count, or -1 when the buffer is too small (the output is still terminated).
 int APS5_VABI vswprintf_nid_postfix(char16_t* buffer, std::size_t size, const char16_t* format, VaList* args) {
     if (buffer == nullptr || size == 0) { errno = 22; return -1; }
     try {
@@ -221,4 +216,4 @@ int APS5_VABI wprintf_nid_postfix(const char16_t* format, ...) {
     return result;
 }
 
-}  // extern "C"
+}

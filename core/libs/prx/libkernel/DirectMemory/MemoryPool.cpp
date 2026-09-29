@@ -33,8 +33,6 @@ struct PhysicalMemoryPool {
     void Free(uint64_t start, size_t len) {
         std::lock_guard<std::mutex> lock(_mutex);
         _mark(start, len, false);
-        // A partial release leaves the rest of the block queryable, so the record is split
-        // rather than dropped.
         auto it = _ranges.upper_bound(start);
         if (it == _ranges.begin()) return;
         --it;
@@ -45,7 +43,6 @@ struct PhysicalMemoryPool {
         if (start + len < block.end) _ranges[start + len] = {start + len, block.end, block.memoryType};
     }
 
-    // Block containing offset, as the guest was given it at allocation time.
     bool Query(uint64_t offset, DirectMemoryBlock* block) {
         std::lock_guard<std::mutex> lock(_mutex);
         auto it = _ranges.upper_bound(offset);
@@ -56,7 +53,6 @@ struct PhysicalMemoryPool {
         return true;
     }
 
-    // Contiguous free bytes from `offset` up to `limit`.
     size_t FreeRun(uint64_t offset, uint64_t limit) {
         std::lock_guard<std::mutex> lock(_mutex);
         uint64_t cur = offset & ~static_cast<uint64_t>(PS5_PAGE_SIZE - 1);

@@ -25,13 +25,11 @@ PadInput::~PadInput() {
 
 void PadInput::openFirstAvailableController() {
     if (controller != nullptr) return;
-    // Read continuously (not just when the SDL hint is checked at subsystem init), so this is set every
-    // time regardless of whether the video driver already brought SDL_INIT_GAMECONTROLLER up.
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1"); // keep reading the pad while the window is unfocused
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if ((SDL_WasInit(SDL_INIT_GAMECONTROLLER) & SDL_INIT_GAMECONTROLLER) == 0) {
         if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
             APS5_LOG_ERR("Pad: SDL game controller init failed: %s", SDL_GetError());
-            return; // no controller support: keyboard and mouse keep working
+            return;
         }
     }
     for (int deviceIndex = 0; deviceIndex < SDL_NumJoysticks(); ++deviceIndex) {
@@ -54,7 +52,7 @@ void PadInput::openController(int deviceIndex) {
         SDL_GameControllerHasSensor(controller, SDL_SENSOR_ACCEL) == SDL_TRUE, SDL_GameControllerHasSensor(controller, SDL_SENSOR_GYRO) == SDL_TRUE,
         SDL_GameControllerGetNumTouchpads(controller), SDL_GameControllerHasLED(controller) == SDL_TRUE, SDL_GameControllerHasRumbleTriggers(controller) == SDL_TRUE);
     enableSensors();
-    outputPending = true; // re-apply the current guest output request to the newly opened pad
+    outputPending = true;
 }
 
 void PadInput::enableSensors() {
@@ -71,7 +69,6 @@ void PadInput::closeController() {
     controllerState = {};
 }
 
-// Pushes the rumble / light bar / trigger requests of the guest to the host pad. Runs on the window thread that owns the SDL joystick.
 void PadInput::applyOutput() {
     PadOutputState fetched;
     if (PadFetchOutput_nid_postfix(&outputSequence, &fetched)) {
@@ -86,7 +83,6 @@ void PadInput::applyOutput() {
     const bool triggerRumble = outputState.trigger[0].fallback != 0 || outputState.trigger[1].fallback != 0;
     const bool isPs5 = SDL_GameControllerGetType(controller) == SDL_CONTROLLER_TYPE_PS5;
     if (!outputPending) {
-        // Rumble requests expire host-side after a fixed time; keep them alive while the guest holds them.
         if ((rumbling || (triggerRumble && !isPs5)) && now >= nextRumbleRefresh) outputPending = true;
         else return;
     }
@@ -100,7 +96,6 @@ void PadInput::applyOutput() {
     }
     if (outputState.triggerTouched) {
         if (isPs5) {
-            // DS5EffectsState: enable bits 0x04 (right) / 0x08 (left) at byte 0, right effect block at +10, left effect block at +21 (47 bytes).
             Uint8 effect[47] = {};
             effect[0] = 0x04 | 0x08;
             std::memcpy(effect + 10, outputState.trigger[1].effect, 11);
@@ -122,14 +117,9 @@ void PadInput::setMouseMode(bool enabled) {
     nextMousePoll = std::chrono::steady_clock::now() + std::chrono::milliseconds(Pad::MousePollIntervalMs);
 }
 
-// SDL reports buttons by physical position (A = bottom face button), which on a PlayStation layout is Cross, so the mapping below is the
-// PlayStation one for every pad type; a Switch-style layout is normalised by SDL's own mapping database.
 PadInputState PadInput::sampleController() const {
     PadInputState result;
     if (controller == nullptr) return result;
-    // Button/trigger/stick mapping and scaling kept identical to the pre-existing gamepad support
-    // (SDL_GameControllerGetAttached block previously inlined in publish()); only motion, touchpad
-    // finger tracking, and device-kind detection are new here.
     const auto readButton = [this](SDL_GameControllerButton button) {
         return SDL_GameControllerGetButton(controller, button) != 0;
     };
@@ -304,7 +294,6 @@ void PadInput::Update() {
         publish();
     }
     if (controller != nullptr) {
-        // Sensors change on every sample, so a pad with motion republishes continuously.
         controllerState = sampleController();
         publish();
     }
@@ -341,8 +330,6 @@ void PadInput::Update() {
 }
 
 void PadInput::publish() {
-    // Gamepad is the base layer (like a title reading a real DualSense); keyboard and mouse bindings are
-    // applied on top and win when they conflict with the gamepad, matching the pre-existing keyboard/mouse behaviour.
     PadInputState state;
     state.buttons = controllerState.buttons;
     state.sticks = controllerState.sticks;

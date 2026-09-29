@@ -129,8 +129,6 @@ int APS5_VABI sceKernelAvailableDirectMemorySize(int64_t search_start, int64_t s
  if (ret != 0) { *phys_addr_out = 0; *size_out = 0; return ret; }
  DirectMemoryFree(tmpPhys, PS5_PAGE_SIZE);
  *phys_addr_out = tmpPhys;
- // The probe only proves one page is free; report the run actually available from there so a
- // title cannot plan an allocation that immediately fails.
  *size_out = DirectMemoryFreeRun(static_cast<uint64_t>(tmpPhys), static_cast<uint64_t>(search_end));
  return 0;
 }
@@ -147,8 +145,6 @@ int APS5_VABI sceKernelDirectMemoryQuery(int64_t offset, int flags, void* info, 
   q->end = static_cast<int64_t>(block.end);
   q->memory_type = block.memoryType;
  } else {
-  // Unallocated range: report the containing page as free-form (-1), same as an unregistered
-  // range has no type to answer with.
   q->start = offset & ~static_cast<int64_t>(PS5_PAGE_SIZE - 1);
   q->end = q->start + PS5_PAGE_SIZE;
   q->memory_type = -1;

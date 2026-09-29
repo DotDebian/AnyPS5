@@ -34,10 +34,8 @@ private:
     std::array<std::uint8_t, 2> mouseStick{128, 128};
     std::chrono::steady_clock::time_point nextMousePoll{};
     bool mouseEnabled = false;
-    // Host gamepad (Xbox / DualShock / DualSense / Switch Pro ... through SDL's GameController mapping database), merged with keyboard and mouse.
     SDL_GameController* controller = nullptr;
     PadInputState controllerState{};
-    // Guest output requests (rumble, light bar, adaptive triggers) mirrored onto the host pad.
     std::uint32_t outputSequence = 0;
     PadOutputState outputState{};
     bool outputPending = false;

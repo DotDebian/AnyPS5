@@ -21,7 +21,6 @@ void* APS5_VABI sceAgcDcbA_zARR5aCmkoY(void) {
 
 
 uint32_t* APS5_VABI sceAgcDcbJump(CommandBuffer* buf, uint8_t mode, uint8_t cache_policy, const uint32_t* target, uint32_t size_in_dwords) {
-    // mode 1 chains (the target replaces the rest of this buffer), mode 0 calls and returns after the target.
     return Agc::Command::WriteJump(buf, mode, cache_policy, target, size_in_dwords, __func__);
 }
 
@@ -40,13 +39,10 @@ uint32_t* APS5_VABI sceAgcDcbRewind(CommandBuffer* buf, uint32_t initial_state) 
 }
 
 uint32_t APS5_VABI sceAgcDcbRewindGetSize(void) {
-    return 8; // REWIND: header + 1 dword
+    return 8;
 }
 
 uint32_t* APS5_VABI sceAgcDcbWaitUntilSafeForRendering(CommandBuffer* buf, uint32_t video_out_handle, uint32_t display_buffer_index) {
-    // Same packet sceAgcDriverWaitUntilSafeForRendering produces; the executor specifically recognizes
-    // AgcDriver::RenderingWaitPacketHeader (see Driver.cpp) and blocks on the display-buffer reuse fence.
-    // A plain NOP with these arguments (upstream's previous stub) is not matched by that check.
     auto* packet = Agc::Command::Allocate(buf, AgcDriver::RenderingWaitPacketWords, __func__);
     packet[0] = AgcDriver::RenderingWaitPacketHeader;
     packet[1] = video_out_handle;

@@ -70,8 +70,6 @@ uint32_t* APS5_VABI sceAgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_
     Agc::Command::CheckAddress(geometry, 2, __func__);
     Agc::Command::Require(object_ids == nullptr, __func__, "per-object id base has no executor contract; expanding to one instanced draw");
     const auto initiator = Agc::Command::DrawInitiator(modifier, true, __func__);
-    // NUM_INSTANCES then DRAW_INDEX_2 in one reservation: the executor reads instanceCount from queue
-    // state a prior NUM_INSTANCES wrote, so the two must stay adjacent and atomic under a grow callback.
     auto* packet = Agc::Command::Allocate(buf, 8, __func__);
     packet[0] = Agc::Command::Header(0x2fu, 2);
     packet[1] = instance_count;
@@ -85,7 +83,7 @@ uint32_t* APS5_VABI sceAgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_
 }
 
 uint32_t APS5_VABI sceAgcDcbDrawIndexMultiInstancedGetSize(void) {
-    return 32; // NUM_INSTANCES (2 dw) + DRAW_INDEX_2 (6 dw)
+    return 32;
 }
 
 }

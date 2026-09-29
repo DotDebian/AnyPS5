@@ -8,7 +8,6 @@ std::uint32_t* WriteJump(CommandBuffer* buffer, std::uint8_t chain, std::uint8_t
     CheckBits(cachePolicy, 3, function);
     CheckBits(sizeInDwords, 0xfffffu, function);
     CheckAddress(guestAddress, 4, function);
-    // INDIRECT_BUFFER: address, then size in bits 19:0, chain (no return) in bit 20, cache policy in 29:28.
     return Emit(buffer, 0x3fu, {static_cast<std::uint32_t>(guestAddress) & ~3u, static_cast<std::uint32_t>(guestAddress >> 32u), 0x0f200000u | (static_cast<std::uint32_t>(cachePolicy) << 28u) | (static_cast<std::uint32_t>(chain) << 20u) | sizeInDwords}, function);
 }
 
@@ -24,7 +23,6 @@ std::uint32_t* WritePredication(CommandBuffer* buffer, std::uint8_t condition, s
     if (operation != 0) {
         CheckAddress(guestAddress, 8, function);
     }
-    // SET_PREDICATION: condition in bit 8, wait in bit 12, operation in 18:16; operation 0 clears predication.
     return Emit(buffer, 0x20u, {(static_cast<std::uint32_t>(condition) << 8u) | (static_cast<std::uint32_t>(waitOperation) << 12u) | (static_cast<std::uint32_t>(operation) << 16u), static_cast<std::uint32_t>(guestAddress) & ~0xfu, static_cast<std::uint32_t>(guestAddress >> 32u)}, function);
 }
 
@@ -34,7 +32,6 @@ std::uint32_t* WriteMemSemaphore(CommandBuffer* buffer, const volatile void* add
     Require(operation == 6 || operation == 7, function, "invalid memory semaphore operation");
     const auto guestAddress = reinterpret_cast<std::uintptr_t>(address);
     CheckAddress(guestAddress, 8, function);
-    // MEM_SEMAPHORE: operation in 31:29 (6 signal, 7 wait), signal type in bit 20, mailbox wait in bit 16.
     return Emit(buffer, 0x39u, {static_cast<std::uint32_t>(guestAddress), static_cast<std::uint32_t>(guestAddress >> 32u), (static_cast<std::uint32_t>(operation) << 29u) | (static_cast<std::uint32_t>(signalType) << 20u) | (static_cast<std::uint32_t>(waitForMailbox) << 16u)}, function);
 }
 

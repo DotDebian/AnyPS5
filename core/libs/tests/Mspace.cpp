@@ -60,6 +60,21 @@ int main() {
     void* large = sceLibcMspaceMalloc_nid_postfix(arena, storage.size() - 256);
     Require(large != nullptr); // freeing coalesced all the fragmented blocks
     sceLibcMspaceFree_nid_postfix(arena, large);
+    void* head = sceLibcMspaceMalloc_nid_postfix(arena, 64);
+    Require(head != nullptr && sceLibcMspaceRealloc_nid_postfix(arena, head, 1024) == head);
+    Require(sceLibcMspaceMallocUsableSize_nid_postfix(head) == 1024);
+    sceLibcMspaceFree_nid_postfix(arena, head);
+    std::array<void*, 2000> small{};
+    for (auto& pointer : small) {
+        pointer = sceLibcMspaceMalloc_nid_postfix(arena, 16);
+        Require(pointer != nullptr);
+    }
+    for (std::size_t i = 0; i < small.size(); i += 2) sceLibcMspaceFree_nid_postfix(arena, small[i]);
+    Require(sceLibcMspaceMalloc_nid_postfix(arena, storage.size() - 256) == nullptr);
+    for (std::size_t i = 1; i < small.size(); i += 2) sceLibcMspaceFree_nid_postfix(arena, small[i]);
+    large = sceLibcMspaceMalloc_nid_postfix(arena, storage.size() - 256);
+    Require(large != nullptr);
+    sceLibcMspaceFree_nid_postfix(arena, large);
     std::array<std::thread, 4> workers;
     for (auto& worker : workers) worker = std::thread([&] {
         for (int i = 0; i < 1000; ++i) {
@@ -98,6 +113,7 @@ int main() {
     Require(nested == region);
     void* inner = sceLibcMspaceMalloc_nid_postfix(nested, 64);
     Require(inner > region && inner < static_cast<unsigned char*>(region) + 8192);
+    Require(sceLibcMspaceMallocUsableSize_nid_postfix(inner) == 64 && sceLibcMspaceMallocUsableSize_nid_postfix(region) == 8192);
     Require(sceLibcMspaceCreate_nid_postfix("flags", storage.data(), storage.size(), 2) == nullptr);
     Require(sceLibcMspaceDestroy_nid_postfix(nested) == 0);
     sceLibcMspaceFree_nid_postfix(arena, region);

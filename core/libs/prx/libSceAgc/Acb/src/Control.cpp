@@ -19,12 +19,11 @@ void* APS5_VABI sceAgcAcb_gQkqkLttcpw (void) {
 }
 
 std::uint32_t* APS5_VABI sceAgcAcbJump(CommandBuffer* buf, std::uint8_t cachePolicy, const std::uint32_t* target, std::uint32_t sizeInDwords) {
-    // The compute ring has no call stack to return to, so the jump always chains.
     return Agc::Command::WriteJump(buf, 1, cachePolicy, target, sizeInDwords, __func__);
 }
 
 uint32_t APS5_VABI sceAgcAcbJumpGetSize(void) {
-    return 16; // INDIRECT_BUFFER: header + 3 dwords
+    return 16;
 }
 
 // Encoded as the custom DISPATCH_RESET NOP packet the driver consumes on compute queues.
@@ -44,7 +43,7 @@ std::uint32_t* APS5_VABI sceAgcAcbRewind(CommandBuffer* buf, std::uint32_t initi
 }
 
 std::uint32_t APS5_VABI sceAgcAcbRewindGetSize() {
-    return 8; // REWIND: header + 1 dword
+    return 8;
 }
 
 std::uint32_t* APS5_VABI sceAgcAcbWaitUntilSafeForRendering(CommandBuffer* buf, std::uint32_t videoOutHandle, std::uint32_t displayBufferIndex) {

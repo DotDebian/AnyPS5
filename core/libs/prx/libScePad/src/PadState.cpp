@@ -15,8 +15,6 @@ namespace {
     std::exception_ptr failure;
     bool initialized = false;
 
-    // Orientation fusion: gyro integration with accelerometer tilt correction (Mahony filter). The identity
-    // quaternion is the pad lying flat and face up, which is also what a pad without sensors reports.
     struct Quat { float w = 1.0f, x = 0.0f, y = 0.0f, z = 0.0f; };
     Quat orientation;
     std::uint64_t lastFuseTime = 0;
@@ -25,18 +23,17 @@ namespace {
     bool prevTouchActive[2] = {false, false};
     std::uint8_t touchIds[2] = {0, 0};
 
-    void Normalize(Quat& q) {
+    void normalize(Quat& q) {
         const float n = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
         if (n < 1e-6f) { q = Quat{}; return; }
         q.w /= n; q.x /= n; q.y /= n; q.z /= n;
     }
 
-    void Fuse(float dt, const std::array<float, 3>& accel, const std::array<float, 3>& gyro) {
+    void fuse(float dt, const std::array<float, 3>& accel, const std::array<float, 3>& gyro) {
         float gx = gyro[0], gy = gyro[1], gz = gyro[2];
         const float an = std::sqrt(accel[0] * accel[0] + accel[1] * accel[1] + accel[2] * accel[2]);
         if (an > 1.0f) {
             const float ax = accel[0] / an, ay = accel[1] / an, az = accel[2] / an;
-            // Gravity direction predicted by the current orientation, in the body frame (rest pose: +Y).
             const float vx = 2.0f * (orientation.x * orientation.y + orientation.w * orientation.z);
             const float vy = orientation.w * orientation.w - orientation.x * orientation.x + orientation.y * orientation.y - orientation.z * orientation.z;
             const float vz = 2.0f * (orientation.y * orientation.z - orientation.w * orientation.x);
@@ -58,12 +55,10 @@ namespace {
         orientation.x = q.x + q.w * hx + q.y * hz - q.z * hy;
         orientation.y = q.y + q.w * hy - q.x * hz + q.z * hx;
         orientation.z = q.z + q.w * hz + q.x * hy - q.y * hx;
-        Normalize(orientation);
+        normalize(orientation);
     }
 
-    // DualSense native effect block: byte 0 = mode, [1..2] = active zone mask, [3..6] = 3-bit strength per zone,
-    // [9] = frequency (vibration modes). Mode 0x05 means "no effect".
-    void EncodeZones(std::uint8_t* dst, std::uint8_t mode, const std::uint8_t* strengths, int count, std::uint8_t frequency) {
+    void encodeZones(std::uint8_t* dst, std::uint8_t mode, const std::uint8_t* strengths, int count, std::uint8_t frequency) {
         std::uint16_t zones = 0;
         std::uint32_t packed = 0;
         for (int i = 0; i < count && i < 10; ++i) {
@@ -80,13 +75,13 @@ namespace {
         dst[9] = frequency;
     }
 
-    std::uint8_t MaxOf(const std::uint8_t* v, int n) {
+    std::uint8_t maxOf(const std::uint8_t* v, int n) {
         std::uint8_t m = 0;
         for (int i = 0; i < n; ++i) m = std::max(m, v[i]);
         return m;
     }
 
-    std::uint8_t ScaleStrength(std::uint8_t s) {
+    std::uint8_t scaleStrength(std::uint8_t s) {
         return s == 0 ? 0 : static_cast<std::uint8_t>(std::min(255, 32 * std::min<int>(s, 8)));
     }
 }
@@ -115,8 +110,6 @@ PadData Pad::ReadState() {
     data.analog_buttons_l2 = std::max<std::uint8_t>(state.analogButtonsL2, (state.buttons & 0x100) != 0 ? 255 : 0);
     data.analog_buttons_r2 = std::max<std::uint8_t>(state.analogButtonsR2, (state.buttons & 0x200) != 0 ? 255 : 0);
 
-    // Motion: real sensor data when the host pad has it and the guest enabled the sensors, otherwise the pad at rest
-    // (gravity on +Y, no rotation, identity orientation).
     const bool live = state.hasMotion && output.motionEnabled;
     const std::array<float, 3> rest{0.0f, 9.80665f, 0.0f};
     const std::array<float, 3>& accel = live ? state.accel : rest;
@@ -124,7 +117,7 @@ PadData Pad::ReadState() {
     if (live) {
         float dt = lastFuseTime != 0 && now > lastFuseTime ? static_cast<float>(now - lastFuseTime) * 1e-6f : 0.0f;
         dt = std::min(dt, 0.1f);
-        Fuse(dt, accel, gyro);
+        fuse(dt, accel, gyro);
     } else {
         orientation = Quat{};
         biasIntegral[0] = biasIntegral[1] = biasIntegral[2] = 0.0f;
@@ -134,8 +127,6 @@ PadData Pad::ReadState() {
     data.orientation_y = orientation.y;
     data.orientation_z = orientation.z;
     data.orientation_w = orientation.w;
-    // ScePadData reports acceleration in units of g (rest = 1.0 on the "up" axis), not m/s^2; the fusion
-    // math above stays in m/s^2 because Fuse()'s free-fall gate assumes that scale.
     constexpr float kGravity = 9.80665f;
     data.acceleration_x = accel[0] / kGravity;
     data.acceleration_y = accel[1] / kGravity;
@@ -148,7 +139,6 @@ PadData Pad::ReadState() {
     data.connected_count = 1;
     data.timestamp = timestamp;
 
-    // Touch: host touchpad fingers, plus the keyboard emulation (BACKSPACE / TAB) when no finger is down.
     std::uint8_t touchNum = 0;
     for (int i = 0; i < 2; ++i) {
         const PadTouchPoint& tp = state.touch[i];
@@ -206,14 +196,14 @@ void Pad::SetTriggerCommand(int trigger, const std::uint8_t* command) {
     req.mode = mode;
     req.effect[0] = 0x05;
     switch (mode) {
-        case 1: { // feedback { position, strength }
+        case 1: {
             std::uint8_t strengths[10] = {};
             if (p[0] <= 9 && p[1] >= 1 && p[1] <= 8) for (int i = p[0]; i < 10; ++i) strengths[i] = p[1];
-            EncodeZones(req.effect, 0x21, strengths, 10, 0);
-            req.fallback = ScaleStrength(p[1]);
+            encodeZones(req.effect, 0x21, strengths, 10, 0);
+            req.fallback = scaleStrength(p[1]);
             break;
         }
-        case 2: { // weapon { startPosition, endPosition, strength }
+        case 2: {
             if (p[0] >= 2 && p[0] <= 7 && p[1] > p[0] && p[1] <= 8 && p[2] >= 1 && p[2] <= 8) {
                 const std::uint16_t zones = static_cast<std::uint16_t>((1u << p[0]) | (1u << p[1]));
                 req.effect[0] = 0x25;
@@ -221,36 +211,36 @@ void Pad::SetTriggerCommand(int trigger, const std::uint8_t* command) {
                 req.effect[2] = static_cast<std::uint8_t>(zones >> 8);
                 req.effect[3] = static_cast<std::uint8_t>(p[2] - 1);
             }
-            req.fallback = ScaleStrength(p[2]);
+            req.fallback = scaleStrength(p[2]);
             break;
         }
-        case 3: { // vibration { position, amplitude, frequency }
+        case 3: {
             std::uint8_t strengths[10] = {};
             if (p[0] <= 9 && p[1] >= 1 && p[1] <= 8) for (int i = p[0]; i < 10; ++i) strengths[i] = p[1];
-            EncodeZones(req.effect, 0x26, strengths, 10, p[2]);
-            req.fallback = ScaleStrength(p[1]);
+            encodeZones(req.effect, 0x26, strengths, 10, p[2]);
+            req.fallback = scaleStrength(p[1]);
             break;
         }
-        case 4: // multi-position feedback { strength[10] }
-            EncodeZones(req.effect, 0x21, p, 10, 0);
-            req.fallback = ScaleStrength(MaxOf(p, 10));
+        case 4:
+            encodeZones(req.effect, 0x21, p, 10, 0);
+            req.fallback = scaleStrength(maxOf(p, 10));
             break;
-        case 5: { // slope feedback { startPosition, endPosition, startStrength, endStrength }
+        case 5: {
             std::uint8_t strengths[10] = {};
             if (p[0] <= 8 && p[1] > p[0] && p[1] <= 9 && p[2] >= 1 && p[2] <= 8 && p[3] >= 1 && p[3] <= 8) {
                 const int dist = p[1] - p[0];
                 for (int i = p[0]; i < 10; ++i)
                     strengths[i] = i <= p[1] ? static_cast<std::uint8_t>(std::lround(p[2] + (p[3] - p[2]) * (i - p[0]) / static_cast<double>(dist))) : p[3];
             }
-            EncodeZones(req.effect, 0x21, strengths, 10, 0);
-            req.fallback = ScaleStrength(std::max(p[2], p[3]));
+            encodeZones(req.effect, 0x21, strengths, 10, 0);
+            req.fallback = scaleStrength(std::max(p[2], p[3]));
             break;
         }
-        case 6: // multi-position vibration { frequency, amplitude[10] }
-            EncodeZones(req.effect, 0x26, p + 1, 10, p[0]);
-            req.fallback = p[0] == 0 ? 0 : ScaleStrength(MaxOf(p + 1, 10));
+        case 6:
+            encodeZones(req.effect, 0x26, p + 1, 10, p[0]);
+            req.fallback = p[0] == 0 ? 0 : scaleStrength(maxOf(p + 1, 10));
             break;
-        default: break; // 0 = off
+        default: break;
     }
     req.valid = req.effect[0] != 0x05;
     if (!req.valid) req.fallback = 0;
@@ -276,9 +266,6 @@ void Pad::SetMotionEnabled(bool enabled) {
 extern "C" void PadPublishInput_nid_postfix(const PadInputState& input) {
     std::lock_guard lock(stateMutex);
     if (failure) std::rethrow_exception(failure);
-    // Change-detection kept from upstream, extended to the motion/touch fields: a pad with live sensors
-    // changes on essentially every call (so this is a no-op there), while a pad without one still only
-    // bumps the reported timestamp when something actually changed.
     if (state.buttons == input.buttons && state.sticks == input.sticks &&
         state.analogButtonsL2 == input.analogButtonsL2 && state.analogButtonsR2 == input.analogButtonsR2 &&
         state.touchLeft == input.touchLeft && state.touchRight == input.touchRight &&

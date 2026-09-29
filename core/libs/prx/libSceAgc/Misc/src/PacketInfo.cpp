@@ -26,8 +26,6 @@ int APS5_VABI sceAgcGetDataPacketPayloadAddressUnk(uint32_t** addr, uint32_t* cm
     return 0;
 }
 
-// SDK 9 Dcb ABI: (destination, packet). Reads the AGC system-software version stamped into the
-// first payload dword of an AGC data packet and copies it to the caller's destination.
 int APS5_VABI sceAgcDcbGetSystemSoftwareVersion(uint32_t* destination, const uint32_t* packet) {
     Agc::Command::CheckAddress(reinterpret_cast<std::uintptr_t>(destination), alignof(uint32_t), __func__);
     Agc::Command::CheckAddress(reinterpret_cast<std::uintptr_t>(packet), alignof(uint32_t), __func__);

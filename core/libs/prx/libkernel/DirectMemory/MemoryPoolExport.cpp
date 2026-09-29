@@ -8,9 +8,6 @@
 
 namespace {
 
-// A pool block is the unit sceKernelMemoryPoolGetBlockStats counts. The pool itself is backed by
-// ordinary direct-memory pages: Expand takes them, Reserve hands out an inaccessible virtual
-// range, Commit makes part of it accessible and Decommit takes the access away again.
 constexpr size_t kPoolBlockSize = 2ULL * 1024 * 1024;
 
 struct PoolState {
@@ -48,10 +45,10 @@ int PoolDecommit(void* addr, uint64_t len) {
     return ret;
 }
 
-template <typename Fn>
-int Guarded(Fn fn) {
+template <typename TFunction>
+int Guarded(TFunction function) {
     try {
-        return fn();
+        return function();
     } catch (const std::exception&) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
@@ -61,7 +58,6 @@ int Guarded(Fn fn) {
 
 extern "C" {
 
-// Batch opcodes: 1 commit, 2 decommit, 3 protect, 4 type-protect. Move (5) is not supported.
 int APS5_VABI sceKernelMemoryPoolBatch(const KernelMemoryPoolBatchEntry* entries, int num_entries, int* num_entries_out, int flags) {
  (void)flags;
  if (!entries || num_entries < 0) return SCE_KERNEL_ERROR_EINVAL;
@@ -109,7 +105,6 @@ int APS5_VABI sceKernelMemoryPoolExpand(int64_t search_start, int64_t search_end
  return ret;
 }
 
-// Counts in whole pool blocks: expanded but uncommitted blocks are "available", committed ones "allocated".
 int APS5_VABI sceKernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* output, size_t output_size) {
  if (!output || output_size < sizeof(KernelMemoryPoolBlockStats)) return SCE_KERNEL_ERROR_EINVAL;
  PoolState& pool = Pool();
@@ -123,7 +118,6 @@ int APS5_VABI sceKernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outpu
  return 0;
 }
 
-// The reservation is an inaccessible virtual range; Commit later gives it access.
 int APS5_VABI sceKernelMemoryPoolReserve(void* addr_in, size_t len, size_t alignment, int flags, void** addr_out) {
  (void)addr_in;
  (void)flags;
