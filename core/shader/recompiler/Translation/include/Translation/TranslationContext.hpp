@@ -12,7 +12,7 @@ public:
     TranslationContext(IrProgram& program, IrBlock& block, std::uint32_t vectorLimit);
 
     void TranslateInstruction(const RdnaInstruction& instruction);
-    void SetPixelInput(const ShaderPixelInputInfo* info) { pixelInput = info; }
+    void SetPixelInput(const ShaderPixelInputInfo* info, bool barycentricEnabled) { pixelInput = info; fragmentShaderBarycentricEnabled = barycentricEnabled; }
     void TranslateEmbeddedFetch(const RdnaInstruction& instruction, std::uint32_t attribute, std::uint32_t componentCount, const ShaderBufferResource& resource);
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
@@ -223,7 +223,7 @@ private:
     void vReadlaneB32(const RdnaInstruction& inst);
     void vWritelaneB32(const RdnaInstruction& inst);
     void vPermlane16B32(const RdnaInstruction& inst, bool x16);
-    void vInterpP1F32();
+    void vInterpP1F32(const RdnaInstruction& inst);
     void vInterpP2F32(const RdnaInstruction& inst);
     void vInterpMovF32(const RdnaInstruction& inst);
     void eXP(const RdnaInstruction& inst);
@@ -234,6 +234,7 @@ private:
 
     IrProgram& program;
     const ShaderPixelInputInfo* pixelInput = nullptr;
+    bool fragmentShaderBarycentricEnabled = false;
     IrBuilder ir;
     IrBlock& block;
     IrU1 instructionBranchCondition;

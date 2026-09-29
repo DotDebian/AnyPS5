@@ -466,7 +466,7 @@ bool readsBuiltin(const std::vector<spv::BuiltIn>& read, spv::BuiltIn builtin) {
 
 // The NoPerspective decorations of a pixel shader that interpolates parameter 0 through the
 // PERSP_CENTER pair (v0/v1) and parameter 1 through the LINEAR_CENTER pair (v2/v3).
-std::vector<std::uint32_t> pixelNoPerspectiveLocations() {
+std::vector<std::uint32_t> pixelNoPerspectiveLocations(bool barycentricEnabled) {
     auto queue = makeState();
     queue.context[0x1b3] = 0x22u;
     queue.context[0x1b4] = 0x22u;
@@ -482,18 +482,27 @@ std::vector<std::uint32_t> pixelNoPerspectiveLocations() {
     request.target.vulkanVersion = 0x00401000u;
     request.target.spirvVersion = 0x00010300u;
     request.target.subgroupSize = 64;
-    request.target.fragmentShaderBarycentricEnabled = true;
+    request.target.fragmentShaderBarycentricEnabled = barycentricEnabled;
     request.layout.pushConstantSizeBytes = 128;
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
     const auto& words = result.spirv.Words();
     std::map<std::uint32_t, std::uint32_t> locations;
     std::vector<std::uint32_t> noPerspective;
+    std::uint32_t perVertex = 0;
+    bool perspectiveBarycentrics = false;
+    bool linearBarycentrics = false;
     for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
         if (static_cast<spv::Op>(words[at] & 0xffffu) != spv::OpDecorate) continue;
         if (words[at + 2] == spv::DecorationLocation) locations[words[at + 1]] = words[at + 3];
         if (words[at + 2] == spv::DecorationNoPerspective) noPerspective.push_back(words[at + 1]);
+        if (words[at + 2] == spv::DecorationPerVertexKHR) perVertex++;
+        if (words[at + 2] == spv::DecorationBuiltIn) {
+            perspectiveBarycentrics |= words[at + 3] == spv::BuiltInBaryCoordKHR;
+            linearBarycentrics |= words[at + 3] == spv::BuiltInBaryCoordNoPerspKHR;
+        }
     }
+    if (barycentricEnabled) Require(perVertex == 2u && perspectiveBarycentrics && linearBarycentrics, "explicit interpolation must preserve both parameter vertices and both barycentric inputs");
     std::vector<std::uint32_t> result2;
     for (const auto id : noPerspective) result2.push_back(locations.count(id) != 0 ? locations.at(id) : 0xffffffffu);
     return result2;
@@ -565,8 +574,9 @@ void pixelInputLayoutTests() {
         Require(readsBuiltin(read, spv::BuiltInBaryCoordKHR) && !readsBuiltin(read, spv::BuiltInFragCoord), "a centroid-layout I/J VGPR does not hold the barycentrics: v" + std::to_string(source));
     }
     for (const auto opcode : {0x17u, 0x18u, 0x19u, 0x1au}) Require(recompilesDebugBranch(opcode), "a conditional debug branch did not recompile");
-    const auto noPerspective = pixelNoPerspectiveLocations();
+    const auto noPerspective = pixelNoPerspectiveLocations(false);
     Require(noPerspective.size() == 1 && noPerspective[0] == 1u, "only the parameter interpolated through the linear pair must be NoPerspective");
+    Require(pixelNoPerspectiveLocations(true).empty(), "explicit interpolation must not interpolate parameter arrays a second time");
     auto read = pixelBuiltinsRead(0x106u, 0x106u, 4u);
     Require(readsBuiltin(read, spv::BuiltInFragCoord) && !readsBuiltin(read, spv::BuiltInBaryCoordKHR), "POS_X is not in v4 after the center and centroid pairs");
     // The game's layout: LINEAR_CENTER's pair holds the linear barycentrics, POS_X is v6.
