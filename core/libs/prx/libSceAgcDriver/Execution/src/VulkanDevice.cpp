@@ -1161,6 +1161,14 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     return 0;
 }
 
+bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirst) {
+    if (!state->recorder) return false;
+    // Finished batches are retired first (the graphics worker only, as in WriteLabelOnGpu), so an
+    // action behind work that already completed runs now rather than at a later reap.
+    if (reapFirst && OpportunisticReap()) state->recorder->Reap();
+    return state->recorder->AfterRecordedWork(std::move(action));
+}
+
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
     auto& recorder = *state->recorder;

@@ -71,6 +71,10 @@ public:
     // `reapFirst` retires finished batches before the checks; a caller recording a group of labels
     // under one lock passes it for the first label only.
     int WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst = true);
+    // Runs `action` once the work recorded so far completed (Recorder::AfterRecordedWork), without
+    // waiting for it; false when there is no such work (the caller runs it now). Under the mutex.
+    // `reapFirst` retires finished batches first: the graphics worker only (see WriteLabelOnGpu).
+    bool AfterRecordedWork(std::function<void()> action, bool reapFirst);
     // Pending-label table lookup and open-batch overlap test for WAIT_REG_MEM (see Recorder).
     std::optional<Graphics::Recorder::LabelHit> PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, Graphics::Recorder::LabelRefusal* refusal = nullptr) const;
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;

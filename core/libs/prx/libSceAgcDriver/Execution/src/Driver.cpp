@@ -5914,6 +5914,56 @@ private:
             if (LatchWaits() && (opcode == 0x49 || opcode == 0x37)) {
                 if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLatchedRelease(label->address, label->Bytes());
             }
+            // An end-of-pipe interrupt (RELEASE_MEM with an interrupt select) reaches the issuing
+            // queue's event once the work before it completed and its label (if any) landed; by
+            // default the packet drains the device for that (a CPU wait for all recorded work, then
+            // the CPU store and the delivery), hundreds of drains per second at Astro Bot's title
+            // stage, which keep the GPU and the worker taking turns. APS5_DEFER_EOP_INTERRUPTS=1 records the
+            // label like any other (on the GPU behind the work, or as a completion action) and
+            // makes the delivery a completion action of the batch holding the work
+            // (Recorder::AfterRecordedWork, behind the label's own completion; at once, after the
+            // CPU store, with nothing unfinished); a label WriteLabelOnGpu refuses (reason 2-4) or
+            // that does not decode still drains. It is 10-20% faster past the title stage, but
+            // Astro Bot's intro then presents a garbage frame in about one run in five (never in
+            // twenty drained runs): the delivery comes after the whole batch completed, i.e. after
+            // the packets recorded behind the RELEASE_MEM ran too, and presumably something the
+            // title does on the interrupt has to happen before those.
+            static const bool deferInterrupts = std::getenv("APS5_DEFER_EOP_INTERRUPTS") != nullptr;
+            bool interruptDeferred = false;
+            if (!drainAll && deferInterrupts && endOfPipeInterrupt) {
+                const auto label = Pm4::DecodeLabelWrite(packet);
+                const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
+                if (label.has_value() || storesNothing) {
+                    // Still an ordering point for the collect memo, as its drain was.
+                    bumpEpoch(&EpochBumps::drains);
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    const auto localDevice = device.load();
+                    // Earlier labels of this queue go first (queue order), as for any label.
+                    recordDeferredLabels(localDevice.get(), submission.queue);
+                    // An interrupt-only packet stores nothing: 0 lets it follow the recorded work.
+                    int reason = localDevice != nullptr ? 0 : 1;
+                    if (label.has_value()) {
+                        const auto bytes = label->Bytes();
+                        reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, ++eventSerial, submission.queue) : 4;
+                        if (reason == 1) GuestMemory::Write(label->address, bytes, 4);
+                        if (reason == 0 || reason == 1 || reason == 5 || reason == 6) Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+                        countLabelOutcome(reason);
+                        ++immediateLabels;
+                    } else {
+                        ++noOpLabels;
+                    }
+                    if (reason == 0 || reason == 5 || reason == 6) {
+                        const auto queueId = submission.queue;
+                        interruptDeferred = localDevice->AfterRecordedWork([queueId] { AgcDriverDeliverEopInterrupt(queueId); }, submission.queue == 0);
+                        wroteOnGpu = true;
+                    } else if (reason == 1) {
+                        // Nothing recorded is unfinished (or no device): delivered after the store,
+                        // below, as the drained path does.
+                        wroteOnGpu = true;
+                    }
+                }
+            }
             if (!drainAll && !endOfPipeInterrupt && (opcode == 0x49 || opcode == 0x37)) {
                 if (const auto label = Pm4::DecodeLabelWrite(packet)) {
                     const auto bytes = label->Bytes();
@@ -6204,7 +6254,7 @@ private:
                 finishDrawPacket(drawn);
             } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
                 if (!wroteOnGpu) Pm4::Execute(packet, queue);
-                if (endOfPipeInterrupt) AgcDriverDeliverEopInterrupt(submission.queue);
+                if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);
             } else if (opcode == 0x46 && (packet[1] & 0x3fu) == 0x39) {
                 Pm4::DumpPixelPipeStatistics(packet);
             }

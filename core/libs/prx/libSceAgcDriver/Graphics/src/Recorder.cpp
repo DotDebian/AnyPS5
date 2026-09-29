@@ -2318,6 +2318,18 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     }
 }
 
+bool Recorder::AfterRecordedWork(std::function<void()> action) {
+    if (Idle()) return false;
+    Batch& batch = open != nullptr ? *open : *inFlight.back();
+    batch.completions.push_back(std::move(action));
+    ++batch.completionLabelCount;
+    completionLabels.fetch_add(1, std::memory_order_acq_rel);
+    if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+        pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+    }
+    return true;
+}
+
 void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
     Recorder* recorder = activeRecorder;
     if (recorder == nullptr || bytes == 0) return;

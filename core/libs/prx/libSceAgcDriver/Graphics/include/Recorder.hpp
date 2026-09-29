@@ -321,6 +321,14 @@ public:
     // completion store would land on memory the game may have reused by then (a stale label value
     // over a fresh command buffer). Debug aid: APS5_LABEL_STORE_ALWAYS=1 stores unconditionally.
     void AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu);
+    // An action that must run once the work recorded so far completed, without the CPU waiting
+    // for that work (an end-of-pipe interrupt, see Driver.cpp): appended, like a completion label,
+    // to the open batch or to the newest in-flight batch when none is open, after its earlier
+    // completions (a completion label stored just before it lands first). It is counted with the
+    // completion labels so the idle workers and the pollers reap its batch, and the open batch
+    // takes the label flush deadline. Returns false, registering nothing, when the recorder is idle
+    // (nothing recorded is unfinished: the caller runs the action itself).
+    bool AfterRecordedWork(std::function<void()> action);
     // A CPU store of GPU results into guest memory (GuestBufferMemory::WriteBack): recorded so a
     // completion label store can tell whether its bytes were overwritten. Under GuestMemory::
     // GpuMutex (every write-back runs inside finish() or a synchronous draw's wait): the first
