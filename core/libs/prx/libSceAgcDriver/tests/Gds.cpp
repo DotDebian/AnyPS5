@@ -116,6 +116,70 @@ alignas(256) constexpr std::array<std::uint32_t, 17> ConsumeCode{
     0xbf810000,
 };
 
+// A linked-list walk as Astro Bot's light-list consumer (0x500597a00) runs it: wave64 over a
+// 32x2 group (two lanes per invocation on a 32-wide subgroup), each lane loading its head, then
+// following {data, next} nodes until next is 0, with the EXECZ exit taken only once every lane is
+// done. s[0:3] heads, s[4:7] nodes (stride 8), s[8:11] the per-lane step counts.
+//   v_lshl_add_u32 v2, v1, 5, v0 / s_lshl_b32 s14, s12, 6 / v_add_nc_u32 v2, s14, v2 (group id s12)
+//   buffer_load_dword v7, v2, s[0:3], 0 idxen / v_mov_b32 v3, 0 / s_waitcnt vmcnt(0)
+//   s_mov_b64 s[16:17], exec
+// loop:
+//   v_cmpx_lt_u32 0, v7 / s_cbranch_execz done / buffer_load_dwordx2 v[4:5], v7, s[4:7], 0 idxen
+//   s_waitcnt vmcnt(0) / v_add_nc_u32 v3, 1, v3 / v_mov_b32 v7, v5 / s_branch loop
+// done:
+//   s_mov_b64 exec, s[16:17] / buffer_store_dword v3, v2, s[8:11], 0 idxen / s_endpgm
+alignas(256) constexpr std::array<std::uint32_t, 21> ListWalkCode{
+    0xd7460002, 0x04010b01, 0x8f0e860c, 0x4a04040e, 0xe0302000, 0x80000702, 0x7e060280, 0xbf8c3f70,
+    0xbe90047e, 0x7da20e80, 0xbf880006, 0xe0342000, 0x80010407, 0xbf8c3f70, 0x4a060681, 0x7e0e0305,
+    0xbf82fff8, 0xbefe0410, 0xe0702000, 0x80020302, 0xbf810000,
+};
+
+constexpr std::uint32_t WalkGroups = 64;
+alignas(256) std::array<std::uint32_t, WalkGroups * 64> WalkHeads{};
+alignas(256) std::array<std::uint32_t, 2 * (1 + WalkGroups * 64 * 24)> WalkNodes{};
+alignas(256) std::array<std::uint32_t, WalkGroups * 64> WalkSteps{};
+
+// Every lane walks a chain of its own length (0 to 23 nodes, varying within each wave and quad).
+void RunListWalk(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
+    std::uint32_t next = 1;
+    std::vector<std::uint32_t> expected(WalkHeads.size());
+    for (std::uint32_t lane = 0; lane < WalkHeads.size(); ++lane) {
+        const std::uint32_t length = (lane * 7u + lane / 64u * 5u) % 24u;
+        std::uint32_t head = 0;
+        for (std::uint32_t k = 0; k < length; ++k) {
+            WalkNodes[next * 2u] = lane;
+            WalkNodes[next * 2u + 1u] = head;
+            head = next++;
+        }
+        WalkHeads[lane] = head;
+        expected[lane] = length;
+    }
+    WalkSteps.fill(Sentinel);
+    std::vector<std::uint32_t> userData(12, 0u);
+    const auto heads = BufferDescriptor(WalkHeads.data(), static_cast<std::uint32_t>(WalkHeads.size()));
+    auto nodes = BufferDescriptor(WalkNodes.data(), static_cast<std::uint32_t>(WalkNodes.size() / 2u));
+    nodes[1] = (nodes[1] & 0xffffu) | (8u << 16u);
+    const auto steps = BufferDescriptor(WalkSteps.data(), static_cast<std::uint32_t>(WalkSteps.size()));
+    std::copy(heads.begin(), heads.end(), userData.begin());
+    std::copy(nodes.begin(), nodes.end(), userData.begin() + 4);
+    std::copy(steps.begin(), steps.end(), userData.begin() + 8);
+    const std::span<const std::uint32_t> code(ListWalkCode);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{32, 2, 1}, 0, {true, false, false}, false, 2};
+    const ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {waveSize, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        device.Target(),
+        {0, 0, 0, 128}
+    };
+    const auto result = ShaderRecompiler::Recompile(request);
+    device.Dispatch(result, WalkGroups, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+    device.WaitIdle();
+    for (std::uint32_t lane = 0; lane < WalkHeads.size(); ++lane) {
+        Require(WalkSteps[lane] == expected[lane], "list walk: lane " + std::to_string(lane) + " took " + std::to_string(WalkSteps[lane]) + " steps for a chain of " + std::to_string(expected[lane]));
+    }
+}
+
 // The pixel test: triangles over a Width x Height target, each pixel shader invocation appending
 // through the GDS and storing its index at its pixel's slot of PixelIndices.
 constexpr std::uint32_t Width = 192;
@@ -266,6 +330,10 @@ int main() {
             CheckDistinct(consume.c_str(), 500 - ActiveThreads);
             Require(ReadGds(0x108) == 500 - ActiveThreads, consume + ": the GDS counter is " + std::to_string(ReadGds(0x108)));
         }
+
+        // Lanes leaving a loop at different iterations (the wave takes the exit once all have).
+        RunListWalk(device, 32);
+        RunListWalk(device, 64);
 
         // A pixel shader's append: the invocations the GPU adds for partly covered quads (helper
         // invocations, whose atomics do nothing) must neither allocate nor be the lane that
