@@ -204,6 +204,9 @@ struct VulkanDevice::State {
     bool drawIndirectFirstInstance = false;
     bool multiDrawIndirect = false;
     bool drawIndirectCount = false;
+    // VK_KHR_pipeline_executable_properties enabled: the recompiler's local memory probe
+    // (ProbeComputeLocalMemory) reads a compute pipeline's statistics.
+    bool pipelineStatistics = false;
     // The device's resolved entry points (Graphics::DeviceFunctions) and the Graphics::Context
     // built once after setup (see graphicsContext); the context's pool reference is dropped before
     // the pool at teardown.
@@ -762,6 +765,17 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     minLodFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
     minLodFeatures.minLod = VK_TRUE;
+    // The recompiler reads compute pipelines' local memory from their statistics (see
+    // ShaderRecompiler::WaveLayoutFor). Debug aid: APS5_NO_LOCAL_MEMORY_PROBE=1 leaves it off.
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executableFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    if (hasExtension(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) && std::getenv("APS5_NO_LOCAL_MEMORY_PROBE") == nullptr) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &executableFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        state->pipelineStatistics = executableFeatures.pipelineExecutableInfo == VK_TRUE;
+        if (state->pipelineStatistics) deviceExtensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    }
+    executableFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    executableFeatures.pipelineExecutableInfo = VK_TRUE;
     VkPhysicalDeviceDepthClipControlFeaturesEXT depthClipFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
     if (hasExtension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &depthClipFeatures};
@@ -859,6 +873,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (state->imageViewMinLod) {
         minLodFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &minLodFeatures;
+    }
+    if (state->pipelineStatistics) {
+        executableFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
+        deviceInfo.pNext = &executableFeatures;
     }
     byteFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
     if (state->fragmentShaderBarycentric) {
@@ -2180,6 +2198,111 @@ void VulkanDevice::QueuePresent() {
     APS5_LOG_OUT_DEBUG("vkQueuePresentKHR queued imageIndex=%u", index);
 }
 
+namespace {
+
+VkDescriptorType ProbeDescriptorType(ShaderRecompiler::DescriptorKind kind) {
+    switch (kind) {
+    case ShaderRecompiler::DescriptorKind::UniformBuffer: return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    case ShaderRecompiler::DescriptorKind::StorageBuffer: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    case ShaderRecompiler::DescriptorKind::UniformTexelBuffer: return VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    case ShaderRecompiler::DescriptorKind::StorageTexelBuffer: return VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+    case ShaderRecompiler::DescriptorKind::SampledImage: return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    case ShaderRecompiler::DescriptorKind::StorageImage: return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    case ShaderRecompiler::DescriptorKind::Sampler: return VK_DESCRIPTOR_TYPE_SAMPLER;
+    }
+    return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+}
+
+}
+
+// The recompiler's local memory probe (SpirvTarget::localMemoryProbe): compiles the compute module
+// with a layout made from its bindings, reads the per-invocation local memory from the pipeline's
+// statistics (NVIDIA's "Local Memory Size", whose low 32 bits are the bytes; other drivers' spill
+// or scratch sizes) and throws the pipeline away. The real pipeline later compiles the module
+// again, which the driver's own cache serves. Debug aid: APS5_TRACE_LOCAL_MEMORY_PROBE=1 prints
+// every probe's statistics.
+std::optional<std::uint32_t> VulkanDevice::ProbeComputeLocalMemory(void* context, std::span<const std::uint32_t> spirv, std::span<const ShaderRecompiler::DescriptorBinding> bindings, std::uint64_t codeAddress) {
+    auto* state = static_cast<VulkanDevice::State*>(context);
+    static const bool trace = std::getenv("APS5_TRACE_LOCAL_MEMORY_PROBE") != nullptr;
+    VkShaderModule module = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSetLayout> setLayouts;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const auto release = [&] {
+        if (pipeline != VK_NULL_HANDLE) state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline")(state->device, pipeline, nullptr);
+        if (layout != VK_NULL_HANDLE) state->DeviceFunction<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(state->device, layout, nullptr);
+        for (const auto set : setLayouts) state->DeviceFunction<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(state->device, set, nullptr);
+        if (module != VK_NULL_HANDLE) state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(state->device, module, nullptr);
+    };
+    std::optional<std::uint32_t> bytes;
+    std::string evidence;
+    try {
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = spirv.size() * sizeof(std::uint32_t);
+        moduleInfo.pCode = spirv.data();
+        check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &module), "vkCreateShaderModule (local memory probe)");
+        std::uint32_t sets = 0;
+        for (const auto& binding : bindings) sets = std::max(sets, binding.descriptorSet + 1u);
+        for (std::uint32_t set = 0; set < sets; ++set) {
+            std::vector<VkDescriptorSetLayoutBinding> entries;
+            for (const auto& binding : bindings) {
+                if (binding.descriptorSet == set) entries.push_back({binding.binding, ProbeDescriptorType(binding.kind), std::max(binding.count, 1u), VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+            }
+            VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            setInfo.bindingCount = static_cast<std::uint32_t>(entries.size());
+            setInfo.pBindings = entries.data();
+            setLayouts.push_back(VK_NULL_HANDLE);
+            check(state->DeviceFunction<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(state->device, &setInfo, nullptr, &setLayouts.back()), "vkCreateDescriptorSetLayout (local memory probe)");
+        }
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = static_cast<std::uint32_t>(setLayouts.size());
+        layoutInfo.pSetLayouts = setLayouts.data();
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout (local memory probe)");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.flags = VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = layout;
+        const auto cache = state->pipelineCache ? state->pipelineCache->Handle() : VK_NULL_HANDLE;
+        check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, cache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines (local memory probe)");
+        const auto executables = state->DeviceFunction<PFN_vkGetPipelineExecutablePropertiesKHR>("vkGetPipelineExecutablePropertiesKHR");
+        const auto statistics = state->DeviceFunction<PFN_vkGetPipelineExecutableStatisticsKHR>("vkGetPipelineExecutableStatisticsKHR");
+        const VkPipelineInfoKHR info{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr, pipeline};
+        std::uint32_t count = 0;
+        check(executables(state->device, &info, &count, nullptr), "vkGetPipelineExecutablePropertiesKHR");
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const VkPipelineExecutableInfoKHR executable{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, nullptr, pipeline, index};
+            std::uint32_t statisticCount = 0;
+            check(statistics(state->device, &executable, &statisticCount, nullptr), "vkGetPipelineExecutableStatisticsKHR");
+            std::vector<VkPipelineExecutableStatisticKHR> values(statisticCount, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+            check(statistics(state->device, &executable, &statisticCount, values.data()), "vkGetPipelineExecutableStatisticsKHR");
+            for (const auto& value : values) {
+                std::uint64_t number = 0;
+                if (value.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR) number = value.value.u64;
+                else if (value.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR) number = value.value.i64 > 0 ? static_cast<std::uint64_t>(value.value.i64) : 0u;
+                else continue;
+                const std::string_view name(value.name);
+                bool local = false;
+                if (name == "Local Memory Size") local = true, number &= 0xffffffffull;
+                else if (name.find("Spill") != std::string_view::npos || name.find("spill") != std::string_view::npos || name.find("Scratch") != std::string_view::npos) local = true;
+                if (trace) evidence += std::string(evidence.empty() ? "" : ", ") + value.name + " " + std::to_string(number);
+                if (local) bytes = static_cast<std::uint32_t>(std::min<std::uint64_t>(number + bytes.value_or(0u), 0xffffffffull));
+            }
+        }
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[wave64] program 0x%llx: the local memory probe failed (%s)\n", static_cast<unsigned long long>(codeAddress), error.what());
+        bytes.reset();
+    }
+    release();
+    if (trace) std::fprintf(stderr, "[wave64] program 0x%llx: %zu SPIR-V words: %s\n", static_cast<unsigned long long>(codeAddress), spirv.size(), evidence.c_str());
+    return bytes;
+}
+
 ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     const auto& limits = state->properties.limits;
     ShaderRecompiler::SpirvTarget target{VK_API_VERSION_1_1, state->meshShader ? 0x00010400u : 0x00010300u, state->subgroup.subgroupSize, ShaderRecompiler::BdaAbi::Version, state->capabilities, state->spirvExtensions, false, {limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]}, limits.maxComputeWorkGroupInvocations, limits.maxComputeSharedMemorySize, {}, {}};
@@ -2188,6 +2311,10 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
         target.mesh = ShaderRecompiler::MeshTargetLimits{{mesh.maxMeshWorkGroupSize[0], mesh.maxMeshWorkGroupSize[1], mesh.maxMeshWorkGroupSize[2]}, mesh.maxMeshWorkGroupInvocations, std::min(mesh.maxMeshSharedMemorySize, mesh.maxMeshPayloadAndSharedMemorySize), mesh.maxMeshOutputVertices, mesh.maxMeshOutputPrimitives, mesh.maxMeshOutputComponents, std::min(mesh.maxMeshOutputMemorySize, mesh.maxMeshPayloadAndOutputMemorySize), mesh.meshOutputPerVertexGranularity, mesh.meshOutputPerPrimitiveGranularity};
     }
     if (state->tessellationShader) target.tessellation = ShaderRecompiler::TessellationTargetLimits{limits.maxTessellationPatchSize, limits.maxTessellationControlPerVertexInputComponents, limits.maxTessellationControlPerVertexOutputComponents, limits.maxTessellationControlPerPatchOutputComponents, limits.maxTessellationControlTotalOutputComponents, limits.maxTessellationEvaluationInputComponents, limits.maxTessellationEvaluationOutputComponents};
+    if (state->pipelineStatistics) {
+        target.localMemoryProbe = &VulkanDevice::ProbeComputeLocalMemory;
+        target.localMemoryProbeContext = state.get();
+    }
     return target;
 }
 
