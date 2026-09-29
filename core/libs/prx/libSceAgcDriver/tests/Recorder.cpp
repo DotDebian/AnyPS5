@@ -733,6 +733,94 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+// Draw input snapshots kept across draws (Recorder::ReusableDrawSnapshot) over write-watched,
+// host-imported memory: a later draw binds the earlier draw's snapshot while the bytes are
+// unchanged, and a CPU store, a driver store (MarkWritten) or a registry mutation makes the next
+// draw copy again, with the new bytes. APS5_DRAW_SNAPSHOT_CACHE_MIB=0 copies for every draw.
+void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: draw snapshot reuse not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the watched block refused: draw snapshot reuse not tested\n";
+        return;
+    }
+    const auto element = address + 4096;
+    constexpr std::size_t elementBytes = 1024;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u};
+    binding.bufferWritten = {false};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const char* budget = std::getenv("APS5_DRAW_SNAPSHOT_CACHE_MIB");
+    const bool cached = budget == nullptr || std::strtoull(budget, nullptr, 10) != 0;
+    {
+        auto snapshotContext = context;
+        DescriptorCache cache(snapshotContext);
+        snapshotContext.descriptorCache = &cache;
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.Activate();
+        ShaderResources resources(snapshotContext, compute);
+        // This thread never bumps its collect epoch, so every collect walks (no memo).
+        const auto snapshot = [&](std::byte expected) {
+            const auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+            Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
+            const auto buffer = bindings->snapshots[0].buffer;
+            const auto contents = buffer->Bytes();
+            Require(contents.size() == elementBytes && std::all_of(contents.begin(), contents.end(), [&](std::byte value) { return value == expected; }), "a draw snapshot does not hold the guest bytes of its draw");
+            return buffer;
+        };
+        const auto first = snapshot(std::byte{0x11});
+        const auto second = snapshot(std::byte{0x11});
+        Require(cached ? second == first : second != first, cached ? "an unchanged draw input was copied again" : "a draw snapshot was reused with the cache off");
+        std::memset(reinterpret_cast<void*>(element), 0x22, elementBytes);
+        const auto afterCpu = snapshot(std::byte{0x22});
+        Require(afterCpu != first, "a draw snapshot outlived a CPU store to its range");
+        Require(!cached || snapshot(std::byte{0x22}) == afterCpu, "the recopied draw input was not kept");
+        std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
+        AgcDriver::GuestMemory::MarkWritten(element, 4);
+        const auto afterStore = snapshot(std::byte{0x33});
+        Require(afterStore != afterCpu, "a draw snapshot outlived a driver store to its range");
+        {
+            GuestAllocations::Mutation mutation;
+        }
+        Require(snapshot(std::byte{0x33}) != afterStore, "a draw snapshot outlived a registry mutation");
+        snapshotRecorder.Sync();
+    }
+    recorder.Activate();
+}
+
 // Unit shadows (UnitShadow.hpp) over a host import of write-watched arena memory: a retile piece's
 // slab destination and its seeds, freshness from the tracker (a publish never stamps, a CPU write
 // makes the unit stale), the scopes, the slab boundary, and the retire publish. With
@@ -1477,6 +1565,7 @@ int main() {
         closeRaceTests(device, recorder);
         keyProofTests(device, recorder);
         resourceReadTests(device, recorder);
+        drawSnapshotReuseTests(device, recorder);
         RunViewAliasTests(device.GetContext(), recorder);
         storeRunTests(device, recorder);
         unitShadowTests(device, recorder);

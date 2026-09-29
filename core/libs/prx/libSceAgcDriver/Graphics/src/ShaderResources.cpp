@@ -2486,6 +2486,29 @@ ShaderResources::DrawBindings::~DrawBindings() {
     if (cache != nullptr && allocation.set != VK_NULL_HANDLE) cache->Free(allocation);
 }
 
+namespace {
+// APS5_PROFILE_DRAW: draw input snapshots copied and reused (Recorder::ReusableDrawSnapshot),
+// printed every 10 s as [drawsnap]. Called under GuestMemory::GpuMutex (plain counters).
+void CountDrawSnapshot(bool reused, std::size_t bytes) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::uint64_t copies = 0, copiedBytes = 0, reuses = 0, reusedBytes = 0;
+    static auto last = std::chrono::steady_clock::now();
+    if (reused) {
+        ++reuses;
+        reusedBytes += bytes;
+    } else {
+        ++copies;
+        copiedBytes += bytes;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    std::fprintf(stderr, "[drawsnap] draw input snapshots (10 s): copied %llu (%.1f MiB), reused %llu (%.1f MiB)\n", static_cast<unsigned long long>(copies), copiedBytes / 1048576.0, static_cast<unsigned long long>(reuses), reusedBytes / 1048576.0);
+    copies = copiedBytes = reuses = reusedBytes = 0;
+}
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
@@ -2496,8 +2519,20 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
         const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
         if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
-        auto buffer = std::make_shared<Buffer>(context, item.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(item.address), item.size);
+        // The range's CPU stores so far are stamped first, so the reuse check sees them; a store
+        // made after the collect (during the copy) is stamped newer by the next one and drops the
+        // snapshot then.
+        const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto generation = GuestMemory::CollectWrites(item.address, item.size);
+        auto buffer = recorder.ReusableDrawSnapshot(item.address, item.size);
+        if (buffer != nullptr) {
+            CountDrawSnapshot(true, item.size);
+        } else {
+            buffer = std::make_shared<Buffer>(context, item.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(item.address), item.size);
+            recorder.KeepDrawSnapshot(item.address, item.size, generation, registryGeneration, buffer);
+            CountDrawSnapshot(false, item.size);
+        }
         selected.push_back(index);
         result->snapshots.push_back({item.address, std::move(buffer)});
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(item.address), item.size);

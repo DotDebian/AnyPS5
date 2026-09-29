@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1885,6 +1886,45 @@ std::size_t Recorder::UnsignaledBatches() const {
 void Recorder::Keep(std::shared_ptr<void> object) {
     ensureOpen();
     open->kept.push_back(std::move(object));
+}
+
+namespace {
+std::size_t DrawSnapshotBudget() {
+    static const std::size_t budget = [] {
+        const char* text = std::getenv("APS5_DRAW_SNAPSHOT_CACHE_MIB");
+        return (text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{256}) << 20u;
+    }();
+    return budget;
+}
+}
+
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes) {
+    const auto found = drawSnapshots.find({address, bytes});
+    if (found == drawSnapshots.end()) return {};
+    if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+        drawSnapshotBytes -= bytes;
+        drawSnapshots.erase(found);
+        return {};
+    }
+    found->second.lastUse = ++drawSnapshotUses;
+    return found->second.buffer;
+}
+
+void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer) {
+    constexpr std::size_t maxEntries = 1024;
+    const auto budget = DrawSnapshotBudget();
+    if (generation == 0 || bytes > budget) return;
+    if (const auto found = drawSnapshots.find({address, bytes}); found != drawSnapshots.end()) {
+        drawSnapshotBytes -= bytes;
+        drawSnapshots.erase(found);
+    }
+    while (!drawSnapshots.empty() && (drawSnapshotBytes + bytes > budget || drawSnapshots.size() >= maxEntries)) {
+        const auto oldest = std::min_element(drawSnapshots.begin(), drawSnapshots.end(), [](const auto& left, const auto& right) { return left.second.lastUse < right.second.lastUse; });
+        drawSnapshotBytes -= oldest->first.second;
+        drawSnapshots.erase(oldest);
+    }
+    drawSnapshots.emplace(std::pair{address, bytes}, DrawSnapshot{generation, registryGeneration, ++drawSnapshotUses, std::move(buffer)});
+    drawSnapshotBytes += bytes;
 }
 
 void Recorder::OnComplete(std::function<void()> action) {

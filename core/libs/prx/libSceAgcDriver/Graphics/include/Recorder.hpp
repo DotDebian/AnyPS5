@@ -20,6 +20,8 @@
 
 namespace AgcDriver::Graphics {
 
+class Buffer;
+
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
 // Sync waits for every batch, then runs its completion actions (write-backs) in order. Objects handed
@@ -91,6 +93,21 @@ public:
     // neither the mutex nor the recorder nor a particular thread. ~Recorder joins the release
     // thread and waits for every release in progress before the device goes.
     void Keep(std::shared_ptr<void> object);
+    // Draw input snapshots (ShaderResources::PrepareDrawBindings) kept across draws: a recorded
+    // draw reads a copy of its read-only in-place inputs, taken when it is recorded, and the draws
+    // of a frame bind the same multi-MiB buffers (light lists a compute pass wrote) hundreds of
+    // times, which copied them again for every draw. A snapshot is immutable once filled, so a
+    // later draw may bind it while the guest bytes are unchanged since the copy: `generation` is
+    // the GuestMemory::CollectWrites value taken right before the copy, and ReusableDrawSnapshot
+    // (called after the caller's own collect of the range) returns it only while
+    // GuestMemory::UnchangedSince holds for it (a CPU store stamped by a later collect, a driver or
+    // GPU store stamped by MarkWritten, drops it) and the guest allocation registry has not changed
+    // since (a range unmapped and mapped again holds new bytes no write stamped; registry mutations
+    // are rare once a title runs). Kept least recently used under a byte budget
+    // (APS5_DRAW_SNAPSHOT_CACHE_MIB, default 256; 0 copies for every draw as before).
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes);
+    // `registryGeneration`: GuestAllocationsGeneration read before the copy, like `generation`.
+    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer);
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
@@ -681,6 +698,16 @@ private:
     std::array<Completed, CompletedRingSize> completed;
     std::uint64_t newestSubmitted = 0;
     std::chrono::steady_clock::time_point newestSubmittedAt{};
+    // See ReusableDrawSnapshot, keyed by guest address and size; `lastUse` orders the eviction.
+    struct DrawSnapshot {
+        std::uint64_t generation;
+        std::uint64_t registryGeneration;
+        std::uint64_t lastUse;
+        std::shared_ptr<Buffer> buffer;
+    };
+    std::map<std::pair<std::uint64_t, std::size_t>, DrawSnapshot> drawSnapshots;
+    std::size_t drawSnapshotBytes = 0;
+    std::uint64_t drawSnapshotUses = 0;
 };
 
 }
