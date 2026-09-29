@@ -6,8 +6,11 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/mman.h>
 #endif
 #include <atomic>
 #include <bit>
@@ -116,6 +119,8 @@ struct HostImports {
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
     // reused while it is unchanged.
     std::uint64_t epoch = 1;
+    VkDevice watchDevice = VK_NULL_HANDLE;
+    bool unwatchImports = false;
 };
 
 HostImports& Imports() {
@@ -153,6 +158,88 @@ void retireImport(const Context& context, HostImports& state, std::map<std::uint
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
     ++state.epoch;
     state.imports.erase(it);
+}
+
+const char* createImport(const Context& context, HostImport& entry, VkResult& failure) {
+    const auto base = entry.base;
+    const auto bytes = entry.bytes;
+    const auto failed = [&](const char* step, VkResult result) -> const char* {
+        if (entry.buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
+        if (entry.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
+        entry.buffer = VK_NULL_HANDLE;
+        entry.memory = VK_NULL_HANDLE;
+        failure = result;
+        return step;
+    };
+    const VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+    info.size = bytes;
+    // INDIRECT_BUFFER: DISPATCH_INDIRECT group counts are read in place (VulkanDevice::DispatchIndirect).
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (const auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &entry.buffer); result != VK_SUCCESS) return failed("vkCreateBuffer", result);
+    VkMemoryHostPointerPropertiesEXT pointer{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (const auto result = context.Function<PFN_vkGetMemoryHostPointerPropertiesEXT>("vkGetMemoryHostPointerPropertiesEXT")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, reinterpret_cast<const void*>(base), &pointer); result != VK_SUCCESS) return failed("vkGetMemoryHostPointerPropertiesEXT", result);
+    VkMemoryRequirements requirements{};
+    context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, entry.buffer, &requirements);
+    const auto types = requirements.memoryTypeBits & pointer.memoryTypeBits;
+    if (types == 0) return failed("memory type selection", VK_ERROR_FORMAT_NOT_SUPPORTED);
+    const VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, reinterpret_cast<void*>(base)};
+    const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+    allocation.allocationSize = bytes;
+    allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
+    if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &entry.memory); result != VK_SUCCESS) return failed("vkAllocateMemory", result);
+    if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return failed("vkBindBufferMemory", result);
+    const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, entry.buffer};
+    entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
+    if (entry.address == 0) return failed("vkGetBufferDeviceAddressKHR", VK_ERROR_UNKNOWN);
+    return nullptr;
+}
+
+#ifndef _WIN32
+enum class ImportWatchRequest : std::uint8_t { Probe, Watch, Unwatch };
+
+ImportWatchRequest importWatchRequest() {
+    static const auto request = [] {
+        const char* value = std::getenv("APS5_WRITE_WATCH_IMPORTS");
+        if (value == nullptr || std::strcmp(value, "probe") == 0) return ImportWatchRequest::Probe;
+        if (std::strcmp(value, "watch") == 0) return ImportWatchRequest::Watch;
+        if (std::strcmp(value, "unwatch") == 0) return ImportWatchRequest::Unwatch;
+        throw std::runtime_error(std::string("APS5_WRITE_WATCH_IMPORTS=") + value + ": expected probe, watch or unwatch");
+    }();
+    return request;
+}
+#endif
+
+void decideImportWatch(const Context& context, HostImports& state) {
+    if (state.watchDevice == context.device) return;
+#ifdef _WIN32
+    state.watchDevice = context.device;
+    state.unwatchImports = false;
+#else
+    const auto request = importWatchRequest();
+    state.watchDevice = context.device;
+    state.unwatchImports = false;
+    if (context.hostImportAlignment == 0 || !GuestMemory::WriteWatched()) return;
+    if (request == ImportWatchRequest::Watch) {
+        std::fprintf(stderr, "[write-watch] host imports stay watched (APS5_WRITE_WATCH_IMPORTS=watch)\n");
+        return;
+    }
+    if (request == ImportWatchRequest::Unwatch) {
+        state.unwatchImports = true;
+        std::fprintf(stderr, "[write-watch] host imports are compared, not watched (APS5_WRITE_WATCH_IMPORTS=unwatch)\n");
+        return;
+    }
+    const auto probe = ProbeImportWriteProtection(context);
+    if (probe.failure != nullptr) {
+        state.unwatchImports = true;
+        std::fprintf(stderr, "[write-watch] host imports resolve write protection: unknown (probe failed at %s, %d); imported ranges are compared\n", probe.failure, static_cast<int>(probe.result));
+        return;
+    }
+    state.unwatchImports = probe.writtenAfterSubmit != 0;
+    std::fprintf(stderr, "[write-watch] host imports resolve write protection: %s (%u of %u scratch pages written after a GPU read, %u after the import); imported ranges %s\n", state.unwatchImports ? "yes" : "no", probe.writtenAfterSubmit, probe.pages, probe.writtenAtImport, state.unwatchImports ? "are compared" : "stay watched");
+#endif
 }
 
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t base, std::uint64_t bytes, const GuestAllocations::Lease& lease) {
@@ -194,10 +281,17 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
     }
 #endif
+    decideImportWatch(context, state);
+    if (state.unwatchImports) GuestMemory::Unwatch(base, bytes);
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
-    const auto fail = [&](const char* step, VkResult result) -> const HostImport* {
-        if (entry.buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
-        if (entry.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
+    entry.unwatched = state.unwatchImports;
+    VkResult result = VK_SUCCESS;
+    const char* step = nullptr;
+    GuestMemory::ImportWatched(base, bytes, [&] {
+        step = createImport(context, entry, result);
+        return step == nullptr;
+    });
+    if (step != nullptr) {
         state.failed.insert(base);
         std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result));
 #ifdef _WIN32
@@ -211,30 +305,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         }
 #endif
         return nullptr;
-    };
-    const VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
-    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
-    info.size = bytes;
-    // INDIRECT_BUFFER: DISPATCH_INDIRECT group counts are read in place (VulkanDevice::DispatchIndirect).
-    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (const auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &entry.buffer); result != VK_SUCCESS) return fail("vkCreateBuffer", result);
-    VkMemoryHostPointerPropertiesEXT pointer{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-    if (const auto result = context.Function<PFN_vkGetMemoryHostPointerPropertiesEXT>("vkGetMemoryHostPointerPropertiesEXT")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, reinterpret_cast<const void*>(base), &pointer); result != VK_SUCCESS) return fail("vkGetMemoryHostPointerPropertiesEXT", result);
-    VkMemoryRequirements requirements{};
-    context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, entry.buffer, &requirements);
-    const auto types = requirements.memoryTypeBits & pointer.memoryTypeBits;
-    if (types == 0) return fail("memory type selection", VK_ERROR_FORMAT_NOT_SUPPORTED);
-    const VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, reinterpret_cast<void*>(base)};
-    const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
-    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
-    allocation.allocationSize = bytes;
-    allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
-    if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &entry.memory); result != VK_SUCCESS) return fail("vkAllocateMemory", result);
-    if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return fail("vkBindBufferMemory", result);
-    const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, entry.buffer};
-    entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
-    if (entry.address == 0) return fail("vkGetBufferDeviceAddressKHR", VK_ERROR_UNKNOWN);
+    }
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
@@ -274,6 +345,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     for (auto it = state.imports.begin(); it != state.imports.end();) {
         const auto* range = leasedRangeAt(lease, it->first);
         if (range != nullptr && range->bytes == it->second.bytes) {
+            if (it->second.unwatched) GuestMemory::Unwatch(it->first, it->second.bytes);
             ++it;
             continue;
         }
@@ -776,6 +848,114 @@ AddressSpaceStats AddressSpaceCounters() {
     const auto& cache = Spaces();
     const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
     return {addressSpaceCacheEnabled(), load(cache.hits), load(cache.rebuiltFirst), load(cache.rebuiltGeneration), load(cache.rebuiltEpoch), load(cache.rebuiltDevice), load(cache.rebuiltWaiterDrop), load(cache.unpublished), load(cache.dissolvedOverlap), load(cache.dissolvedImports), load(cache.waiterDrops)};
+}
+
+ImportProbe ProbeImportWriteProtection(const Context& context) {
+    ImportProbe probe;
+#ifdef _WIN32
+    static_cast<void>(context);
+    probe.failure = "the Linux write watch";
+    return probe;
+#else
+    if (context.hostImportAlignment == 0) {
+        probe.failure = "host import support";
+        return probe;
+    }
+    if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
+        probe.failure = "the write watch";
+        return probe;
+    }
+    constexpr std::uint64_t page = 4096;
+    const std::uint64_t alignment = std::max<std::uint64_t>(context.hostImportAlignment, page);
+    const std::uint64_t bytes = (4 * page + alignment - 1) / alignment * alignment;
+    probe.pages = static_cast<std::uint32_t>(bytes / page);
+    void* raw = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) {
+        probe.failure = "mmap";
+        return probe;
+    }
+    const auto base = (reinterpret_cast<std::uint64_t>(raw) + alignment - 1) / alignment * alignment;
+    auto* scratch = reinterpret_cast<volatile std::uint8_t*>(base);
+    for (std::uint64_t offset = 0; offset < bytes; offset += page) scratch[offset] = 1;
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
+    HostImport import{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+    VkBuffer destination = VK_NULL_HANDLE;
+    VkDeviceMemory destinationMemory = VK_NULL_HANDLE;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    bool submitted = false;
+    const auto collect = [&](std::uint32_t& pages) {
+        pages = 0;
+        return GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes), [](void* count, std::uintptr_t begin, std::uintptr_t end) { *static_cast<std::uint32_t*>(count) += static_cast<std::uint32_t>((end - begin) / 4096); }, &pages);
+    };
+    const auto run = [&]() -> const char* {
+        std::uint32_t quiet = 0;
+        if (!collect(quiet)) return "the first collect";
+        if (!collect(quiet)) return "the second collect";
+        if (quiet != 0) return "an unwritten scratch range";
+        if (const char* step = createImport(context, import, probe.result)) return step;
+        if (!collect(probe.writtenAtImport)) return "the collect after the import";
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        info.size = bytes;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if ((probe.result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &destination)) != VK_SUCCESS) return "vkCreateBuffer";
+        VkMemoryRequirements requirements{};
+        context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, destination, &requirements);
+        if (requirements.memoryTypeBits == 0) return "the destination memory type";
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(requirements.memoryTypeBits));
+        if ((probe.result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &destinationMemory)) != VK_SUCCESS) return "vkAllocateMemory";
+        if ((probe.result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, destination, destinationMemory, 0)) != VK_SUCCESS) return "vkBindBufferMemory";
+        VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocate.commandPool = context.pool;
+        allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocate.commandBufferCount = 1;
+        if ((probe.result = context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, &commands)) != VK_SUCCESS) return "vkAllocateCommandBuffers";
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if ((probe.result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer";
+        const VkBufferCopy region{0, 0, bytes};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, import.buffer, destination, 1, &region);
+        if ((probe.result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands)) != VK_SUCCESS) return "vkEndCommandBuffer";
+        const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if ((probe.result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence)) != VK_SUCCESS) return "vkCreateFence";
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commands;
+        if ((probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit";
+        submitted = true;
+        if ((probe.result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences";
+        submitted = false;
+        if (!collect(probe.writtenAfterSubmit)) return "the collect after the submission";
+        return nullptr;
+    };
+    probe.failure = run();
+    if (submitted) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+    if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
+    if (commands != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+    if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);
+    if (destinationMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, destinationMemory, nullptr);
+    if (import.buffer != VK_NULL_HANDLE) destroyImport(context, import);
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
+    munmap(raw, bytes + alignment);
+    return probe;
+#endif
+}
+
+ImportWatch PrepareImportWatch(const Context& context) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    decideImportWatch(context, state);
+    return state.unwatchImports ? ImportWatch::Unwatch : ImportWatch::Watch;
+}
+
+void SetImportWatch(const Context& context, ImportWatch watch) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    state.watchDevice = context.device;
+    state.unwatchImports = watch == ImportWatch::Unwatch;
 }
 
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {

@@ -972,10 +972,10 @@ bool StorageTexture::Refresh() {
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
-        GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped);
-        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
+        for (std::uint32_t unit = 0; alias != nullptr && unit < trackedLayers; ++unit) {
             if (!alias->layerPending[unit]) continue;
-            if (alias->layerGeneration[unit] == 0 || (aliasStamped[unit] == 0 && layerPending[unit])) {
+            if (alias->layerGeneration[unit] == 0 || aliasStamped[unit] == GuestMemory::BlockMaybeWritten || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
                 alias = nullptr;
                 break;
             }
@@ -999,6 +999,7 @@ bool StorageTexture::Refresh() {
     bool anyBorrowed = false;
     bool unchanged = true;
     bool stamped = true;
+    bool tracked = true;
     bool keysChanged = false;
     bool cpuWrote = false;
     bool direct = false;
@@ -1013,7 +1014,7 @@ bool StorageTexture::Refresh() {
             blockGenerations(generations);
             stampedBlocks.assign(generations.size(), 0);
             cpuBlocks.assign(generations.size(), 0);
-            GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stampedBlocks, cpuBlocks);
+            tracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stampedBlocks, cpuBlocks);
         };
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = ProvedClearKeys(descriptor, guestBytes, keyProof);
@@ -1050,7 +1051,7 @@ bool StorageTexture::Refresh() {
         // "cpu" names a CPU store in both models; a block without a generation (untracked) says
         // nothing about who wrote it.
         for (std::size_t k = 0; k < cpuBlocks.size(); ++k) {
-            if (cpuBlocks[k] != 0 && generations[k] != 0) cpuWrote = true;
+            if (tracked && cpuBlocks[k] != 0 && generations[k] != 0) cpuWrote = true;
         }
         // Unchanged bytes rescue an upload only when nothing else moved: with the keys changed
         // the same bytes read differently, and a changed unit holding pending results must take
@@ -1073,10 +1074,10 @@ bool StorageTexture::Refresh() {
             // already holding them at the same alias version stay as they are.
             const bool sameBorrow = borrowedFrom.lock() == alias && borrowedVersion == alias->version && borrowedUnits.size() == trackedLayers;
             std::vector<std::uint8_t> aliasStamped(trackedLayers);
-            GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped);
+            const bool aliasTracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped);
             borrowed.assign(trackedLayers, false);
             for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
-                if (!alias->layerPending[unit] || aliasStamped[unit] != 0 || alias->layerGeneration[unit] == 0 || layerPending[unit]) continue;
+                if (!aliasTracked || !alias->layerPending[unit] || aliasStamped[unit] != 0 || alias->layerGeneration[unit] == 0 || layerPending[unit]) continue;
                 if (sameBorrow && borrowedUnits[unit]) continue;
                 borrowed[unit] = true;
                 anyBorrowed = true;
@@ -1125,7 +1126,7 @@ bool StorageTexture::Refresh() {
     // clear).
     const auto droppable = [&](std::uint32_t unit) {
         if (keysChanged && IsDccClear(keys)) return true;
-        return layerGeneration[unit] != 0 && unit < stampedBlocks.size() && stampedBlocks[unit] != 0;
+        return tracked && layerGeneration[unit] != 0 && unit < stampedBlocks.size() && stampedBlocks[unit] == GuestMemory::BlockWritten;
     };
     // A clear code -> uncompressed flip on an image with results pending: an unstamped pending
     // unit's results ARE the uncompressed texels (nothing wrote its memory since), so it keeps
@@ -1144,7 +1145,7 @@ bool StorageTexture::Refresh() {
     }
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!layerPending[layer]) continue;
-        if (keyFlip && layerGeneration[layer] != 0 && stampedBlocks[layer] == 0) {
+        if (keyFlip && layerGeneration[layer] != 0 && stampedBlocks[layer] != GuestMemory::BlockWritten) {
             changed[layer] = false;
             keyFlipKept.fetch_add(1, std::memory_order_relaxed);
             if (direct) continue;
@@ -2110,7 +2111,7 @@ bool StorageTexture::blocksKept(std::span<const std::shared_ptr<StorageTexture>>
             for (auto at = begin & ~(block - 1); at < end; at += block) {
                 const auto from = std::max(at, begin);
                 const auto to = std::min(at + block, end);
-                if (GuestMemory::UnchangedSince(from, static_cast<std::size_t>(to - from), texture->layerGeneration[layer])) return false;
+                if (!GuestMemory::WrittenSince(from, static_cast<std::size_t>(to - from), texture->layerGeneration[layer])) return false;
             }
         }
     }
@@ -2206,7 +2207,7 @@ bool StorageTexture::evictStale(std::uint64_t address, std::size_t bytes, std::s
         const auto end = begin + layerBytes(layer);
         for (auto at = begin & ~(block - 1); at < end; at += block) {
             const auto from = std::max(at, begin);
-            if (GuestMemory::UnchangedSince(from, static_cast<std::size_t>(std::min(at + block, end) - from), layerGeneration[layer])) return false;
+            if (!GuestMemory::WrittenSince(from, static_cast<std::size_t>(std::min(at + block, end) - from), layerGeneration[layer])) return false;
         }
     }
     // As the empty write-back leaves the layers: no results pending, the generation unchanged (the
@@ -3025,12 +3026,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         for (auto at = layerBegin(layer) & ~(block - 1); at < end; at += block) generations[static_cast<std::size_t>((at - spanBegin) / block)] = layerGeneration[layer];
     }
     std::vector<std::uint8_t> changedBlocks(spanBlocks);
-    GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks);
+    const bool tracked = GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks);
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!layers[layer]) continue;
         const auto begin = layerBegin(layer);
         const auto end = begin + layerBytes(layer);
-        if (layerGeneration[layer] == 0) {
+        if (!tracked || layerGeneration[layer] == 0) {
             keep.emplace_back(begin, end);
             continue;
         }
@@ -3038,7 +3039,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             const auto from = std::max(at, begin);
             const auto to = std::min(at + block, end);
             if (from >= to) continue;
-            if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] != 0) {
+            if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten) {
                 skippedAny = true;
                 skippedLayer[layer] = true;
                 ++skipped;

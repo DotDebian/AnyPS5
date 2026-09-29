@@ -27,7 +27,22 @@ struct HostImport {
     VkDeviceAddress address;
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
+    bool unwatched = false;
 };
+
+enum class ImportWatch : std::uint8_t { Watch, Unwatch };
+
+struct ImportProbe {
+    const char* failure = nullptr;
+    VkResult result = VK_SUCCESS;
+    std::uint32_t pages = 0;
+    std::uint32_t writtenAtImport = 0;
+    std::uint32_t writtenAfterSubmit = 0;
+};
+
+ImportProbe ProbeImportWriteProtection(const Context& context);
+ImportWatch PrepareImportWatch(const Context& context);
+void SetImportWatch(const Context& context, ImportWatch watch);
 
 // The host import of the registered allocation containing [address, address + bytes), made on demand
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in

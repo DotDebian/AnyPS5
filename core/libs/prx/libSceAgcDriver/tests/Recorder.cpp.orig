@@ -25,7 +25,6 @@
 #else
 #include <sys/mman.h>
 #endif
-#include <algorithm>
 #include <array>
 #include <cmath>
 #include <atomic>
@@ -868,10 +867,6 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the shadow test block refused: unit shadows not tested\n";
         return;
     }
-    if (!Watched(address, bytes)) {
-        std::cout << "host imports are compared, not watched: unit shadows not tested\n";
-        return;
-    }
     Require(import->base == address && import->bytes == bytes, "the import does not cover the block");
     CollectWritesUncached(address, bytes);
     const auto* words = static_cast<const std::uint8_t*>(block);
@@ -1077,8 +1072,6 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
         std::cout << "host import of the storage refresh block refused: storage refresh not tested\n";
         return;
     }
-    if (watched && !AgcDriver::GuestMemory::Watched(address, bytes)) std::cout << "host imports are compared, not watched: storage refresh in watched memory runs as unwatched\n";
-    watched = watched && AgcDriver::GuestMemory::Watched(address, bytes);
     Require(watched || !ShadowDestinationFor(base, *import, address, address + 65536).has_value(), "a unit shadow was offered for memory the write tracker does not watch");
     if (!AgcDriver::GuestMemory::WriteWatched()) Require(!UnitShadowEnabled(), "unit shadows are on without write watching");
     TextureDetiler detiler(base);
@@ -1300,338 +1293,6 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
     RunColorMetadataPass(context, pass);
     Require(memoryHolds({0x66, 0x66, 0x66, 0x66}), "a pass over uncompressed keys changed the texels");
     recorder.Sync();
-}
-
-void importWatchTests(const Device& device) {
-    using namespace AgcDriver::GuestMemory;
-    const auto& context = device.GetContext();
-#ifdef _WIN32
-    static_cast<void>(context);
-    std::cout << "import watch decisions: Linux write watch only\n";
-#else
-    if (context.hostImportAlignment == 0 || !WriteWatched()) {
-        std::cout << "host imports or write watching unavailable: import watch decisions not tested\n";
-        return;
-    }
-    const auto probe = ProbeImportWriteProtection(context);
-    Require(probe.failure == nullptr, std::string("(u) the import probe failed at ") + (probe.failure != nullptr ? probe.failure : "") + " (" + std::to_string(static_cast<int>(probe.result)) + ")");
-    std::cout << "import probe: " << probe.writtenAfterSubmit << " of " << probe.pages << " scratch pages written after a GPU read, " << probe.writtenAtImport << " after the import\n";
-    const auto decided = PrepareImportWatch(context);
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{context, decided};
-    constexpr std::size_t unit = 65536;
-    const auto remap = [](void* block, std::size_t bytes) {
-        munmap(block, bytes);
-        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, bytes);
-        Require(mmap(block, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == block, "(u) cannot map the test block again");
-        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
-    };
-    const auto registerRange = [](void* block, std::size_t bytes) {
-        GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
-    };
-    const auto unregisterRange = [](void* block) {
-        GuestAllocations::Mutation mutation;
-        mutation.Remove(block);
-    };
-    SetImportWatch(context, ImportWatch::Unwatch);
-    {
-        constexpr std::size_t bytes = 3 * unit;
-        void* block = AllocateWatched(bytes, unit);
-        const auto address = reinterpret_cast<std::uint64_t>(block);
-        std::memset(block, 0x11, bytes);
-        const auto before = CollectWrites(address, bytes);
-        Require(before != 0, "(u) a watched block is not collected");
-        BumpCollectEpoch();
-        Require(CollectWrites(address, 2 * unit) != 0, "(u) the memoized collect of a watched block failed");
-        registerRange(block, 2 * unit);
-        const auto* import = HostImportFor(context, address, 2 * unit);
-        Require(import != nullptr && import->unwatched, "(u) an import made under the unwatch decision is not marked unwatched");
-        Require(!Watched(address, 2 * unit) && !Watched(address + unit, 4096), "(u) an imported range stays watched");
-        Require(CollectWrites(address, 2 * unit) == 0 && CollectWrites(address + 4096, 4096) == 0, "(u) a collect memoized before the import answers for the unwatched range");
-        Require(CollectWrites(address + 2 * unit - 4096, 8192) == 0, "(u) a range partly imported is collected");
-        Require(Watched(address + 2 * unit, unit), "(u) the unimported neighbour left the watch");
-        const auto neighbour = CollectWrites(address + 2 * unit, unit);
-        Require(neighbour != 0, "(u) the unimported neighbour is not collected");
-        static_cast<volatile std::uint8_t*>(block)[4096] = 0x22;
-        Require(!UnchangedSince(address, 2 * unit, before) && !UnchangedSince(address, 4096, TrackerGeneration()) && !UnchangedSinceCollected(address, 4096, TrackerGeneration()), "(u) an unwatched range reports unchanged");
-        const std::array<std::uint64_t, 2> generations{before, TrackerGeneration()};
-        std::array<std::uint8_t, 2> changed{};
-        std::array<std::uint8_t, 2> cpu{};
-        Require(!ChangedBlocks(address, 2 * unit, generations, changed, cpu) && changed[0] != 0 && changed[1] != 0, "(u) the stamps of an unwatched range are offered as tracked");
-        Require(MarkWritten(address, unit) == 0, "(u) a GPU write into an unwatched range claims a generation");
-        Require(MarkWritten(address + 2 * unit, 4096) != 0 && !UnchangedSince(address + 2 * unit, unit, neighbour), "(u) a GPU write into the watched neighbour is not stamped");
-        unregisterRange(block);
-        remap(block, 2 * unit);
-        Require(Watched(address, 2 * unit), "(u) a remapped range is not watched");
-        registerRange(block, 2 * unit);
-        const auto* kept = HostImportFor(context, address, 2 * unit);
-        Require(kept != nullptr && kept->unwatched && !Watched(address, 2 * unit) && CollectWrites(address, 2 * unit) == 0, "(u) an import kept over a remap left the range watched");
-        unregisterRange(block);
-        remap(block, 2 * unit);
-        registerRange(block, unit);
-        const auto* again = HostImportFor(context, address, unit);
-        Require(again != nullptr && again->unwatched && again->bytes == unit && !Watched(address, unit), "(u) a re-import after an unmap did not follow the decision");
-        Require(Watched(address + unit, unit) && CollectWrites(address + unit, unit) != 0, "(u) the unregistered rest of a remapped range is not watched");
-        unregisterRange(block);
-        Require(HostImportFor(context, address, unit) == nullptr, "(u) an unregistered range still imports");
-        ReleaseWatched(block, bytes);
-    }
-    SetImportWatch(context, ImportWatch::Watch);
-    {
-        constexpr std::size_t bytes = unit;
-        void* block = AllocateWatched(bytes, unit);
-        const auto address = reinterpret_cast<std::uint64_t>(block);
-        registerRange(block, bytes);
-        const auto* import = HostImportFor(context, address, bytes);
-        Require(import != nullptr && !import->unwatched && Watched(address, bytes), "(u) an import made under the watch decision left the watch");
-        const auto generation = CollectWrites(address, bytes);
-        Require(generation != 0 && UnchangedSince(address, bytes, generation), "(u) a watched import is not collected");
-        Require(MarkWritten(address, 4096) != 0 && !UnchangedSince(address, bytes, generation), "(u) a GPU write into a watched import is not stamped");
-        unregisterRange(block);
-        HostImportFor(context, address, bytes);
-        ReleaseWatched(block, bytes);
-    }
-#endif
-}
-
-void staleGenerationTests(const Device& device, Recorder& recorder) {
-    const auto& base = device.GetContext();
-#ifdef _WIN32
-    static_cast<void>(recorder);
-    static_cast<void>(base);
-    std::cout << "a range leaving the watch: Linux write watch only\n";
-#else
-    if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: a range leaving the watch not tested\n";
-        return;
-    }
-    constexpr std::uint32_t side = 256;
-    constexpr std::size_t surfaceBytes = side * side * 4;
-    constexpr std::size_t keyCount = surfaceBytes / 256;
-    constexpr std::size_t bytes = surfaceBytes + 65536;
-    void* block = AllocateWatched(bytes, 65536);
-    if (block == nullptr) {
-        std::cout << "no write watching: a range leaving the watch not tested\n";
-        return;
-    }
-    struct Release {
-        void* block;
-        ~Release() { ReleaseWatched(block, bytes); }
-    } release{block};
-    const auto decided = PrepareImportWatch(base);
-    SetImportWatch(base, ImportWatch::Unwatch);
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{base, decided};
-    auto* texels = static_cast<std::uint8_t*>(block);
-    std::memset(texels, 0x55, surfaceBytes);
-    std::memset(texels + surfaceBytes, 0x00, keyCount);
-    const auto address = reinterpret_cast<std::uint64_t>(block);
-    {
-        GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
-    }
-    struct Unregister {
-        const Context& context;
-        void* block;
-        std::uint64_t address;
-        ~Unregister() {
-            {
-                GuestAllocations::Mutation mutation;
-                mutation.Remove(block);
-            }
-            HostImportFor(context, address, bytes);
-        }
-    } unregister{base, block, address};
-    TextureDetiler detiler(base);
-    auto context = base;
-    context.detiler = &detiler;
-    GuestTextureResource resource{};
-    resource.baseAddress = address;
-    resource.width = side;
-    resource.height = side;
-    resource.mipCount = 1;
-    resource.tileMode = TextureTileMode::kR64KBX;
-    resource.dimension = TextureDimension::k2D;
-    resource.format = 56;
-    resource.dstSelX = 4;
-    resource.dstSelY = 5;
-    resource.dstSelZ = 6;
-    resource.dstSelW = 7;
-    resource.dccAddress = address + surfaceBytes;
-    {
-        auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
-        Require(AgcDriver::GuestMemory::Watched(address, bytes), "(s) the storage image imported its memory before a generation was taken");
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        const auto commands = recorder.Commands();
-        recorder.Keep(image);
-        const VkClearColorValue red{{1.0f, 0.0f, 0.0f, 1.0f}};
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &red, 1, &range);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        image->MarkDirty();
-        const auto* import = HostImportFor(base, address, bytes);
-        if (import == nullptr) {
-            std::cout << "host import of the stale generation block refused: a range leaving the watch not tested\n";
-            recorder.Sync();
-            return;
-        }
-        Require(!AgcDriver::GuestMemory::Watched(address, bytes), "(s) the imported range stayed watched");
-        image->Refresh();
-        Buffer readback(context, surfaceBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        const auto copyCommands = recorder.Commands();
-        RecordMemoryBarrier(context, copyCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        VkBufferImageCopy copy{};
-        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.imageExtent = {side, side, 1};
-        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(copyCommands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
-        RecordMemoryBarrier(context, copyCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-        recorder.Submit();
-        device.WaitQueue();
-        recorder.Sync();
-        const auto pixels = readback.Bytes();
-        constexpr std::array<std::uint8_t, 4> expected{255, 0, 0, 255};
-        for (std::size_t i = 0; i < pixels.size(); ++i) Require(std::to_integer<std::uint8_t>(pixels[i]) == expected[i % 4], "(s) results pending when their memory left the watch were dropped");
-        for (std::size_t i = 0; i < surfaceBytes; ++i) Require(texels[i] == expected[i % 4], "(s) results pending when their memory left the watch did not reach it");
-    }
-    recorder.Sync();
-#endif
-}
-
-void importWindowTests(const Device& device, Recorder& recorder) {
-    using namespace AgcDriver::GuestMemory;
-    const auto& base = device.GetContext();
-#ifdef _WIN32
-    static_cast<void>(recorder);
-    static_cast<void>(base);
-    std::cout << "the import window: Linux write watch only\n";
-#else
-    if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: the import window not tested\n";
-        return;
-    }
-    constexpr std::uint32_t side = 256;
-    constexpr std::size_t surfaceBytes = side * side * 4;
-    constexpr std::size_t keyCount = surfaceBytes / 256;
-    constexpr std::size_t bytes = surfaceBytes + 65536;
-    void* block = AllocateWatched(bytes, 65536);
-    if (block == nullptr) {
-        std::cout << "no write watching: the import window not tested\n";
-        return;
-    }
-    struct Release {
-        void* block;
-        ~Release() { ReleaseWatched(block, bytes); }
-    } release{block};
-    const auto probe = ProbeImportWriteProtection(base);
-    Require(probe.failure == nullptr, "(w) the import probe failed");
-    const bool importWrites = probe.writtenAtImport != 0;
-    const auto decided = PrepareImportWatch(base);
-    SetImportWatch(base, ImportWatch::Watch);
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{base, decided};
-    auto* texels = static_cast<std::uint8_t*>(block);
-    std::memset(texels, 0x55, surfaceBytes);
-    std::memset(texels + surfaceBytes, 0x00, keyCount);
-    const auto address = reinterpret_cast<std::uint64_t>(block);
-    {
-        GuestAllocations::Mutation mutation;
-        mutation.Add(block, bytes, true, true);
-    }
-    struct Unregister {
-        const Context& context;
-        void* block;
-        std::uint64_t address;
-        ~Unregister() {
-            {
-                GuestAllocations::Mutation mutation;
-                mutation.Remove(block);
-            }
-            HostImportFor(context, address, bytes);
-        }
-    } unregister{base, block, address};
-    TextureDetiler detiler(base);
-    auto context = base;
-    context.detiler = &detiler;
-    GuestTextureResource resource{};
-    resource.baseAddress = address;
-    resource.width = side;
-    resource.height = side;
-    resource.mipCount = 1;
-    resource.tileMode = TextureTileMode::kR64KBX;
-    resource.dimension = TextureDimension::k2D;
-    resource.format = 56;
-    resource.dstSelX = 4;
-    resource.dstSelY = 5;
-    resource.dstSelZ = 6;
-    resource.dstSelW = 7;
-    resource.dccAddress = address + surfaceBytes;
-    {
-        auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
-        Require(!HostImportCovers(base, address, bytes), "(w) the storage image imported its memory before a generation was taken");
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        const auto commands = recorder.Commands();
-        recorder.Keep(image);
-        const VkClearColorValue red{{1.0f, 0.0f, 0.0f, 1.0f}};
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &red, 1, &range);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        image->MarkDirty();
-        const auto cached = CollectWritesUncached(address, surfaceBytes);
-        Require(cached != 0 && UnchangedSince(address, surfaceBytes, cached), "(w) the cache's generation is not current before the import");
-        const auto* import = HostImportFor(base, address, bytes);
-        if (import == nullptr) {
-            std::cout << "host import of the import window block refused: the import window not tested\n";
-            recorder.Sync();
-            return;
-        }
-        Require(!import->unwatched && Watched(address, bytes), "(w) an import under the watch decision left the watch");
-        CollectWritesUncached(address, surfaceBytes);
-        if (importWrites) {
-            Require(!UnchangedSince(address, surfaceBytes, cached), "(w) a cache over the pages the import reported sees no change");
-            std::array<std::uint8_t, surfaceBytes / 65536> changed{};
-            const std::array<std::uint64_t, surfaceBytes / 65536> generations{cached, cached, cached, cached};
-            Require(ChangedBlocks(address, surfaceBytes, generations, changed) && std::all_of(changed.begin(), changed.end(), [](std::uint8_t value) { return value == BlockMaybeWritten; }), "(w) the pages the import reported read as written by the CPU");
-            Require(!WrittenSince(address, surfaceBytes, cached), "(w) the import window reads as a CPU store");
-        } else {
-            std::cout << "the import reports no pages here: only the pending results of the import window checked\n";
-        }
-        const auto after = CollectWritesUncached(address, surfaceBytes);
-        Require(after != 0 && UnchangedSince(address, surfaceBytes, after), "(w) the imported range is not watched again after the import window");
-        image->Refresh();
-        Buffer readback(context, surfaceBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        const auto copyCommands = recorder.Commands();
-        RecordMemoryBarrier(context, copyCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        VkBufferImageCopy copy{};
-        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.imageExtent = {side, side, 1};
-        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(copyCommands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
-        RecordMemoryBarrier(context, copyCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-        recorder.Submit();
-        device.WaitQueue();
-        recorder.Sync();
-        const auto pixels = readback.Bytes();
-        constexpr std::array<std::uint8_t, 4> expected{255, 0, 0, 255};
-        for (std::size_t i = 0; i < pixels.size(); ++i) Require(std::to_integer<std::uint8_t>(pixels[i]) == expected[i % 4], "(w) results pending over the import window were dropped");
-        std::vector<std::byte> memory(surfaceBytes);
-        Read(address, memory);
-        for (std::size_t i = 0; i < surfaceBytes; ++i) Require(std::to_integer<std::uint8_t>(memory[i]) == expected[i % 4], "(w) results pending over the import window did not reach guest memory");
-        const auto stored = CollectWritesUncached(address, surfaceBytes);
-        texels[65536 + 8] = 0x77;
-        CollectWritesUncached(address, surfaceBytes);
-        Require(WrittenSince(address + 65536, 65536, stored) && !WrittenSince(address, 65536, stored), "(w) a CPU store after the import window is not reported as one");
-    }
-    recorder.Sync();
-#endif
 }
 
 // The data word positions of a dispatch-cache variant (Driver.cpp's data-only hits): leaves
@@ -1893,7 +1554,6 @@ int main() {
     try {
         Device device;
         std::lock_guard gpu(GpuMutex());
-        std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
         readTrackingTests(device, recorder);
@@ -1911,9 +1571,6 @@ int main() {
         unitShadowTests(device, recorder);
         storageRefreshTests(device, recorder, false);
         storageRefreshTests(device, recorder, true);
-        importWatchTests(device);
-        staleGenerationTests(device, recorder);
-        importWindowTests(device, recorder);
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);

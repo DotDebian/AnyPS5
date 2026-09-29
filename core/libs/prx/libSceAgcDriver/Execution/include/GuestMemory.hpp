@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <span>
 #include <utility>
@@ -60,6 +61,8 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 // and UnchangedSince is always false, so callers fall back to comparing bytes.
 // WriteWatched: whether any memory is watched; Watched: whether every page of a range is.
 bool WriteWatched();
+void Unwatch(std::uint64_t address, std::size_t bytes);
+bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import);
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
@@ -69,6 +72,7 @@ struct UnchangedQuery {
     std::size_t bytes;
     std::uint64_t generation;
 };
+bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
 // Returns the generation the blocks were stamped with (0 when the range is not write-watched):
 // UnchangedSince(range, it) holds until the next store over the range.
@@ -107,7 +111,10 @@ bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint
 // UnchangedSinceCollected tells them apart from the driver's MarkWritten stamps, but without its
 // walk: the caller collected the range first). One tracker lock for the whole range. Outside the
 // watched arena, or for a generation of 0, a block reads as changed.
-void ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {});
+constexpr std::uint8_t BlockUnchanged = 0;
+constexpr std::uint8_t BlockWritten = 1;
+constexpr std::uint8_t BlockMaybeWritten = 2;
+bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {});
 
 // Serializes device work: draws, dispatches, presentation and the deferred write-backs below. The
 // mutex is recursive; it is wrapped so every acquisition (std::lock_guard at any site) measures how

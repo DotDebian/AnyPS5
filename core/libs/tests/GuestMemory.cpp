@@ -8,10 +8,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <source_location>
 #include <thread>
 #include <utility>
 #include <vector>
 #if defined(__linux__)
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -28,9 +30,9 @@ int APS5_VABI sceKernelSetVirtualRangeName(const void*, std::uint64_t, const cha
 int APS5_VABI sceKernelClearVirtualRangeName(const void*, std::uint64_t);
 }
 
-static void Require(bool condition) {
+static void Require(bool condition, std::source_location location = std::source_location::current()) {
     if (!condition) {
-        std::fputs("Guest memory check failed\n", stderr);
+        std::fprintf(stderr, "Guest memory check failed at %s:%u\n", location.file_name(), static_cast<unsigned>(location.line()));
         std::abort();
     }
 }
@@ -82,12 +84,14 @@ static bool CollectRuns(const void* base, std::size_t offset, std::size_t bytes,
 
 static bool Written(const void* base, std::size_t bytes, PageRuns expected) {
     PageRuns runs;
-    return CollectRuns(base, 0, bytes, runs) && runs == expected;
+    const bool complete = CollectRuns(base, 0, bytes, runs);
+    if (complete && runs == expected) return true;
+    std::fprintf(stderr, "write watch collect %s, written pages:", complete ? "complete" : "incomplete");
+    for (const auto& [first, last] : runs) std::fprintf(stderr, " [%zu, %zu)", static_cast<std::size_t>(first), static_cast<std::size_t>(last));
+    std::fputs("\n", stderr);
+    return false;
 }
 
-// Page write watching of guest mappings (GuestWriteWatch): a mapping is watched from the call that
-// made it, a collect reports the 4 KiB pages written since the last one whatever wrote them and
-// re-protects only those, and a mapping change reads as a write of its pages.
 static void CheckWriteWatch() {
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
         std::puts("write watch unavailable: not tested");
@@ -147,6 +151,22 @@ static void CheckWriteWatch() {
     Require(Written(mapping, length, {{16, 17}}));
     Require(sceKernelMunmap(mapping, length) == 0);
     Require(!GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address, small));
+    constexpr std::size_t tableSpan = 0x200000;
+    constexpr std::size_t spanned = 2 * tableSpan;
+    void* raw = mmap(nullptr, spanned + tableSpan, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(raw != MAP_FAILED);
+    const auto rawAddress = reinterpret_cast<std::uintptr_t>(raw);
+    void* region = reinterpret_cast<void*>((rawAddress + tableSpan - 1) & ~(tableSpan - 1));
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(region, spanned);
+    Require(GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(reinterpret_cast<std::uintptr_t>(region), spanned));
+    Require(Written(region, spanned, {{0, spanned / small}}));
+    Require(Written(region, spanned, {}));
+    static_cast<volatile unsigned char*>(region)[tableSpan + 3 * small] = 1;
+    static_cast<volatile unsigned char*>(region)[7 * small] = 1;
+    Require(Written(region, spanned, {{7, 8}, {tableSpan / small + 3, tableSpan / small + 4}}));
+    Require(Written(region, spanned, {}));
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(region, spanned);
+    Require(munmap(raw, spanned + tableSpan) == 0);
 }
 #endif
 
