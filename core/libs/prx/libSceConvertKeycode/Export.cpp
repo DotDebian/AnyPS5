@@ -1,5 +1,3 @@
-// libSceConvertKeycode: keyboard type query. sceConvertKeycodeGetVirtualKeycode has an unverified signature, so it
-// only logs its raw arguments and reports failure without writing through any pointer.
 #include <cstdint>
 #include "SceTypes.hpp"
 #include "HitLog.hpp"
@@ -12,9 +10,9 @@ constexpr int kErrInvalidUserId = static_cast<int>(0x80BC0010u);
 
 extern "C" {
 
-int APS5_VABI sceConvertKeycodeGetImeKeyboardType(int32_t user_id, uint32_t* type) {
+int APS5_VABI sceConvertKeycodeGetImeKeyboardType(int32_t userId, uint32_t* type) {
  if (type == nullptr) return kErrInvalidAddress;
- if (user_id < 0) return kErrInvalidUserId;
+ if (userId < 0) return kErrInvalidUserId;
  *type = 0;
  return 0;
 }

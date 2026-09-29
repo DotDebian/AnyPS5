@@ -9,13 +9,12 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
-// Offline voice chat: the library initialises, sessions and channels cannot be joined without a connection.
 namespace {
 constexpr int VOICECHAT_ERROR_SIGNED_OUT = static_cast<int>(0x80550006u);
 }  // namespace
 
 namespace {
-void log_soft(const char* func, const char* what) {
+void logSoft(const char* func, const char* what) {
     static std::mutex mtx;
     static std::map<std::string, int> hits;
     std::lock_guard<std::mutex> lk(mtx);
@@ -34,21 +33,21 @@ int APS5_VABI sceVoiceChatTerminate(void) { return 0; }
 int APS5_VABI sceVoiceChatRegisterHandlers(void* a) { (void)a; return 0; }
 int APS5_VABI sceVoiceChatRegisterMicEventHandler(void* a, void* b) { (void)a; (void)b; return 0; }
 int APS5_VABI sceVoiceChatProcessEvent(void) { return 0; }
-int APS5_VABI sceVoiceChatDeleteRequest(int request_id) { (void)request_id; return 0; }
+int APS5_VABI sceVoiceChatDeleteRequest(int requestId) { (void)requestId; return 0; }
 
 int APS5_VABI sceVoiceChatCreateRequest(void* a, void* b) {
     (void)a;
     (void)b;
-    log_soft(__func__, "SIGNED_OUT (offline)");
+    logSoft(__func__, "SIGNED_OUT (offline)");
     return VOICECHAT_ERROR_SIGNED_OUT;
 }
 
 #define VOICECHAT_OFFLINE_REQUEST(NAME) \
-    int APS5_VABI NAME(int request_id, void* a, void* b) { \
-        (void)request_id; \
+    int APS5_VABI NAME(int requestId, void* a, void* b) { \
+        (void)requestId; \
         (void)a; \
         (void)b; \
-        log_soft(#NAME, "SIGNED_OUT (offline)"); \
+        logSoft(#NAME, "SIGNED_OUT (offline)"); \
         return VOICECHAT_ERROR_SIGNED_OUT; \
     }
 

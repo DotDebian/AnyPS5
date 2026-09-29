@@ -85,7 +85,6 @@ int APS5_VABI scePlayGoGetEta(int handle, const uint16_t* chunk_ids, uint32_t nu
 }
 
 int APS5_VABI scePlayGoGetInstallChunkId(int handle, uint16_t* out_chunk_id_list, uint32_t number_of_entries, uint32_t* out_entries) {
-    // Every chunk this title has is already installed, so the installed set is the same as the full chunk set.
     return scePlayGoGetChunkId(handle, out_chunk_id_list, number_of_entries, out_entries);
 }
 

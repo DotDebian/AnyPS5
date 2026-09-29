@@ -637,7 +637,7 @@ ValueType APS5_VABI _ZNK3sce4Json5Value7getTypeEv(const Value* self) { return No
 const bool* APS5_VABI _ZNK3sce4Json5Value10getBooleanEv(const Value* self) { return &Typed(self, TypeBoolean).boolean; }
 const std::int64_t* APS5_VABI _ZNK3sce4Json5Value10getIntegerEv(const Value* self) {
     Node& n = const_cast<Node&>(NodeOf(*self));
-    if (n.type == TypeUInteger) {
+    if (n.type == TypeUInteger && n.uinteger <= static_cast<std::uint64_t>(INT64_MAX)) {
         n.integer = static_cast<std::int64_t>(n.uinteger);
         return &n.integer;
     }
@@ -645,7 +645,7 @@ const std::int64_t* APS5_VABI _ZNK3sce4Json5Value10getIntegerEv(const Value* sel
 }
 const std::uint64_t* APS5_VABI _ZNK3sce4Json5Value11getUIntegerEv(const Value* self) {
     Node& n = const_cast<Node&>(NodeOf(*self));
-    if (n.type == TypeInteger) {
+    if (n.type == TypeInteger && n.integer >= 0) {
         n.uinteger = static_cast<std::uint64_t>(n.integer);
         return &n.uinteger;
     }
