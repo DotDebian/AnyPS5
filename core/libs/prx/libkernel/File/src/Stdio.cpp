@@ -18,6 +18,7 @@
 #include <io.h>
 #include <direct.h>
 #include <sys/stat.h>
+#include <sys/utime.h>
 static int NativeRmdir(const std::filesystem::path& path) {
     return ::_wrmdir(path.wstring().c_str());
 }
@@ -30,6 +31,14 @@ static int NativeChmod(const std::filesystem::path& path, int mode) {
 }
 static int NativeFtruncate(int descriptor, std::int64_t length) {
     return static_cast<int>(::_chsize_s(descriptor, length));
+}
+static int NativeFsync(int descriptor) {
+    return ::_commit(descriptor);
+}
+static int NativeUtimes(const std::filesystem::path& path, const KernelTimeval* times) {
+    if (times == nullptr) return ::_wutime(path.wstring().c_str(), nullptr);
+    struct _utimbuf values{static_cast<time_t>(times[0].tv_sec), static_cast<time_t>(times[1].tv_sec)};
+    return ::_wutime(path.wstring().c_str(), &values);
 }
 static int NativeFlock(int descriptor, int operation) {
     HANDLE handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
@@ -79,6 +88,7 @@ static std::int64_t NativePwrite(int descriptor, const void* buf, std::size_t nb
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/time.h>
 #include <dirent.h>
 #include <sys/syscall.h>
 #include <vector>
@@ -93,6 +103,15 @@ static int NativeChmod(const std::filesystem::path& path, int mode) {
 }
 static int NativeFtruncate(int descriptor, std::int64_t length) {
     return ::ftruncate(descriptor, static_cast<off_t>(length));
+}
+static int NativeFsync(int descriptor) {
+    return ::fsync(descriptor);
+}
+static int NativeUtimes(const std::filesystem::path& path, const KernelTimeval* times) {
+    if (times == nullptr) return ::utimes(path.c_str(), nullptr);
+    struct timeval values[2]{{static_cast<time_t>(times[0].tv_sec), static_cast<suseconds_t>(times[0].tv_usec)},
+        {static_cast<time_t>(times[1].tv_sec), static_cast<suseconds_t>(times[1].tv_usec)}};
+    return ::utimes(path.c_str(), values);
 }
 static int NativeFlock(int descriptor, int operation) {
     return ::flock(descriptor, operation);
@@ -175,6 +194,23 @@ int APS5_VABI ftruncate_nid_postfix(int d, int64_t length) {
 #else
     if (NativeFtruncate(d, length) != 0) {
         throw std::runtime_error(std::string(__func__) + ": ftruncate failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
+    }
+#endif
+    return 0;
+}
+
+int APS5_VABI sceKernelFtruncate(int d, int64_t length) {
+    return ftruncate_nid_postfix(d, length);
+}
+
+int APS5_VABI sceKernelFsync(int fd) {
+#ifdef _WIN32
+    if (NativeFsync(fd) != 0) {
+        throw std::runtime_error(std::string(__func__) + ": fsync failed, fd=" + std::to_string(fd) + ", error=" + std::to_string(::GetLastError()));
+    }
+#else
+    if (NativeFsync(fd) != 0) {
+        throw std::runtime_error(std::string(__func__) + ": fsync failed, fd=" + std::to_string(fd) + ", errno=" + std::to_string(errno));
     }
 #endif
     return 0;
@@ -282,12 +318,6 @@ int APS5_VABI sceKernelFstat(int d, FileStat* sb) {
     if (sb == nullptr) throw std::invalid_argument("sceKernelFstat: sb is null");
     if (!File::FillFileStatFromDescriptor(d, sb)) return SceErrorFromErrno(errno);
     return 0;
-}
-
-int APS5_VABI sceKernelFsync(int fd) {
- (void)fd;
- NotImplemented_nid_no_patch(__func__);
- return 0;
 }
 
 #ifdef _WIN32
@@ -435,23 +465,24 @@ int APS5_VABI rmdir_nid_postfix(const char* path) {
 extern "C" {
 
 int APS5_VABI sceKernelChmod_nid_postfix(const char* path, std::uint16_t mode) {
-    (void)path;
-    (void)mode;
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return chmod_nid_postfix(path, mode);
 }
 
 int APS5_VABI sceKernelTruncate_nid_postfix(const char* path, std::int64_t length) {
-    (void)path;
-    (void)length;
-    NotImplemented_nid_no_patch(__func__);
+    if (path == nullptr) throw std::invalid_argument("sceKernelTruncate: path is null");
+    if (length < 0) return SceErrorFromErrno(GUEST_EINVAL);
+    const auto native = ResolvePath_nid_no_patch(path);
+    std::error_code error;
+    if (!std::filesystem::exists(native, error)) return SceErrorFromErrno(GUEST_ENOENT);
+    std::filesystem::resize_file(native, static_cast<std::uintmax_t>(length), error);
+    if (error) return SceErrorFromErrno(GUEST_EIO);
     return 0;
 }
 
 int APS5_VABI sceKernelUtimes_nid_postfix(const char* path, const KernelTimeval* times) {
-    (void)path;
-    (void)times;
-    NotImplemented_nid_no_patch(__func__);
+    if (path == nullptr) throw std::invalid_argument("sceKernelUtimes: path is null");
+    const auto native = ResolvePath_nid_no_patch(path);
+    if (NativeUtimes(native, times) != 0) return SceErrorFromErrno(errno);
     return 0;
 }
 
