@@ -267,6 +267,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.spirvVersion = target.spirvVersion;
     state.supportedCapabilities = target.supportedCapabilities;
     state.supportedExtensions = target.supportedExtensions;
+    state.nonConstantImageOffsets = target.nonConstantImageOffsets;
     const auto* workgroup = ShaderWorkgroupInputFor(state);
     const bool splitHost = workgroup != nullptr && program.WaveSize() == 64u && workgroup->hostSubgroupSize == 32u;
     state.laneCount = splitHost && !workgroup->singleLane ? 2u : 1u;

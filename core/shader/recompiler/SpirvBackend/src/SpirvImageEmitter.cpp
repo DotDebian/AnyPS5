@@ -5,6 +5,7 @@
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -765,12 +766,25 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
         operandMask |= spv::ImageOperandsBiasMask;
         operands.push_back(AddressF32(ctx, access, setup.layout.bias));
     }
-    if (setup.layout.offset != NoImageComponent) {
-        const auto* packed = access.address.Argument(setup.layout.offset);
-        if (packed == nullptr || !packed->HasImmediate()) {
-            ctx.Fail(access.inst, "requires a constant texel offset for image sampling");
+    // A texel offset the address holds as a constant is a ConstOffset; one the guest computed is an
+    // Offset, which Vulkan takes on a sampling instruction only with maintenance8.
+    const auto constantOffset = [&]() -> const IrValue* {
+        const auto component = GetRdnaImageAddressComponentLayout(mem.imageSampleFlags, setup.layout.offset);
+        const auto argument = component.bitOffset / 32u;
+        if (component.bitWidth != 32u || argument >= access.address.ArgumentCount()) return nullptr;
+        const auto* value = access.address.Argument(argument)->Resolve();
+        return value->HasImmediate() ? value : nullptr;
+    };
+    if (setup.layout.offset != NoImageComponent && constantOffset() == nullptr) {
+        const bool gatherExtended = std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityImageGatherExtended)) != state.supportedCapabilities.end();
+        if (!state.nonConstantImageOffsets || !gatherExtended) {
+            ctx.Fail(access.inst, "has a texel offset that is not a constant, which image sampling takes only with VK_KHR_maintenance8 and shaderImageGatherExtended");
         }
-        const auto bits = packed->ImmediateU32();
+        state.module.EmitCapability(spv::CapabilityImageGatherExtended);
+        operandMask |= spv::ImageOperandsOffsetMask;
+        operands.push_back(PackedOffset(ctx, access, setup.layout));
+    } else if (setup.layout.offset != NoImageComponent) {
+        const auto bits = constantOffset()->ImmediateU32();
         std::array<std::uint32_t, 3> values{};
         for (std::uint32_t index = 0; index < setup.dimensionInfo.spatialComponents; index++) {
             const auto field = (bits >> (index * 8u)) & 0x3fu;

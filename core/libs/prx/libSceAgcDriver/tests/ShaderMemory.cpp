@@ -648,6 +648,9 @@ int main() {
         require(!fresh.cacheHit, "disabled cache reused the compiled variant");
         verifyResult(first, fresh);
         require(!RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(uncached)).request.useCache, "cache policy was lost in serialization");
+        auto offsets = uncached;
+        offsets.target.nonConstantImageOffsets = true;
+        require(RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(offsets)).request.target.nonConstantImageOffsets, "non-constant texel offsets were lost in serialization");
         auto changedLayout = request;
         changedLayout.layout.pushConstantSizeBytes = 64;
         require(!Recompile(changedLayout).cacheHit, "binding layout change reused an incompatible variant");

@@ -205,6 +205,9 @@ struct SpirvTarget {
     // module needs local memory.
     LocalMemoryProbe localMemoryProbe = nullptr;
     void* localMemoryProbeContext = nullptr;
+    // VK_KHR_maintenance8's maintenance8 feature: OpImageSample* take a non-constant Offset image
+    // operand (texel offsets the guest computes into a VGPR).
+    bool nonConstantImageOffsets = false;
 };
 
 struct BindingLayout {
