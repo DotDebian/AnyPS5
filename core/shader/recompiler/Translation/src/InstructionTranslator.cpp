@@ -463,6 +463,9 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];
             if (isCodeTableLoad(cfg, instruction.programCounter)) {
+                const auto table = std::find_if(cfg.codeTableLoads.begin(), cfg.codeTableLoads.end(), [&](const auto& entry) { return entry.programCounter == instruction.programCounter; });
+                if (table == cfg.codeTableLoads.end()) throw std::runtime_error("missing shader code table values");
+                context.TranslateCodeTableLoad(instruction, *table);
                 continue;
             }
             const auto* embedded = findEmbeddedFetchLoad(options.embeddedFetch, instruction.programCounter);

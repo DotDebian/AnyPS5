@@ -15,6 +15,7 @@ public:
     void SetPixelInput(const ShaderPixelInputInfo* info) { pixelInput = info; }
     void TranslateEmbeddedFetch(const RdnaInstruction& instruction, std::uint32_t attribute, std::uint32_t componentCount, const ShaderBufferResource& resource);
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
+    void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
 
 private:
     struct AddressOperands {

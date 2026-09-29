@@ -113,7 +113,7 @@ bool IsLoopMerge(const IrProgram& program, std::uint32_t block) {
 }
 
 std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& info) {
-    if (ctx.otherHalf == nullptr || info.terminator.condition == BranchCondition::ScalarInstruction || info.terminator.condition == BranchCondition::GotoVariable) {
+    if (ctx.otherHalf == nullptr || info.terminator.condition == BranchCondition::ScalarInstruction || info.terminator.condition == BranchCondition::GotoVariable || info.terminator.condition == BranchCondition::IndirectTarget) {
         return ctx.Def(info.condition);
     }
     auto& state = ctx.state;
