@@ -69,23 +69,81 @@ ShaderStageKind toShaderStageKind(ShaderStage stage) {
 
 namespace {
 
-// The host subgroup width wave64 programs are laid out for. Debug aid: APS5_SINGLE_LANE=<hex code
-// addresses, comma separated, or "all"> keeps the listed programs at one guest lane per invocation.
-std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
-    static const std::string list = [] { const char* text = std::getenv("APS5_SINGLE_LANE"); return text ? std::string(text) : std::string(); }();
-    if (!list.empty()) {
-        if (list == "all") return 64u;
-        char address[32];
-        std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(request.shader.codeAddress));
-        if (list.find(address) != std::string::npos) return 64u;
-    }
-    return request.target.subgroupSize;
+// Debug aid: whether `list` (hex code addresses, comma separated, or "all") names the program.
+bool ListedProgram(const std::string& list, const RecompileRequest& request) {
+    if (list.empty()) return false;
+    if (list == "all") return true;
+    char address[32];
+    std::snprintf(address, sizeof(address), "%llx", static_cast<unsigned long long>(request.shader.codeAddress));
+    return list.find(address) != std::string::npos;
+}
+
+std::string EnvironmentText(const char* variable) {
+    const char* text = std::getenv(variable);
+    return text != nullptr ? std::string(text) : std::string();
+}
+
+}
+
+namespace {
+
+// The threads of a wave64 compute workgroup that spans several host subgroups of a 32-wide host,
+// where the lane layout matters; 0 for every other program.
+std::uint32_t SplitWorkgroupThreads(const RecompileRequest& request) {
+    if (request.shader.stage != ShaderStage::Compute || request.context.waveSize != 64u || request.target.subgroupSize != 32u || !request.context.compute.has_value()) return 0u;
+    const auto& compute = *request.context.compute;
+    const auto threads = std::max(compute.numThreads[0], 1u) * std::max(compute.numThreads[1], 1u) * std::max(compute.numThreads[2], 1u);
+    // A workgroup of at most 32 threads is one host subgroup in either layout.
+    return threads > 32u ? threads : 0u;
+}
+
+// Whether the SingleLane exchange slots fit the workgroup memory beside the program's LDS.
+bool SingleLaneFits(const RecompileRequest& request, std::uint32_t threads) {
+    const auto limit = request.target.maxWorkgroupSharedMemoryBytes;
+    return limit == 0u || (request.context.compute->ldsSizeDwords + SingleLaneExchangeDwords(threads)) * 4u <= limit;
+}
+
+}
+
+WaveLayout WaveLayoutFor(const RecompileRequest& request) {
+    const auto threads = SplitWorkgroupThreads(request);
+    if (threads == 0u) return WaveLayout::Auto;
+    static const std::string singleLane = EnvironmentText("APS5_SINGLE_LANE");
+    static const std::string twoLane = EnvironmentText("APS5_TWO_LANE");
+    auto layout = request.waveLayout;
+    if (ListedProgram(twoLane, request)) layout = WaveLayout::TwoLane;
+    else if (ListedProgram(singleLane, request)) layout = WaveLayout::SingleLane;
+    if (layout == WaveLayout::SingleLane && !SingleLaneFits(request, threads)) layout = WaveLayout::TwoLane;
+    return layout;
+}
+
+namespace {
+
+// The layout the request compiles to: its WaveLayoutFor, with an Auto program compiled as TwoLane
+// first (see compileVariant); Auto where no layout applies.
+WaveLayout CompiledLayout(const RecompileRequest& request) {
+    if (SplitWorkgroupThreads(request) == 0u) return WaveLayout::Auto;
+    const auto layout = WaveLayoutFor(request);
+    return layout == WaveLayout::Auto ? WaveLayout::TwoLane : layout;
 }
 
 // The stage input metadata of a request (a mesh-stage program's with its subgroup configuration).
 ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
-    return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, HostSubgroupSize(request), mesh);
+    // Debug aid: APS5_INEXACT_SINGLE_LANE=<hex code addresses, comma separated, or "all"> lays the
+    // listed wave64 programs out at one lane per invocation with each 32-lane half acting as a wave
+    // of its own (what APS5_SINGLE_LANE did before SingleLane): NOT exact, since ballots, lane
+    // reads and branches only see the invocation's half and lanes 32-63 read as lanes 0-31.
+    static const std::string inexact = EnvironmentText("APS5_INEXACT_SINGLE_LANE");
+    if (ListedProgram(inexact, request)) return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, 64u, mesh, false);
+    return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, request.target.subgroupSize, mesh, CompiledLayout(request) == WaveLayout::SingleLane);
+}
+
+// The request with its layout fixed to SingleLane.
+RecompileRequest SingleLaneRequest(const RecompileRequest& request) {
+    auto single = request;
+    single.waveLayout = WaveLayout::SingleLane;
+    return single;
 }
 
 }
@@ -184,6 +242,9 @@ struct SourceEntry {
     // points into a registration the driver may replace while the entry lives on.
     std::vector<std::uint32_t> code;
     std::shared_ptr<const IrResourcePlan> plan;
+    // The layout an Auto wave64 program settled on (under mutex): its first variant's, so later
+    // variants skip the spill probe (see compileVariant).
+    WaveLayout settledLayout = WaveLayout::Auto;
     // A plan build that threw (an unsupported resource chain or control flow) is remembered and
     // rethrown: the front end ran every pass before failing, ~13 ms per dispatch of a shader the
     // title issues every frame (0x1048947300 at the intro video). APS5_NO_FAILURE_MEMO=1 rebuilds.
@@ -279,7 +340,10 @@ std::uint64_t nextVariantId() {
     return variants.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
-CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, const ResourceSnapshot& resourceSnapshot, const ResourceSpecialization& resourceSpecialization) {
+// With `chooseLayout`, an Auto wave64 program whose TwoLane module needs local memory is compiled as
+// SingleLane too, and the module needing less local memory is kept (see WaveLayoutFor). With
+// `localMemory`, the module's local memory as the target's probe reports it.
+CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, const ResourceSnapshot& resourceSnapshot, const ResourceSpecialization& resourceSpecialization, bool chooseLayout, std::optional<std::uint32_t>* localMemory = nullptr) {
     const auto inputInfo = RequestInputInfo(request);
     constexpr DeadCodeEliminator deadCodeEliminator;
     constexpr ResourceMaterializer resourceMaterializer;
@@ -309,11 +373,37 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     constexpr SpirvEmitter spirvEmitter;
     RecompileResult result;
     result.variantId = nextVariantId();
-    result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+    try {
+        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
+    } catch (const SingleLaneNotExact& error) {
+        auto twoLane = request;
+        twoLane.waveLayout = WaveLayout::TwoLane;
+        std::fprintf(stderr, "[wave64] program 0x%llx: %s; compiling it two lanes per invocation\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
+        return compileVariant(twoLane, PrepareResourceProgram(twoLane), resourceSnapshot, resourceSpecialization, false, localMemory);
+    }
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion);
 #endif
+    result.waveLayout = CompiledLayout(request);
+    const auto& probe = request.target.localMemoryProbe;
+    // Only single-wave workgroups: their halves meet at workgroup barriers. With several waves the
+    // halves pair through counters in workgroup memory, exact on its own (agc_driver_wave_tests)
+    // but Astro Bot's 16x16 light programs (0x500630800 and siblings) laid out that way reproduce
+    // the MMU fault in the light-list consumer 0x500597a00 that the layout choice avoids.
+    const bool choose = chooseLayout && result.waveLayout == WaveLayout::TwoLane && WaveLayoutFor(request) == WaveLayout::Auto && probe != nullptr && SplitWorkgroupThreads(request) <= 64u && SingleLaneFits(request, SplitWorkgroupThreads(request));
+    if (probe != nullptr && (localMemory != nullptr || choose)) {
+        const auto bytes = probe(request.target.localMemoryProbeContext, result.spirv.Words(), bindings.bindings, request.shader.codeAddress);
+        if (localMemory != nullptr) *localMemory = bytes;
+        if (choose && bytes.has_value() && *bytes != 0u) {
+            const auto single = SingleLaneRequest(request);
+            std::optional<std::uint32_t> singleBytes;
+            auto singleVariant = compileVariant(single, PrepareResourceProgram(single), resourceSnapshot, resourceSpecialization, false, &singleBytes);
+            const bool takeSingle = singleBytes.has_value() && *singleBytes < *bytes;
+            std::fprintf(stderr, "[wave64] program 0x%llx: %u bytes of local memory per invocation at two lanes, %s at one; %s\n", static_cast<unsigned long long>(request.shader.codeAddress), *bytes, singleBytes ? std::to_string(*singleBytes).c_str() : "unknown", takeSingle ? "taking one lane per invocation" : "keeping two lanes per invocation");
+            if (takeSingle) return singleVariant;
+        }
+    }
 
     result.bdaAbiVersion = program.Info().usesDma ? request.target.bdaAbiVersion : 0u;
     result.vertexOffsetSgpr = program.Info().vertexOffsetSgpr;
@@ -380,7 +470,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     std::vector<std::byte> diskKey;
     std::shared_ptr<const CompiledVariant> variant;
     if (disk) {
-        ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), specialization, diskKey);
+        ShaderDiskCache::BuildKey(request, request.target.subgroupSize, specialization, diskKey);
         CompiledVariant loaded;
         if (ShaderDiskCache::Load(diskKey, loaded)) {
             loaded.specialization = specialization;
@@ -390,10 +480,14 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         }
     }
     if (variant == nullptr) {
-        auto program = PrepareResourceProgram(request);
-        variant = std::make_shared<const CompiledVariant>(compileVariant(request, std::move(program), snapshot, specialization));
+        // An Auto program's later variants take the layout its first one settled on.
+        const bool settledSingle = source.settledLayout == WaveLayout::SingleLane && WaveLayoutFor(request) == WaveLayout::Auto;
+        const auto& compiled = settledSingle ? SingleLaneRequest(request) : request;
+        auto program = PrepareResourceProgram(compiled);
+        variant = std::make_shared<const CompiledVariant>(compileVariant(compiled, std::move(program), snapshot, specialization, source.settledLayout == WaveLayout::Auto));
         if (disk) ShaderDiskCache::Store(std::move(diskKey), variant);
     }
+    if (source.settledLayout == WaveLayout::Auto && WaveLayoutFor(request) == WaveLayout::Auto) source.settledLayout = variant->result.waveLayout;
     source.variants.push_back(variant);
     return variant;
 }
@@ -422,7 +516,7 @@ RecompileResult RecompileImpl(const RecompileRequest& request) {
         auto program = PrepareResourceProgram(request);
         const auto plan = materializer.ExtractPlan(program);
         materializer.Materialize(plan, runtime, snapshot, specialization);
-        const auto variant = compileVariant(request, std::move(program), snapshot, specialization);
+        const auto variant = compileVariant(request, std::move(program), snapshot, specialization, true);
         return materializeResult(variant, request, snapshot);
     }
     const auto source = getSource(request);
@@ -570,7 +664,7 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
 std::shared_ptr<const RecompileResult> RecompileImpl(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit) {
     if (!request.useCache || capture.source == nullptr) {
         auto program = PrepareResourceProgram(request);
-        const auto variant = compileVariant(request, std::move(program), capture.snapshot, capture.specialization);
+        const auto variant = compileVariant(request, std::move(program), capture.snapshot, capture.specialization, true);
         return std::make_shared<const RecompileResult>(materializeResult(variant, request, capture.snapshot));
     }
     if (!ResultMemo()) return std::make_shared<const RecompileResult>(materializeVariant(*capture.source, request, capture.snapshot, capture.specialization));

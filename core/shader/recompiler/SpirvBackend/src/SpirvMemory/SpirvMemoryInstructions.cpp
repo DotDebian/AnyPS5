@@ -1,6 +1,7 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
+#include "SpirvBackend/SpirvWaveExchange.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -872,7 +873,7 @@ std::uint32_t AppendConsume(SpirvValueEmitContext& ctx, const IrValue& inst, boo
         return ctx.otherHalf->Def(&inst);
     }
     const auto& mem = SharedMemory(ctx, inst);
-    const bool wave64 = state.laneCount == 2u;
+    const bool wave64 = state.laneCount == 2u || state.splitWave;
     const auto m0 = ctx.Arg(inst, 0);
     const auto base = Binary(state, spv::OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16u));
     const auto size = Binary(state, spv::OpBitwiseAnd, TypeU32(state), m0, ConstantU32(state, 0xffffu));
@@ -889,7 +890,8 @@ std::uint32_t AppendConsume(SpirvValueEmitContext& ctx, const IrValue& inst, boo
     const auto count = Binary(state, spv::OpIAdd, TypeU32(state), Unary(state, spv::OpBitCount, TypeU32(state), low), Unary(state, spv::OpBitCount, TypeU32(state), high));
     const auto first = ctx.FirstLane(ballot);
     const auto sourceLane = wave64 ? Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 31u)) : first;
-    const auto isFirst = Binary(state, spv::OpIEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), sourceLane);
+    // A SingleLane wave compares guest lanes (its halves are two subgroups).
+    const auto isFirst = Binary(state, spv::OpIEqual, TypeBool(state), EmitSubgroupLocalInvocationId(state), state.splitWave ? first : sourceLane);
     const auto storageBounds = EmitMemoryElementInBounds(state, access, index);
     const auto m0Bounds = mem.kind == ResourceKind::Gds ? Binary(state, spv::OpINotEqual, TypeBool(state), size, ConstantU32(state, 0u)) : Binary(state, spv::OpULessThan, TypeBool(state), ConstantU32(state, mem.offset + 3u), size);
     const auto lanesActive = wave64 ? Binary(state, spv::OpINotEqual, TypeBool(state), count, ConstantU32(state, 0u)) : exec;
@@ -901,7 +903,14 @@ std::uint32_t AppendConsume(SpirvValueEmitContext& ctx, const IrValue& inst, boo
     });
     const auto result = state.module.AllocateId();
     state.module.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup), atomic, sourceLane);
-    return result;
+    if (!state.splitWave) {
+        return result;
+    }
+    // The half that holds the first lane has the value; the other gets it through an exchange.
+    const std::array<std::uint32_t, 1> values{result};
+    const auto halves = EmitWaveExchange(state, values);
+    const auto firstHigh = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), first, ConstantU32(state, 32u)), ConstantU32(state, 0u));
+    return Select(state, TypeU32(state), firstHigh, halves[0][1], halves[0][0]);
 }
 
 // A scalar buffer read through a V# the program computed (MemoryInfo::runtimeDescriptor), with the

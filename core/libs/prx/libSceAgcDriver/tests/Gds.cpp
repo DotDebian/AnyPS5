@@ -13,6 +13,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -58,8 +59,8 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t co
 }
 
 // Runs `code` as Groups groups of GroupThreads threads: user data s0 = M0, s[4:7] = the output V#,
-// the group id in s8.
-void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint32_t waveSize, std::uint32_t m0) {
+// the group id in s8. A wave64 program takes `layout` on a 32-wide host.
+void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint32_t waveSize, std::uint32_t m0, ShaderRecompiler::WaveLayout layout) {
     Output.fill(Sentinel);
     std::vector<std::uint32_t> userData(8, 0u);
     userData[0] = m0;
@@ -67,12 +68,13 @@ void Run(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, s
     std::copy(descriptor.begin(), descriptor.end(), userData.begin() + 4);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{GroupThreads, 1, 1}, 0, {true, false, false}, false, 1};
-    const ShaderRecompiler::RecompileRequest request{
+    ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {waveSize, 0, userData, compute, std::nullopt, std::nullopt, memory},
         device.Target(),
         {0, 0, 0, 128}
     };
+    request.waveLayout = layout;
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, Groups, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
@@ -140,7 +142,7 @@ alignas(256) std::array<std::uint32_t, 2 * (1 + WalkGroups * 64 * 24)> WalkNodes
 alignas(256) std::array<std::uint32_t, WalkGroups * 64> WalkSteps{};
 
 // Every lane walks a chain of its own length (0 to 23 nodes, varying within each wave and quad).
-void RunListWalk(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
+void RunListWalk(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, ShaderRecompiler::WaveLayout layout) {
     std::uint32_t next = 1;
     std::vector<std::uint32_t> expected(WalkHeads.size());
     for (std::uint32_t lane = 0; lane < WalkHeads.size(); ++lane) {
@@ -166,12 +168,13 @@ void RunListWalk(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
     const std::span<const std::uint32_t> code(ListWalkCode);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{32, 2, 1}, 0, {true, false, false}, false, 2};
-    const ShaderRecompiler::RecompileRequest request{
+    ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {waveSize, 0, userData, compute, std::nullopt, std::nullopt, memory},
         device.Target(),
         {0, 0, 0, 128}
     };
+    request.waveLayout = layout;
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, WalkGroups, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
@@ -317,23 +320,28 @@ int main() {
 
         // M0: base 0x100 (bits 31:16), size 0x20. The append counter is GDS dword 0x104.
         constexpr std::uint32_t m0 = (0x100u << 16u) | 0x20u;
-        for (const auto waveSize : {64u, 32u}) {
-            const auto name = std::string("ds_append wave") + std::to_string(waveSize);
+        // Wave64 in both layouts of a 32-wide host (two lanes per invocation, and one with the
+        // wave's halves exchanging: the atomic's lane and its result cross the halves).
+        using ShaderRecompiler::WaveLayout;
+        for (const auto [waveSize, layout] : {std::pair{64u, WaveLayout::TwoLane}, std::pair{64u, WaveLayout::SingleLane}, std::pair{32u, WaveLayout::Auto}}) {
+            const auto suffix = std::to_string(waveSize) + (layout == WaveLayout::SingleLane ? " single-lane" : "");
+            const auto name = std::string("ds_append wave") + suffix;
             WriteGds(0x104, 1000);
-            Run(device, AppendCode, waveSize, m0);
+            Run(device, AppendCode, waveSize, m0, layout);
             CheckDistinct(name.c_str(), 1000);
             Require(ReadGds(0x104) == 1000 + ActiveThreads, name + ": the GDS counter is " + std::to_string(ReadGds(0x104)));
 
-            const auto consume = std::string("ds_consume wave") + std::to_string(waveSize);
+            const auto consume = std::string("ds_consume wave") + suffix;
             WriteGds(0x108, 500);
-            Run(device, ConsumeCode, waveSize, m0);
+            Run(device, ConsumeCode, waveSize, m0, layout);
             CheckDistinct(consume.c_str(), 500 - ActiveThreads);
             Require(ReadGds(0x108) == 500 - ActiveThreads, consume + ": the GDS counter is " + std::to_string(ReadGds(0x108)));
         }
 
         // Lanes leaving a loop at different iterations (the wave takes the exit once all have).
-        RunListWalk(device, 32);
-        RunListWalk(device, 64);
+        RunListWalk(device, 32, WaveLayout::Auto);
+        RunListWalk(device, 64, WaveLayout::TwoLane);
+        RunListWalk(device, 64, WaveLayout::SingleLane);
 
         // A pixel shader's append: the invocations the GPU adds for partly covered quads (helper
         // invocations, whose atomics do nothing) must neither allocate nor be the lane that

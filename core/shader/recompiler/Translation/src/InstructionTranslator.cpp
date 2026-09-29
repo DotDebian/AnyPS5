@@ -206,7 +206,7 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
     const auto* workgroup = shaderWorkgroupInput(options.stage, options.inputInfo);
     if (workgroup != nullptr) {
         totalThreads = std::max(workgroup->threadsNum[0], 1u) * std::max(workgroup->threadsNum[1], 1u) * std::max(workgroup->threadsNum[2], 1u);
-        if (options.waveSize == 64u && workgroup->hostSubgroupSize == 32u && totalThreads % 64u != 0u) {
+        if (options.waveSize == 64u && workgroup->hostSubgroupSize == 32u && !workgroup->singleLane && totalThreads % 64u != 0u) {
             initialExec = &entryIr.ULessThan(builtin(StageInputKind::LocalInvocationIndex), entryIr.Constant(totalThreads));
         }
     }

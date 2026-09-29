@@ -150,7 +150,9 @@ void EmitIfCondition(SpirvEmitterState& state, std::uint32_t condition, TFunctio
     state.module.AddFunction(spv::OpSelectionMerge, mergeLabel, spv::SelectionControlMaskNone);
     state.module.AddFunction(spv::OpBranchConditional, condition, thenLabel, mergeLabel);
     EmitLabel(state, thenLabel);
+    ++state.conditionalDepth;
     function();
+    --state.conditionalDepth;
     state.module.AddFunction(spv::OpBranch, mergeLabel);
     EmitLabel(state, mergeLabel);
 }
@@ -164,7 +166,9 @@ std::uint32_t EmitValueOrDefaultIfCondition(SpirvEmitterState& state, std::uint3
     state.module.AddFunction(spv::OpSelectionMerge, mergeLabel, spv::SelectionControlMaskNone);
     state.module.AddFunction(spv::OpBranchConditional, condition, thenLabel, elseLabel);
     EmitLabel(state, thenLabel);
+    ++state.conditionalDepth;
     const auto thenValue = function();
+    --state.conditionalDepth;
     state.module.AddFunction(spv::OpBranch, thenExit);
     EmitLabel(state, thenExit);
     state.module.AddFunction(spv::OpBranch, mergeLabel);
@@ -193,12 +197,16 @@ std::uint32_t EmitValueIfElse(SpirvEmitterState& state, std::uint32_t condition,
     state.module.AddFunction(spv::OpSelectionMerge, mergeLabel, spv::SelectionControlMaskNone);
     state.module.AddFunction(spv::OpBranchConditional, condition, thenLabel, elseLabel);
     EmitLabel(state, thenLabel);
+    ++state.conditionalDepth;
     const auto thenValue = thenFunction();
+    --state.conditionalDepth;
     state.module.AddFunction(spv::OpBranch, thenExit);
     EmitLabel(state, thenExit);
     state.module.AddFunction(spv::OpBranch, mergeLabel);
     EmitLabel(state, elseLabel);
+    ++state.conditionalDepth;
     const auto elseValue = elseFunction();
+    --state.conditionalDepth;
     state.module.AddFunction(spv::OpBranch, elseExit);
     EmitLabel(state, elseExit);
     state.module.AddFunction(spv::OpBranch, mergeLabel);
@@ -234,7 +242,9 @@ std::uint32_t AtomicUpdate(SpirvEmitterState& state, std::uint32_t pointer, Reso
     state.module.AddFunction(spv::OpBranch, header);
     EmitLabel(state, header);
     state.module.AddFunction(spv::OpPhi, TypeU32(state), observed, initial, preheader, exchanged, cont);
+    ++state.conditionalDepth;
     const auto next = function(observed);
+    --state.conditionalDepth;
     state.module.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), exchanged, pointer, ConstantU32(state, scope), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, spv::MemorySemanticsMaskNone), next, observed);
     const auto success = state.module.AllocateId();
     state.module.AddFunction(spv::OpIEqual, TypeBool(state), success, exchanged, observed);

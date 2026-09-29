@@ -1,6 +1,8 @@
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
+#include "SpirvBackend/SpirvWaveExchange.hpp"
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -112,7 +114,44 @@ bool IsLoopMerge(const IrProgram& program, std::uint32_t block) {
     return false;
 }
 
+// A SingleLane wave's branch on EXEC or VCC: taken as the wave's masks decide, so both halves
+// take it alike (see SpirvWaveExchange.hpp). The zero tests read "no lane has the bit", which a
+// half the workgroup does not have satisfies, instead of "every lane lacks it".
+std::uint32_t EmitSplitWaveBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& info) {
+    auto& state = ctx.state;
+    const auto kind = info.terminator.condition;
+    const bool zero = kind == BranchCondition::ExecZero || kind == BranchCondition::VccZero;
+    // The translator writes a zero test as LogicalNot(mask bit); its operand is the predicate the
+    // mask's own ballot took, which the block may have exchanged already.
+    const IrValue* predicate = info.condition->Resolve();
+    std::uint32_t bit = 0;
+    if (zero && predicate->Opcode() == IrOpcode::LogicalNot) {
+        predicate = predicate->Argument(0);
+    } else if (zero) {
+        bit = Unary(state, spv::OpLogicalNot, TypeBool(state), ctx.Def(predicate));
+    }
+    std::uint32_t ballot = 0;
+    if (bit == 0) {
+        ballot = ctx.Ballot(predicate);
+    } else {
+        const std::array<std::uint32_t, 1> words{EmitSplitBallotWord(state, bit)};
+        const auto halves = EmitWaveExchange(state, words);
+        ballot = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), ballot, halves[0][0], halves[0][1], ConstantU32(state, 0u), ConstantU32(state, 0u));
+    }
+    const auto low = state.module.AllocateId();
+    const auto high = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0u);
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1u);
+    const auto any = Binary(state, spv::OpINotEqual, TypeBool(state), EmitBinaryU32(state, spv::OpBitwiseOr, low, high), ConstantU32(state, 0u));
+    return zero ? Unary(state, spv::OpLogicalNot, TypeBool(state), any) : any;
+}
+
 std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& info) {
+    const auto kind = info.terminator.condition;
+    if (ctx.state.splitWave && (kind == BranchCondition::ExecZero || kind == BranchCondition::ExecNonZero || kind == BranchCondition::VccZero || kind == BranchCondition::VccNonZero)) {
+        return EmitSplitWaveBranchCondition(ctx, info);
+    }
     if (ctx.otherHalf == nullptr || info.terminator.condition == BranchCondition::ScalarInstruction || info.terminator.condition == BranchCondition::GotoVariable || info.terminator.condition == BranchCondition::IndirectTarget) {
         return ctx.Def(info.condition);
     }
@@ -123,7 +162,6 @@ std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& i
     const auto result = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0u);
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1u);
-    const auto kind = info.terminator.condition;
     const bool zero = kind == BranchCondition::ExecZero || kind == BranchCondition::VccZero || kind == BranchCondition::SccZero;
     const auto combined = EmitBinaryU32(state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
     state.module.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result, combined, ConstantU32(state, zero ? ~0u : 0u));
@@ -533,6 +571,7 @@ void EmitStructuredInstruction(SpirvValueEmitContext& ctx, StructuredFunctionSta
 void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrBlock* block) {
     auto& state = ctx.state;
     state.currentBlock = block;
+    ctx.blockWaveBallots.clear();
     EmitLabel(state, ctx.Label(block));
     bool emittedNonPhi = false;
     // Wave LDS ordering (see WaveLdsScope): a barrier separates an LDS write from the next LDS access
@@ -555,7 +594,8 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             } else if (access != SharedAccess::None) {
                 const bool writes = access != SharedAccess::Read;
                 if (ldsWritten || (writes && ldsRead)) {
-                    state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, state.waveLdsScope), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
+                    if (state.splitWave) EmitWaveSync(state);
+                    else state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, state.waveLdsScope), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
                     ldsWritten = false;
                     ldsRead = false;
                 }
@@ -630,8 +670,10 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
             context.Fail("structured control flow block has no terminator metadata");
         }
         EmitStructuredBlock(context, functionState, block);
-        functionState.blockExitLabels.emplace(block, state.currentLabel);
         EmitStructuredTerminator(context, program, *info);
+        // The label the block branches from (the terminator's condition may open blocks of its own,
+        // a SingleLane wave's pairing loop).
+        functionState.blockExitLabels.emplace(block, state.currentLabel);
     }
     PatchStructuredPhis(context, functionState);
 }

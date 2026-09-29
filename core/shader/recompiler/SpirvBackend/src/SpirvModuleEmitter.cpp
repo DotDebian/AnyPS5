@@ -2,6 +2,7 @@
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
+#include "SpirvBackend/SpirvWaveExchange.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -922,6 +923,9 @@ void EmitProgram(SpirvEmitterState& state) {
         state.module.AddFunction(spv::OpStore, state.pixelValidMaskVariable, ConstantU32(state, 1u));
     }
     EmitMemoryOffsets(state);
+    if (state.splitWave) {
+        EmitWaveExchangeEntry(state);
+    }
     if (program.BlockOrder().empty()) {
         if (state.pixelValidMaskVariable != 0u) {
             const auto maskValue = state.module.AllocateId();

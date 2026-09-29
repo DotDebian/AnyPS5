@@ -37,7 +37,7 @@ namespace ShaderRecompiler::ShaderDiskCache {
 
 // The file format; bumped by hand only when the layout below changes (the source version already
 // changes with every source edit).
-inline constexpr std::uint32_t FormatVersion = 1;
+inline constexpr std::uint32_t FormatVersion = 2;
 
 enum class LoadStatus {
     Loaded,
