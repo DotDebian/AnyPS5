@@ -7,6 +7,7 @@
 #include <chrono>
 #include <atomic>
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,8 +23,10 @@
 #endif
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <fstream>
 #include <sstream>
+#include <unistd.h>
 #endif
 
 namespace AgcDriver::GuestMemory {
@@ -471,6 +474,97 @@ struct PageRun {
     bool writable;
 };
 
+#ifndef _WIN32
+// Linux has no VirtualQuery: the mappings come from /proc/self/maps, whose line-by-line parse cost
+// ~20 us per query and GPU workers verify ranges ~10000 times per second. The title's GPU memory
+// is direct memory (libkernel DirectMemory), mapped, protected and unmapped only through registry
+// mutations, and registered with the write watch for as long as it is mapped: for a range the watch
+// covers, the whole table is parsed once and reused while the registry generation it was parsed
+// under is the live one (every mutation bumps it after changing the mappings, so a table read
+// during a mutation is tagged older and parsed again). Any other range (host heap memory the
+// registry never sees) is looked up afresh each time, as before. APS5_NO_MAPS_CACHE=1 looks every
+// range up afresh.
+struct Mapping {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+    bool readable;
+    bool writable;
+};
+
+struct MappingTable {
+    std::uint64_t generation = 0;
+    std::vector<Mapping> mappings;
+};
+
+std::atomic<std::shared_ptr<const MappingTable>> mappingTable;
+
+bool mapsCacheEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_MAPS_CACHE") != nullptr;
+    return !disabled;
+}
+
+// The whole of /proc/self/maps, sorted by address as the kernel lists it; null when unreadable.
+std::shared_ptr<const MappingTable> parseMappings(std::uint64_t generation) {
+    const TimedAccess timed(CounterQuery, 0);
+    const int file = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (file < 0) return nullptr;
+    std::string text;
+    std::array<char, 65536> chunk;
+    for (;;) {
+        const auto count = ::read(file, chunk.data(), chunk.size());
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        text.append(chunk.data(), static_cast<std::size_t>(count));
+    }
+    ::close(file);
+    auto table = std::make_shared<MappingTable>();
+    table->generation = generation;
+    const auto hex = [&](std::size_t& at, std::uintptr_t& value) {
+        const auto start = at;
+        value = 0;
+        for (; at < text.size(); ++at) {
+            const char c = text[at];
+            const int digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+            if (digit < 0) break;
+            value = (value << 4u) | static_cast<std::uintptr_t>(digit);
+        }
+        return at != start;
+    };
+    std::size_t at = 0;
+    while (at < text.size()) {
+        const auto lineEnd = std::min(text.find('\n', at), text.size());
+        std::uintptr_t first = 0;
+        std::uintptr_t last = 0;
+        if (!hex(at, first) || at >= lineEnd || text[at++] != '-' || !hex(at, last) || at + 2 >= lineEnd || text[at] != ' ' || first >= last) return nullptr;
+        table->mappings.push_back({first, last, text[at + 1] == 'r', text[at + 1] == 'r' && text[at + 2] == 'w'});
+        at = lineEnd + 1;
+    }
+    return table;
+}
+
+// The run of [cursor, end) that starts at `cursor` as the cached table describes it, when the
+// range is direct memory (see MappingTable); false leaves the query to the caller.
+bool cachedMappingRun(std::uintptr_t cursor, std::uintptr_t end, PageRun& run) {
+    if (!mapsCacheEnabled() || !GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(cursor, static_cast<std::size_t>(end - cursor))) return false;
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto table = mappingTable.load(std::memory_order_acquire);
+    if (table == nullptr || table->generation != generation) {
+        table = parseMappings(generation);
+        if (table == nullptr) return false;
+        mappingTable.store(table, std::memory_order_release);
+    }
+    const auto& mappings = table->mappings;
+    const auto next = std::upper_bound(mappings.begin(), mappings.end(), cursor, [](std::uintptr_t value, const Mapping& mapping) { return value < mapping.begin; });
+    if (next != mappings.begin() && cursor < std::prev(next)->end) {
+        const auto& mapping = *std::prev(next);
+        run = {cursor, std::min(end, mapping.end), mapping.readable, mapping.writable};
+    } else {
+        run = {cursor, next != mappings.end() ? std::min(end, next->begin) : end, false, false};
+    }
+    return true;
+}
+#endif
+
 // Calls `emit` with consecutive runs of uniform accessibility covering [address, address + bytes) in
 // order, stopping early when it returns false. Returns false when the address space cannot be queried.
 template <class Emit>
@@ -526,6 +620,11 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         if (!emit(PageRun{cursor, next, readable, writable})) return true;
         cursor = next;
 #else
+        if (PageRun run{}; cachedMappingRun(cursor, end, run)) {
+            if (!emit(run)) return true;
+            cursor = run.end;
+            continue;
+        }
         std::ifstream maps("/proc/self/maps");
         if (!maps.is_open()) return false;
         std::string line;
