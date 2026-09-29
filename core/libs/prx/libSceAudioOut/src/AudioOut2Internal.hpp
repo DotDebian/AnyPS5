@@ -10,6 +10,7 @@
 
 #include "SDL.h"
 #include "SceTypes.hpp"
+#include "AudioOut2PadMix.hpp"
 
 // Shared by the AudioOut2 context and port files.
 //
@@ -70,6 +71,17 @@ struct AudioOut2Context {
     SDL_AudioDeviceID device = 0;
     // Stereo float mix of the ports for one push.
     std::vector<float> mix;
+    // The DualSense's USB sound card, open while the context has controller ports and the card is
+    // present (AudioOut2PadMix.hpp): the 4-channel mix of one push, and the same grain in the card's
+    // layout as it is queued with every push.
+    SDL_AudioDeviceID padDevice = 0;
+    std::chrono::steady_clock::time_point nextPadProbe;
+    AudioOut2PadLayout padLayout;
+    std::vector<float> padMix;
+    std::vector<float> padFrames;
+    std::uint64_t padPrimes = 0;
+    std::uint64_t padDropped = 0;
+    float summaryPadPeak[4] = {};
     // Trace counters.
     std::uint64_t pushes = 0;
     std::uint64_t blockingPushes = 0;
@@ -87,8 +99,11 @@ struct AudioOut2Context {
 };
 
 // Mixes every port of the context that carries PCM data into out (stereo float, frames frames), summing
-// onto the zeroed buffer. Returns the number of ports mixed.
-std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, float* out, std::uint32_t frames);
+// onto the zeroed buffer. With padOut (4-channel float, the controller's sound card) the controller's
+// speaker and vibration ports go there instead (AudioOut2PadMix.hpp). Returns the number of ports mixed.
+std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, float* out, float* padOut, std::uint32_t frames);
+// Whether the context has a port that plays on the controller when its sound card is open.
+bool AudioOut2HasPadPorts(const AudioOut2Context& context);
 // Forgets the ports of a context being destroyed.
 void AudioOut2ReleasePorts(const AudioOut2Context& context);
 

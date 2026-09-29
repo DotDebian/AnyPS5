@@ -40,6 +40,8 @@ private:
     PadOutputState outputState{};
     bool outputPending = false;
     std::chrono::steady_clock::time_point nextRumbleRefresh{};
+    std::uint64_t rumbleCalls = 0;
+    std::uint64_t rumbleNonZeroCalls = 0;
 };
 
 #endif

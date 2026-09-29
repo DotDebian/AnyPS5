@@ -6,6 +6,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "AudioOut2Internal.hpp"
+#include "AudioOut2PadMix.hpp"
 
 static constexpr std::uint16_t OUTPUT_MAIN = 1;
 static constexpr std::int16_t VOLUME_MAX = 127;
@@ -61,15 +62,24 @@ static void AccumulatePort(const AudioOut2Port& port, float* out, std::uint32_t 
     }
 }
 
-std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, float* out, std::uint32_t frames) {
+std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, float* out, float* padOut, std::uint32_t frames) {
     std::lock_guard lock(g_portsLock);
     std::uint32_t mixed = 0;
     for (const auto& port : g_ports) {
         if (!port.used || port.context != &context || port.data == nullptr || port.channels == 0) continue;
-        AccumulatePort(port, out, frames);
+        const auto route = padOut != nullptr ? AudioOut2RouteForPort(port.type, port.channels) : AudioOut2Route::Main;
+        if (route == AudioOut2Route::Main) AccumulatePort(port, out, frames);
+        else AudioOut2AccumulatePadPort(route, port.data, port.channels, port.volume, padOut, frames);
         mixed++;
     }
     return mixed;
+}
+
+bool AudioOut2HasPadPorts(const AudioOut2Context& context) {
+    std::lock_guard lock(g_portsLock);
+    return std::any_of(g_ports.begin(), g_ports.end(), [&context](const AudioOut2Port& port) {
+        return port.used && port.context == &context && AudioOut2RouteForPort(port.type, port.channels) != AudioOut2Route::Main;
+    });
 }
 
 void AudioOut2ReleasePorts(const AudioOut2Context& context) {

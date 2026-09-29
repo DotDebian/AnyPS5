@@ -4,12 +4,44 @@
 #include <cstring>
 #include <stdexcept>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 
 #include "SceTypes.hpp"
 #include "prx//libc/include/General.hpp"
 #include "prx/libScePad/include/Pad.hpp"
 #include "prx/libScePad/include/PadState.hpp"
+
+// APS5_TRACE_PAD_OUTPUT=1 prints the title's pad output requests (vibration, vibration mode, trigger
+// effects, light bar): the first few of each kind, then a count per kind every few seconds.
+namespace {
+enum PadOutputKind { OutputVibration, OutputVibrationNonZero, OutputVibrationMode, OutputTriggerEffect, OutputLightBar, OutputKinds };
+constexpr const char* OUTPUT_KIND_NAMES[OutputKinds] = {"SetVibration", "SetVibration(non-zero)", "SetVibrationMode", "SetTriggerEffect", "SetLightBar"};
+constexpr std::uint64_t OUTPUT_TRACE_FULL = 8;
+constexpr auto OUTPUT_TRACE_SUMMARY = std::chrono::seconds(5);
+
+bool PadOutputTraceEnabled() {
+ static const bool enabled = std::getenv("APS5_TRACE_PAD_OUTPUT") != nullptr;
+ return enabled;
+}
+
+void TracePadOutput(PadOutputKind kind, int handle, int a, int b) {
+ if (!PadOutputTraceEnabled()) return;
+ static std::atomic<std::uint64_t> counts[OutputKinds];
+ static std::atomic<std::int64_t> lastSummary{0};
+ const auto count = ++counts[kind];
+ if (count <= OUTPUT_TRACE_FULL) std::fprintf(stderr, "[padout] %s handle=%d %d %d (call %llu)\n", OUTPUT_KIND_NAMES[kind], handle, a, b, static_cast<unsigned long long>(count));
+ const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+ auto last = lastSummary.load();
+ if (last == 0) lastSummary.compare_exchange_strong(last, now);
+ else if (now - last >= std::chrono::duration_cast<std::chrono::steady_clock::duration>(OUTPUT_TRACE_SUMMARY).count() && lastSummary.compare_exchange_strong(last, now)) {
+  std::fprintf(stderr, "[padout] totals:");
+  for (int index = 0; index < OutputKinds; index++) std::fprintf(stderr, " %s=%llu", OUTPUT_KIND_NAMES[index], static_cast<unsigned long long>(counts[index].load()));
+  std::fprintf(stderr, "\n");
+ }
+}
+}
 
 extern "C" {
 
@@ -171,6 +203,7 @@ int APS5_VABI scePadSetAngularVelocityDeadbandState(int handle, bool enable) {
 }
 
 int APS5_VABI scePadSetLightBar(int handle, const PadLightBarParam* param) {
+ if (param != nullptr) TracePadOutput(OutputLightBar, handle, (param->r << 16) | (param->g << 8) | param->b, 0);
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (param == nullptr) return PAD_ERROR_INVALID_ARG;
  Pad::SetLightBar(true, param->r, param->g, param->b);
@@ -191,6 +224,7 @@ int APS5_VABI scePadSetTiltCorrectionState(int handle, bool enabled) {
 }
 
 int APS5_VABI scePadSetTriggerEffect(int handle, const void* param) {
+ if (param != nullptr) TracePadOutput(OutputTriggerEffect, handle, static_cast<const std::uint8_t*>(param)[0], 0);
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (param == nullptr) return PAD_ERROR_INVALID_ARG;
  const std::uint8_t* bytes = static_cast<const std::uint8_t*>(param);
@@ -210,6 +244,10 @@ int APS5_VABI scePadSetTriggerEffect(int handle, const void* param) {
 }
 
 int APS5_VABI scePadSetVibration(int handle, const PadVibrationParam* param) {
+ if (param != nullptr) {
+  TracePadOutput(OutputVibration, handle, param->large_motor, param->small_motor);
+  if (param->large_motor != 0 || param->small_motor != 0) TracePadOutput(OutputVibrationNonZero, handle, param->large_motor, param->small_motor);
+ }
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (param == nullptr) return PAD_ERROR_INVALID_ARG;
  Pad::SetVibration(param->large_motor, param->small_motor);
@@ -217,6 +255,7 @@ int APS5_VABI scePadSetVibration(int handle, const PadVibrationParam* param) {
 }
 
 int APS5_VABI scePadSetVibrationMode(int handle, int mode) {
+ TracePadOutput(OutputVibrationMode, handle, mode, 0);
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
  if (mode != 0 && mode != 1) return PAD_ERROR_INVALID_ARG;
  Pad::SetVibrationMode(mode);

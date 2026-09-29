@@ -90,7 +90,17 @@ void PadInput::applyOutput() {
     outputPending = false;
     nextRumbleRefresh = now + std::chrono::milliseconds(700);
     constexpr Uint32 rumbleMs = 2000;
-    SDL_GameControllerRumble(controller, static_cast<Uint16>(outputState.vibrationLarge * 257), static_cast<Uint16>(outputState.vibrationSmall * 257), rumbling ? rumbleMs : 0);
+    const int rumbleResult = SDL_GameControllerRumble(controller, static_cast<Uint16>(outputState.vibrationLarge * 257), static_cast<Uint16>(outputState.vibrationSmall * 257), rumbling ? rumbleMs : 0);
+    // APS5_TRACE_PAD_OUTPUT=1: the rumble requests that reach SDL (see libScePad's trace of the title's calls).
+    static const bool traceOutput = std::getenv("APS5_TRACE_PAD_OUTPUT") != nullptr;
+    if (traceOutput) {
+        ++rumbleCalls;
+        if (rumbling) ++rumbleNonZeroCalls;
+        if (rumbleCalls <= 8 || (rumbling && rumbleNonZeroCalls <= 8) || rumbleCalls % 200 == 0) {
+            std::fprintf(stderr, "[padout] SDL_GameControllerRumble(%u, %u) -> %d (calls %llu, non-zero %llu)\n", outputState.vibrationLarge * 257u, outputState.vibrationSmall * 257u,
+                rumbleResult, static_cast<unsigned long long>(rumbleCalls), static_cast<unsigned long long>(rumbleNonZeroCalls));
+        }
+    }
     if (SDL_GameControllerHasLED(controller) == SDL_TRUE) {
         if (outputState.lightBarValid) SDL_GameControllerSetLED(controller, outputState.lightBar[0], outputState.lightBar[1], outputState.lightBar[2]);
         else SDL_GameControllerSetLED(controller, 0, 64, 255);
