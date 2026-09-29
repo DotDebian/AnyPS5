@@ -52,6 +52,14 @@ struct PthreadCondPrivate {
     int _clockid = 0;
 };
 
+struct PthreadSemPrivate {
+    std::mutex _mutex;
+    TimedWait::Condition _cv;
+    int _count = 0;
+
+    explicit PthreadSemPrivate(unsigned int value) : _count(static_cast<int>(value)) {}
+};
+
 static constexpr KernelCpumask DEFAULT_THREAD_AFFINITY = 0x1FFF;
 static constexpr int DEFAULT_THREAD_PRIORITY = 700;
 
