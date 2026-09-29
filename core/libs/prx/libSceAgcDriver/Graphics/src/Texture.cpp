@@ -2413,9 +2413,15 @@ std::size_t StorageTexture::NoteKeysFill(std::uint64_t address, std::size_t byte
     return marked;
 }
 
+// Off unless APS5_KEYS_FILL_CLEAR=1: a key fill changes only the DCC metadata, so a read that does
+// not go through the keys (a view without the DCC address, a copy) still sees the texels the
+// surface's memory holds on hardware, including results still pending here. Clearing the image
+// and dropping those results at the fill lost them for such readers (Astro Bot's title logo and
+// its glow went dim and ghosted); the fill's code reaches DCC-aware reads through the keys as
+// before (the memo below and the refresh).
 std::size_t StorageTexture::ClearByKeysFill(std::uint64_t address, std::size_t bytes, std::uint8_t key) {
-    static const bool disabled = std::getenv("APS5_NO_KEYS_FILL_CLEAR") != nullptr;
-    if (disabled) return 0;
+    static const bool enabled = std::getenv("APS5_KEYS_FILL_CLEAR") != nullptr;
+    if (!enabled) return 0;
     DccKeys keys = DccKeys::Mixed;
     switch (key) {
         case 0x00: keys = DccKeys::Clear0000; break;
