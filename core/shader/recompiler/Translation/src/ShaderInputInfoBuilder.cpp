@@ -63,7 +63,7 @@ void _detectVertexBuffers(ShaderVertexInputInfo& info) {
 
 }
 
-ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const GuestContext& context, std::uint32_t hostSubgroupSize, const MeshConfiguration* mesh) {
+ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const GuestContext& context, std::uint32_t hostSubgroupSize, const MeshConfiguration* mesh, bool singleLane) {
     switch (stage) {
     case ShaderStageKind::Compute: {
         if (!context.compute.has_value()) {
@@ -79,6 +79,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         computeStorage.ldsSizeDwords = compute.ldsSizeDwords;
         computeStorage.waveSize = context.waveSize;
         computeStorage.hostSubgroupSize = hostSubgroupSize;
+        computeStorage.singleLane = singleLane;
         computeStorage.groupId[0] = compute.groupIdEnable[0];
         computeStorage.groupId[1] = compute.groupIdEnable[1];
         computeStorage.groupId[2] = compute.groupIdEnable[2];

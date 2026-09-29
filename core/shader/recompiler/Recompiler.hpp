@@ -181,6 +181,13 @@ struct TessellationTargetLimits {
     std::uint32_t maxEvaluationOutputComponents;
 };
 
+struct DescriptorBinding;
+
+// A driver's look at a compiled compute module, given its SPIR-V, its descriptor bindings and the
+// program's guest code address: the per-invocation local (spill and scratch) memory the device's
+// compiler gives it, when the device reports one.
+using LocalMemoryProbe = std::optional<std::uint32_t> (*)(void* context, std::span<const std::uint32_t> spirv, std::span<const DescriptorBinding> bindings, std::uint64_t codeAddress);
+
 struct SpirvTarget {
     std::uint32_t vulkanVersion;
     std::uint32_t spirvVersion;
@@ -194,6 +201,10 @@ struct SpirvTarget {
     std::uint32_t maxWorkgroupSharedMemoryBytes;
     std::optional<MeshTargetLimits> mesh;
     std::optional<TessellationTargetLimits> tessellation;
+    // Optional (see WaveLayoutFor): picks the layout of the wave64 compute programs whose two-lane
+    // module needs local memory.
+    LocalMemoryProbe localMemoryProbe = nullptr;
+    void* localMemoryProbeContext = nullptr;
 };
 
 struct BindingLayout {
@@ -265,6 +276,13 @@ struct GraphicsCompileContext {
     GraphicsDrawParameters draw;
 };
 
+// How a wave64 compute program is laid out on a device whose subgroups are 32 lanes wide (other
+// programs and devices have one layout). TwoLane runs two guest lanes per invocation, so a guest
+// wave is one host subgroup; SingleLane runs one guest lane per invocation, a guest wave spanning
+// two host subgroups that share their wave-wide state (ballots, lane reads, branch decisions)
+// through workgroup memory (see SpirvWaveExchange.hpp). Auto picks one (see WaveLayoutFor).
+enum class WaveLayout : std::uint8_t { Auto, TwoLane, SingleLane };
+
 struct RecompileRequest {
     ShaderBinary shader;
     GuestContext context;
@@ -272,6 +290,7 @@ struct RecompileRequest {
     BindingLayout layout;
     std::optional<GraphicsCompileContext> graphics;
     bool useCache = true;
+    WaveLayout waveLayout = WaveLayout::Auto;
 };
 
 enum class DescriptorKind {
@@ -406,9 +425,22 @@ struct RecompileResult {
     // Identifies the compiled variant the result came from: equal ids mean identical SPIR-V and
     // bindings, so drivers can reuse pipeline objects. Zero when unknown.
     std::uint64_t variantId = 0;
+    // The layout a wave64 compute program took on a 32-wide host (Auto: not applicable).
+    WaveLayout waveLayout = WaveLayout::Auto;
 };
 
 [[nodiscard]] RecompileResult Recompile(const RecompileRequest& request);
+
+// The layout a request asks for: for a wave64 compute program whose workgroup spans more than one
+// 32-wide host subgroup, TwoLane or SingleLane when the request or a debug switch (APS5_SINGLE_LANE,
+// APS5_TWO_LANE) fixes it, else Auto; Auto for every other program. An Auto program compiles to
+// TwoLane, unless its workgroup is one wave, the target's local memory probe finds that module
+// needing local memory and the SingleLane module needs less: two lanes per invocation double the
+// registers an invocation holds, and what the device's compiler spills of them goes to local
+// memory, which is slow and, on NVIDIA, what Astro Bot's MMU-faulting async compute programs had in
+// common. Both layouts are exact; SingleLane pays a workgroup-memory exchange per wave-wide value,
+// so it is kept for those programs.
+[[nodiscard]] WaveLayout WaveLayoutFor(const RecompileRequest& request);
 
 // The resource plan, snapshot and specialization a driver captured for the request (see
 // CaptureResources in Optimization/ResourceProgram.hpp): this overload reuses them instead of

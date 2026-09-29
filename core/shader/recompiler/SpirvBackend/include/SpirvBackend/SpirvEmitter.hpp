@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <vector>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 
 namespace ShaderRecompiler {
@@ -20,6 +21,13 @@ struct SpirvTargetOptions {
     std::span<const std::string_view> supportedExtensions;
     // The guest program's address, for the loop guard's report (APS5_LOOP_GUARD).
     std::uint64_t codeAddress = 0;
+};
+
+// What Emit throws for a SingleLane program whose wave halves could take a branch apart (see
+// SpirvWaveExchange.hpp): the caller compiles it two lanes per invocation instead.
+class SingleLaneNotExact : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
 };
 
 class SpirvEmitter {

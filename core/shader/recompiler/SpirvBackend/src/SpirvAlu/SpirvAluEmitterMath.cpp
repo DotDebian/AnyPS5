@@ -1,5 +1,7 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "IntermediateRepresentation/IrValue.hpp"
+#include "SpirvBackend/SpirvWaveExchange.hpp"
+#include <array>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include <initializer_list>
@@ -193,7 +195,7 @@ std::uint32_t EmitDppWriteCondition(SpirvValueEmitContext& ctx, const DppMoveFla
 
 std::uint32_t EmitDsMaskedLaneRead(SpirvEmitterState& state, std::uint32_t source, std::uint32_t target, std::uint32_t exec) {
     auto lane = target;
-    if (state.laneCount == 2) {
+    if (state.laneCount == 2 || state.splitWave) {
         lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state), lane, ConstantU32(state, 31u));
     }
     const auto shuffled = state.module.AllocateId();
@@ -488,7 +490,7 @@ std::uint32_t EmitDppMoveU32(SpirvValueEmitContext& ctx, const IrValue& inst) {
     if (flags.fetchInactive) {
         return shuffled;
     }
-    const auto ballot = ctx.Ballot(inst.Argument(1));
+    const auto ballot = ctx.HalfBallot(inst.Argument(1));
     const auto sourceActive = EmitBallotLaneActiveBool(state, ballot, target.lane);
     const auto canFetch = state.module.AllocateId();
     state.module.AddFunction(spv::OpLogicalAnd, TypeBool(state), canFetch, target.valid, sourceActive);
@@ -527,6 +529,20 @@ std::uint32_t EmitBallot(SpirvValueEmitContext& ctx, const IrValue* predicate) {
 
 std::uint32_t EmitReadFirstLane(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
+    if (state.splitWave) {
+        // Each half's EXEC word and the value of its first active lane, exchanged in one go: the
+        // wave's first active lane is the low half's if it has one.
+        const auto word = EmitSplitBallotWord(state, ctx.Arg(inst, 1));
+        const auto active = Binary(state, spv::OpINotEqual, TypeBool(state), word, ConstantU32(state, 0u));
+        const auto first = Select(state, TypeU32(state), active, EmitExt(state, TypeU32(state), GLSLstd450FindILsb, {word}), ConstantU32(state, 0u));
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), value, ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0), first);
+        const std::array<std::uint32_t, 2> values{word, value};
+        const auto halves = EmitWaveExchange(state, values);
+        // With no lane active the hardware reads lane 0, which the low half's shuffle read.
+        const auto highFirst = Binary(state, spv::OpLogicalAnd, TypeBool(state), Binary(state, spv::OpIEqual, TypeBool(state), halves[0][0], ConstantU32(state, 0u)), Binary(state, spv::OpINotEqual, TypeBool(state), halves[0][1], ConstantU32(state, 0u)));
+        return Select(state, TypeU32(state), highFirst, halves[1][1], halves[1][0]);
+    }
     // With no lane active the hardware reads lane 0.
     const auto ballot = ctx.Ballot(inst.Argument(1));
     const auto low = state.module.AllocateId();
@@ -538,6 +554,17 @@ std::uint32_t EmitReadFirstLane(SpirvValueEmitContext& ctx, const IrValue& inst)
 }
 
 std::uint32_t EmitReadLane(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    auto& state = ctx.state;
+    if (state.splitWave) {
+        // Both halves read their lane (lane & 31) and exchange; the lane's half picks.
+        const auto lane = EmitBinaryU32(state, spv::OpBitwiseAnd, ctx.Arg(inst, 1), ConstantU32(state, 63u));
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), value, ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0), EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31u)));
+        const std::array<std::uint32_t, 1> values{value};
+        const auto halves = EmitWaveExchange(state, values);
+        const auto high = Binary(state, spv::OpINotEqual, TypeBool(state), EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 32u)), ConstantU32(state, 0u));
+        return Select(state, TypeU32(state), high, halves[0][1], halves[0][0]);
+    }
     return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
 }
 

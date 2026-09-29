@@ -176,7 +176,7 @@ void DefineInputs(SpirvEmitterState& state) {
     for (const auto& input : state.program.Info().inputs) {
         state.inputs.push_back(SpirvInputBinding {input});
     }
-    if (state.laneCount == 2u) {
+    if (state.laneCount == 2u || state.splitWave) {
         const auto addBuiltin = [&](StageInputKind kind, std::uint32_t components, const char* name) {
             if (std::none_of(state.inputs.begin(), state.inputs.end(), [kind](const SpirvInputBinding& input) {
                 return input.kind == kind;
@@ -185,7 +185,7 @@ void DefineInputs(SpirvEmitterState& state) {
             }
         };
         addBuiltin(StageInputKind::LocalInvocationIndex, 1u, "gl_LocalInvocationIndex");
-        if (std::any_of(state.inputs.begin(), state.inputs.end(), [](const SpirvInputBinding& input) {
+        if (state.laneCount == 2u && std::any_of(state.inputs.begin(), state.inputs.end(), [](const SpirvInputBinding& input) {
             return input.kind == StageInputKind::GlobalInvocationId;
         })) {
             addBuiltin(StageInputKind::WorkgroupId, 3u, "gl_WorkGroupID");

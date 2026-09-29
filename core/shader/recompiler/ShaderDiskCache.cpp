@@ -24,7 +24,7 @@ namespace ShaderRecompiler::ShaderDiskCache {
 // the encoder does not know would silently load as its default): these sizes are a reminder, and
 // are only checked where they were measured.
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(RecompileResult) == 176, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(RecompileResult) == 184, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 224, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 28, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
@@ -261,6 +261,7 @@ void encodeResult(Writer& writer, const RecompileResult& result) {
         out.Value(parameter.flat);
         out.Value(parameter.perVertex);
     });
+    writer.Value(static_cast<std::uint8_t>(result.waveLayout));
 }
 
 void decodeResult(Reader& reader, RecompileResult& result) {
@@ -292,6 +293,8 @@ void decodeResult(Reader& reader, RecompileResult& result) {
         in.Value(parameter.flat);
         in.Value(parameter.perVertex);
     });
+    const auto waveLayout = reader.Get<std::uint8_t>();
+    result.waveLayout = waveLayout <= static_cast<std::uint8_t>(WaveLayout::SingleLane) ? static_cast<WaveLayout>(waveLayout) : WaveLayout::Auto;
     result.cacheHit = false;
     result.variantId = 0;
 }

@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvEmitter.hpp"
+#include "SpirvBackend/SpirvWaveExchange.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <stdexcept>
 #include <string>
@@ -19,7 +20,12 @@ namespace ShaderRecompiler
 
     }
 
+    // The guest lane of the invocation (the two-lane layout's high half adds 32; a SingleLane wave's
+    // lanes are its invocation indices modulo 64).
     std::uint32_t EmitSubgroupLocalInvocationId(SpirvEmitterState& state) {
+        if (state.splitWave) {
+            return EmitSplitGuestLane(state);
+        }
         if (state.subgroupLocalInvocationIdVariable == 0) {
             FailEmit("SubgroupLocalInvocationId was not declared before function emission");
         }
@@ -154,6 +160,7 @@ namespace ShaderRecompiler
         return result;
     }
 
+    // Whether the host subgroup's invocation `lane` (0-31 on a 32-wide host) is active.
     std::uint32_t EmitSubgroupLaneActiveBool(SpirvEmitterState& state, std::uint32_t lane) {
         const auto activeBallot = state.module.AllocateId();
         state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), activeBallot, ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));

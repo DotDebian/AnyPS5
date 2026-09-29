@@ -91,7 +91,18 @@ struct ShaderWorkgroupInputInfo {
     std::uint32_t scratchSizeDwords = 0;
     std::uint32_t hostSubgroupSize = 64;
     std::uint32_t waveSize = 64;
+    // A wave64 program on 32-wide host subgroups at one guest lane per invocation
+    // (WaveLayout::SingleLane); otherwise such a program runs two guest lanes per invocation.
+    bool singleLane = false;
 };
+
+// The workgroup memory a SingleLane wave64 workgroup of `threads` threads adds for the state its
+// waves' two host subgroups exchange (see SpirvWaveExchange.hpp): per wave, two generations of
+// two dwords from each half, and with several waves in the group each half's arrival counter.
+constexpr std::uint32_t SingleLaneExchangeDwords(std::uint32_t threads) {
+    const std::uint32_t waves = (threads + 63u) / 64u;
+    return waves * 8u + (waves > 1u ? waves * 2u : 0u);
+}
 
 // An NGG geometry subgroup emulated by one mesh workgroup: `primitivesPerGroup` input primitives of
 // the draw (with no vertex reuse, so `verticesPerGroup` ES vertices), whose GS threads emit up to

@@ -80,6 +80,26 @@ struct SpirvEmitterState {
     SpirvRequirements requirements;
     std::uint32_t laneCount = 1;
     std::uint32_t laneHalf = 0;
+    // WaveLayout::SingleLane (see SpirvWaveExchange.hpp): each guest wave64 spans two host
+    // subgroups; with several waves per workgroup (`splitWaveCounters`) its halves pair up through
+    // arrival counters rather than workgroup barriers.
+    bool splitWave = false;
+    bool splitWaveCounters = false;
+    std::uint32_t splitThreads = 0;
+    std::uint32_t waveExchangeVariable = 0;
+    std::uint32_t waveExchangeGeneration = 0;
+    // Entry block values: whether the invocation is in its wave's lanes 0-31, its own and the other
+    // half's first slot index of generation 0, the other half's arrival counter index and whether
+    // the other half exists (0: always).
+    std::uint32_t splitFirstHalf = 0;
+    std::uint32_t splitOwnSlot = 0;
+    std::uint32_t splitOtherSlot = 0;
+    std::uint32_t splitOwnArrival = 0;
+    std::uint32_t splitOtherArrival = 0;
+    std::uint32_t splitOtherExists = 0;
+    // Selections and loops an emitter opened around a callback (EmitIfCondition and friends): a
+    // SingleLane exchange there would not be reached by both halves alike.
+    std::uint32_t conditionalDepth = 0;
     // The target's SPIR-V version and what the device accepts, for capabilities an emitter adds
     // only when needed (bindless image tables: see TableImageIndex).
     std::uint32_t spirvVersion = 0x00010300u;
@@ -149,8 +169,14 @@ struct SpirvValueEmitContext {
     std::uint32_t Def(const IrValue* value);
     std::uint32_t Arg(const IrValue& inst, std::size_t index);
     std::uint32_t HalfArg(const IrValue& inst, std::size_t index, std::uint32_t half);
+    // The wave's ballot of `predicate` (uvec4: lanes 0-31, lanes 32-63, 0, 0).
     std::uint32_t Ballot(const IrValue* predicate);
+    // A ballot good for testing lanes of this invocation's own 32-lane half only (DPP rows and
+    // the like): the wave's ballot, except in the SingleLane layout, where it is the half's.
+    std::uint32_t HalfBallot(const IrValue* predicate);
     std::uint32_t FirstLane(std::uint32_t ballot);
+    // Argument `index` of `inst` in guest lane `lane`; in the SingleLane layout the lane must be in
+    // this invocation's 32-lane half (see EmitReadLane for any lane of the wave).
     std::uint32_t Shuffle(const IrValue& inst, std::size_t index, std::uint32_t lane);
     std::uint32_t Result(const IrValue& inst);
     std::uint32_t Define(const IrValue& inst, std::uint32_t value);
@@ -167,6 +193,9 @@ struct SpirvValueEmitContext {
     std::uint32_t scratchU32Variable = 0;
     SpirvValueEmitContext* otherHalf = nullptr;
     std::uint32_t half = 0;
+    // SingleLane: the wave ballots exchanged in the current IR block, by predicate id (a branch on
+    // EXEC reuses the ballot its s_and_saveexec made).
+    std::unordered_map<std::uint32_t, std::uint32_t> blockWaveBallots;
 };
 
 struct SpirvDeferredPhiPatch {

@@ -357,6 +357,21 @@ target_link_libraries(agc_driver_gds_tests PRIVATE shader_recompiler_agc_driver 
 set_target_properties(agc_driver_gds_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_gds_tests)
 
+# Wave64 programs recompiled in both layouts of a 32-wide host and run on the GPU (run by hand).
+add_executable(agc_driver_wave_tests EXCLUDE_FROM_ALL
+        tests/WaveLayout.cpp
+        ${agcDriverSources}
+)
+target_include_directories(agc_driver_wave_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${agcTextureDetileGeneratedRoot}
+        ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
+        ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Headers/include
+)
+target_link_libraries(agc_driver_wave_tests PRIVATE shader_recompiler_agc_driver SDL2-static libc libkernel)
+set_target_properties(agc_driver_wave_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_driver_wave_tests)
+
 if(BUILD_TESTING)
     foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_shader_control_flow_tests agc_shader_disk_cache_tests agc_driver_flip_tests agc_driver_pm4_tests)
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")

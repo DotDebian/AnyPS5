@@ -3,11 +3,14 @@
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvEmitterState.hpp"
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
+#include "SpirvBackend/SpirvWaveExchange.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvModuleSetup.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -42,7 +45,7 @@ const ShaderWorkgroupInputInfo* ShaderWorkgroupInputFor(const SpirvEmitterState&
 // barrier. Host invocations need one; it can be issued wherever the guest wave's control flow is
 // uniform across the barrier's scope: the host subgroup when it holds exactly one guest wave, or the
 // workgroup when the workgroup is a single wave.
-std::uint32_t WaveLdsScope(const IrProgram& program, const ShaderWorkgroupInputInfo* workgroup, std::uint32_t laneCount) {
+std::uint32_t WaveLdsScope(const IrProgram& program, const ShaderWorkgroupInputInfo* workgroup, std::uint32_t laneCount, bool splitWave) {
     if (program.Resources().stage != IrShaderStage::Compute || workgroup == nullptr) return 0;
     bool writes = false;
     for (const auto* block : program.BlockOrder()) {
@@ -59,9 +62,9 @@ std::uint32_t WaveLdsScope(const IrProgram& program, const ShaderWorkgroupInputI
     // APS5_WAVE_LDS_SUBGROUP=1 restores the subgroup scope for comparison.
     static const bool preferSubgroup = std::getenv("APS5_WAVE_LDS_SUBGROUP") != nullptr;
     if (!preferSubgroup && threads <= program.WaveSize()) return spv::ScopeWorkgroup;
-    // A wave64 program kept at one lane per invocation (APS5_SINGLE_LANE reports a 64-wide host) spans
-    // two real subgroups, so only the workgroup scope covers it; hosts wider than 32 lanes are not
-    // distinguished from that case and get the same, still correct, scope.
+    // A SingleLane wave spans two subgroups, which pair up for it (EmitWaveSync); the scope only
+    // marks that barriers are needed.
+    if (splitWave) return spv::ScopeSubgroup;
     if (laneCount == 2u || (program.WaveSize() == workgroup->hostSubgroupSize && workgroup->hostSubgroupSize <= 32u)) return spv::ScopeSubgroup;
     return threads <= program.WaveSize() ? spv::ScopeWorkgroup : 0u;
 }
@@ -115,6 +118,18 @@ std::uint32_t SpirvValueEmitContext::HalfArg(const IrValue& inst, std::size_t in
 
 std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
     const auto ballotType = TypeU32Vector(state, 4u);
+    if (state.splitWave) {
+        // Each half's word, exchanged (see SpirvWaveExchange.hpp); a predicate the block balloted
+        // already reuses that exchange.
+        const auto value = Def(predicate);
+        if (const auto found = blockWaveBallots.find(value); found != blockWaveBallots.end()) return found->second;
+        const std::array<std::uint32_t, 1> words{EmitSplitBallotWord(state, value)};
+        const auto halves = EmitWaveExchange(state, words);
+        const auto ballot = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, ballotType, ballot, halves[0][0], halves[0][1], ConstantU32(state, 0u), ConstantU32(state, 0u));
+        blockWaveBallots.emplace(value, ballot);
+        return ballot;
+    }
     const auto scope = ConstantU32(state, spv::ScopeSubgroup);
     const auto low = state.module.AllocateId();
     state.module.AddFunction(spv::OpGroupNonUniformBallot, ballotType, low, scope, otherHalf == nullptr || half == 0u ? Def(predicate) : otherHalf->Def(predicate));
@@ -132,8 +147,12 @@ std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
     return ballot;
 }
 
+std::uint32_t SpirvValueEmitContext::HalfBallot(const IrValue* predicate) {
+    return state.splitWave ? EmitSplitHalfBallot(state, Def(predicate)) : Ballot(predicate);
+}
+
 std::uint32_t SpirvValueEmitContext::FirstLane(std::uint32_t ballot) {
-    if (otherHalf == nullptr) {
+    if (otherHalf == nullptr && !state.splitWave) {
         const auto result = state.module.AllocateId();
         state.module.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup), ballot);
         return result;
@@ -158,7 +177,9 @@ std::uint32_t SpirvValueEmitContext::Shuffle(const IrValue& inst, std::size_t in
     const auto scope = ConstantU32(state, spv::ScopeSubgroup);
     const auto low = state.module.AllocateId();
     if (otherHalf == nullptr) {
-        state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index), lane);
+        // SingleLane: `lane` is in this invocation's half (the callers' lanes stay within 32).
+        const auto physical = state.splitWave ? EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31u)) : lane;
+        state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index), physical);
         return low;
     }
     const auto physicalLane = EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31u));
@@ -247,21 +268,37 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.supportedCapabilities = target.supportedCapabilities;
     state.supportedExtensions = target.supportedExtensions;
     const auto* workgroup = ShaderWorkgroupInputFor(state);
-    state.laneCount = workgroup != nullptr && program.WaveSize() == 64u && workgroup->hostSubgroupSize == 32u ? 2u : 1u;
+    const bool splitHost = workgroup != nullptr && program.WaveSize() == 64u && workgroup->hostSubgroupSize == 32u;
+    state.laneCount = splitHost && !workgroup->singleLane ? 2u : 1u;
+    if (splitHost && workgroup->singleLane && program.Resources().stage == IrShaderStage::Compute) {
+        const auto threads = std::max(workgroup->threadsNum[0], 1u) * std::max(workgroup->threadsNum[1], 1u) * std::max(workgroup->threadsNum[2], 1u);
+        // A workgroup of at most 32 threads holds its wave in one subgroup.
+        if (threads > 32u) {
+            // Its halves must take every branch alike (see SpirvWaveExchange.hpp).
+            const auto varying = LaneVaryingScalarBranches(program);
+            if (!varying.empty()) {
+                char where[96];
+                std::snprintf(where, sizeof(where), "block %u (pc 0x%x)", varying.front()->id, varying.front()->startPc);
+                throw SingleLaneNotExact(std::string("one lane per invocation is not exact: ") + where + " branches on a scalar condition that may differ between the lanes of a wave");
+            }
+            PrepareWaveExchange(state, *workgroup);
+        }
+    }
     if (program.Resources().stage == IrShaderStage::Compute && workgroup != nullptr) {
         // The key comes from a subgroup ballot (ReadFirstLane), so the slot is uniform over the
         // workgroup only when the workgroup is one wave held by one host subgroup; a wave64 program
         // kept at one lane per invocation spans two subgroups (see WaveLdsScope).
         const auto threads = std::max(workgroup->threadsNum[0], 1u) * std::max(workgroup->threadsNum[1], 1u) * std::max(workgroup->threadsNum[2], 1u);
-        const bool oneSubgroup = state.laneCount == 2u || (program.WaveSize() == workgroup->hostSubgroupSize && workgroup->hostSubgroupSize <= 32u);
+        const bool oneSubgroup = !state.splitWave && (state.laneCount == 2u || (program.WaveSize() == workgroup->hostSubgroupSize && workgroup->hostSubgroupSize <= 32u));
         state.tableIndexNonUniform = threads > program.WaveSize() || !oneSubgroup;
     }
-    state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
+    state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount, state.splitWave);
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
     state.loopGuardProgram = target.codeAddress;
     // Stopped invocations would leave the wave LDS barriers incomplete.
     // A mesh-stage program's epilogue (EmitMeshEntryPoint) has a workgroup barrier of its own.
-    state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
+    // So would a SingleLane wave's exchanges.
+    state.bdaStopsInvocations = state.waveLdsScope == 0 && !state.splitWave && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);
