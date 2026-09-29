@@ -98,7 +98,8 @@ bool Replay(const char* path) {
             ShaderRecompiler::Structurizer{}.Structurize(graph);
             std::printf("structured control flow graph:\n%s", ShaderRecompiler::GraphToString(graph).c_str());
         } catch (const std::exception& error) {
-            std::printf("  structurization failed: %s\n", error.what());
+            std::printf("  structurization failed: %s\n", FirstLine(error.what()).c_str());
+            return false;
         }
     }
     try {
