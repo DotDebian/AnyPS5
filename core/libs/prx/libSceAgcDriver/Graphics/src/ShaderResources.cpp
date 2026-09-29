@@ -276,6 +276,20 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return keys;
     };
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+    // A comparison sample reads an R32 float or R16 unorm surface through a native depth image
+    // (Vulkan compares only depth formats). Other formats and 3D surfaces keep the binding they had
+    // before: their color image under the comparison sampler, whose result Vulkan leaves to the
+    // driver, rather than a skipped draw. Said once per format.
+    if (depthCompare) {
+        const auto format = ResolveTextureFormat(resource.format);
+        if ((format != VK_FORMAT_R32_SFLOAT && format != VK_FORMAT_R16_UNORM) || resource.dimension == TextureDimension::k3D) {
+            static std::mutex reportedMutex;
+            static std::set<std::uint32_t> reported;
+            std::lock_guard lock(reportedMutex);
+            if (reported.insert(resource.format).second) std::fprintf(stderr, "[gpu] comparison sampling of guest format %u (VkFormat %d%s) goes through its color image\n", resource.format, static_cast<int>(format), resource.dimension == TextureDimension::k3D ? ", 3D" : "");
+            depthCompare = false;
+        }
+    }
     // Depth surfaces are rendered into resident depth images only (DepthTarget.hpp): say so once
     // when one is sampled.
     NoteDepthSurfaceSampled(resource.baseAddress);

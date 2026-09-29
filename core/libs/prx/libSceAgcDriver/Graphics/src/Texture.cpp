@@ -231,7 +231,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
     PhaseTimer timer;
     try {
         const auto colorFormat = ResolveTextureFormat(descriptor.format);
-        Require(!depthCompare || colorFormat == VK_FORMAT_R32_SFLOAT || colorFormat == VK_FORMAT_R16_UNORM, "comparison sampling requires an R32 float or R16 unorm depth texture");
+        if (depthCompare && colorFormat != VK_FORMAT_R32_SFLOAT && colorFormat != VK_FORMAT_R16_UNORM) Require(false, "comparison sampling requires an R32 float or R16 unorm depth texture (guest format " + std::to_string(descriptor.format) + ", VkFormat " + std::to_string(static_cast<int>(colorFormat)) + ")");
         Require(!depthCompare || descriptor.dimension != TextureDimension::k3D, "comparison sampling does not support 3D depth textures");
         const auto vkFormat = depthCompare ? (colorFormat == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM) : colorFormat;
         const VkImageAspectFlags aspect = depthCompare ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
