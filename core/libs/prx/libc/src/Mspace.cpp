@@ -264,6 +264,32 @@ void* APS5_VABI sceLibcMspaceMemalign_nid_postfix(void* handle, std::size_t alig
     return Allocate(Find(handle), size, alignment);
 }
 
+void* APS5_VABI sceLibcMspaceReallocalign_nid_postfix(void* handle, void* pointer, std::size_t size, std::size_t alignment) {
+    if (alignment == 0 || (alignment & (alignment - 1))) {
+        Error(22);
+        return nullptr;
+    }
+    const auto effective = std::max<std::size_t>(alignment, 16);
+    std::lock_guard lock(arenaMutex);
+    auto* arena = Find(handle);
+    if (!pointer) return Allocate(arena, size, effective);
+    std::map<std::uintptr_t, Chunk>::iterator chunk;
+    if (!FindUsed(arena, pointer, chunk)) return nullptr;
+    if (!size) { Release(*arena, chunk); return nullptr; }
+    const auto start = chunk->first;
+    if (AlignUp(size, Granule) <= chunk->second.end - start && (start & (effective - 1)) == 0) {
+        chunk->second.requested = size;
+        return pointer;
+    }
+    const auto previousSize = chunk->second.requested;
+    void* result = Allocate(arena, size, effective);
+    if (result) {
+        std::memcpy(result, pointer, std::min(previousSize, size));
+        Release(*arena, arena->chunks.find(start));
+    }
+    return result;
+}
+
 int APS5_VABI sceLibcMspaceMallocStats_nid_postfix(void* handle, MallocManagedSize* stats) {
     return FillStats(handle, stats);
 }

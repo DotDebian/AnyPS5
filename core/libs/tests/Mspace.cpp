@@ -17,6 +17,7 @@ void APS5_VABI sceLibcMspaceFree_nid_postfix(void*, void*);
 int APS5_VABI sceLibcMspacePosixMemalign_nid_postfix(void*, void**, std::size_t, std::size_t);
 std::size_t APS5_VABI sceLibcMspaceMallocUsableSize_nid_postfix(const void*);
 void* APS5_VABI sceLibcMspaceMemalign_nid_postfix(void*, std::size_t, std::size_t);
+void* APS5_VABI sceLibcMspaceReallocalign_nid_postfix(void*, void*, std::size_t, std::size_t);
 int APS5_VABI sceLibcMspaceMallocStats_nid_postfix(void*, void*);
 int APS5_VABI sceLibcMspaceMallocStatsFast_nid_postfix(void*, void*);
 }
@@ -79,6 +80,15 @@ int main() {
     void* memaligned = sceLibcMspaceMemalign_nid_postfix(arena, 256, 100);
     Require(memaligned && (reinterpret_cast<std::uintptr_t>(memaligned) & 255) == 0);
     Require(sceLibcMspaceMemalign_nid_postfix(arena, 24, 100) == nullptr);
+    unsigned char* realigned = static_cast<unsigned char*>(sceLibcMspaceReallocalign_nid_postfix(arena, nullptr, 64, 64));
+    Require(realigned && (reinterpret_cast<std::uintptr_t>(realigned) & 63) == 0);
+    for (int i = 0; i < 64; ++i) realigned[i] = static_cast<unsigned char>(i + 1);
+    unsigned char* regrown = static_cast<unsigned char*>(sceLibcMspaceReallocalign_nid_postfix(arena, realigned, 256, 64));
+    Require(regrown && (reinterpret_cast<std::uintptr_t>(regrown) & 63) == 0);
+    for (int i = 0; i < 64; ++i) Require(regrown[i] == static_cast<unsigned char>(i + 1));
+    Require(sceLibcMspaceReallocalign_nid_postfix(arena, regrown, 16, 0) == nullptr);
+    Require(sceLibcMspaceReallocalign_nid_postfix(arena, regrown, 16, 3) == nullptr);
+    Require(sceLibcMspaceReallocalign_nid_postfix(arena, regrown, 0, 16) == nullptr);
     Require(sceLibcMspaceMallocStatsFast_nid_postfix(arena, &stats) == 0 && stats.currentInuseSize >= 100);
     sceLibcMspaceFree_nid_postfix(arena, memaligned);
     void* region = sceLibcMspaceMalloc_nid_postfix(arena, 8192);

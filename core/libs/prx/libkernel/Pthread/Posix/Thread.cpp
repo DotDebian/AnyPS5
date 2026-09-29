@@ -57,6 +57,15 @@ Pthread APS5_VABI pthread_self_nid_postfix(void) {
     return scePthreadSelf();
 }
 
+int APS5_VABI pthread_equal_nid_postfix(Pthread first, Pthread second) {
+    return first == second;
+}
+
+int APS5_VABI sched_yield_nid_postfix(void) {
+    std::this_thread::yield();
+    return 0;
+}
+
 int APS5_VABI pthread_setcancelstate_nid_postfix(int state, int* old_state) {
     return PosixThread::ToErrno(scePthreadSetcancelstate(state, old_state));
 }

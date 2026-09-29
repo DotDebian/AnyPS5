@@ -36,6 +36,9 @@ int main(const int argc, char* argv[]) {
     }
 
     try {
+        auto extension = std::filesystem::path(args.outputPath).extension().string();
+        for (auto& character : extension) if (character >= 'A' && character <= 'Z') character = static_cast<char>(character + ('a' - 'A'));
+        if (!args.toWindows && extension == ".exe") std::cerr << "WARNING: Output filename ends with .exe, but --windows was not specified. The output will be a Linux ELF executable.\n";
         Io::FileReader fileReader;
         Io::FileWriter fileWriter;
 
@@ -111,6 +114,15 @@ int main(const int argc, char* argv[]) {
         }
         fileWriter.Write(absPath, executableBytes);
         std::cout << "External prx references: " << result.RegistryEntries.size() << "\nOutput file: " << absPath << '\n';
+        std::cout << "Expected runtime layout (relative to the output executable):\n"
+                  << std::filesystem::path(absPath).filename().string() << "\n"
+                  << "libs/\n    *.prx\napp0/\n    <game resources>\n";
+        if (!guestArtifacts.empty()) {
+            std::cout << "    " << guestArtifacts.front().Path.parent_path().filename().string() << "/\n";
+            for (const auto& artifact : guestArtifacts) std::cout << "        " << artifact.Path.filename().string() << '\n';
+        }
+        std::cout << "Game resources and system libraries must be placed in this layout separately.\n";
+        if (args.runPath != "$ORIGIN/libs") std::cout << "Custom library search path (--rpath): " << args.runPath << '\n';
 
         if (args.autorun) return Cli::Autorun(absPath, args.toWindows);
 
