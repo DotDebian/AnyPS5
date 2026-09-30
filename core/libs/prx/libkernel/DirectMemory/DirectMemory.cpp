@@ -228,11 +228,11 @@ public:
         section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
         if (!section) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "create direct memory backing");
 #else
-        file = std::tmpfile();
-        if (!file) throw std::system_error(errno, std::generic_category(), "create direct memory backing");
-        if (ftruncate(fileno(file), static_cast<off_t>(bytes)) != 0) {
+        file = memfd_create("direct memory", MFD_CLOEXEC);
+        if (file < 0) throw std::system_error(errno, std::generic_category(), "create direct memory backing");
+        if (ftruncate(file, static_cast<off_t>(bytes)) != 0) {
             const int error = errno;
-            std::fclose(file);
+            ::close(file);
             throw std::system_error(error, std::generic_category(), "size direct memory backing");
         }
 #endif
@@ -244,7 +244,7 @@ public:
 #ifdef _WIN32
         CloseHandle(section);
 #else
-        std::fclose(file);
+        ::close(file);
 #endif
     }
 
@@ -255,7 +255,7 @@ public:
 #ifdef _WIN32
         GuestArena::GuestArenaMap_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
 #else
-        if (::mmap(reinterpret_cast<void*>(address), bytes, protection, MAP_SHARED | MAP_FIXED, fileno(file), static_cast<off_t>(offset)) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map direct memory backing");
+        if (::mmap(reinterpret_cast<void*>(address), bytes, protection, MAP_SHARED | MAP_FIXED, file, static_cast<off_t>(offset)) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map direct memory backing");
 #endif
     }
 
@@ -264,7 +264,7 @@ private:
 #ifdef _WIN32
     HANDLE section = nullptr;
 #else
-    std::FILE* file = nullptr;
+    int file = -1;
 #endif
 };
 
