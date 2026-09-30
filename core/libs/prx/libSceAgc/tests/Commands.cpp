@@ -28,6 +28,7 @@ extern "C" std::uint32_t* APS5_VABI sceAgcAcbPushMarker(CommandBuffer* buf, cons
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbPopMarker(CommandBuffer* buf);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexBuffer(CommandBuffer* buf, std::uint64_t indexAddress);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexSizeNid_KRzWekV120(CommandBuffer* buf, std::uint32_t indexSize, std::uint64_t cachePolicy, std::uint64_t unknown);
 
 namespace {
 
@@ -162,6 +163,22 @@ void testIndexBuffer() {
         return;
     }
     throw std::runtime_error("misaligned index buffer was accepted");
+}
+
+// The -KRzWekV120 export selects the index size as sceAgcDcbSetIndexSize does: a
+// SET_UCONFIG_REG_INDEX of VGT_INDEX_TYPE (it was a no-op, so 32-bit index buffers were read as
+// 16-bit ones).
+void testIndexSizeExport() {
+    Storage storage;
+    const auto* wide = sceAgcDcbSetIndexSizeNid_KRzWekV120(&storage.buffer, 1, 0, 0);
+    check(wide == storage.words.data() && wide[0] == Agc::Command::Header(0x7au, 3) && wide[1] == 0x20000243u && wide[2] == 0x401u, "32-bit index size packet mismatch");
+    const auto* narrow = sceAgcDcbSetIndexSizeNid_KRzWekV120(&storage.buffer, 0, 2, 0);
+    check(narrow == wide + 3 && narrow[0] == wide[0] && narrow[1] == 0x20000243u && narrow[2] == (0x400u | (2u << 6u)), "16-bit index size packet mismatch");
+    const auto before = storage.words;
+    expectFailure([&] { sceAgcDcbSetIndexSizeNid_KRzWekV120(&storage.buffer, 3, 0, 0); });
+    expectFailure([&] { sceAgcDcbSetIndexSizeNid_KRzWekV120(&storage.buffer, 1, 4, 0); });
+    expectFailure([&] { sceAgcDcbSetIndexSizeNid_KRzWekV120(&storage.buffer, 1, 0, 1); });
+    check(storage.words == before, "rejected index size calls modified packet memory");
 }
 
 void testContextState() {
@@ -343,6 +360,7 @@ int main() {
         testIndexedIndirectDraws();
         testMarkers();
         testIndexBuffer();
+        testIndexSizeExport();
         testContextState();
         testFlip();
         testRegisters();
