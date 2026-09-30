@@ -552,12 +552,12 @@ void verifyWorkgroupReserve() {
     using namespace ShaderRecompiler;
     static const std::array<std::uint32_t, 1> code{0xbf810000u};
     const std::array<std::uint32_t, 1> capabilities{29u};
-    const auto compile = [&](LocalMemoryDevice& device, std::uint32_t sharedLimit) {
+    const auto compile = [&](LocalMemoryDevice& device, std::uint32_t sharedLimit, std::array<std::uint32_t, 3> threads = {32u, 2u, 1u}) {
         RecompileRequest request{};
         request.shader = {ShaderStage::Compute, 0x30000u, code, 0, {}};
         request.context.waveSize = 64;
         request.context.userDataBaseRegister = 0;
-        request.context.compute = ShaderComputeStageInfo{{32u, 2u, 1u}, 0u, {false, false, false}, false, 2u};
+        request.context.compute = ShaderComputeStageInfo{threads, 0u, {false, false, false}, false, 2u};
         request.target.vulkanVersion = 0x00401000u;
         request.target.spirvVersion = 0x00010300u;
         request.target.subgroupSize = 32;
@@ -591,6 +591,16 @@ void verifyWorkgroupReserve() {
     LocalMemoryDevice limited{1u << 20u};
     static_cast<void>(compile(limited, 12288u));
     require(limited.probes == 4u, "workgroup reserve: a reserve past the device's workgroup memory was probed");
+
+    LocalMemoryDevice waves{8192u};
+    const auto multiWave = compile(waves, 49152u, {16u, 16u, 1u});
+    require(multiWave.waveLayout == WaveLayout::TwoLane, "workgroup reserve: a multi-wave workgroup left the two-lane layout");
+    require(multiWave.workgroupReserveBytes == 8192u && WorkgroupBytes(multiWave.spirv) == 8192u, "workgroup reserve: a multi-wave workgroup did not take the smallest spill-free reserve");
+    require(waves.probes == 3u, "workgroup reserve: a multi-wave workgroup was not probed at two lanes and two reserves only");
+
+    LocalMemoryDevice cleanWaves{0u};
+    const auto multiWaveClean = compile(cleanWaves, 49152u, {16u, 16u, 1u});
+    require(multiWaveClean.workgroupReserveBytes == 0u && WorkgroupBytes(multiWaveClean.spirv) == 0u && cleanWaves.probes == 1u, "workgroup reserve: a spill-free multi-wave module was reserved");
 }
 
 int main() {

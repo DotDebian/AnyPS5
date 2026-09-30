@@ -419,10 +419,15 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     // halves pair through counters in workgroup memory, exact on its own (agc_driver_wave_tests)
     // but Astro Bot's 16x16 light programs (0x500630800 and siblings) laid out that way reproduce
     // the MMU fault in the light-list consumer 0x500597a00 that the layout choice avoids.
-    const bool choose = chooseLayout && result.waveLayout == WaveLayout::TwoLane && WaveLayoutFor(request) == WaveLayout::Auto && probe != nullptr && SplitWorkgroupThreads(request) <= 64u && SingleLaneFits(request, SplitWorkgroupThreads(request));
-    if (probe != nullptr && (localMemory != nullptr || choose)) {
+    const bool settle = chooseLayout && result.waveLayout == WaveLayout::TwoLane && WaveLayoutFor(request) == WaveLayout::Auto && probe != nullptr;
+    const bool choose = settle && SplitWorkgroupThreads(request) <= 64u && SingleLaneFits(request, SplitWorkgroupThreads(request));
+    if (probe != nullptr && (localMemory != nullptr || settle)) {
         const auto bytes = probe(request.target.localMemoryProbeContext, result.spirv.Words(), bindings.bindings, request.shader.codeAddress);
         if (localMemory != nullptr) *localMemory = bytes;
+        if (settle && !choose && bytes.has_value() && *bytes != 0u) {
+            std::fprintf(stderr, "[wave64] program 0x%llx: %u bytes of local memory per invocation at two lanes\n", static_cast<unsigned long long>(request.shader.codeAddress), *bytes);
+            if (auto reserved = compileWithoutLocalMemory(request, resourceSnapshot, resourceSpecialization)) return std::move(*reserved);
+        }
         if (choose && bytes.has_value() && *bytes != 0u) {
             const auto single = SingleLaneRequest(request);
             std::optional<std::uint32_t> singleBytes;
