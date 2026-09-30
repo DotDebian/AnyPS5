@@ -839,17 +839,27 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
+    std::vector<VertexFetch> fetches;
+    fetches.reserve(attributes.size());
     for (const auto& attribute : attributes) {
         // An indirect draw's counts are unknown here: the descriptor's whole range is copied.
         const auto bytes = args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance);
         const auto& fields = attribute.resource.fields;
         const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
         Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address, "vertex buffer aliases the render target");
-        GuestMemory::CheckRange(reinterpret_cast<const void*>(address), bytes, 1);
-        auto copy = CopyDrawInput(context, context.recorder, address, bytes, 1, Recorder::SnapshotUse::Vertex);
-        KeepDrawInput(context.recorder, address, copy, Recorder::SnapshotUse::Vertex, 0);
-        inputs.vertexHandles.push_back(copy.buffer->Handle());
+        fetches.push_back({address, address + bytes, (fields[1] >> 16u) & 0x3fffu, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
+    }
+    const auto plan = PlanVertexCopies(fetches);
+    for (const auto& [begin, end] : plan.copies) {
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
+        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
+        KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
+    }
+    for (std::size_t i = 0; i < attributes.size(); ++i) {
+        inputs.vertexHandles.push_back(inputs.vertexBuffers[plan.copyOf[i]]->Handle());
+        inputs.vertexOffsets[i] = plan.offsets[i];
     }
     timer.phase(PhaseVertex);
     return inputs;

@@ -1976,6 +1976,42 @@ void validationTests() {
 
 }
 
+void vertexCopyTests() {
+    using AgcDriver::Graphics::PlanVertexCopies;
+    using AgcDriver::Graphics::VertexFetch;
+    {
+        const std::array<VertexFetch, 3> fetches{{{0x1018, 0x1018 + 32 * 9 + 8, 32, 0, 4}, {0x1000, 0x1000 + 32 * 9 + 12, 32, 0, 4}, {0x100c, 0x100c + 32 * 9 + 12, 32, 0, 4}}};
+        const auto plan = PlanVertexCopies(fetches);
+        Require(plan.copies.size() == 1 && plan.copies[0].first == 0x1000 && plan.copies[0].second == 0x1018 + 32 * 9 + 8, "interleaved attributes were not copied as one union");
+        Require(plan.copyOf == std::vector<std::size_t>{0, 0, 0} && plan.offsets == std::vector<std::uint64_t>{0x18, 0, 0xc}, "interleaved attribute offsets are wrong");
+    }
+    {
+        const std::array<VertexFetch, 6> fetches{{
+            {0x2000, 0x2100, 32, 0, 4},
+            {0x2004, 0x2100, 16, 0, 4},
+            {0x2020, 0x2120, 32, 0, 4},
+            {0x2002, 0x2102, 32, 0, 4},
+            {0x2008, 0x2108, 32, 1, 4},
+            {0x2000, 0x2010, 0, 0, 4},
+        }};
+        const auto plan = PlanVertexCopies(fetches);
+        Require(plan.copies.size() == 6, "fetches of other records, strides, rates or alignments shared a copy");
+        for (std::size_t i = 0; i < fetches.size(); ++i) {
+            const auto& copy = plan.copies[plan.copyOf[i]];
+            Require(plan.offsets[i] == 0 && copy.first == fetches[i].begin && copy.second == fetches[i].end, "a lone fetch was not copied exactly");
+        }
+    }
+    {
+        const std::array<VertexFetch, 2> fetches{{{0x3000, 0x3100, 24, 0, 2}, {0x3002, 0x3102, 24, 0, 2}}};
+        const auto plan = PlanVertexCopies(fetches);
+        Require(plan.copies.size() == 1 && plan.copies[0].second == 0x3102 && plan.offsets[1] == 2, "aligned 16-bit attributes of one record were not merged");
+    }
+    {
+        const std::array<VertexFetch, 1> empty{{{0x4000, 0x4000, 16, 0, 4}}};
+        expectFailure([&] { PlanVertexCopies(empty); }, "empty vertex fetch");
+    }
+}
+
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
@@ -2019,6 +2055,7 @@ int main() {
         pushConstantTests();
         resourceTests();
         validationTests();
+        vertexCopyTests();
         pixelParameterSlotTests();
         rectListTests();
         depthPipelineTests();
