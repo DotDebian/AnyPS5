@@ -266,7 +266,7 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
-std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
+std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes, bool depthCompare, VkImageAspectFlags depthAspect) {
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
     if (words.size() >= 4 && ShaderRecompiler::IsDepthBitsTexture(words[1], words[3])) {
         char text[160];
@@ -297,9 +297,6 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             depthCompare = false;
         }
     }
-    // Depth surfaces are rendered into resident depth images only (DepthTarget.hpp): say so once
-    // when one is sampled.
-    NoteDepthSurfaceSampled(resource.baseAddress);
     auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
@@ -307,14 +304,14 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
     auto source = StorageTexture::FindPending(address, guestBytes);
-    if (source != nullptr && (depthCompare || !Texture::CanCopyFrom(*source, resource) || MetadataMoved(*source, resource))) source.reset();
+    if (source != nullptr && (depthAspect != 0 || depthCompare || !Texture::CanCopyFrom(*source, resource) || MetadataMoved(*source, resource))) source.reset();
     // Otherwise a surface in host-imported memory is viewed through its cached storage image (made
     // here when there is none): its refresh after a CPU or GPU write is a GPU-direct detile from the
     // import, recorded behind the producer, so no bytes are read or compared on the CPU and nothing
     // waits for the producer. A fast-cleared surface (keys) is viewed only through an image whose own
     // descriptor carries the DCC address (below); it stays a snapshot otherwise, its texels not read.
     std::optional<DccKeys> keys;
-    if (!depthCompare && source == nullptr && SampledFromStorageEligible(context, resource, guestBytes)) {
+    if (depthAspect == 0 && !depthCompare && source == nullptr && SampledFromStorageEligible(context, resource, guestBytes)) {
         keys = scanKeys();
         if (*keys == DccKeys::Uncompressed) {
             source = sampledStorageSource(context, resource, guestBytes);
@@ -366,7 +363,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
             // see (keys, and no pending results to prefer) ends the view: a snapshot holds the clear.
-            if ((source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed)) {
+            if (depthAspect == 0 && (source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed)) {
                 if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) it->source->Refresh();
                 it->keys = *keys;
                 touchTexture(cache, it);
@@ -424,6 +421,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     cache.index[key] = cache.entries.begin();
     reportTextureCounters();
     if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
+    return texture;
+}
+
+std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
+    const auto depthAspect = SampledDepthAspect(context, resource);
+    auto texture = cachedTextureLookup(context, words, resource, components, guestBytes, depthCompare, depthAspect);
+    if (depthAspect != 0) SampleDepthSurface(context, texture, resource, depthAspect);
     return texture;
 }
 
@@ -1308,6 +1312,7 @@ void ShaderResources::captureValidation() {
         return nullptr;
     };
     validatedTextures.assign(textures.size(), {});
+    depthHoldingSeen = DepthHoldingGeneration();
     for (std::size_t i = 0; i < textures.size(); ++i) {
         if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, true};
     }
@@ -1340,6 +1345,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         return false;
     };
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
+    if (!textures.empty() && depthHoldingSeen != DepthHoldingGeneration()) return fail(FastFail::Changed);
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
     thread_local std::vector<GuestMemory::UnchangedQuery> queries;
@@ -1473,6 +1479,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
 
 bool ShaderResources::fastRevalidateEach() {
     if (validatedTextures.size() != textures.size()) return false;
+    if (!textures.empty() && depthHoldingSeen != DepthHoldingGeneration()) return false;
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (!surface.valid) return false;

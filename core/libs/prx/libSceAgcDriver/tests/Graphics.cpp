@@ -205,6 +205,34 @@ void expectDepthRejection(const AgcDriver::QueueState& queue, std::string_view r
     Require(rejection.find(reason) != std::string::npos, "the precheck disagrees with the decode: '" + rejection + "' for " + std::string(reason));
 }
 
+void depthSurfaceTexelTests() {
+    using AgcDriver::Graphics::DepthTexelBytes;
+    Require(DepthTexelBytes(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_FORMAT_R32_SFLOAT) == 4 && DepthTexelBytes(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_FORMAT_D32_SFLOAT) == 4, "32-bit float depth is not sampled as its texels");
+    Require(DepthTexelBytes(VK_FORMAT_D16_UNORM, VK_IMAGE_ASPECT_DEPTH_BIT, VK_FORMAT_R16_UNORM) == 2 && DepthTexelBytes(VK_FORMAT_D16_UNORM_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_FORMAT_D16_UNORM) == 2, "16-bit depth is not sampled as its texels");
+    Require(DepthTexelBytes(VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT, VK_FORMAT_R8_UINT) == 1 && DepthTexelBytes(VK_FORMAT_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT, VK_FORMAT_R8_UNORM) == 1, "the stencil is not sampled as 8-bit texels");
+    Require(DepthTexelBytes(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_FORMAT_R16_UNORM) == 0 && DepthTexelBytes(VK_FORMAT_D16_UNORM, VK_IMAGE_ASPECT_DEPTH_BIT, VK_FORMAT_R32_SFLOAT) == 0, "depth was sampled as texels of another size");
+    Require(DepthTexelBytes(VK_FORMAT_D24_UNORM_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_FORMAT_R32_SFLOAT) == 0, "24-bit depth was sampled as 32-bit floats");
+    Require(DepthTexelBytes(VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_STENCIL_BIT, VK_FORMAT_R8_UINT) == 0, "a depth format without stencil gave stencil texels");
+    using AgcDriver::Graphics::WritesDepthImage;
+    AgcDriver::Graphics::DepthState state{};
+    state.depthWrite = true;
+    Require(!WritesDepthImage(state), "a draw without a depth attachment writes one");
+    state.attached = true;
+    Require(WritesDepthImage(state), "a depth write does not write the depth image");
+    state.depthWrite = false;
+    state.depthTest = true;
+    Require(!WritesDepthImage(state), "a depth test writes the depth image");
+    state.clearStencil = true;
+    Require(WritesDepthImage(state), "a stencil clear does not write the depth image");
+    state.clearStencil = false;
+    state.stencilTest = true;
+    state.front = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xff, 0xff, 1};
+    state.back = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xff, 0xff, 1};
+    Require(WritesDepthImage(state), "a stencil replace does not write the depth image");
+    state.front.writeMask = 0;
+    Require(!WritesDepthImage(state), "a stencil operation under a zero write mask writes the depth image");
+}
+
 void depthTests() {
     using namespace AgcDriver::Graphics;
     auto queue = makeDepthState();
@@ -2042,6 +2070,7 @@ int main() {
         }
         stateTests();
         depthTests();
+        depthSurfaceTexelTests();
         hardwareScreenOffsetTests();
         DepthClipTests();
         ColorViewTests();

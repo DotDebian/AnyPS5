@@ -75,6 +75,12 @@ public:
     bool ViewsStorageImage() const { return storageSource != nullptr; }
     const StorageTexture* StorageSource() const { return storageSource.get(); }
     const std::shared_ptr<StorageTexture>& SharedStorageSource() const { return storageSource; }
+    VkImage Image() const { return image; }
+    VkFormat ImageFormat() const { return imageFormat; }
+    VkImageAspectFlags ImageAspect() const { return imageAspect; }
+    std::uint32_t ImageLayers() const { return imageLayers; }
+    bool SamplesResidentDepth() const { return residentDepth.load(std::memory_order_acquire); }
+    void MarkResidentDepth() { residentDepth.store(true, std::memory_order_release); }
     // The last key scan of the sampled surface (ProvedClearKeys), for surfaces whose keys are not
     // the source image's own (snapshots, views over other metadata); one per cache entry, so every
     // object binding the texture shares it. Under GuestMemory::GpuMutex only.
@@ -95,6 +101,10 @@ private:
     VkImageView firstLayerView = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkDeviceSize allocationBytes = 0;
+    VkFormat imageFormat = VK_FORMAT_UNDEFINED;
+    VkImageAspectFlags imageAspect = 0;
+    std::uint32_t imageLayers = 0;
+    std::atomic<bool> residentDepth{false};
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;

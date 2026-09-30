@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -165,6 +166,7 @@ public:
             context.limits = properties.limits;
             context.bufferDeviceAddress = true;
             context.formatProperties = function<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
+            context.imageFormatProperties = function<PFN_vkGetPhysicalDeviceImageFormatProperties>("vkGetPhysicalDeviceImageFormatProperties");
             context.Function<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(context.device, family, 0, &context.queue);
             VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
             pool.queueFamilyIndex = family;
@@ -2280,6 +2282,178 @@ void firstLayerViewTests(const Device& device, Recorder& recorder) {
     expectRed(program.Red(flatTexture.View(), flatTexture.Layout(), 0.0f), 0x20 / 255.0f, "a 2D texture over the surface does not read its first layer");
 }
 
+
+GuestTextureResource depthSurfaceResource(std::uint64_t address, std::uint32_t format, std::uint32_t layers, std::uint32_t baseArray) {
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = 64;
+    resource.height = 4;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = layers > 1 ? TextureDimension::k2DArray : TextureDimension::k2D;
+    resource.depthOrLastArray = layers - 1;
+    resource.baseArray = baseArray;
+    resource.format = format;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    return resource;
+}
+
+std::uint8_t* alignedSurface(std::vector<std::uint8_t>& memory, std::size_t offset) {
+    return reinterpret_cast<std::uint8_t*>((reinterpret_cast<std::uintptr_t>(memory.data() + offset) + 255) & ~std::uintptr_t{255});
+}
+
+std::vector<float> readDepth(const Device& device, Recorder& recorder, DepthImage& image) {
+    const auto& context = device.GetContext();
+    const auto& target = image.Target();
+    Buffer readback(context, static_cast<std::size_t>(target.extent.width) * target.extent.height * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.Commands();
+    image.RecordCopyToBuffer(commands, readback.Handle(), VK_IMAGE_ASPECT_DEPTH_BIT);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    std::vector<float> texels(static_cast<std::size_t>(target.extent.width) * target.extent.height);
+    std::memcpy(texels.data(), readback.Bytes().data(), texels.size() * sizeof(float));
+    return texels;
+}
+
+void depthSurfaceSamplingTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+    std::vector<std::uint8_t> memory(1u << 16u, 0);
+    auto* depthMemory = alignedSurface(memory, 0);
+    auto* stencilMemory = alignedSurface(memory, 8192);
+    auto* layeredMemory = alignedSurface(memory, 16384);
+    const auto depthResource = depthSurfaceResource(reinterpret_cast<std::uint64_t>(depthMemory), 22, 1, 0);
+    const auto stencilResource = depthSurfaceResource(reinterpret_cast<std::uint64_t>(stencilMemory), 1, 1, 0);
+    const auto depthBytes = static_cast<std::size_t>(DescribeSurface(depthResource).guestBytes);
+    const auto stencilBytes = static_cast<std::size_t>(DescribeSurface(stencilResource).guestBytes);
+    Require(depthMemory + depthBytes <= stencilMemory && stencilMemory + stencilBytes <= layeredMemory, "the depth surface test memory overlaps");
+    DepthTarget target{};
+    target.address = depthResource.baseAddress;
+    target.stencilAddress = stencilResource.baseAddress;
+    target.extent = {64, 4};
+    target.zFormat = 3;
+    target.stencil = true;
+    auto image = CachedDepthImage(context, target);
+    Require(image->ContentHolder() == DepthImage::Holder::Memory, "a new depth image holds its surface");
+    Require(SampledDepthAspect(context, depthResource) == 0, "a depth surface no draw wrote is sampled from its resident image");
+    DepthState state{};
+    state.attached = true;
+    const auto clear = [&](DepthImage& target, float depth, std::uint32_t stencil) {
+        state.depthClearValue = depth;
+        state.stencilClearValue = stencil;
+        target.RequestClear(true);
+        Require(target.RecordPendingClear(recorder.Commands(), state), "an HTILE clear was not recorded");
+    };
+    clear(*image, 0.25f, 0x40);
+    Require(image->ContentHolder() == DepthImage::Holder::Image, "an HTILE clear left the surface to its memory");
+    Require(SampledDepthAspect(context, depthResource) == VK_IMAGE_ASPECT_DEPTH_BIT && SampledDepthAspect(context, stencilResource) == VK_IMAGE_ASPECT_STENCIL_BIT, "the aspects of a resident depth surface were not told apart");
+    auto wrongTexels = depthResource;
+    wrongTexels.format = 7;
+    bool thrown = false;
+    try {
+        static_cast<void>(SampledDepthAspect(context, wrongTexels));
+    } catch (const std::runtime_error&) {
+        thrown = true;
+    }
+    Require(thrown, "a 16-bit texture over a 32-bit depth surface was sampled from its resident image");
+    auto otherExtent = depthResource;
+    otherExtent.width = 32;
+    Require(SampledDepthAspect(context, otherExtent) == 0, "a texture of another extent was taken for the resident depth surface");
+    auto depthTexture = std::make_shared<Texture>(context, detiler, depthResource, identity, std::span<const std::byte>(reinterpret_cast<const std::byte*>(depthMemory), depthBytes));
+    auto stencilTexture = std::make_shared<Texture>(context, detiler, stencilResource, identity, std::span<const std::byte>(reinterpret_cast<const std::byte*>(stencilMemory), stencilBytes));
+    SampleDepthSurface(context, depthTexture, depthResource, VK_IMAGE_ASPECT_DEPTH_BIT);
+    SampleDepthSurface(context, stencilTexture, stencilResource, VK_IMAGE_ASPECT_STENCIL_BIT);
+    SampleProgram program(context, recorder);
+    const std::vector<std::shared_ptr<Texture>> bound{depthTexture, stencilTexture};
+    const auto depthRed = [&] { return program.Red(depthTexture->View(), depthTexture->Layout(), 0.0f); };
+    expectRed(depthRed(), 0.0f, "a registered depth texture changed before a draw or dispatch");
+    SyncDepthSurfaceTextures(context, nullptr, bound);
+    expectRed(depthRed(), 0.25f, "a sampled depth surface did not take its resident image's depth");
+    expectRed(program.Red(stencilTexture->View(), stencilTexture->Layout(), 0.0f), 0x40 / 255.0f, "a sampled stencil surface did not take its resident image's stencil");
+    clear(*image, 0.75f, 0x80);
+    SyncDepthSurfaceTextures(context, image.get(), bound);
+    expectRed(depthRed(), 0.25f, "the depth image a draw writes was copied before its pass ended");
+    SyncDepthSurfaceTextures(context, image.get(), bound);
+    expectRed(depthRed(), 0.25f, "the depth image a draw writes was copied before its pass ended");
+    SyncDepthSurfaceTextures(context, nullptr, bound);
+    expectRed(depthRed(), 0.75f, "the next command after a depth pass did not take the pass's depth");
+    expectRed(program.Red(stencilTexture->View(), stencilTexture->Layout(), 0.0f), 0x80 / 255.0f, "the next command after a depth pass did not take the pass's stencil");
+    image->NoteWritten();
+    SyncDepthSurfaceTextures(context, nullptr, bound);
+    expectRed(depthRed(), 0.75f, "a copy of an unchanged depth image changed the texture");
+    std::vector<float> half(depthBytes / sizeof(float), 0.5f);
+    std::memcpy(depthMemory, half.data(), depthBytes);
+    auto storage = std::make_shared<StorageTexture>(context, detiler, depthResource, 0);
+    recorder.Keep(storage);
+    NoteDepthSurfaceStored(storage);
+    Require(image->ContentHolder() == DepthImage::Holder::Memory && image->Writer() == storage, "a storage write of the surface left it to the resident image");
+    Require(SampledDepthAspect(context, depthResource) == 0, "a surface a storage image wrote since is sampled from its resident image");
+    SyncDepthSurfaceTextures(context, nullptr, bound);
+    expectRed(depthRed(), 0.5f, "a registered texture did not take the texels of the storage image that wrote its surface");
+    image->RequestClear(true);
+    PrepareDepthAttachment(context, *image, state);
+    Require(image->ContentHolder() == DepthImage::Holder::Memory, "a storage image's texels replaced an HTILE clear that followed them");
+    clear(*image, 0.125f, 0);
+    NoteDepthSurfaceStored(storage);
+    PrepareDepthAttachment(context, *image, state);
+    Require(image->ContentHolder() == DepthImage::Holder::Both, "a depth target did not take the texels of the storage image that wrote it");
+    const auto texels = readDepth(device, recorder, *image);
+    Require(std::all_of(texels.begin(), texels.end(), [](float value) { return value == 0.5f; }), "the depth target does not hold the storage image's texels");
+    const auto bothHolding = DepthHoldingGeneration();
+    image->NoteWritten();
+    const auto writtenHolding = DepthHoldingGeneration();
+    Require(writtenHolding != bothHolding, "a draw writing a depth image its surface's storage image shared did not move the holding generation");
+    image->NoteWritten();
+    Require(DepthHoldingGeneration() == writtenHolding, "a second write of a depth image moved the holding generation");
+    auto aliasResource = depthResource;
+    aliasResource.format = 56;
+    auto alias = std::make_shared<StorageTexture>(context, detiler, aliasResource, 0);
+    recorder.Keep(alias);
+    NoteDepthSurfaceStored(alias);
+    Require(image->ContentHolder() == DepthImage::Holder::Memory && image->Writer() == nullptr, "a storage write of other texels over the depth surface became the depth image's source");
+    Require(DepthHoldingGeneration() != writtenHolding, "a storage write over the depth surface did not move the holding generation");
+    Require(SampledDepthAspect(context, depthResource) == 0, "a depth surface written over by other texels is sampled from its resident image");
+    Require(SampledDepthAspect(context, stencilResource) == VK_IMAGE_ASPECT_STENCIL_BIT, "the stencil of a surface whose depth memory was written left its resident image");
+    PrepareDepthAttachment(context, *image, state);
+    Require(image->ContentHolder() == DepthImage::Holder::Memory, "a depth target took texels of another format");
+    const auto layeredResource = depthSurfaceResource(reinterpret_cast<std::uint64_t>(layeredMemory), 7, 2, 0);
+    const auto layeredBytes = static_cast<std::size_t>(DescribeSurface(layeredResource).guestBytes);
+    Require(layeredMemory + layeredBytes <= memory.data() + memory.size(), "the layered depth surface does not fit its test memory");
+    std::vector<std::shared_ptr<DepthImage>> layers;
+    for (std::uint32_t slice = 0; slice < 2; ++slice) {
+        DepthTarget layer{};
+        layer.address = layeredResource.baseAddress;
+        layer.extent = {64, 4};
+        layer.zFormat = 1;
+        layer.slice = slice;
+        layers.push_back(CachedDepthImage(context, layer));
+        clear(*layers.back(), slice == 0 ? 0.2f : 0.6f, 0);
+    }
+    Require(layers[0] != layers[1], "the layers of a depth surface share a resident image");
+    Require(SampledDepthAspect(context, layeredResource) == VK_IMAGE_ASPECT_DEPTH_BIT, "a layered depth surface was not sampled from its resident images");
+    const auto layeredSnapshot = std::span<const std::byte>(reinterpret_cast<const std::byte*>(layeredMemory), layeredBytes);
+    auto firstLayer = std::make_shared<Texture>(context, detiler, layeredResource, identity, layeredSnapshot);
+    auto secondLayer = std::make_shared<Texture>(context, detiler, depthSurfaceResource(layeredResource.baseAddress, 7, 2, 1), identity, layeredSnapshot);
+    SampleDepthSurface(context, firstLayer, layeredResource, VK_IMAGE_ASPECT_DEPTH_BIT);
+    SampleDepthSurface(context, secondLayer, depthSurfaceResource(layeredResource.baseAddress, 7, 2, 1), VK_IMAGE_ASPECT_DEPTH_BIT);
+    SyncDepthSurfaceTextures(context, nullptr, std::vector<std::shared_ptr<Texture>>{firstLayer});
+    expectRed(program.Red(secondLayer->FirstLayerView(), secondLayer->Layout(), 0.0f), 0.0f, "a depth texture no command binds took its resident image");
+    SyncDepthSurfaceTextures(context, nullptr, std::vector<std::shared_ptr<Texture>>{firstLayer, secondLayer});
+    expectRed(program.Red(firstLayer->FirstLayerView(), firstLayer->Layout(), 0.0f), 0.2f, "the first layer of a sampled depth array did not take its resident image");
+    expectRed(program.Red(secondLayer->FirstLayerView(), secondLayer->Layout(), 0.0f), 0.6f, "the second layer of a sampled depth array did not take its resident image");
+    device.WaitQueue();
+    recorder.Sync();
+    ClearDepthImages(base.device);
+}
+
 int main() {
     try {
         Device device;
@@ -2313,6 +2487,7 @@ int main() {
         dataRefreshTests(device, recorder);
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
+        depthSurfaceSamplingTests(device, recorder);
         metadataPassTests(device, recorder);
         movedMetadataTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";

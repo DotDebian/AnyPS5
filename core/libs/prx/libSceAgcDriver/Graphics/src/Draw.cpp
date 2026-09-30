@@ -1274,6 +1274,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
     using CommandClass = Recorder::CommandClass;
     const auto countBarrier = [&](std::uint32_t count) { Recorder::CountBarriers(CommandClass::Draw, count); };
+    if (record.depth != nullptr) PrepareDepthAttachment(context, *record.depth, state.depth);
+    const bool writesDepth = record.depth != nullptr && WritesDepthImage(state.depth);
+    SyncDepthSurfaceTextures(context, writesDepth ? record.depth.get() : nullptr, resources.SampledTextures());
     // The pass is named by its attachment views (renderPassKey). The previous draw's pass is
     // continued only when this draw neither reads its attachments (a barrier would be owed, which no
     // pass allows) nor records anything outside a pass (an indirect draw's argument barrier and
@@ -1345,6 +1348,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+    if (writesDepth) record.depth->NoteWritten();
     if (record.depth != nullptr) CountDepthDraw(state.depth);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
@@ -1712,6 +1716,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (recorded && recorder->HasQueuedKeyStores() && (resources->HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    const bool writesDepth = depthImage != nullptr && WritesDepthImage(state.depth);
+    // Technical debt: a draw recorded outside the recorder neither gives its depth image a storage
+    // image's texels nor brings the textures sampling resident depth surfaces up to date.
+    if (recorded) {
+        if (depthImage != nullptr) PrepareDepthAttachment(context, *depthImage, state.depth);
+        SyncDepthSurfaceTextures(context, writesDepth ? depthImage.get() : nullptr, resources->SampledTextures());
+    }
     const auto commands = recorded ? recorder->Commands() : batch->Handle();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.
@@ -1775,6 +1786,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
+    if (writesDepth) depthImage->NoteWritten();
     if (depthImage != nullptr) CountDepthDraw(state.depth);
     if (args != nullptr) CountIndirectDraw(indirect.path, indirect.readMs, rewritten);
     auto checkRecords = indirectRecordCheck(args != nullptr ? &indirect : nullptr);
