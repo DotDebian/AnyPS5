@@ -197,6 +197,7 @@ void logLookup(const LookupRecord& record) {
 }
 
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0);
+bool MetadataMoved(const StorageTexture& image, const GuestTextureResource& resource);
 
 // Whether a sampled texture over `resource` can be a view of the surface's cached storage image
 // instead of a CPU snapshot (see cachedTexture): the format has a storage form and is not block
@@ -300,7 +301,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
     auto source = StorageTexture::FindPending(address, guestBytes);
-    if (source != nullptr && (depthCompare || !Texture::CanCopyFrom(*source, resource))) source.reset();
+    if (source != nullptr && (depthCompare || !Texture::CanCopyFrom(*source, resource) || MetadataMoved(*source, resource))) source.reset();
     // Otherwise a surface in host-imported memory is viewed through its cached storage image (made
     // here when there is none): its refresh after a CPU or GPU write is a GPU-direct detile from the
     // import, recorded behind the producer, so no bytes are read or compared on the CPU and nothing
@@ -486,8 +487,22 @@ void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::i
     cache.entries.erase(it);
 }
 
+// Whether a descriptor names DCC metadata other than the keys `image` follows. The image stands
+// for the surface as read through its own descriptor's keys (its refresh scans them, a fast clear of
+// them clears it, its write-back marks them uncompressed), so a surface whose metadata moved (the
+// title reallocated it, or its memory was another surface's before) must not keep the old keys: the
+// title's fast clears of the new ones would never reach the image, and its write-backs would store
+// into metadata the surface no longer owns. A descriptor without metadata reads the texels as
+// stored and keeps whatever image the surface has. APS5_NO_MOVED_DCC_CHECK=1 keeps the first
+// descriptor's keys for good, as before.
+bool MetadataMoved(const StorageTexture& image, const GuestTextureResource& resource) {
+    static const bool disabled = std::getenv("APS5_NO_MOVED_DCC_CHECK") != nullptr;
+    return !disabled && resource.dccAddress != 0 && image.Descriptor().dccAddress != resource.dccAddress;
+}
+
 // Storage images are shared by every descriptor of one surface (address, extent, layers, format, tile
 // mode): the image holds the whole mip chain, and render targets in the same memory attach to it.
+// The image follows one DCC key range, the newest a descriptor named (see MetadataMoved).
 std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextureResource& resource) {
     // Guest formats that store in the same Vulkan format share the image (views carry the difference).
     return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
@@ -504,7 +519,14 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     const StorageKey key{context.device, SurfaceKey(context, resource)};
     auto& cache = StorageTextures();
     std::lock_guard lock(cache.mutex);
-    if (auto it = findStorage(cache, key); it != cache.entries.end()) {
+    if (auto it = findStorage(cache, key); it != cache.entries.end() && MetadataMoved(*it->texture, resource)) {
+        // The old image leaves with its pending results stored (as the hardware's rendering left the
+        // memory), and a new one is made below from memory under the keys the descriptor names; views
+        // and recipes holding the old one see it gone from the cache (StorageImageCached).
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx (%ux%u format %u): DCC keys moved from 0x%llx to 0x%llx; the image is remade under the new keys\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned long long>(it->texture->Descriptor().dccAddress), static_cast<unsigned long long>(resource.dccAddress));
+        evictStorage(cache, it);
+    } else if (it != cache.entries.end()) {
         it->texture->Refresh();
         cache.entries.splice(cache.entries.begin(), cache.entries, it);
         counters.storageHits.fetch_add(1, std::memory_order_relaxed);

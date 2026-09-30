@@ -1198,6 +1198,136 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
     recorder.Sync();
 }
 
+// A surface whose DCC metadata moved (the title reallocated the keys, or the memory held another
+// surface with its own keys before): the storage cache's image follows the keys the newest
+// descriptor with metadata names. A fast clear of the new keys reaches the image, and results
+// pending in the image made under the old keys are stored first, so the new image starts from what
+// the memory holds. A descriptor without metadata keeps the image the surface has.
+void movedMetadataTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: moved DCC metadata not tested\n";
+        return;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t surfaceBytes = side * side * 4;
+    constexpr std::size_t keyCount = surfaceBytes / 256;
+    constexpr std::size_t bytes = surfaceBytes + 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the moved metadata block");
+    auto* texels = static_cast<std::uint8_t*>(block);
+    auto* firstKeys = texels + surfaceBytes;
+    auto* secondKeys = firstKeys + 4096;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr) {
+        std::cout << "host import of the moved metadata block refused: moved DCC metadata not tested\n";
+        return;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == surfaceBytes, "the moved metadata surface has an unexpected size");
+    const auto first = address + surfaceBytes;
+    const auto second = first + 4096;
+    const auto withKeys = [&](std::uint64_t keys) {
+        auto described = resource;
+        described.dccAddress = keys;
+        return described;
+    };
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    // Every texel of `image` is `texel` (read back after everything recorded ran).
+    const auto holds = [&](const StorageTexture& image, std::array<std::uint8_t, 4> texel) {
+        Buffer readback(context, surfaceBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {side, side, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image.Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        const auto pixels = readback.Bytes();
+        for (std::size_t i = 0; i < pixels.size(); ++i) {
+            if (std::to_integer<std::uint8_t>(pixels[i]) != texel[i % 4]) return false;
+        }
+        return true;
+    };
+    // A draw into the target: its results are the image's, pending like a recorded draw's.
+    const auto draw = [&](const std::shared_ptr<StorageTexture>& image, VkClearColorValue value) {
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+    };
+    std::memset(texels, 0x55, surfaceBytes);
+    std::memset(firstKeys, 0xff, keyCount);
+    std::memset(secondKeys, 0x00, keyCount);
+    // The first descriptor names the first keys (uncompressed): the image holds the stored texels.
+    const auto original = CachedStorageSurface(context, withKeys(first));
+    Require(original->Descriptor().dccAddress == first && holds(*original, {0x55, 0x55, 0x55, 0x55}), "the first image does not hold the stored texels");
+    // The surface's keys move to a 0000 fast clear elsewhere: the image reads through them.
+    const auto moved = CachedStorageSurface(context, withKeys(second));
+    Require(moved->Descriptor().dccAddress == second, "the storage image kept the keys the surface no longer names");
+    Require(!StorageImageCached(context, original.get()), "the image of the old keys is still the surface's");
+    Require(holds(*moved, {0, 0, 0, 0}), "a fast clear of the moved keys did not reach the image");
+    // A descriptor without metadata keeps the surface's image and its keys.
+    Require(CachedStorageSurface(context, resource) == moved && moved->Descriptor().dccAddress == second, "a descriptor without metadata replaced the image");
+    // Results rendered under the new keys (now uncompressed), then the keys move back: the results
+    // reach guest memory before the image is remade from it.
+    std::memset(secondKeys, 0xff, keyCount);
+    moved->Refresh();
+    VkClearColorValue green{};
+    green.float32[1] = 1.0f;
+    green.float32[3] = 1.0f;
+    draw(moved, green);
+    const auto back = CachedStorageSurface(context, withKeys(first));
+    Require(back != moved && back->Descriptor().dccAddress == first, "the keys moving back did not remake the image");
+    Require(holds(*back, {0, 255, 0, 255}), "results pending under the old keys were lost when the keys moved");
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    for (std::size_t i = 0; i < surfaceBytes; ++i) {
+        if (texels[i] != std::array<std::uint8_t, 4>{0, 255, 0, 255}[i % 4]) throw std::runtime_error("guest memory lost the results rendered under the old keys");
+    }
+}
+
 // A CB metadata pass over a resident render target (Draw.hpp's RunColorMetadataPass): the target's
 // image in the storage cache takes what its fast-clear keys say, a code's value from the lookup's
 // refresh or the register clear's CB_COLOR_CLEAR_WORD texel as a GPU clear, and is left dirty; the
@@ -1919,6 +2049,7 @@ int main() {
         minLodTests(device, recorder);
         firstLayerViewTests(device, recorder);
         metadataPassTests(device, recorder);
+        movedMetadataTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {
