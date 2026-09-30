@@ -2547,7 +2547,8 @@ void CountDrawSnapshot(bool reused, std::size_t bytes) {
     const auto now = std::chrono::steady_clock::now();
     if (now - last < std::chrono::seconds(10)) return;
     last = now;
-    std::fprintf(stderr, "[drawsnap] draw input snapshots (10 s): copied %llu (%.1f MiB), reused %llu (%.1f MiB)\n", static_cast<unsigned long long>(copies), copiedBytes / 1048576.0, static_cast<unsigned long long>(reuses), reusedBytes / 1048576.0);
+    const auto cache = Recorder::DrawSnapshotCounts();
+    std::fprintf(stderr, "[drawsnap] draw input snapshots (10 s): copied %llu (%.1f MiB), reused %llu (%.1f MiB); cache (cumulative): %llu lookups found no entry, %llu found a stale one, %llu evicted\n", static_cast<unsigned long long>(copies), copiedBytes / 1048576.0, static_cast<unsigned long long>(reuses), reusedBytes / 1048576.0, static_cast<unsigned long long>(cache.absent), static_cast<unsigned long long>(cache.stale), static_cast<unsigned long long>(cache.evicted));
     copies = copiedBytes = reuses = reusedBytes = 0;
 }
 }

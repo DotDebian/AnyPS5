@@ -759,6 +759,45 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+// The draw snapshot cache evicts least recently used first: a use moves an entry to the back, and
+// the entry past the 1024-entry cap pushes out the oldest untouched one only.
+void drawSnapshotEvictionTests(const Device& device) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t bytes = 65536;
+    void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "write watching unavailable: draw snapshot eviction not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const char* budget = std::getenv("APS5_DRAW_SNAPSHOT_CACHE_MIB");
+    if (budget != nullptr && std::strtoull(budget, nullptr, 10) < 1) {
+        std::cout << "draw snapshot cache disabled: eviction not tested\n";
+        return;
+    }
+    Recorder cache(device.GetContext());
+    const auto buffer = std::make_shared<Buffer>(device.GetContext(), 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto generation = CollectWrites(address, 4096);
+    Require(generation != 0, "the watched block has no generation");
+    for (std::size_t size = 1; size <= 1024; ++size) cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
+    Require(cache.ReusableDrawSnapshot(address, 1) == buffer, "a kept snapshot is not reusable");
+    cache.KeepDrawSnapshot(address, 1025, generation, registry, buffer);
+    Require(cache.ReusableDrawSnapshot(address, 2) == nullptr, "the least recently used snapshot survived the cap");
+    Require(cache.ReusableDrawSnapshot(address, 1) == buffer && cache.ReusableDrawSnapshot(address, 3) == buffer && cache.ReusableDrawSnapshot(address, 1025) == buffer, "eviction dropped a more recently used snapshot");
+    cache.KeepDrawSnapshot(address, 1026, generation, registry, buffer);
+    Require(cache.ReusableDrawSnapshot(address, 4) == nullptr && cache.ReusableDrawSnapshot(address, 1) == buffer, "the second eviction did not take the next oldest");
+    cache.KeepDrawSnapshot(address, 1, generation, registry, buffer);
+    Require(cache.ReusableDrawSnapshot(address, 1) == buffer && cache.ReusableDrawSnapshot(address, 5) == buffer, "replacing a kept snapshot evicted another");
+    std::memset(block, 0x5a, 16);
+    CollectWrites(address, 16);
+    Require(cache.ReusableDrawSnapshot(address, 1) == nullptr && cache.ReusableDrawSnapshot(address, 1) == nullptr, "a snapshot outlived a CPU store");
+}
+
 // Draw input snapshots kept across draws (Recorder::ReusableDrawSnapshot) over write-watched,
 // host-imported memory: a later draw binds the earlier draw's snapshot while the bytes are
 // unchanged, and a CPU store, a driver store (MarkWritten) or a registry mutation makes the next
@@ -2079,6 +2118,7 @@ int main() {
         keyProofTests(device, recorder);
         resourceReadTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
+        drawSnapshotEvictionTests(device);
         RunViewAliasTests(device.GetContext(), recorder);
         storeRunTests(device, recorder);
         unitShadowTests(device, recorder);

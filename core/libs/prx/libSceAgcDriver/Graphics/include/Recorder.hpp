@@ -10,6 +10,7 @@
 #include <deque>
 #include <mutex>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -111,6 +112,12 @@ public:
     // are rare once a title runs). Kept least recently used under a byte budget
     // (APS5_DRAW_SNAPSHOT_CACHE_MIB, default 256; 0 copies for every draw as before).
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes);
+    // APS5_PROFILE_DRAW: the snapshot cache's lookups that found no entry, found a stale one
+    // (dropped), and entries evicted to make room (cumulative, all recorders).
+    struct DrawSnapshotStatistics {
+        std::uint64_t absent, stale, evicted;
+    };
+    static DrawSnapshotStatistics DrawSnapshotCounts();
     // `registryGeneration`: GuestAllocationsGeneration read before the copy, like `generation`.
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer);
     void OnComplete(std::function<void()> action);
@@ -721,16 +728,19 @@ private:
     std::array<Completed, CompletedRingSize> completed;
     std::uint64_t newestSubmitted = 0;
     std::chrono::steady_clock::time_point newestSubmittedAt{};
-    // See ReusableDrawSnapshot, keyed by guest address and size; `lastUse` orders the eviction.
+    // See ReusableDrawSnapshot, keyed by guest address and size; `recency` lists the keys least
+    // recently used first (each entry holds its own position), so an eviction and a use are O(1).
+    using DrawSnapshotKey = std::pair<std::uint64_t, std::size_t>;
     struct DrawSnapshot {
         std::uint64_t generation;
         std::uint64_t registryGeneration;
-        std::uint64_t lastUse;
+        std::list<DrawSnapshotKey>::iterator recent;
         std::shared_ptr<Buffer> buffer;
     };
-    std::map<std::pair<std::uint64_t, std::size_t>, DrawSnapshot> drawSnapshots;
+    std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
+    std::list<DrawSnapshotKey> drawSnapshotRecency;
     std::size_t drawSnapshotBytes = 0;
-    std::uint64_t drawSnapshotUses = 0;
+    void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
 };
 
 }

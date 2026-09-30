@@ -1943,15 +1943,32 @@ std::size_t DrawSnapshotBudget() {
 }
 }
 
+namespace {
+std::atomic<std::uint64_t> drawSnapshotAbsent{0}, drawSnapshotStale{0}, drawSnapshotEvicted{0};
+}
+
+Recorder::DrawSnapshotStatistics Recorder::DrawSnapshotCounts() {
+    return {drawSnapshotAbsent.load(std::memory_order_relaxed), drawSnapshotStale.load(std::memory_order_relaxed), drawSnapshotEvicted.load(std::memory_order_relaxed)};
+}
+
+void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
+    drawSnapshotBytes -= entry->first.second;
+    drawSnapshotRecency.erase(entry->second.recent);
+    drawSnapshots.erase(entry);
+}
+
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes) {
     const auto found = drawSnapshots.find({address, bytes});
-    if (found == drawSnapshots.end()) return {};
-    if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
-        drawSnapshotBytes -= bytes;
-        drawSnapshots.erase(found);
+    if (found == drawSnapshots.end()) {
+        if (DrawProfiled()) drawSnapshotAbsent.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
-    found->second.lastUse = ++drawSnapshotUses;
+    if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+        if (DrawProfiled()) drawSnapshotStale.fetch_add(1, std::memory_order_relaxed);
+        eraseDrawSnapshot(found);
+        return {};
+    }
+    drawSnapshotRecency.splice(drawSnapshotRecency.end(), drawSnapshotRecency, found->second.recent);
     return found->second.buffer;
 }
 
@@ -1959,16 +1976,19 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     constexpr std::size_t maxEntries = 1024;
     const auto budget = DrawSnapshotBudget();
     if (generation == 0 || bytes > budget) return;
-    if (const auto found = drawSnapshots.find({address, bytes}); found != drawSnapshots.end()) {
-        drawSnapshotBytes -= bytes;
-        drawSnapshots.erase(found);
-    }
+    if (const auto found = drawSnapshots.find({address, bytes}); found != drawSnapshots.end()) eraseDrawSnapshot(found);
     while (!drawSnapshots.empty() && (drawSnapshotBytes + bytes > budget || drawSnapshots.size() >= maxEntries)) {
-        const auto oldest = std::min_element(drawSnapshots.begin(), drawSnapshots.end(), [](const auto& left, const auto& right) { return left.second.lastUse < right.second.lastUse; });
-        drawSnapshotBytes -= oldest->first.second;
-        drawSnapshots.erase(oldest);
+        if (DrawProfiled()) drawSnapshotEvicted.fetch_add(1, std::memory_order_relaxed);
+        eraseDrawSnapshot(drawSnapshots.find(drawSnapshotRecency.front()));
     }
-    drawSnapshots.emplace(std::pair{address, bytes}, DrawSnapshot{generation, registryGeneration, ++drawSnapshotUses, std::move(buffer)});
+    const DrawSnapshotKey key{address, bytes};
+    drawSnapshotRecency.push_back(key);
+    try {
+        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(drawSnapshotRecency.end()), std::move(buffer)});
+    } catch (...) {
+        drawSnapshotRecency.pop_back();
+        throw;
+    }
     drawSnapshotBytes += bytes;
 }
 
