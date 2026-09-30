@@ -426,6 +426,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView");
+        createFirstLayerView(descriptor, viewInfo);
         if (profile) {
             auto& totals = Profile();
             totals.view += timer.lap();
@@ -469,6 +470,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView storage view");
+        createFirstLayerView(descriptor, viewInfo);
         if (profile) {
             auto& totals = Profile();
             totals.view += timer.lap();
@@ -485,10 +487,23 @@ Texture::~Texture() {
     release();
 }
 
+void Texture::createFirstLayerView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo) {
+    if (descriptor.dimension != TextureDimension::k2DArray) return;
+    // The full view's pNext (the MIN_LOD clamp) was chained from the caller's stack: chain it again.
+    viewInfo.pNext = nullptr;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.subresourceRange.layerCount = 1;
+    VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
+    ChainMinLod(context, descriptor, viewInfo, minLod);
+    Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &firstLayerView), "vkCreateImageView first layer");
+}
+
 void Texture::release() noexcept {
     upload.reset();
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     view = VK_NULL_HANDLE;
+    if (firstLayerView) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, firstLayerView, nullptr);
+    firstLayerView = VK_NULL_HANDLE;
     // The image and its memory go with the last holder: this texture, or the batch still uploading it.
     owned.reset();
     image = VK_NULL_HANDLE;

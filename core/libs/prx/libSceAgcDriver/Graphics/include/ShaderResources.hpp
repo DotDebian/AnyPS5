@@ -386,6 +386,9 @@ private:
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
     std::vector<std::shared_ptr<Texture>> textures;
+    // Sampled elements a 2D instruction addresses in a 2D array surface: bound as the first layer's
+    // 2D view (Texture::FirstLayerView).
+    std::vector<bool> textureFirstLayer;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
     std::vector<std::uint32_t> storageMips;
     // Storage elements a 2D instruction addresses in a 2D array surface: bound as the first layer's
