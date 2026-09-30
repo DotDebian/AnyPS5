@@ -15,6 +15,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "ViewAliases.hpp"
+#include "ResidentPresent.hpp"
 #include "SampleLod_spv.h"
 #include <SDL_loadso.h>
 #ifdef _WIN32
@@ -2188,6 +2189,7 @@ int main() {
         drawSnapshotEvictionTests(device);
         drawInputReuseTests(device, recorder);
         RunViewAliasTests(device.GetContext(), recorder);
+        RunResidentPresentTests(device.GetContext());
         storeRunTests(device, recorder);
         unitShadowTests(device, recorder);
         storageRefreshTests(device, recorder, false);

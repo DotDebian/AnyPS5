@@ -312,7 +312,9 @@ private:
     // The tail of a dispatch's device call from the open batch's command buffer to the completion
     // registration: keeps, the template data refresh, barriers, bind, push, dispatch, marks.
     void recordDispatch(RecordedDispatch& record);
-    bool present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display = nullptr, const std::shared_ptr<Graphics::StorageTexture>& resident = nullptr, VkFilter residentFilter = VK_FILTER_LINEAR, bool dumpFrame = false);
+    // `residentConvert`: the resident image presents through the color transfer's conversion
+    // (ResidentPresent::Convert) instead of a blit of the image itself.
+    bool present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display = nullptr, const std::shared_ptr<Graphics::StorageTexture>& resident = nullptr, VkFilter residentFilter = VK_FILTER_LINEAR, bool dumpFrame = false, bool residentConvert = false);
     struct State;
     std::unique_ptr<State> state;
     std::uint64_t serial;

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -1768,33 +1769,32 @@ void WriteFrameBmp(int index, std::uint32_t fullWidth, std::uint32_t fullHeight,
     }
 }
 
-// Whether a resident image of the display buffer can be blitted to the swapchain as it is: one 2D
-// level of the display's extent in a normalized 4-byte color format (a blit converts components,
-// so an integer or float reinterpretation would present wrong values). `filter` gets the best
-// filter the format allows.
-bool ResidentPresentable(const Graphics::Context& context, const Graphics::StorageTexture& image, const DisplayBuffer& buffer, VkFilter& filter) {
+// How a resident image of the display buffer presents (ResidentPresentPath: blitted as it is, or
+// converted from a raw copy of its texels as the guest-memory path converts them): one 2D level of
+// the display's extent and size. `filter` gets the best filter a blit of the format allows.
+ResidentPresent ResidentPresentable(const Graphics::Context& context, const Graphics::StorageTexture& image, const DisplayBuffer& buffer, VkFilter& filter) {
     const auto& descriptor = image.Descriptor();
-    if (descriptor.width != buffer.width || descriptor.height != buffer.height || descriptor.mipCount != 1 || image.ImageLayers() != 1 || image.ImageDepth() != 1) return false;
-    if (image.GuestBytes() != DisplayBufferSize(buffer)) return false;
+    if (descriptor.width != buffer.width || descriptor.height != buffer.height || descriptor.mipCount != 1 || image.ImageLayers() != 1 || image.ImageDepth() != 1) return ResidentPresent::None;
+    if (image.GuestBytes() != DisplayBufferSize(buffer)) return ResidentPresent::None;
     const auto format = Graphics::StorageFormatForGuest(context, descriptor.format);
-    constexpr std::uint64_t tenBitFormat = 0x0100000000000000ull;
-    const bool tenBit = (buffer.pixelFormat & tenBitFormat) != 0;
-    const bool rgba = (buffer.pixelFormat & ~tenBitFormat) == 0x8000000022000000ull;
-    const auto displayFormat = tenBit ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : rgba ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
-    if (format != displayFormat) return false;
     VkFormatProperties properties{};
     context.formatProperties(context.physical, format, &properties);
-    if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) == 0) return false;
+    const bool blitSource = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
     filter = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    return true;
+    return ResidentPresentPath(format, buffer.pixelFormat, blitSource);
 }
 
-// The resident image a display buffer is blitted from, or null; `pending` tells a buffer without
-// a pending image from one whose image is unsuitable.
-std::shared_ptr<Graphics::StorageTexture> PresentableResident(const Graphics::Context& context, const DisplayBuffer& buffer, VkFilter& filter, bool& pending) {
+// The resident image a display buffer is presented from, or null; `pending` tells a buffer without
+// a pending image from one whose image is unsuitable, `convert` whether it presents through the
+// conversion (ResidentPresent::Convert).
+std::shared_ptr<Graphics::StorageTexture> PresentableResident(const Graphics::Context& context, const DisplayBuffer& buffer, VkFilter& filter, bool& pending, bool& convert) {
     auto resident = Graphics::StorageTexture::FindPending(buffer.address, DisplayBufferSize(buffer));
     pending = resident != nullptr;
-    if (resident != nullptr && !ResidentPresentable(context, *resident, buffer, filter)) resident.reset();
+    convert = false;
+    if (resident == nullptr) return resident;
+    const auto path = ResidentPresentable(context, *resident, buffer, filter);
+    if (path == ResidentPresent::None) resident.reset();
+    convert = path == ResidentPresent::Convert;
     return resident;
 }
 
@@ -1838,9 +1838,10 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     const auto bytes = DisplayBufferSize(buffer);
     std::shared_ptr<Graphics::StorageTexture> resident;
     VkFilter filter = VK_FILTER_LINEAR;
+    bool convert = false;
     if (!NoResidentPresent()) {
         bool pending = false;
-        resident = PresentableResident(graphicsContext(), buffer, filter, pending);
+        resident = PresentableResident(graphicsContext(), buffer, filter, pending, convert);
         if (!pending) {
             ++notPending;
         } else if (resident == nullptr) {
@@ -1876,7 +1877,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         std::fprintf(stderr, "[flip] %llu presents from the resident image (%llu refreshed first), through guest memory: %llu not pending, %llu unsuitable; %llu GPU frame dumps\n", static_cast<unsigned long long>(residentPresents), static_cast<unsigned long long>(refreshedPresents), static_cast<unsigned long long>(notPending), static_cast<unsigned long long>(unsuitable), static_cast<unsigned long long>(gpuDumps));
     }
     CaptureTrace::Log("present dump=%d address=%llx width=%u height=%u resident=%d generation=%llu", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, resident != nullptr, static_cast<unsigned long long>(resident ? resident->Generation() : 0));
-    if (!present(buffer.width, buffer.height, true, {}, &buffer, resident, filter, dumpFrame)) {
+    if (!present(buffer.width, buffer.height, true, {}, &buffer, resident, filter, dumpFrame, convert)) {
         // A dropped frame (swapchain out of date) keeps the dump numbering contiguous.
         if (dumpFrame) --dumps.dumped;
         return false;
@@ -1921,7 +1922,7 @@ bool VulkanDevice::AcquireImage() {
     return true;
 }
 
-bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display, const std::shared_ptr<Graphics::StorageTexture>& resident, VkFilter residentFilter, bool dumpFrame) {
+bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display, const std::shared_ptr<Graphics::StorageTexture>& resident, VkFilter residentFilter, bool dumpFrame, bool residentConvert) {
     PerformanceTimer timing("Vulkan.Present");
     APS5_LOG_OUT_DEBUG("present begin width=%u height=%u opaque=%u pixels=%zu", width, height, static_cast<unsigned>(opaque), pixels.size());
     require(state->swapchain != VK_NULL_HANDLE, "device has no swapchain");
@@ -1936,7 +1937,8 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     require(index < state->images.size() && index < state->rendered.size(), "acquired image index is out of range");
     auto& rendered = state->rendered[index];
     const bool clearOnly = pixels.empty() && display == nullptr;
-    const bool direct = resident != nullptr;
+    require(!residentConvert || (resident != nullptr && display != nullptr), "a converted resident presentation needs its image and display buffer");
+    const bool direct = resident != nullptr && !residentConvert;
     // The scaler's source image, the color transfer's staging and the upload buffer are single
     // objects an in-flight blit through them may still read: the paths using or re-creating them
     // wait for every slot first. The game path did so before taking the mutex
@@ -2017,14 +2019,17 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             residentBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
             pipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &residentBarrier);
             Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
-            if (!direct) state->scaler->RecordBlitInto(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, residentFilter);
+            if (residentConvert) {
+                // The guest-memory path's conversion (below) from the image's raw texels: both paths
+                // present the same pixels.
+                state->colorTransfer->DetileImage(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, Graphics::ColorTileMode::RenderTarget, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat));
+                state->scaler->RecordUpload(commands, state->colorTransfer->LinearBuffer());
+            }
         } else {
             if (display != nullptr) {
-                // Bit 56 selects the 10-bit A2B10G10R10 variant; R8G8B8A8-ordered formats need red and blue
-                // swapped for the B8G8R8A8 swapchain.
-                constexpr std::uint64_t tenBitFormat = 0x0100000000000000ull;
-                const bool tenBit = (display->pixelFormat & tenBitFormat) != 0;
-                state->colorTransfer->Detile(commands, (display->pixelFormat & ~tenBitFormat) == 0x8000000022000000ull, tenBit);
+                // The texels in DisplayTexelFormat's order: red in the low bits (R8G8B8A8 base) is
+                // swapped for the B8G8R8A8 swapchain; the 10-bit variant drops each channel's low bits.
+                state->colorTransfer->Detile(commands, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat));
             }
             state->scaler->RecordUpload(commands, display != nullptr ? state->colorTransfer->LinearBuffer() : state->uploadBuffer);
         }
@@ -2151,7 +2156,9 @@ bool VulkanDevice::PresentWaitsForSlots(const DisplayBuffer* buffer) const {
     if (NoResidentPresent()) return true;
     VkFilter filter = VK_FILTER_LINEAR;
     bool pending = false;
-    if (PresentableResident(graphicsContext(), *buffer, filter, pending) == nullptr) return true;
+    bool convert = false;
+    // A converted image goes through the shared color transfer and scaler source like guest memory.
+    if (PresentableResident(graphicsContext(), *buffer, filter, pending, convert) == nullptr || convert) return true;
     return state->scaler == nullptr || state->scaler->SourceWidth() != buffer->width || state->scaler->SourceHeight() != buffer->height;
 }
 

@@ -49,6 +49,7 @@ add_custom_command(
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
@@ -214,6 +215,7 @@ add_custom_command(
 add_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
         tests/ViewAliases.cpp
+        tests/ResidentPresent.cpp
         ${agcSampleLodShaderHeader}
 )
 
@@ -415,6 +417,7 @@ if(AGC_BUILD_VISUAL_TEST)
     add_executable(agc_driver_visual_test EXCLUDE_FROM_ALL
             tests/Visual.cpp
             Execution/src/VulkanDevice.cpp
+            Execution/src/DisplayFormat.cpp
             Execution/src/AspectFit.cpp
             Execution/src/PresentationScaler.cpp
             Execution/src/GuestMemory.cpp
