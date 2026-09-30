@@ -784,13 +784,17 @@ void drawSnapshotEvictionTests(const Device& device) {
     const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto generation = CollectWrites(address, 4096);
     Require(generation != 0, "the watched block has no generation");
-    for (std::size_t size = 1; size <= 1024; ++size) cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
+    const auto cap = Recorder::DrawSnapshotEntries(Recorder::SnapshotUse::Storage);
+    const bool inputs = Recorder::DrawSnapshotBudget(Recorder::SnapshotUse::Vertex) >= 16;
+    if (inputs) cache.KeepDrawSnapshot(address, 16, generation, registry, buffer, Recorder::SnapshotUse::Vertex);
+    for (std::size_t size = 1; size <= cap; ++size) cache.KeepDrawSnapshot(address, size, generation, registry, buffer);
     Require(cache.ReusableDrawSnapshot(address, 1) == buffer, "a kept snapshot is not reusable");
-    cache.KeepDrawSnapshot(address, 1025, generation, registry, buffer);
+    cache.KeepDrawSnapshot(address, cap + 1, generation, registry, buffer);
     Require(cache.ReusableDrawSnapshot(address, 2) == nullptr, "the least recently used snapshot survived the cap");
-    Require(cache.ReusableDrawSnapshot(address, 1) == buffer && cache.ReusableDrawSnapshot(address, 3) == buffer && cache.ReusableDrawSnapshot(address, 1025) == buffer, "eviction dropped a more recently used snapshot");
-    cache.KeepDrawSnapshot(address, 1026, generation, registry, buffer);
+    Require(cache.ReusableDrawSnapshot(address, 1) == buffer && cache.ReusableDrawSnapshot(address, 3) == buffer && cache.ReusableDrawSnapshot(address, cap + 1) == buffer, "eviction dropped a more recently used snapshot");
+    cache.KeepDrawSnapshot(address, cap + 2, generation, registry, buffer);
     Require(cache.ReusableDrawSnapshot(address, 4) == nullptr && cache.ReusableDrawSnapshot(address, 1) == buffer, "the second eviction did not take the next oldest");
+    Require(!inputs || cache.ReusableDrawSnapshot(address, 16, Recorder::SnapshotUse::Vertex) == buffer, "storage snapshots evicted a vertex snapshot");
     cache.KeepDrawSnapshot(address, 1, generation, registry, buffer);
     Require(cache.ReusableDrawSnapshot(address, 1) == buffer && cache.ReusableDrawSnapshot(address, 5) == buffer, "replacing a kept snapshot evicted another");
     std::memset(block, 0x5a, 16);
@@ -806,7 +810,7 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     using Use = Recorder::SnapshotUse;
     constexpr std::size_t bytes = 65536;
-    if (std::getenv("APS5_NO_DRAW_INPUT_REUSE") != nullptr || (std::getenv("APS5_DRAW_SNAPSHOT_CACHE_MIB") != nullptr && std::strtoull(std::getenv("APS5_DRAW_SNAPSHOT_CACHE_MIB"), nullptr, 10) == 0)) {
+    if (std::getenv("APS5_NO_DRAW_INPUT_REUSE") != nullptr || Recorder::DrawSnapshotBudget(Recorder::SnapshotUse::Vertex) == 0) {
         std::cout << "draw input reuse disabled: not tested\n";
         return;
     }

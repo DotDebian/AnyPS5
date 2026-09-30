@@ -1964,13 +1964,24 @@ void Recorder::Keep(std::shared_ptr<void> object) {
 }
 
 namespace {
-std::size_t DrawSnapshotBudget() {
-    static const std::size_t budget = [] {
-        const char* text = std::getenv("APS5_DRAW_SNAPSHOT_CACHE_MIB");
-        return (text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{256}) << 20u;
-    }();
-    return budget;
+std::size_t SnapshotLimit(const char* name, std::size_t fallback) {
+    const char* text = std::getenv(name);
+    return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : fallback;
 }
+
+std::size_t SnapshotPool(Recorder::SnapshotUse use) {
+    return use == Recorder::SnapshotUse::Storage ? 0 : 1;
+}
+}
+
+std::size_t Recorder::DrawSnapshotBudget(SnapshotUse use) {
+    static const std::array<std::size_t, 2> budgets{SnapshotLimit("APS5_DRAW_SNAPSHOT_CACHE_MIB", 256) << 20u, SnapshotLimit("APS5_DRAW_INPUT_CACHE_MIB", 1024) << 20u};
+    return budgets[SnapshotPool(use)];
+}
+
+std::size_t Recorder::DrawSnapshotEntries(SnapshotUse use) {
+    static const std::array<std::size_t, 2> entries{std::max<std::size_t>(SnapshotLimit("APS5_DRAW_SNAPSHOT_CACHE_ENTRIES", 1024), 1), std::max<std::size_t>(SnapshotLimit("APS5_DRAW_INPUT_CACHE_ENTRIES", 16384), 1)};
+    return entries[SnapshotPool(use)];
 }
 
 namespace {
@@ -1982,8 +1993,9 @@ Recorder::DrawSnapshotStatistics Recorder::DrawSnapshotCounts() {
 }
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
-    drawSnapshotBytes -= std::get<2>(entry->first);
-    drawSnapshotRecency.erase(entry->second.recent);
+    auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
+    pool.bytes -= std::get<2>(entry->first);
+    pool.recency.erase(entry->second.recent);
     drawSnapshots.erase(entry);
 }
 
@@ -1999,33 +2011,35 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
         eraseDrawSnapshot(found);
         return {};
     }
-    drawSnapshotRecency.splice(drawSnapshotRecency.end(), drawSnapshotRecency, found->second.recent);
+    auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
+    recency.splice(recency.end(), recency, found->second.recent);
     if (derived != nullptr) *derived = found->second.derived;
     return found->second.buffer;
 }
 
 void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
-    constexpr std::size_t maxEntries = 1024;
-    const auto budget = DrawSnapshotBudget();
+    const auto maxEntries = DrawSnapshotEntries(use);
+    const auto budget = DrawSnapshotBudget(use);
+    auto& pool = drawSnapshotPools[SnapshotPool(use)];
     if (generation == 0 || bytes > budget) return;
     if (use == SnapshotUse::Vertex) {
         for (auto it = drawSnapshots.lower_bound({address, use, 0}); it != drawSnapshots.end() && std::get<0>(it->first) == address && std::get<1>(it->first) == use && std::get<2>(it->first) <= bytes;) eraseDrawSnapshot(it++);
     } else if (const auto found = drawSnapshots.find({address, use, bytes}); found != drawSnapshots.end()) {
         eraseDrawSnapshot(found);
     }
-    while (!drawSnapshots.empty() && (drawSnapshotBytes + bytes > budget || drawSnapshots.size() >= maxEntries)) {
+    while (!pool.recency.empty() && (pool.bytes + bytes > budget || pool.recency.size() >= maxEntries)) {
         if (DrawProfiled()) drawSnapshotEvicted.fetch_add(1, std::memory_order_relaxed);
-        eraseDrawSnapshot(drawSnapshots.find(drawSnapshotRecency.front()));
+        eraseDrawSnapshot(drawSnapshots.find(pool.recency.front()));
     }
     const DrawSnapshotKey key{address, use, bytes};
-    drawSnapshotRecency.push_back(key);
+    pool.recency.push_back(key);
     try {
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(drawSnapshotRecency.end()), std::move(buffer), derived});
+        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
     } catch (...) {
-        drawSnapshotRecency.pop_back();
+        pool.recency.pop_back();
         throw;
     }
-    drawSnapshotBytes += bytes;
+    pool.bytes += bytes;
 }
 
 void Recorder::OnComplete(std::function<void()> action) {

@@ -110,7 +110,10 @@ public:
     // GPU store stamped by MarkWritten, drops it) and the guest allocation registry has not changed
     // since (a range unmapped and mapped again holds new bytes no write stamped; registry mutations
     // are rare once a title runs). Kept least recently used under a byte budget
-    // (APS5_DRAW_SNAPSHOT_CACHE_MIB, default 256; 0 copies for every draw as before).
+    // (APS5_DRAW_SNAPSHOT_CACHE_MIB, default 256; 0 copies for every draw as before) and an entry
+    // count (APS5_DRAW_SNAPSHOT_CACHE_ENTRIES, default 1024); the vertex and index snapshots are kept
+    // apart under their own (APS5_DRAW_INPUT_CACHE_MIB, default 1024, and
+    // APS5_DRAW_INPUT_CACHE_ENTRIES, default 16384), so storage copies do not evict them.
     // A snapshot's use: the storage-buffer copies of PrepareDrawBindings, or a draw's vertex or
     // index input (Draw.hpp CopyDrawInput). Part of the key: a range read in two ways gets two
     // snapshots, each made with its own buffer usage. An index snapshot also keeps its highest
@@ -125,6 +128,8 @@ public:
         std::uint64_t absent, stale, evicted;
     };
     static DrawSnapshotStatistics DrawSnapshotCounts();
+    static std::size_t DrawSnapshotBudget(SnapshotUse use);
+    static std::size_t DrawSnapshotEntries(SnapshotUse use);
     // `registryGeneration`: GuestAllocationsGeneration read before the copy, like `generation`.
     // `derived`: a value computed from the copied bytes, returned with the snapshot on reuse.
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
@@ -742,9 +747,9 @@ private:
     std::array<Completed, CompletedRingSize> completed;
     std::uint64_t newestSubmitted = 0;
     std::chrono::steady_clock::time_point newestSubmittedAt{};
-    // See ReusableDrawSnapshot, keyed by guest address, use and size; `recency` lists the keys
-    // least recently used first (each entry holds its own position), so an eviction and a use are
-    // O(1).
+    // See ReusableDrawSnapshot, keyed by guest address, use and size; each pool's `recency` lists
+    // its keys least recently used first (each entry holds its own position), so an eviction and a
+    // use are O(1).
     using DrawSnapshotKey = std::tuple<std::uint64_t, SnapshotUse, std::size_t>;
     struct DrawSnapshot {
         std::uint64_t generation;
@@ -754,8 +759,11 @@ private:
         std::uint32_t derived;
     };
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
-    std::list<DrawSnapshotKey> drawSnapshotRecency;
-    std::size_t drawSnapshotBytes = 0;
+    struct DrawSnapshotPool {
+        std::list<DrawSnapshotKey> recency;
+        std::size_t bytes = 0;
+    };
+    std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
 };
 
