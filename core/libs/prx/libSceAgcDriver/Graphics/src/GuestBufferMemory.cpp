@@ -244,6 +244,20 @@ void decideImportWatch(const Context& context, HostImports& state) {
 #endif
 }
 
+}
+
+std::uint64_t DefaultHostImportBudget(const VkPhysicalDeviceMemoryProperties& memory) {
+    VkDeviceSize systemHeap = 0;
+    for (std::uint32_t index = 0; index < memory.memoryHeapCount && index < VK_MAX_MEMORY_HEAPS; ++index) {
+        if ((memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) systemHeap = std::max(systemHeap, memory.memoryHeaps[index].size);
+    }
+    constexpr std::uint64_t reserve = 2048ull << 20u;
+    constexpr std::uint64_t floor = 6144ull << 20u;
+    return systemHeap > floor + reserve ? systemHeap - reserve : floor;
+}
+
+namespace {
+
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t base, std::uint64_t bytes, const GuestAllocations::Lease& lease) {
     if (const auto found = state.imports.find(base); found != state.imports.end()) {
         if (found->second.bytes == bytes) return &found->second;
@@ -252,11 +266,11 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     const auto alignment = context.hostImportAlignment;
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
     // Pinned imports count against the driver's system memory budget; past it ordinary host
-    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
-    // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
-    static const std::uint64_t budget = [] {
-        const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
-        return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
+    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default DefaultHostImportBudget;
+    // past it address-based shaders copy gigabytes per dispatch).
+    static const std::uint64_t budget = [&context]() -> std::uint64_t {
+        if (const char* value = std::getenv("APS5_HOST_IMPORT_MIB")) return std::strtoull(value, nullptr, 10) << 20u;
+        return DefaultHostImportBudget(context.memory);
     }();
     std::uint64_t live = 0;
     for (const auto& [address, existing] : state.imports) live += existing.bytes;

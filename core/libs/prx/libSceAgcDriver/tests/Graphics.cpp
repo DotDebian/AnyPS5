@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
@@ -203,6 +204,18 @@ void expectDepthRejection(const AgcDriver::QueueState& queue, std::string_view r
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, reason);
     const auto rejection = AgcDriver::Graphics::DrawRejection(queue, false);
     Require(rejection.find(reason) != std::string::npos, "the precheck disagrees with the decode: '" + rejection + "' for " + std::string(reason));
+}
+
+void hostImportBudgetTests() {
+    VkPhysicalDeviceMemoryProperties memory{};
+    memory.memoryHeapCount = 2;
+    memory.memoryHeaps[0] = {24ull << 30u, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryHeaps[1] = {47ull << 30u, 0};
+    Require(AgcDriver::Graphics::DefaultHostImportBudget(memory) == (45ull << 30u), "the host import budget is not the system memory heap less 2 GiB");
+    memory.memoryHeaps[1].size = 8ull << 30u;
+    Require(AgcDriver::Graphics::DefaultHostImportBudget(memory) == (6ull << 30u), "a small system memory heap lowered the host import budget below 6 GiB");
+    memory.memoryHeapCount = 1;
+    Require(AgcDriver::Graphics::DefaultHostImportBudget(memory) == (6ull << 30u), "a device without a system memory heap has no 6 GiB host import budget");
 }
 
 void depthSurfaceTexelTests() {
@@ -2071,6 +2084,7 @@ int main() {
         stateTests();
         depthTests();
         depthSurfaceTexelTests();
+        hostImportBudgetTests();
         hardwareScreenOffsetTests();
         DepthClipTests();
         ColorViewTests();
