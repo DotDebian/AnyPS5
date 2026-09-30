@@ -48,6 +48,7 @@ struct ImageSampleLayout {
     std::uint32_t bias = NoImageComponent;
     std::uint32_t coord = 0;
     std::uint32_t lod = NoImageComponent;
+    std::uint32_t clamp = NoImageComponent;
     std::uint32_t gradX = NoImageComponent;
     std::uint32_t gradY = NoImageComponent;
 };
@@ -65,6 +66,7 @@ struct MemoryResourceAccess {
     std::uint32_t indexOffset = 0;
     std::uint32_t byteOffset = 0;
     bool addIndexOffset = false;
+    std::uint32_t memoryAccess = 0;
 };
 
 struct SpirvEmitterState {
@@ -119,6 +121,8 @@ struct SpirvEmitterState {
     // The lookup without fault recording that wide reads try first (see EmitBdaDwordReads); 0 when
     // every read takes the byte path.
     std::uint32_t bdaProbeFunction = 0;
+    std::uint32_t bdaWritePointerFunction = 0;
+    std::uint32_t bdaNoteWriteFunction = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across

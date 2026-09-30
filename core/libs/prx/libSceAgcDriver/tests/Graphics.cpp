@@ -130,10 +130,12 @@ void stateTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "unsupported color tile mode");
     queue = makeState();
     queue.context[0x3b0] = (62u << 14u) | 3u;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "pitch");
+    Require(AgcDriver::Graphics::DecodeState(queue).color.bytes == 64u * 4u * 4u, "padded linear pitch changed");
     queue = makeState();
     // A second written slot needs its own CB_COLOR1 registers.
     queue.context[0x8e] = 0xff;
+    queue.context[0x8f] = 0xff;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "color export format 0");
     queue.context[0x8f] = 0xfff;
     queue.context[0x1c5] = 0x999;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register");
@@ -164,7 +166,7 @@ void stateTests() {
     queue.context[0x1b4] = 2;
     state = AgcDriver::Graphics::DecodeState(queue);
     Require(AgcDriver::Graphics::DrawRejection(queue, true).empty(), "precheck rejected the reference state");
-    static_cast<void>(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, state.hasColorTarget, state.color.componentMapping));
+    static_cast<void>(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state)));
     AgcDriver::Graphics::RegisterReadLog() = nullptr;
     Require(!log.empty(), "the register facade recorded nothing");
     for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a register the decoders read: " + std::string(AgcDriver::Graphics::RegisterBankName(read.bank)) + " " + std::to_string(read.offset));
@@ -429,11 +431,13 @@ void ShaderStageTests() {
 
 // Recompiles a pixel shader that exports v<source> to MRT0 under SPI_PS_INPUT_ENA/ADDR and returns
 // the builtins its SPIR-V reads (the loads and access chains of builtin input variables).
+constexpr std::array<std::uint8_t, 8> IdentityExports{0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u};
+
 std::vector<spv::BuiltIn> pixelBuiltinsRead(std::uint32_t ena, std::uint32_t addr, std::uint32_t source) {
     auto queue = makeState();
     queue.context[0x1b3] = ena;
     queue.context[0x1b4] = addr;
-    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, true, 0xe4u);
+    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, IdentityExports);
     // exp mrt0 v<source> x4 done vm; s_endpgm.
     const std::array<std::uint32_t, 3> code{0xf800180fu, source * 0x01010101u, 0xbf810000u};
     ShaderRecompiler::RecompileRequest request{};
@@ -473,7 +477,7 @@ std::vector<std::uint32_t> pixelNoPerspectiveLocations(bool barycentricEnabled) 
     queue.context[0x1b6] = 2u;
     queue.context[0x191] = 0u;
     queue.context[0x192] = 1u;
-    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, true, 0xe4u);
+    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, IdentityExports);
     const std::array<std::uint32_t, 8> code{0xc8100000u, 0xc8110001u, 0xc8140402u, 0xc8150403u, 0xf800180fu, 0x05040504u, 0xbf810000u, 0xbf810000u};
     ShaderRecompiler::RecompileRequest request{};
     request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x30000u, code, 0, {}};
@@ -514,7 +518,7 @@ bool recompilesDebugBranch(std::uint32_t opcode) {
     auto queue = makeState();
     queue.context[0x1b3] = 0x2u;
     queue.context[0x1b4] = 0x2u;
-    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, true, 0xe4u);
+    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, IdentityExports);
     const std::array<std::uint32_t, 4> code{0xbf800000u | (opcode << 16u) | 1u, 0xf800180fu, 0x00000000u, 0xbf810000u};
     ShaderRecompiler::RecompileRequest request{};
     request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x30000u, code, 0, {}};
@@ -537,7 +541,7 @@ void pixelInputLayoutTests() {
     const auto decode = [&](std::uint32_t ena, std::uint32_t addr) {
         queue.context[0x1b3] = ena;
         queue.context[0x1b4] = addr;
-        return AgcDriver::Graphics::DecodePixelStageInfo(queue.context, true, 0xe4u);
+        return AgcDriver::Graphics::DecodePixelStageInfo(queue.context, IdentityExports);
     };
     // Astro Bot's PERSP_CENTER | PERSP_CENTROID | LINEAR_CENTER | POS_X | POS_Y: three I/J pairs
     // before the position.
@@ -735,7 +739,15 @@ void mimgDecodeTests() {
     Require(ShaderRecompiler::DecodeRdnaMimg(0, bvh, 0).op == ShaderRecompiler::RdnaOpcode::ImageBvhIntersectRay, "Astro Bot's BVH intersection encoding was not decoded");
     // image_sample (0x20) with TFE (bit 16): a reserved control bit, named with the words.
     const std::array<std::uint32_t, 2> tfe{0xf0800f00u | (1u << 16u), 0x00000000u};
-    expectFailure([&] { ShaderRecompiler::DecodeRdnaMimg(0, tfe, 0); }, "reserved MIMG control bits (f0810f00 00000000)");
+    expectFailure([&] { ShaderRecompiler::DecodeRdnaMimg(0, tfe, 0); }, "reserved MIMG control bits (words f0810f00 00000000)");
+}
+
+void ColorViewTests() {
+    auto queue = makeState();
+    queue.context[0x31b] = 1u << 26u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "mip exceeds");
+    queue.context[0x31b] = 1u << 13u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "array views");
 }
 
 void DepthClipTests() {
@@ -1140,6 +1152,17 @@ void expectSingleFailure(const ShaderRecompiler::DescriptorBinding& binding, std
     expectResourceFailure(vertex, fragment, reason);
 }
 
+void expectSingleAccepted(const ShaderRecompiler::DescriptorBinding& binding, std::string_view what) {
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    vertex.bindings.push_back(binding);
+    mock = MockVulkan{};
+    const auto context = mockContext();
+    const auto color = AgcDriver::Graphics::DecodeState(makeState()).color;
+    { AgcDriver::Graphics::ShaderResources resources(context, vertex, fragment, color, 0, 0); }
+    Require(mock.live == 0, std::string(what) + " leaked Vulkan objects");
+}
+
 void pushConstantTests() {
     ShaderRecompiler::RecompileResult vertex;
     ShaderRecompiler::RecompileResult fragment;
@@ -1301,12 +1324,11 @@ void resourceTests() {
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; binding.count = 2; binding.guestDescriptor = {1, 2}; }), "must not be arrays");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::ShaderData; binding.guestDescriptor.clear(); }), "empty shader data descriptor");
     expectSingleFailure(changed([](auto& binding) { binding.role = Role::FlattenedSrt; binding.guestDescriptor.clear(); }), "empty shader data descriptor");
-    expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor[0] = 0; binding.guestDescriptor[1] = 0; }), "null shader buffer descriptor address");
-    expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor[2] = 0; }), "empty shader buffer descriptor");
     expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor[1] |= 0x40000000u; }), "reserved bits");
     expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor[3] |= 0x40000000u; }), "unsupported type");
     expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor[1] |= 0x3fffu << 16u; binding.guestDescriptor[2] = 0xffffffffu; }), "descriptor range limit");
     expectSingleFailure(changed([](auto& binding) { binding.guestDescriptor[2] = 8192; }), "descriptor range limit");
+    expectSingleAccepted(changed([](auto& binding) { binding.guestDescriptor = vsharp(reinterpret_cast<const void*>(0x1000), 8); }), "an unmapped V#");
     expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = vsharp(reinterpret_cast<const void*>(state.color.address), 64); }), "aliases the render target");
     // A descriptor over unmapped memory is a sparse region that reads as zeros (GuestBufferMemory),
     // not a failed build.
@@ -1317,6 +1339,7 @@ void resourceTests() {
         vertex.bindings.push_back(changed([](auto& binding) { binding.guestDescriptor = vsharp(reinterpret_cast<const void*>(0x1000), 8); }));
         AgcDriver::Graphics::ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
     }
+    expectSingleAccepted(changed([](auto& binding) { binding.count = 3; binding.guestDescriptor = join(join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)), vsharp(reinterpret_cast<const void*>(0x1000), 8)); }), "an unmapped V# element");
     expectSingleFailure(changed([&](auto& binding) { binding.count = 2; binding.guestDescriptor = join(vsharp(guestFirst.data(), 16), vsharp(reinterpret_cast<const void*>(state.color.address), 64)); }), "aliases the render target");
     expectSingleFailure(changed([](auto& binding) { binding.count = 17; binding.guestDescriptor.assign(68, 0); }), "per-stage limits");
     {
@@ -1590,8 +1613,8 @@ void rectListTests() {
     expectFailure([&] { static_cast<void>(BuildRectListShaders(vertex, fragment, target)); }, "per-vertex interpolation");
     fragment.fragmentParameters[0].perVertex = false;
     vertex.parameterExports.clear();
-    // A parameter the vertex shader never exports reads zero, as from the hardware's parameter cache.
-    static_cast<void>(BuildRectListShaders(vertex, fragment, target));
+    auto unexported = BuildRectListShaders(vertex, fragment, target);
+    Require(!unexported.control.spirv.empty() && !unexported.evaluation.spirv.empty(), "rect-list shaders with an unexported parameter are empty");
     fragment.fragmentParameters.clear();
     target.tessellation->maxPatchSize = 3;
     expectFailure([&] { static_cast<void>(BuildRectListShaders(vertex, fragment, target)); }, "device limits");
@@ -1615,7 +1638,7 @@ ShaderRecompiler::RecompileResult recompilePixel(std::initializer_list<std::uint
     queue.context[0x1c5] = colorFormat;
     std::uint32_t index = 0;
     for (const auto control : controls) queue.context[0x191 + index++] = control;
-    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, true, 0xe4u);
+    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, IdentityExports);
     ShaderRecompiler::RecompileRequest request{};
     request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x30000u, code, 0, {}};
     request.context.waveSize = 64;
@@ -1954,6 +1977,11 @@ void validationTests() {
 }
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("APS5_PIN_WAIT_MS", "200");
+#else
+    setenv("APS5_PIN_WAIT_MS", "200", 1);
+#endif
     try {
         {
             const AgcDriver::Graphics::Context context{};
@@ -1980,6 +2008,7 @@ int main() {
         depthTests();
         hardwareScreenOffsetTests();
         DepthClipTests();
+        ColorViewTests();
         DisabledColorTests();
         metadataPassTests();
         depthMetadataBlitTests();
@@ -1996,6 +2025,7 @@ int main() {
         mock = MockVulkan{};
         auto bdaContext = mockContext();
         bdaContext.bufferDeviceAddress = true;
+        bdaContext.limits.maxStorageBufferRange = 1u << 27;
         RunBdaResourceTests(bdaContext, {
             [](VkBuffer buffer) -> std::span<std::byte> { return mock.memories.at(mock.bufferMemory.at(buffer)); },
             [](std::uint32_t binding) {
@@ -2003,6 +2033,11 @@ int main() {
                     if (it->binding == binding) return it->buffers.at(0);
                 }
                 throw std::runtime_error("missing BDA test descriptor");
+            },
+            [](VkDeviceAddress address) {
+                const auto offset = address - 0x100000000000ULL;
+                const auto buffer = reinterpret_cast<VkBuffer>(offset / 0x10000);
+                return std::span<std::byte>(mock.memories.at(mock.bufferMemory.at(buffer))).subspan(offset % 0x10000);
             }
         });
         Require(mock.live == 0, "BDA resources leaked Vulkan objects");

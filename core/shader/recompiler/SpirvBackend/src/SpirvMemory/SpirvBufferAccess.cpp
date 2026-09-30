@@ -109,8 +109,12 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(SpirvEmitterState& state
     access.objectPointer = state.module.AllocateId();
     state.module.AddFunction(spv::OpAccessChain, pointerType, access.objectPointer, variable, ConstantU32(state, arrayIndex));
     access.byteOffset = state.memoryByteOffsets.at(arrayIndex);
+    access.memoryAccess = mem.coherent ? spv::MemoryAccessVolatileMask : 0u;
     access.length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, TypeU32(state), access.length, access.objectPointer, 0u);
+    if (mem.resource < state.program.Info().buffers.size() && state.program.Info().buffers[mem.resource].empty) {
+        access.length = ConstantU32(state, 0u);
+    }
     return access;
 }
 

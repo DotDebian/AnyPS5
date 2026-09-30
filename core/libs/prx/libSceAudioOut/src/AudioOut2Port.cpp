@@ -1,7 +1,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
@@ -20,11 +23,9 @@ static constexpr std::uint64_t ATTRIBUTE_TRACE_EVERY = 2000;
 static constexpr std::uint32_t ATTRIBUTE_DATA = 0;
 static constexpr std::uint32_t ATTRIBUTE_VOLUME = 1;
 
-// data_format bits 8..11 carry the channel count: the title opens 0x100 (mono object ports),
-// 0x200 (stereo) and 0x880 (7.1 bed). The buffers behind them are float, as their spacing shows
-// (1024 bytes per 256-sample mono grain). The low byte's meaning is not known.
 static constexpr std::uint32_t FORMAT_CHANNELS_SHIFT = 8;
 static constexpr std::uint32_t FORMAT_CHANNELS_MASK = 0xFu;
+static constexpr std::uint32_t FORMAT_TYPE_MASK = 0x7Fu;
 
 static std::mutex g_portsLock;
 // Grows on demand: the title opens its bed ports plus max_object_ports object ports at once.
@@ -40,11 +41,27 @@ static AudioOut2Port* FromHandle(AudioOut2PortHandle handle) {
 // and side pairs fold into the front at -3 dB, the centre into both sides, and the LFE is dropped.
 static constexpr float DOWNMIX_GAIN = 0.7071f;
 
+static void ReadFrame(const AudioOut2Port& port, std::uint32_t frame, float* in) {
+    const auto first = static_cast<std::size_t>(frame) * port.channels;
+    for (std::uint32_t c = 0; c < port.channels; c++) {
+        in[c] = port.int16 ? static_cast<const std::int16_t*>(port.data)[first + c] / 32768.0f : static_cast<const float*>(port.data)[first + c];
+    }
+}
+
+static void AccumulatePadPort(const AudioOut2Port& port, AudioOut2Route route, float* out, std::uint32_t frames) {
+    float in[AUDIO_OUT2_PORT_CHANNELS_MAX];
+    for (std::uint32_t frame = 0; frame < frames; frame++) {
+        ReadFrame(port, frame, in);
+        AudioOut2AccumulatePadFrame(route, in, port.channels, port.volume, out + static_cast<std::size_t>(frame) * AUDIO_OUT2_PAD_CHANNELS);
+    }
+}
+
 static void AccumulatePort(const AudioOut2Port& port, float* out, std::uint32_t frames) {
     const auto ch = port.channels;
     const float* volume = port.volume;
+    float in[AUDIO_OUT2_PORT_CHANNELS_MAX];
     for (std::uint32_t frame = 0; frame < frames; frame++) {
-        const float* in = port.data + static_cast<std::size_t>(frame) * ch;
+        ReadFrame(port, frame, in);
         float left = 0.0f;
         float right = 0.0f;
         if (ch == 1) {
@@ -69,7 +86,7 @@ std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, float* out, flo
         if (!port.used || port.context != &context || port.data == nullptr || port.channels == 0) continue;
         const auto route = padOut != nullptr ? AudioOut2RouteForPort(port.type, port.channels) : AudioOut2Route::Main;
         if (route == AudioOut2Route::Main) AccumulatePort(port, out, frames);
-        else AudioOut2AccumulatePadPort(route, port.data, port.channels, port.volume, padOut, frames);
+        else AccumulatePadPort(port, route, padOut, frames);
         mixed++;
     }
     return mixed;
@@ -126,7 +143,12 @@ int APS5_VABI sceAudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2
     entry.samplingFreq = params->sampling_freq;
     entry.flags = params->flags;
     entry.channels = (params->data_format >> FORMAT_CHANNELS_SHIFT) & FORMAT_CHANNELS_MASK;
-    if (entry.channels > AUDIO_OUT2_PORT_CHANNELS_MAX) entry.channels = 0;
+    const auto sampleType = params->data_format & FORMAT_TYPE_MASK;
+    if (entry.channels == 0 || entry.channels > AUDIO_OUT2_PORT_CHANNELS_MAX || sampleType > 1) {
+        entry = AudioOut2Port{};
+        throw std::runtime_error("sceAudioOut2PortCreate: data format 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%x", params->data_format); return std::string(text); }() + " is not implemented");
+    }
+    entry.int16 = sampleType == 1;
     *port = static_cast<AudioOut2PortHandle>(index) + 1;
     AUDIOOUT2_TRACE("t=%.3f PortCreate ctx=%llx -> port %llu: type=0x%x data_format=0x%x (%u float ch) sampling_freq=%u flags=0x%x user=%llx\n",
         AudioOut2TraceSeconds(), static_cast<unsigned long long>(ctx), static_cast<unsigned long long>(*port), params->port_type, params->data_format,

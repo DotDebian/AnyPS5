@@ -84,8 +84,8 @@ void validateFlags(std::uint32_t flags) {
     if ((flags & ~known) != 0u) {
         throw std::runtime_error("unknown image address flags");
     }
-    if ((flags & (RdnaImageSampleFlagLodClamp | RdnaImageSampleFlagCd | RdnaImageSampleFlagAdjust)) != 0u) {
-        throw std::runtime_error("unsupported image clamp, coarse derivative or adjustment address layout");
+    if ((flags & RdnaImageSampleFlagCd) != 0u) {
+        throw std::runtime_error("unsupported image coarse derivative (_cd) address layout");
     }
     const auto lodModes = flags & (RdnaImageSampleFlagLod | RdnaImageSampleFlagBias | RdnaImageSampleFlagDerivative | RdnaImageSampleFlagLevelZero);
     if (std::popcount(lodModes) > 1) {
@@ -227,11 +227,12 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
         throw std::runtime_error("instruction is not MIMG");
     }
     const auto opcode = ((word0 >> 18u) & 0x7Fu) | ((word0 & 1u) << 7u);
-    const auto reservedWord0 = opcode == 0xe6u ? 0x000340C0u : 0x000350C0u;
+    const auto& info = lookupOpcode(opcode);
+    const auto reservedWord0 = info.sample || info.gather ? 0x000350C0u : 0x000340C0u;
     if ((word0 & reservedWord0) != 0u || (word1 & 0x3C000000u) != 0u) {
-        char words[64];
-        std::snprintf(words, sizeof(words), " (%08x %08x)", word0, word1);
-        throw std::runtime_error(std::string("unsupported or reserved MIMG control bits") + words);
+        char message[96];
+        std::snprintf(message, sizeof(message), "unsupported or reserved MIMG control bits (words %08x %08x)", word0, word1);
+        throw std::runtime_error(message);
     }
     const auto nsa = (word0 >> 1u) & 3u;
     const auto wordCount = 2u + nsa;
@@ -241,7 +242,6 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
     if (programCounter % 4u != 0u || programCounter > std::numeric_limits<std::uint32_t>::max() - (wordCount * 4u - 1u)) {
         throw std::runtime_error("invalid MIMG program counter");
     }
-    const auto& info = lookupOpcode(opcode);
     const bool a16 = (word1 & 0x40000000u) != 0u;
     const bool d16 = (word1 & 0x80000000u) != 0u;
     const auto flags = info.flags | (a16 ? RdnaImageSampleFlagA16 : 0u);
@@ -258,17 +258,19 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
     if (d16 && !(info.sample || info.gather || opcode == 0u || opcode == 1u || opcode == 8u || opcode == 9u)) {
         throw std::runtime_error("MIMG opcode does not support D16");
     }
-    std::uint32_t components = opcode == 0x0Eu ? 1u : coordinateCount(dimension);
+    const bool rayQuery = info.opcode == RdnaOpcode::ImageBvhIntersectRay;
+    std::uint32_t components = rayQuery ? (a16 ? 8u : 11u) : opcode == 0x0Eu ? 1u : coordinateCount(dimension);
     if (opcode == 1u || opcode == 9u) {
         ++components;
     }
     if (info.sample || info.gather) {
-        components += std::popcount(info.flags & (RdnaImageSampleFlagOffset | RdnaImageSampleFlagCompare | RdnaImageSampleFlagBias | RdnaImageSampleFlagLod));
+        components += std::popcount(info.flags & (RdnaImageSampleFlagOffset | RdnaImageSampleFlagCompare | RdnaImageSampleFlagBias | RdnaImageSampleFlagLod | RdnaImageSampleFlagLodClamp));
         if ((flags & RdnaImageSampleFlagDerivative) != 0u) {
             components += gradientCount(dimension) * 2u;
         }
     }
-    const auto addressDwords = GetRdnaImageAddressDwordCount(flags, components);
+    const auto addressFlags = rayQuery ? info.flags : flags;
+    const auto addressDwords = GetRdnaImageAddressDwordCount(addressFlags, components);
     const auto vaddr = word1 & 255u;
     const auto vdata = (word1 >> 8u) & 255u;
     if (nsa != 0u && addressDwords > 1u + nsa * 4u) {
@@ -307,7 +309,7 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
     instruction.imageD16 = d16;
     instruction.imageR128 = r128;
     instruction.imageDimension = dimension;
-    instruction.imageSampleFlags = flags;
+    instruction.imageSampleFlags = addressFlags;
     instruction.imageAddressComponents = components;
     instruction.imageNsaDwordCount = nsa;
     instruction.destination = vectorRegister(vdata);

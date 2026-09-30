@@ -81,6 +81,7 @@ std::span<std::byte> Buffer::Bytes() {
 }
 
 void Buffer::Invalidate() {
+    Require(mapping != nullptr, "cannot invalidate an unmapped GPU buffer");
     VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
     range.memory = memory;
     range.size = VK_WHOLE_SIZE;

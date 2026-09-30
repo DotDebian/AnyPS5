@@ -80,7 +80,7 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
         const auto pc = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeU32(state), pc, state.loopGuardPc);
         EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), pc, ConstantU32(state, 0u)), [&] {
-            RecordBdaFault(state, BdaConstant(state, state.loopGuardProgram), ConstantU32(state, state.loopGuardLimit), EmitBinaryU32(state, spv::OpISub, pc, ConstantU32(state, 1u)), BdaAbi::FaultReason::LoopLimit);
+            RecordBdaFault(state, BdaConstant(state, state.program.Resources().shaderHash), ConstantU32(state, state.loopGuardLimit), EmitBinaryU32(state, spv::OpISub, pc, ConstantU32(state, 1u)), BdaAbi::FaultReason::LoopLimit);
         });
     }
     EmitKillIfPixelValidMaskInactive(state);
@@ -145,6 +145,13 @@ std::uint32_t EmitSplitWaveBranchCondition(SpirvValueEmitContext& ctx, const Blo
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1u);
     const auto any = Binary(state, spv::OpINotEqual, TypeBool(state), EmitBinaryU32(state, spv::OpBitwiseOr, low, high), ConstantU32(state, 0u));
     return zero ? Unary(state, spv::OpLogicalNot, TypeBool(state), any) : any;
+}
+
+bool IsContinueTarget(const IrProgram& program, std::uint32_t block) {
+    for (const auto& info : program.Metadata().blockInfo) {
+        if (info.terminator.loopHeader && info.terminator.continueBlock == block) return true;
+    }
+    return false;
 }
 
 std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& info) {
@@ -527,6 +534,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::ImageQueryDimensions: return Invoke(EmitImageQueryDimensions, ctx, inst);
         case IrOpcode::ImageQueryLod: return Invoke(EmitImageQueryLod, ctx, inst);
         case IrOpcode::ImageRead: return Invoke(EmitImageRead, ctx, inst);
+        case IrOpcode::ImageBvhIntersectRay: return Invoke(EmitImageBvhIntersectRay, ctx, inst);
         case IrOpcode::ImageWrite: return Invoke(EmitImageWrite, ctx, inst);
         case IrOpcode::ImageSampleRaw: return Invoke(EmitImageSampleRaw, ctx, inst);
         case IrOpcode::ImageGatherRaw: return Invoke(EmitImageGatherRaw, ctx, inst);
@@ -669,11 +677,14 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         if (info == nullptr) {
             context.Fail("structured control flow block has no terminator metadata");
         }
+        const bool stops = state.bdaStopsInvocations;
+        state.bdaStopsInvocations = stops && !IsContinueTarget(program, info->id);
         EmitStructuredBlock(context, functionState, block);
         EmitStructuredTerminator(context, program, *info);
         // The label the block branches from (the terminator's condition may open blocks of its own,
         // a SingleLane wave's pairing loop).
         functionState.blockExitLabels.emplace(block, state.currentLabel);
+        state.bdaStopsInvocations = stops;
     }
     PatchStructuredPhis(context, functionState);
 }

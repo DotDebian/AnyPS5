@@ -1,6 +1,15 @@
 #include "ShaderDiskCache.hpp"
 #include "CacheKey.hpp"
 #include "ShaderCacheDirectory.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include "ShaderCacheVersion.hpp"
 #include <algorithm>
 #include <atomic>
@@ -10,19 +19,48 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
 #include <type_traits>
 
+namespace ShaderRecompiler {
+
+std::filesystem::path ShaderCacheDirectory() {
+    const char* disabled = std::getenv("ANYPS5_NO_SHADER_CACHE");
+    if (disabled != nullptr && *disabled != '\0' && std::strcmp(disabled, "0") != 0) return {};
+#ifdef _WIN32
+    const wchar_t* directory = _wgetenv(L"ANYPS5_SHADER_CACHE_DIR");
+    if (directory != nullptr && *directory != L'\0') return std::filesystem::path(directory);
+    std::wstring executable(MAX_PATH, L'\0');
+    for (;;) {
+        const auto length = GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+        if (length == 0) return {};
+        if (length < executable.size()) {
+            executable.resize(length);
+            break;
+        }
+        executable.resize(executable.size() * 2);
+    }
+    return std::filesystem::path(executable).parent_path() / "shader_cache";
+#else
+    const char* directory = std::getenv("ANYPS5_SHADER_CACHE_DIR");
+    if (directory != nullptr && *directory != '\0') return std::filesystem::path(directory);
+    std::error_code error;
+    const auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (error) return {};
+    return executable.parent_path() / "shader_cache";
+#endif
+}
+
+}
+
 namespace ShaderRecompiler::ShaderDiskCache {
 
-// The encoders below list every field of the structures they store. A field added to one of them
-// must be added to its encoder and decoder too (the source version changes by itself, but a field
-// the encoder does not know would silently load as its default): these sizes are a reminder, and
-// are only checked where they were measured.
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(RecompileResult) == 184, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 264, "DescriptorBinding changed: update the binding encoder");
@@ -40,16 +78,15 @@ static_assert(sizeof(IrBindingLayout) == 64, "IrBindingLayout changed: update th
 static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: update the layout encoder");
 static_assert(sizeof(BindingAllocationResult) == 120, "BindingAllocationResult changed: update the allocation encoder");
 static_assert(sizeof(ResourceSpecialization) == 72, "ResourceSpecialization changed: update BuildKey");
-static_assert(sizeof(ResourceSpecialization::Buffer) == 12, "ResourceSpecialization::Buffer changed: update BuildKey");
+static_assert(sizeof(ResourceSpecialization::Buffer) == 16, "ResourceSpecialization::Buffer changed: update BuildKey");
 static_assert(sizeof(ResourceSpecialization::Image) == 36, "ResourceSpecialization::Image changed: update BuildKey");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
 #endif
 
 namespace {
 
-constexpr std::uint32_t FileMagic = 0x43535041u; // "APSC"
+constexpr std::uint32_t FileMagic = 0x43535041u;
 
-// The entry header; the key and the payload follow it.
 struct FileHeader {
     std::uint32_t magic;
     std::uint32_t format;
@@ -61,7 +98,6 @@ struct FileHeader {
 };
 static_assert(sizeof(FileHeader) == 48 && std::is_trivially_copyable_v<FileHeader>);
 
-// Little-endian host order throughout (the entries are a cache of this machine's builds).
 class Writer {
 public:
     explicit Writer(std::vector<std::byte>& out) : out(out) {}
@@ -112,9 +148,6 @@ private:
     std::vector<std::byte>& out;
 };
 
-// Reads what Writer wrote. A read beyond the end, or a count larger than the bytes left could
-// hold, fails the reader for good and yields zeros, so a truncated or corrupt payload never
-// allocates on its word and is rejected at the end.
 class Reader {
 public:
     explicit Reader(std::span<const std::byte> bytes) : bytes(bytes) {}
@@ -164,7 +197,6 @@ public:
         position += count;
     }
 
-    // `minimum` is the fewest bytes one element encodes to.
     template<typename TValue, typename TDecode>
     void List(std::vector<TValue>& values, std::size_t minimum, TDecode&& decode) {
         const auto count = Count(minimum);
@@ -188,7 +220,6 @@ private:
         return value;
     }
 
-    // A count whose elements (each at least `elementBytes` long) fit in the bytes left.
     std::size_t Count(std::size_t elementBytes) {
         const auto count = Raw<std::uint64_t>();
         if (!ok || elementBytes == 0 || count > (bytes.size() - position) / elementBytes) {
@@ -244,6 +275,7 @@ void encodeResult(Writer& writer, const RecompileResult& result) {
     writer.Value<std::uint64_t>(result.pushConstants.size());
     for (const auto byte : result.pushConstants) writer.Value(static_cast<std::uint8_t>(byte));
     writer.Value(result.bdaAbiVersion);
+    writer.Value(result.memoryOffsetDword);
     writer.List(result.vertexAttributes, [](Writer& out, const VertexAttribute& attribute) {
         out.Value(attribute.location);
         out.Value(attribute.components);
@@ -276,6 +308,7 @@ void decodeResult(Reader& reader, RecompileResult& result) {
     result.pushConstants.resize(pushConstants.size());
     std::memcpy(result.pushConstants.data(), pushConstants.data(), pushConstants.size());
     reader.Value(result.bdaAbiVersion);
+    reader.Value(result.memoryOffsetDword);
     reader.List(result.vertexAttributes, 28, [](Reader& in, VertexAttribute& attribute) {
         in.Value(attribute.location);
         in.Value(attribute.components);
@@ -305,6 +338,7 @@ void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
     writer.Value(layout.pushDataStartDword);
     writer.Value(layout.memoryOffsetDword);
     writer.Value(layout.memoryOffsetCount);
+    writer.Value(layout.dispatchThreadLimit);
     writer.Values(std::span<const std::uint32_t>(layout.userDataRegisters));
     writer.List(layout.descriptors, [](Writer& out, const IrDescriptorBinding& descriptor) {
         out.Value(descriptor.kind);
@@ -316,6 +350,7 @@ void decodeLayout(Reader& reader, IrBindingLayout& layout) {
     reader.Value(layout.pushDataStartDword);
     reader.Value(layout.memoryOffsetDword);
     reader.Value(layout.memoryOffsetCount);
+    reader.Value(layout.dispatchThreadLimit);
     reader.Values(layout.userDataRegisters);
     reader.List(layout.descriptors, 12, [](Reader& in, IrDescriptorBinding& descriptor) {
         in.Value(descriptor.kind);
@@ -347,6 +382,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(buffer.atomic);
         out.Value(buffer.formatted);
         out.Value(buffer.scalar);
+        out.Value(buffer.empty);
     });
     writer.List(info.images, [](Writer& out, const ImageResource& image) {
         out.Value(image.source);
@@ -364,6 +400,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.depthCompare);
         out.Value(image.cube);
         out.Value(image.r128);
+        out.Value(image.depthBits);
         out.Value(image.indirectRoot);
         out.Value(image.indirectMappingOffset);
         out.Value(image.indirectSearchIterations);
@@ -402,6 +439,8 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
     writer.Value(info.instanceOffsetConflict);
     writer.Value(info.hasBitwiseXor);
     writer.Value(info.usesDma);
+    writer.Value(info.bdaWrites);
+    writer.Value(info.dispatchThreadLimit);
     encodeLayout(writer, compiled.bindings);
 }
 
@@ -416,7 +455,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     auto& info = compiled.info;
     reader.Value(info.scratchDwords);
     reader.Value(info.sharedMemoryBytes);
-    reader.List(info.buffers, 33, [](Reader& in, BufferResource& buffer) {
+    reader.List(info.buffers, 34, [](Reader& in, BufferResource& buffer) {
         in.Value(buffer.source);
         in.Value(buffer.firstUsePc);
         in.Value(buffer.maxByteExtent);
@@ -429,8 +468,9 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(buffer.atomic);
         in.Value(buffer.formatted);
         in.Value(buffer.scalar);
+        in.Value(buffer.empty);
     });
-    reader.List(info.images, 62, [](Reader& in, ImageResource& image) {
+    reader.List(info.images, 63, [](Reader& in, ImageResource& image) {
         in.Value(image.source);
         in.Value(image.firstUsePc);
         in.Value(image.resourceClass);
@@ -446,6 +486,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.depthCompare);
         in.Value(image.cube);
         in.Value(image.r128);
+        in.Value(image.depthBits);
         in.Value(image.indirectRoot);
         in.Value(image.indirectMappingOffset);
         in.Value(image.indirectSearchIterations);
@@ -484,6 +525,8 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     reader.Value(info.instanceOffsetConflict);
     reader.Value(info.hasBitwiseXor);
     reader.Value(info.usesDma);
+    reader.Value(info.bdaWrites);
+    reader.Value(info.dispatchThreadLimit);
     decodeLayout(reader, compiled.bindings);
 }
 
@@ -507,20 +550,14 @@ void decodeAllocation(Reader& reader, BindingAllocationResult& allocation) {
     std::memcpy(allocation.pushConstants.data(), pushConstants.data(), pushConstants.size());
 }
 
-// The APS5_* switches of the recompiler that only report, bypass an in-memory cache or place this
-// one: their values cannot change a variant, so they stay out of the key. Every other switch the
-// recompiler sources name (Generated::RecompilerSwitches) enters it, a new one included.
 constexpr std::string_view NeutralSwitches[] = {
     "APS5_PROFILE_DRAW",
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",
     "APS5_NO_FAILURE_MEMO",
     "APS5_NO_RESULT_MEMO",
-    "APS5_SHADER_CACHE_DIR",
-    "APS5_NO_SHADER_DISK_CACHE",
 };
 
-// The switch values in the key: fixed for the process (the recompiler reads each once).
 const std::vector<std::byte>& switchKey() {
     static const std::vector<std::byte> key = [] {
         std::vector<std::byte> bytes;
@@ -543,9 +580,6 @@ std::string hex(std::uint64_t value) {
     return text;
 }
 
-// The cache's state: the directory, the background writer and the counters. Made on first use and
-// never destroyed (the writer thread is detached; a write cut off by the process exit leaves a
-// temporary file the next run removes).
 class DiskStore {
 public:
     DiskStore() {
@@ -584,7 +618,6 @@ public:
                 }
             }
         }
-        // A large module's buffer is not kept past the load.
         if (file.capacity() > (4u << 20u)) std::vector<std::byte>().swap(file);
         loadNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         report(false);
@@ -622,8 +655,6 @@ private:
         std::shared_ptr<const CompiledVariant> variant;
     };
 
-    // The writer: encodes and writes queued variants, and reports every 10 s while there is
-    // activity. Housekeeping runs first, off the draw and dispatch paths.
     void run() {
         std::fprintf(stderr, "[shader-disk-cache] %s (source version %s, format %u)\n", directory.string().c_str(), hex(SourceVersion()).c_str(), FormatVersion);
         housekeeping();
@@ -658,13 +689,11 @@ private:
         }
     }
 
-    // Marks this version's directory as used, removes other versions' directories no build used for
-    // two weeks, and removes temporary files a killed writer left.
     void housekeeping() {
         std::error_code error;
         std::filesystem::create_directories(directory, error);
         const auto stamp = directory / "last-used";
-        if (std::FILE* file = std::fopen(stamp.string().c_str(), "wb")) std::fclose(file);
+        std::ofstream(stamp, std::ios::binary | std::ios::trunc).close();
         std::filesystem::last_write_time(stamp, std::filesystem::file_time_type::clock::now(), error);
         const auto now = std::filesystem::file_time_type::clock::now();
         for (std::filesystem::directory_iterator it(root, error), end; !error && it != end; it.increment(error)) {
@@ -690,7 +719,6 @@ private:
         }
     }
 
-    // One line per 10 s with activity: the lookups, writes and failures since the last line.
     void report(bool force) {
         const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         auto last = lastReport.load(std::memory_order_relaxed);
@@ -743,8 +771,6 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, c
     writer.Value(FileMagic);
     writer.Value(FormatVersion);
     writer.Value(SourceVersion());
-    // The in-memory key covers the stage, the code (as a hash), the stage registers, the user data
-    // count, the target (limits, capabilities and extensions) and the probe flag.
     thread_local std::vector<std::uint64_t> memoryKey;
     RecompileCacheKey::Build(request, memoryKey);
     writer.Values(std::span<const std::uint64_t>(memoryKey));
@@ -758,6 +784,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, c
         out.Value(buffer.packedStride);
         out.Value(buffer.descriptorFormat);
         out.Value(buffer.descriptorSwizzle);
+        out.Value(buffer.empty);
     });
     writer.List(specialization.images, [](Writer& out, const ResourceSpecialization::Image& image) {
         out.Value(image.numericClass);
@@ -770,6 +797,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, c
         out.Value(image.indirectSearchIterations);
         out.Value(image.cube);
         out.Value(image.fmask);
+        out.Value(image.depthBits);
     });
     writer.Values(std::span<const std::uint32_t>(specialization.boundDescriptors));
     const auto& switches = switchKey();

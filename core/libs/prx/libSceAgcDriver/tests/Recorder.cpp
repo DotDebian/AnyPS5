@@ -14,7 +14,6 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
-#include "ViewAliases.hpp"
 #include "ResidentPresent.hpp"
 #include "SampleLod_spv.h"
 #include <SDL_loadso.h>
@@ -52,7 +51,7 @@ void* AllocateWatched(std::size_t bytes, std::size_t alignment) {
     if (!AgcDriver::GuestMemory::WriteWatched()) return nullptr;
 #ifdef _WIN32
     void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, alignment);
-    if (VirtualAlloc(block, bytes, MEM_COMMIT, PAGE_READWRITE) == nullptr) throw std::runtime_error("cannot commit the arena block");
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
 #else
     void* raw = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (raw == MAP_FAILED) throw std::runtime_error("cannot map the watched block");
@@ -69,7 +68,7 @@ void* AllocateWatched(std::size_t bytes, std::size_t alignment) {
 
 void ReleaseWatched(void* block, std::size_t bytes) {
 #ifdef _WIN32
-    VirtualFree(block, bytes, MEM_DECOMMIT);
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
     GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
 #else
     munmap(block, bytes);
@@ -2188,7 +2187,6 @@ int main() {
         drawSnapshotReuseTests(device, recorder);
         drawSnapshotEvictionTests(device);
         drawInputReuseTests(device, recorder);
-        RunViewAliasTests(device.GetContext(), recorder);
         RunResidentPresentTests(device.GetContext());
         storeRunTests(device, recorder);
         unitShadowTests(device, recorder);

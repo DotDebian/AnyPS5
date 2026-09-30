@@ -88,33 +88,31 @@ void RunTextureTilingTests() {
     {
         const auto mips = ComputeMipLayout(TextureTileMode::RenderTarget64KB, 56, 257, 129, 1);
         Require(mips[0].blocksPerRow == 3 && mips[0].tiledSize == 393216, "render target surfaces must pad to complete 128 by 128 blocks for 32-bit pixels");
-        // The detiler writes whole padded rows (TextureTiling.cpp: linearSize spans pitchBytes rows).
-        Require(mips[0].pitchBytes == 1536 && mips[0].linearSize == 198144, "detiled render target rows must span the padded block width");
+        Require(mips[0].pitchBytes == 1536 && mips[0].linearSize == 1536u * 129u, "detiled render target rows must span the padded block width");
         Require(ComputeSurfaceSize(mips, 6) == 2359296, "render target cube faces must retain the padded guest slice stride");
     }
     for (const auto format : std::array<std::uint32_t, 5>{1, 7, 56, 71, 77}) {
         const auto mips = ComputeMipLayout(TextureTileMode::RenderTarget64KB, format, 1024, 513, 11);
-        // The regular levels sit at their tiled offsets (smallest level first), the tail levels after
-        // the chain: the ranges must not overlap in whatever order they lie.
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-        for (const auto& mip : mips) ranges.emplace_back(mip.linearOffset, mip.linearOffset + mip.linearSize);
-        std::sort(ranges.begin(), ranges.end());
-        for (std::size_t i = 1; i < ranges.size(); ++i) Require(ranges[i].first >= ranges[i - 1].second, "detiled mip levels must occupy separate ranges");
         bool tailSeen = false;
         for (const auto& mip : mips) {
-            Require(mip.linearOffset % 4 == 0, "detiled mip levels must be word-aligned");
+            Require(mip.linearOffset % 4 == 0, "detiled mip levels must start word-aligned");
             Require(mip.linearSize >= static_cast<std::uint64_t>(mip.pitchBytes) * mip.height, "detiled mip allocation must contain every row");
             Require(mip.linearSize % 4 == 0, "detiled mip sizes must preserve word alignment between array layers");
+            ranges.emplace_back(mip.linearOffset, mip.linearOffset + mip.linearSize);
             if (mip.tail) {
                 tailSeen = true;
                 Require(mip.tiledOffset == 0 && mip.tiledSize == 65536, "render target mip tails must share one guest 64KB block");
             }
         }
+        std::sort(ranges.begin(), ranges.end());
+        for (std::size_t index = 1; index < ranges.size(); ++index) Require(ranges[index].first >= ranges[index - 1].second, "detiled mip levels must occupy separate ranges");
         Require(tailSeen && !mips.front().tail, "render target mip chains must cover both regular blocks and mip tails");
     }
-    // SW_64KB_R_X follows the generic 64 KiB thin-block rules for every format, block-compressed and
-    // wide ones included.
-    static_cast<void>(ComputeMipLayout(TextureTileMode::RenderTarget64KB, 169, 64, 64, 1));
+    const auto compressed = ComputeMipLayout(TextureTileMode::RenderTarget64KB, 169, 64, 64, 1);
+    Require(compressed.size() == 1 && compressed[0].tiledSize == 65536 && compressed[0].linearSize != 0, "block compressed render target layout is wrong");
+    Require(ComputeMipLayout(TextureTileMode::RenderTarget64KB, 132, 64, 64, 1).size() == 1, "format 132 render target layout is missing");
+    reject([] { ComputeMipLayout(TextureTileMode::RenderTarget64KB, 74, 64, 64, 1); }, "unsupported bytes per element");
 
     reject([] { ComputeMipLayout(TextureTileMode::kLinear, 1, 0, 4, 1); }, "zero-sized texture");
     reject([] { ComputeMipLayout(TextureTileMode::kLinear, 1, 4, 0, 1); }, "zero-sized texture");

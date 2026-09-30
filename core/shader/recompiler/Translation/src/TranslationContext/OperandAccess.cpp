@@ -36,6 +36,12 @@ RdnaOperand TranslationContext::destinationOperand(const RdnaInstruction& inst) 
     return destination;
 }
 
+RdnaOperand TranslationContext::accumulatorOperand(const RdnaInstruction& inst) {
+    RdnaOperand accumulator = inst.destination;
+    accumulator.dpp = false;
+    return accumulator;
+}
+
 RdnaOperand TranslationContext::offsetOperand(const RdnaOperand& operand, std::uint32_t offset) {
     if (offset == 0u) {
         return operand;

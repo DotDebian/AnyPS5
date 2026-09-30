@@ -392,6 +392,16 @@ void testMemorySynchronization() {
     check(memory.destination == 42, "failed synchronization changed the destination");
 }
 
+void testWriteChangedKeepsUntouchedBytes() {
+    alignas(256) static std::uint8_t guest[256];
+    std::memset(guest, 0, sizeof(guest));
+    std::vector<std::byte> original(sizeof(guest)), current(sizeof(guest));
+    current[3] = std::byte{7};
+    guest[100] = 0x55;
+    AgcDriver::GuestMemory::WriteChanged(reinterpret_cast<std::uintptr_t>(guest), current, original);
+    check(guest[3] == 7 && guest[100] == 0x55, "write-back rolled back a byte the GPU did not change");
+}
+
 void testEventWrite() {
     for (const auto eventType : {0x07u, 0x0fu, 0x10u}) {
         AgcDriver::Pm4::Validate(makePacket(0x46, {0x400u | eventType}), 0);
@@ -414,12 +424,22 @@ void testEventWrite() {
         }
         expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x46, {eventType}), 0x20); }, "compute queue");
     }
+    AgcDriver::Pm4::Validate(makePacket(0x46, {0x139, 0x1000, 0x2}), 0);
+    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x139, 0x1000, 0x2}), 0x20); }, "compute queue");
+    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x039, 0x1000, 0x2}), 0); }, "counter dump event index");
+    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x139, 0x1004, 0x2}), 0); }, "misaligned occlusion counter");
+    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x139, 0, 0}), 0); }, "null or misaligned occlusion counter");
+    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x139, 0x1000}), 0); }, "packet size");
+    AgcDriver::Pm4::Validate(makePacket(0x46, {0x038}), 0);
+    AgcDriver::Pm4::Validate(makePacket(0x46, {0x03a}), 0);
+    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x038}), 0x20); }, "compute queue");
+    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x138, 0x1000, 0x2}), 0); }, "packet size");
     for (const auto bit : {0x40u, 0x80u, 0x800u, 0x80000000u}) {
         expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x410u | bit}), 0); }, "reserved bits");
     }
     expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x410}, 1), 0); }, "header flags");
     expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x410, 0, 0}), 0); }, "packet size");
-    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x139, 0, 0}), 0); }, "event type 57");
+    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x13a, 0, 0}), 0); }, "packet size");
     expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x0d}), 0); }, "event type 13");
 }
 
@@ -488,7 +508,7 @@ void testDriverSubmission() {
     AgcDriverWaitIdle_nid_postfix();
     check(destination[0] == 83, "worker did not execute PM4 memory operations");
     auto rejectedCommands = commands;
-    const auto unsupportedEvent = makePacket(0x46, {0x139, 0, 0});
+    const auto unsupportedEvent = makePacket(0x46, {0x0d});
     rejectedCommands.insert(rejectedCommands.end(), unsupportedEvent.begin(), unsupportedEvent.end());
     Packet rejectedPacket{rejectedCommands.data(), static_cast<std::uint32_t>(rejectedCommands.size()), 0, {}};
     destination[0] = 0;
@@ -531,6 +551,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         testCatalog();
+        testWriteChangedKeepsUntouchedBytes();
         testRegisters();
         testContextAndBases();
         testIndexedDraw();

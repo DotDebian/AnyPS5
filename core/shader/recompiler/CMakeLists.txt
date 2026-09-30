@@ -154,9 +154,6 @@ function(add_shader_recompiler target runtimeTarget)
 
     target_compile_features(${target} PUBLIC cxx_std_20)
 
-    # The shader disk cache's version (ShaderCacheVersion.cmake): a hash of the recompiler and AGC
-    # driver sources, regenerated whenever one of them changes. The glob is re-run on every build
-    # (CONFIGURE_DEPENDS), so an added file changes the version too.
     set(shaderCacheGeneratedDir "${CMAKE_CURRENT_BINARY_DIR}/${target}_generated")
     set(shaderCacheVersionHeader "${shaderCacheGeneratedDir}/ShaderCacheVersion.hpp")
     set(shaderCacheDriverDir "${PROJECT_SOURCE_DIR}/core/libs/prx/libSceAgcDriver")
@@ -173,9 +170,7 @@ function(add_shader_recompiler target runtimeTarget)
             "${shaderCacheDriverDir}/*.cmake"
             "${shaderCacheDriverDir}/CMakeLists.txt"
     )
-    # The driver's tests and tools are not part of the library the game loads.
     list(FILTER shaderCacheSources EXCLUDE REGEX "^${shaderCacheDriverDir}/(tests|tools)/")
-    # SPIRV-Tools optimizes the emitted modules; its change log moves with every release.
     if(ANYPS5_ENABLE_SPIRV_TOOLS AND EXISTS "${PROJECT_SOURCE_DIR}/3rdparty/SPIRV-Tools/CHANGES")
         list(APPEND shaderCacheSources "${PROJECT_SOURCE_DIR}/3rdparty/SPIRV-Tools/CHANGES")
     endif()

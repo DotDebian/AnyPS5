@@ -47,13 +47,9 @@ struct AudioOut2Port {
     std::uint32_t dataFormat = 0;
     std::uint32_t samplingFreq = 0;
     std::uint32_t flags = 0;
-    // Channel count decoded from dataFormat; 0 when the format is not understood (the port is then
-    // not rendered). Samples are float.
     std::uint32_t channels = 0;
-    // The PCM buffer (one grain, float, interleaved) the title last handed over through the data
-    // attribute. It is guest memory the title rewrites every tick, so it is read when the context
-    // mixes, not when it is set.
-    const float* data = nullptr;
+    bool int16 = false;
+    const void* data = nullptr;
     float volume[AUDIO_OUT2_PORT_CHANNELS_MAX] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     std::uint64_t dataSets = 0;
     std::uint64_t attributeTraces = 0;
@@ -71,17 +67,11 @@ struct AudioOut2Context {
     SDL_AudioDeviceID device = 0;
     // Stereo float mix of the ports for one push.
     std::vector<float> mix;
-    // The DualSense's USB sound card, open while the context has controller ports and the card is
-    // present (AudioOut2PadMix.hpp): the 4-channel mix of one push, and the same grain in the card's
-    // layout as it is queued with every push.
     SDL_AudioDeviceID padDevice = 0;
     std::chrono::steady_clock::time_point nextPadProbe;
     AudioOut2PadLayout padLayout;
     std::vector<float> padMix;
     std::vector<float> padFrames;
-    std::uint64_t padPrimes = 0;
-    std::uint64_t padDropped = 0;
-    float summaryPadPeak[4] = {};
     // Trace counters.
     std::uint64_t pushes = 0;
     std::uint64_t blockingPushes = 0;
@@ -99,10 +89,8 @@ struct AudioOut2Context {
 };
 
 // Mixes every port of the context that carries PCM data into out (stereo float, frames frames), summing
-// onto the zeroed buffer. With padOut (4-channel float, the controller's sound card) the controller's
-// speaker and vibration ports go there instead (AudioOut2PadMix.hpp). Returns the number of ports mixed.
+// onto the zeroed buffer. Returns the number of ports mixed.
 std::uint32_t AudioOut2MixPorts(const AudioOut2Context& context, float* out, float* padOut, std::uint32_t frames);
-// Whether the context has a port that plays on the controller when its sound card is open.
 bool AudioOut2HasPadPorts(const AudioOut2Context& context);
 // Forgets the ports of a context being destroyed.
 void AudioOut2ReleasePorts(const AudioOut2Context& context);

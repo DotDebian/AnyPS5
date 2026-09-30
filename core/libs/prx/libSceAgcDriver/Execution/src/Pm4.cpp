@@ -33,7 +33,11 @@ std::uint64_t address(std::uint32_t low, std::uint32_t high) {
 std::uint32_t registerOffset(std::uint32_t value) {
     require(value != 0xffffffffu, "indirect register sentinel semantics are not implemented");
     const auto offset = value & ~0x70000000u;
-    require(offset <= 0xffffu, "extended register semantics are not implemented");
+    if (offset > 0xffffu) {
+        char what[80];
+        std::snprintf(what, sizeof(what), "extended register semantics are not implemented (offset dword 0x%08x)", value);
+        throw std::runtime_error(what);
+    }
     return offset;
 }
 
@@ -196,8 +200,9 @@ std::string_view UnsupportedReason(std::uint32_t header) {
         case 0x22: return "conditional command execution and conditional flip reservation are not implemented";
         case 0x33: case 0x3f: return "nested command buffers, branching and nested flip reservation are not implemented";
         case 0x3c: case 0x93: return {};
-        case 0x39: case 0x59:
+        case 0x39:
             return "cooperative command-queue waits are not implemented";
+        case 0x59: return {};
         case 0x84: case 0x85: case 0x86: case 0x88:
             return "separate CE/DE execution and counter synchronization are not implemented";
         case 0x49: return {};
@@ -327,16 +332,16 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
                     graphics();
                     size(2);
                     break;
-                case 0x39:
-                    graphics();
-                    size(4);
-                    require(eventIndex == 1, "invalid PIXEL_PIPE_STAT_DUMP event index");
-                    require((packet[2] & 7u) == 0, "misaligned PIXEL_PIPE_STAT_DUMP destination");
-                    break;
                 case 0x16: case 0x31: case 0x2a: case 0x2c: case 0x2e:
                     graphics();
                     size(2);
                     require(eventIndex == 0 || eventIndex == 7, "invalid cache-flush event index");
+                    break;
+                case 0x39:
+                    graphics();
+                    size(4);
+                    require(eventIndex == 1, "invalid occlusion counter dump event index");
+                    require(address(packet[2], packet[3]) != 0 && (packet[2] & 7u) == 0, "null or misaligned occlusion counter dump address");
                     break;
                 default: {
                     std::string words;
@@ -376,6 +381,10 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
             require(packet.size() - 2 <= 0x10000u - offset, "register range overflow");
             break;
         }
+        case 0x59:
+            size(2);
+            require((packet[1] & 0x7fffffffu) == 0, "unsupported REWIND payload bits");
+            break;
         case 0x3c: case 0x93: {
             size(opcode == 0x3c ? 7 : 9);
             require((packet[1] & 0x10u) != 0, "register-space WAIT_REG_MEM is not implemented");
@@ -484,17 +493,6 @@ bool WaitComparesValue(std::span<const std::uint32_t> packet, std::uint64_t valu
 std::size_t WaitAwaitedBytes(std::span<const std::uint32_t> packet) {
     const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
     return wide && (packet.size() < 8 || packet[7] != 0) ? 8 : 4;
-}
-
-void DumpPixelPipeStatistics(std::span<const std::uint32_t> packet) {
-    static const std::uint32_t backends = [] {
-        const char* text = std::getenv("APS5_RENDER_BACKENDS");
-        return text ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 0)) : 16u;
-    }();
-    static std::atomic<std::uint64_t> samples{0};
-    const auto destination = address(packet[2], packet[3]);
-    const std::uint64_t value = (samples.fetch_add(0x100000u) + 0x100000u) | (1ull << 63u);
-    for (std::uint32_t backend = 0; backend < backends; ++backend) GuestMemory::Write(destination + backend * 16u, std::as_bytes(std::span(&value, 1)), 8);
 }
 
 std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet) {
@@ -748,6 +746,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             }
             return;
         }
+        case 0x59: break;
         case 0x3c: case 0x93: {
             // The waited-on value is written by the CPU or another queue; poll it like the CP would.
             const auto start = std::chrono::steady_clock::now();

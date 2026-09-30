@@ -107,7 +107,7 @@ private:
 
     static void commit(void* pointer, std::size_t bytes) {
 #ifdef _WIN32
-        if (!VirtualAlloc(pointer, bytes, MEM_COMMIT, PAGE_READWRITE)) throw std::bad_alloc();
+        GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, PAGE_READWRITE, bytes);
 #else
         (void)pointer;
         (void)bytes;
@@ -165,7 +165,7 @@ private:
 
         static void release(void* raw, std::size_t bytes) {
 #ifdef _WIN32
-            if (!VirtualFree(raw, bytes, MEM_DECOMMIT)) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "guest heap decommit failed");
+            GuestArena::GuestArenaReset_nid_postfix(raw, bytes);
             GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(raw), bytes);
 #endif
             GuestArena::GuestArenaRelease_nid_postfix(raw, bytes);

@@ -2,10 +2,20 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <functional>
+#include <iostream>
 #include <limits>
+#include <string>
 
 namespace {
 
@@ -26,6 +36,193 @@ ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
     return {ShaderRecompiler::DescriptorKind::StorageBuffer, role, 0, slot, 1, {}, false};
 }
 
+void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
+    if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
+        std::cout << "guest arena unavailable or not write-watched: heap mirrors not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 2 * 65536;
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+#ifdef _WIN32
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+#endif
+    auto* guest = static_cast<std::uint8_t*>(block);
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uintptr_t>(block);
+    const auto registry = [&](bool add, bool writable) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, bytes, true, writable);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto build = [&](std::uint64_t written, const std::function<void(GuestBufferMemory&)>& gpu) {
+        GuestBufferMemory leased(context);
+        leased.AcquireRegistered();
+        if (written != 0) leased.AddWritable(written, 32);
+        leased.Upload(true);
+        const auto ranges = leased.AddressRanges();
+        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == address && range.end == address + bytes; });
+        Require(found != ranges.end() && found->permissions == ShaderRecompiler::BdaAbi::Read, "the heap range is missing from the BDA table");
+        const auto device = found->deviceAddress;
+        if (gpu) gpu(leased);
+        leased.WriteBack();
+        return device;
+    };
+    const auto sweep = [&] {
+        GuestBufferMemory leased(context);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        leased.WriteBack();
+    };
+    sweep();
+    registry(true, false);
+    const auto before = MirrorCounters();
+    const auto first = build(0, {});
+    const auto made = MirrorCounters();
+    Require(made.heapMirrors == before.heapMirrors + 1 && made.heapBytes == before.heapBytes + bytes, "a read-only heap range was not mirrored");
+    Require(access.addressBytes(first)[65536 + 3] == std::byte{0x11}, "the heap mirror was not filled");
+    Require(build(0, {}) == first && MirrorCounters().blocksCopied == made.blocksCopied && MirrorCounters().heapRefills == made.heapRefills, "an unchanged heap range was read into its mirror again");
+    guest[65536 + 3] = 0x22;
+    Require(build(0, {}) == first && MirrorCounters().heapRefills == made.heapRefills + 1 && MirrorCounters().blocksCopied == made.blocksCopied + 1, "a written heap block was not read again alone");
+    Require(access.addressBytes(first)[65536 + 3] == std::byte{0x22}, "the heap mirror missed the CPU write");
+    const auto one = MirrorCounters();
+    guest[5] = 0x33;
+    guest[65536 + 7] = 0x44;
+    Require(build(0, {}) == first && MirrorCounters().blocksCopied == one.blocksCopied + 2, "two written heap blocks were not read again");
+    Require(access.addressBytes(first)[5] == std::byte{0x33} && access.addressBytes(first)[65536 + 7] == std::byte{0x44}, "the heap mirror missed the CPU writes");
+    registry(false, false);
+    sweep();
+    const auto swept = MirrorCounters();
+    Require(swept.heapMirrors == before.heapMirrors && swept.heapBytes == before.heapBytes, "the heap mirror outlived its range");
+
+    registry(true, true);
+    const auto device = build(address + 16, [&](GuestBufferMemory& leased) {
+        std::uint32_t adjustment = 0;
+        const auto view = leased.Descriptor(address + 16, 32, adjustment);
+        access.bytes(view.buffer)[view.offset + adjustment] = std::byte{0x77};
+        guest[16 + 8] = 0x55;
+    });
+    Require(guest[16] == 0x77 && guest[16 + 8] == 0x55, "a writable heap mirror's write-back lost the GPU's store or rolled back the CPU's");
+    Require(build(0, {}) == device && access.addressBytes(device)[16] == std::byte{0x77} && access.addressBytes(device)[16 + 8] == std::byte{0x55}, "the writable heap mirror missed the stores");
+    registry(false, true);
+    sweep();
+    Require(MirrorCounters().heapMirrors == before.heapMirrors, "the writable heap mirror outlived its range");
+
+#ifdef _WIN32
+    {
+        constexpr std::size_t half = 2 * 65536;
+        void* pair = GuestArena::GuestArenaAllocate_nid_postfix(2 * half, 65536);
+        GuestArena::GuestArenaCommit_nid_postfix(pair, 2 * half, PAGE_READWRITE, 2 * half);
+        std::memset(pair, 0x11, 2 * half);
+        auto* first = static_cast<std::uint8_t*>(pair);
+        auto* second = first + half;
+        const auto registerPair = [&](bool add) {
+            auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+            for (auto* range : {first, second}) {
+                if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, half, true, false);
+                else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+            }
+            GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+        };
+        const auto firstDevice = [&] {
+            GuestBufferMemory leased(context);
+            leased.AcquireRegistered();
+            leased.Upload(true);
+            const auto ranges = leased.AddressRanges();
+            const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == reinterpret_cast<std::uintptr_t>(first); });
+            Require(found != ranges.end(), "the first heap range is missing from the BDA table");
+            const auto device = found->deviceAddress;
+            leased.WriteBack();
+            return device;
+        };
+        registerPair(true);
+        const auto device = firstDevice();
+        first[5] = 0x66;
+        DWORD previous = 0;
+        Require(VirtualProtect(second, 65536, PAGE_NOACCESS, &previous) != 0, "cannot protect the second heap range");
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(second), 65536);
+        bool threw = false;
+        try {
+            GuestBufferMemory leased(context);
+            leased.AcquireRegistered();
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        Require(VirtualProtect(second, 65536, PAGE_READWRITE, &previous) != 0, "cannot unprotect the second heap range");
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(second), 65536);
+        Require(threw, "a build over an inaccessible heap mirror range did not fail");
+        Require(firstDevice() == device && access.addressBytes(device)[5] == std::byte{0x66}, "an interrupted build left a changed heap block marked current");
+        registerPair(false);
+        sweep();
+        GuestArena::GuestArenaReset_nid_postfix(pair, 2 * half);
+        GuestArena::GuestArenaRelease_nid_postfix(pair, 2 * half);
+    }
+#endif
+#ifdef _WIN32
+    {
+        constexpr std::size_t size = 2 * 65536;
+        void* raw = GuestArena::GuestArenaAllocate_nid_postfix(size, 65536);
+        GuestArena::GuestArenaCommit_nid_postfix(raw, size, PAGE_READWRITE, size);
+        auto* bytes8 = static_cast<std::uint8_t*>(raw);
+        std::memset(raw, 0x11, size);
+        const auto base = reinterpret_cast<std::uintptr_t>(raw);
+        const auto page = base + 65536;
+        DWORD previous = 0;
+        Require(VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READONLY, &previous) != 0, "cannot make the aliased page read-only");
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(page, 4096);
+        const auto registerRange = [&](bool add) {
+            auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+            if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, raw, size, true, true);
+            else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, raw);
+            GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+        };
+        registerRange(true);
+        const auto storeAt = [&](std::uint64_t at) {
+            GuestBufferMemory leased(context);
+            leased.AcquireRegistered();
+            leased.AddWritable(page - 16, 32);
+            leased.Upload(true);
+            const auto ranges = leased.AddressRanges();
+            const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == base; });
+            Require(found != ranges.end() && access.addressBytes(found->deviceAddress)[65536 + 8] == std::byte{0x11}, "a writable range with a read-only page was not mirrored with its bytes");
+            std::uint32_t adjustment = 0;
+            const auto view = leased.Descriptor(page - 16, 32, adjustment);
+            access.bytes(view.buffer)[view.offset + adjustment + static_cast<std::size_t>(at - (page - 16))] = std::byte{0x77};
+            leased.WriteBack();
+        };
+        const auto made = MirrorCounters().heapMirrors;
+        storeAt(page - 8);
+        Require(MirrorCounters().heapMirrors == made + 1 && bytes8[65536 - 8] == 0x77, "a store next to a read-only page was not written back");
+        bool refused = false;
+        try {
+            storeAt(page + 4);
+        } catch (const std::runtime_error& error) {
+            refused = std::string(error.what()).find("aliased writes are not implemented") != std::string::npos;
+        }
+        Require(refused && bytes8[65536 + 4] == 0x11, "a GPU change of a read-only page was not refused");
+        {
+            GuestBufferMemory plain(context);
+            plain.AddReadable(page, 16);
+            plain.Upload(false);
+            std::uint32_t adjustment = 0;
+            const auto view = plain.Descriptor(page, 16, adjustment);
+            Require(access.bytes(view.buffer)[view.offset + adjustment] == std::byte{0x11}, "a descriptor over a read-only page of a writable range read zeros");
+            plain.WriteBack();
+        }
+        registerRange(false);
+        sweep();
+        Require(VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READWRITE, &previous) != 0, "cannot restore the aliased page");
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(page, 4096);
+        GuestArena::GuestArenaReset_nid_postfix(raw, size);
+        GuestArena::GuestArenaRelease_nid_postfix(raw, size);
+    }
+#endif
+#ifdef _WIN32
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+#endif
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+}
+
 }
 
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
@@ -36,9 +233,11 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     memory.AddWritable(address, sizeof(guest));
     memory.AddWritable(address + 16, 16);
     memory.Upload(true);
-    const auto first = memory.Descriptor(address, sizeof(guest));
-    const auto alias = memory.Descriptor(address + 16, 16);
-    Require(first.buffer == alias.buffer && alias.offset == 16, "aliased guest buffers have different owners");
+    std::uint32_t adjustment = 0;
+    const auto first = memory.Descriptor(address, sizeof(guest), adjustment);
+    Require(adjustment == 0, "a view at its owner's start is bound off it");
+    const auto alias = memory.Descriptor(address + 16, 16, adjustment);
+    Require(first.buffer == alias.buffer && alias.offset + adjustment == 16 && alias.range == 16 + adjustment, "aliased guest buffers have different owners");
     const auto ranges = memory.AddressRanges();
     Require(ranges.size() == 1 && ranges[0].begin == address && ranges[0].end == address + sizeof(guest), "incorrect BDA range bounds");
     Require(ranges[0].deviceAddress != 0 && ranges[0].permissions == ShaderRecompiler::BdaAbi::Read, "incorrect BDA address or permissions");
@@ -94,6 +293,10 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         Require(range.begin == snapshots[0].address && range.end == range.begin + source.size(), "64-bit guest address was truncated");
         const auto fault = access.bytes(access.descriptor(5).buffer);
         for (const auto byte : fault) Require(byte == std::byte{}, "fault buffer was not initialized");
+        const ShaderRecompiler::BdaAbi::Fault denied{ShaderRecompiler::BdaAbi::FaultState::Ready, ShaderRecompiler::BdaAbi::FaultReason::Permission, snapshots[0].address + 4, 4, 0, 0x88, 0};
+        std::memcpy(fault.data(), &denied, sizeof(denied));
+        reject([&] { resources.WriteBack(); }, "read-only in the BDA table");
+        std::memset(fault.data(), 0, fault.size());
         resources.WriteBack();
     }
     {
@@ -118,42 +321,10 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         GuestBufferMemory unaligned(aligned);
         unaligned.AddWritable(address, sizeof(guest));
         unaligned.Upload(true);
-        reject([&] { unaligned.Descriptor(address + 4, 4); }, "offset alignment");
-        reject([&] { unaligned.Descriptor(address + sizeof(guest), 4); }, "exceeds its GPU owner");
-
-        // View aliases on the CPU path (no import, no recorder): views registered at a misaligned
-        // distance inside a copied region bind copies of their own that start at their address,
-        // hold the guest bytes there, and store what the GPU changed at write-back.
-        alignas(64) std::array<std::uint8_t, 64> views{};
-        for (std::size_t i = 0; i < views.size(); ++i) views[i] = static_cast<std::uint8_t>(i);
-        const auto viewsAddress = reinterpret_cast<std::uintptr_t>(views.data());
-        {
-            GuestBufferMemory memory(aligned);
-            memory.AddReadable(viewsAddress, views.size());
-            memory.AddWritable(viewsAddress + 4, 8);
-            memory.AddReadable(viewsAddress + 40, 8);
-            memory.Upload(false);
-            Require(memory.ViewAliases() == 2 && memory.GpuViewAliases() == 0, "misaligned views were not given host copies");
-            const auto whole = memory.Descriptor(viewsAddress, views.size());
-            const auto written = memory.Descriptor(viewsAddress + 4, 8);
-            const auto read = memory.Descriptor(viewsAddress + 40, 8);
-            Require(whole.offset == 0 && written.offset % 16 == 0 && read.offset % 16 == 0, "view descriptors are not aligned");
-            Require(written.buffer != whole.buffer && read.buffer != whole.buffer && written.buffer != read.buffer && written.range == 8 && read.range == 8, "misaligned views bind the region's buffer");
-            Require(std::memcmp(access.bytes(written.buffer).data() + written.offset, views.data() + 4, 8) == 0 && std::memcmp(access.bytes(read.buffer).data() + read.offset, views.data() + 40, 8) == 0, "a view's binding does not hold the guest bytes at its address");
-            reject([&] { memory.Descriptor(viewsAddress + 8, 4); }, "offset alignment");
-            Require(memory.HasCopiedWrites(), "a written view alias needs no write-back");
-            access.bytes(written.buffer)[written.offset + 1] = std::byte{0xee};
-            access.bytes(written.buffer)[written.offset + 7] = std::byte{0xdd};
-            memory.WriteBack();
-            Require(views[5] == 0xee && views[11] == 0xdd && views[4] == 4 && views[12] == 12 && views[40] == 40, "a view alias's stores did not land in guest memory (or rolled back others)");
-        }
-        {
-            // Written views overlapping at incompatible alignments cannot share bytes: rejected.
-            GuestBufferMemory memory(aligned);
-            memory.AddWritable(viewsAddress, views.size());
-            memory.AddWritable(viewsAddress + 4, 8);
-            reject([&] { memory.Upload(false); }, "incompatible storage buffer offset alignments");
-        }
+        std::uint32_t adjustment = 0;
+        const auto view = unaligned.Descriptor(address + 4, 4, adjustment);
+        Require(adjustment == 4 && view.offset == 0 && view.range == 8, "a view off the offset alignment binds from below it");
+        reject([&] { unaligned.Descriptor(address + sizeof(guest), 4, adjustment); }, "exceeds its GPU owner");
     }
     {
         // The cached address space: a second build in an unchanged registry takes the first one's
@@ -173,8 +344,9 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
             leased.AcquireRegistered();
             Require(leased.HoldsLease(), "address-based build holds no lease");
             leased.Upload(true);
-            const auto view = leased.Descriptor(blockAddress, 64);
-            Require(view.range == 64, "leased block has no descriptor");
+            std::uint32_t adjustment = 0;
+            const auto view = leased.Descriptor(blockAddress, 64, adjustment);
+            Require(view.range == 64 + adjustment, "leased block has no descriptor");
             const auto ranges = leased.AddressRanges();
             Require(std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == blockAddress && range.end == blockAddress + 64; }), "leased block is missing from the BDA table");
             leased.WriteBack();
@@ -187,4 +359,8 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         const auto dropped = AddressSpaceCounters();
         if (dropped.enabled) Require(dropped.waiterDrops == after.waiterDrops + 1 && LeaseCounters().cacheDrops == dropped.waiterDrops, "the free did not drop the cached address space");
     }
+    heapMirrorTests(context, access);
+    Require(AddressCopyOverflow({{0x1000, 0x3000, 0x2000, "uncommitted pages"}}, 0x2000).empty(), "copies within the limit were refused");
+    const auto copies = AddressCopyOverflow({{0x1000, 0x2000, 0x1000, "not mirrored"}, {0x10000, 0x30000, 0x18000, "uncommitted pages"}}, 0x2000);
+    Require(!copies.empty() && copies.find("0x10000+0x20000 (0.1 MiB committed, uncommitted pages)") < copies.find("0x1000+0x1000"), "the copy limit does not name the largest copy first");
 }

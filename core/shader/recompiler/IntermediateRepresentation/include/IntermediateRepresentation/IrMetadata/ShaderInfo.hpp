@@ -32,6 +32,8 @@ struct ShaderInfo {
     bool instanceOffsetConflict = false;
     bool hasBitwiseXor = false;
     bool usesDma = false;
+    bool bdaWrites = false;
+    bool dispatchThreadLimit = false;
 
     bool operator==(const ShaderInfo& other) const = default;
 };

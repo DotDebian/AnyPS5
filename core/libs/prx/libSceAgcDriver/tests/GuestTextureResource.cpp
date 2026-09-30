@@ -114,11 +114,9 @@ void RunGuestTextureResourceTests() {
     tileModes.tileModeRaw = 0x09;
     Require(DecodeTextureResource(pack(tileModes)).tileMode == TextureTileMode::kStandard64KB, "tile mode 0x09 must decode to standard 64KB");
     tileModes.tileModeRaw = 0x1b;
-    // An XOR swizzle mode needs a 64 KiB aligned base (no pipe/bank XOR folded into the low bits).
-    tileModes.base40 = 0x123400ull;
+    rejectFields(tileModes, "pipe/bank XOR base");
+    tileModes.base40 = 0x120000ull;
     Require(DecodeTextureResource(pack(tileModes)).tileMode == TextureTileMode::RenderTarget64KB, "tile mode 0x1b must decode to render target 64KB");
-    tileModes.base40 = 0x123456ull;
-    rejectFields(tileModes, "XOR swizzle");
     tileModes.base40 = base.base40;
     tileModes.tileModeRaw = 0x02;
     rejectFields(tileModes, "unsupported tile mode");
@@ -240,17 +238,22 @@ void RunGuestTextureResourceTests() {
     badMsaa.msaaDepth = true;
     rejectFields(badMsaa, "MSAA");
 
-    // DCC fields are accepted: surfaces are read uncompressed here and only the fast-clear keys at
-    // META_DATA_ADDRESS change what a read returns (DccMetadata.hpp).
-    for (const auto mutate : {+[](Fields& f) { f.maxUncompBlkSize = 1; }, +[](Fields& f) { f.maxCompBlkSize = 1; }, +[](Fields& f) { f.metaPipeAligned = true; }, +[](Fields& f) { f.writeCompress = true; }, +[](Fields& f) { f.dccAlphaPos = true; }, +[](Fields& f) { f.metaAddr = 1; }}) {
-        Fields dcc = base;
-        mutate(dcc);
-        Require(DecodeTextureResource(pack(dcc)).dccAddress == 0, "DCC fields without metadata compression named DCC keys");
-    }
-    Fields dcc = base;
-    dcc.metaCompress = true;
-    dcc.metaAddr = 0x42;
-    Require(DecodeTextureResource(pack(dcc)).dccAddress == 0x4200, "the DCC key address was not decoded");
+    Fields blockSize = base;
+    blockSize.maxUncompBlkSize = 1;
+    blockSize.maxCompBlkSize = 1;
+    Require(DecodeTextureResource(pack(blockSize)).baseAddress == DecodeTextureResource(pack(base)).baseAddress, "DCC block size overrides changed texture storage");
+
+    Fields meta = base;
+    meta.metaPipeAligned = true;
+    meta.writeCompress = true;
+    meta.dccColorTransf = true;
+    meta.metaAddr = 1;
+    const auto uncompressed = DecodeTextureResource(pack(meta));
+    Require(uncompressed.dccAddress == 0 && !uncompressed.dccAlphaOnMsb, "DCC metadata without compression was decoded");
+    meta.metaCompress = true;
+    meta.dccAlphaPos = true;
+    const auto compressed = DecodeTextureResource(pack(meta));
+    Require(compressed.dccAddress == 0x100 && compressed.dccAlphaOnMsb, "DCC metadata was decoded wrongly");
 
     Fields badSwizzle = base;
     badSwizzle.bcSwizzle = 1;
@@ -262,11 +265,11 @@ void RunGuestTextureResourceTests() {
     badLevels.maxMip = 1;
     rejectFields(badLevels, "base mip level past its last mip level");
 
-    Fields badMaxMip = base;
-    badMaxMip.lastLevel = 1;
-    badMaxMip.maxMip = 2;
-    // A view may cover fewer levels than the surface has.
-    static_cast<void>(DecodeTextureResource(pack(badMaxMip)));
+    Fields partialMips = base;
+    partialMips.lastLevel = 1;
+    partialMips.maxMip = 2;
+    const auto partial = DecodeTextureResource(pack(partialMips));
+    Require(partial.lastLevel == 1 && partial.mipCount == 3, "a view over part of the mip chain decoded wrongly");
 
     std::array<std::uint32_t, 4> shortWords{};
     reject([&] { DecodeTextureResource(shortWords); }, "8 dwords");
@@ -276,8 +279,7 @@ void RunGuestTextureResourceTests() {
     Require(MatchesGuestDimension(Shape::Image2D, TextureDimension::k2D), "2D shape must match 2D dimension");
     Require(!MatchesGuestDimension(Shape::Image2D, TextureDimension::k2DArray), "2D shape must not match 2D array dimension");
     Require(MatchesGuestDimension(Shape::Image2DArray, TextureDimension::k2DArray), "2D array shape must match 2D array dimension");
-    // A cube's six faces read as a six-layer array (gradients and fetches through a 2D array view).
-    Require(MatchesGuestDimension(Shape::Image2DArray, TextureDimension::kCube), "2D array shape must match a cube's faces");
+    Require(MatchesGuestDimension(Shape::Image2DArray, TextureDimension::kCube), "a cube must be readable as a 2D array of its faces");
     Require(MatchesGuestDimension(Shape::ImageCube, TextureDimension::kCube), "cube shape must match cube dimension");
     Require(!MatchesGuestDimension(Shape::ImageCube, TextureDimension::k1D), "cube shape must not match 1D dimension");
     Require(!MatchesGuestDimension(Shape::Image3D, TextureDimension::k1D), "3D shape must never match a guest dimension");

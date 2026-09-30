@@ -166,9 +166,8 @@ struct ShaderVertexInputInfo {
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
-    std::uint32_t dispatchThreadsNum[3] = {0, 0, 0};
     bool groupId[3] = {false, false, false};
-    bool dispatchThreadDimensions = false;
+    bool partialGroups = false;
     int threadIdsNum = 0;
     int workgroupRegister = 0;
     bool tgSizeEn = false;

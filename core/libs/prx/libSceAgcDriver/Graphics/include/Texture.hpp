@@ -57,6 +57,7 @@ public:
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
     // CanCopyFrom says whether the two descriptors address the same surface compatibly.
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
+    Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components);
     static bool CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     ~Texture();
     Texture(const Texture&) = delete;
@@ -121,7 +122,7 @@ public:
     // Render targets live in the same images: draws attach mip 0 through a view of the color
     // buffer's format and mark the image dirty like a storage write.
     bool Attachable() const { return attachable; }
-    VkImageView AttachmentView(VkFormat format);
+    VkImageView AttachmentView(VkFormat format, std::uint32_t mip = 0);
     void WriteBack();
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
@@ -417,7 +418,7 @@ private:
     std::map<std::uint32_t, VkImageView> extraViews;
     std::map<std::uint32_t, VkImageView> firstLayerViews;
     bool attachable = false;
-    std::map<VkFormat, VkImageView> attachmentViews;
+    std::map<std::pair<VkFormat, std::uint32_t>, VkImageView> attachmentViews;
     VkFormat storageFormat = VK_FORMAT_UNDEFINED;
     // Results are on the GPU only (guarded by the pending-write registry lock).
     bool dirty = false;

@@ -44,6 +44,11 @@ struct ColorTarget {
     // CB_COLOR_CLEAR_WORD0/1: the texel (in memory order, 64 bits at most) the DCC register clear code
     // (DccKeys::ClearRegister) stands for.
     std::array<std::uint32_t, 2> clearWords{};
+    std::uint64_t surfaceAddress = 0;
+    VkExtent2D surfaceExtent{};
+    std::uint32_t mipCount = 1;
+    std::uint32_t mip = 0;
+    bool mipTail = false;
 };
 
 // The depth/stencil surface a draw tests against (DB_Z_INFO, DB_STENCIL_INFO, the DB_*_BASE words,
@@ -142,6 +147,7 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
 // surface's memory is not coherent with its resident image, HTILE fills only mark clears), so such a
 // blit changes nothing here. A register a rule needs that is absent makes it no blit.
 bool DepthMetadataBlit(const QueueState& queue);
+std::array<std::uint8_t, 8> ExportMappings(const State& state);
 // The message DecodeState (or the pixel stage decode after it) would throw for the register rules
 // this precheck covers, evaluated without exceptions before the draw is decoded; empty when they
 // pass (DecodeState still checks everything). A register a rule needs that is absent is no verdict.

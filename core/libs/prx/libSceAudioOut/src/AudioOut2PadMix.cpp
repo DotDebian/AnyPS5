@@ -1,10 +1,9 @@
 #include "AudioOut2PadMix.hpp"
 
 #include <algorithm>
-#include <cctype>
 #include <cstddef>
 #include <cstring>
-#include <string>
+#include <stdexcept>
 
 AudioOut2Route AudioOut2RouteForPort(std::uint16_t type, std::uint32_t channels) {
     if (type == AUDIO_OUT2_PORT_TYPE_PAD_SPEAKER && (channels == 1 || channels == 2)) return AudioOut2Route::PadSpeaker;
@@ -14,22 +13,23 @@ AudioOut2Route AudioOut2RouteForPort(std::uint16_t type, std::uint32_t channels)
 
 bool AudioOut2IsPadAudioDevice(const char* name) {
     if (name == nullptr) return false;
-    std::string lower(name);
-    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return lower.find("dualsense") != std::string::npos;
+    constexpr char needle[] = "dualsense";
+    constexpr std::size_t length = sizeof(needle) - 1;
+    for (const char* start = name; *start != '\0'; start++) {
+        std::size_t matched = 0;
+        while (matched < length && start[matched] != '\0' && (start[matched] | 0x20) == needle[matched]) matched++;
+        if (matched == length) return true;
+    }
+    return false;
 }
 
-void AudioOut2AccumulatePadPort(AudioOut2Route route, const float* data, std::uint32_t channels, const float* volume, float* out, std::uint32_t frames) {
-    if (route == AudioOut2Route::Main || data == nullptr || (channels != 1 && channels != 2)) return;
+void AudioOut2AccumulatePadFrame(AudioOut2Route route, const float* in, std::uint32_t channels, const float* volume, float* pad) {
+    if (route == AudioOut2Route::Main || (channels != 1 && channels != 2)) throw std::invalid_argument("AudioOut2AccumulatePadFrame: the port does not play on the controller");
     const auto left = route == AudioOut2Route::PadSpeaker ? AUDIO_OUT2_PAD_SPEAKER_LEFT : AUDIO_OUT2_PAD_VIBRATION_LEFT;
     const auto right = route == AudioOut2Route::PadSpeaker ? AUDIO_OUT2_PAD_SPEAKER_RIGHT : AUDIO_OUT2_PAD_VIBRATION_RIGHT;
     const auto rightSource = channels == 2 ? 1u : 0u;
-    for (std::uint32_t frame = 0; frame < frames; frame++) {
-        const float* in = data + static_cast<std::size_t>(frame) * channels;
-        float* pad = out + static_cast<std::size_t>(frame) * AUDIO_OUT2_PAD_CHANNELS;
-        pad[left] += in[0] * volume[0];
-        pad[right] += in[rightSource] * volume[rightSource];
-    }
+    pad[left] += in[0] * volume[0];
+    pad[right] += in[rightSource] * volume[rightSource];
 }
 
 void AudioOut2FinishPadMix(float* out, std::uint32_t frames) {

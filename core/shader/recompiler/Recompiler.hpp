@@ -43,6 +43,11 @@ struct ShaderComputeStageInfo {
     std::array<bool, 3> groupIdEnable;
     bool tgSizeEnable;
     std::uint32_t threadIdComponentCount;
+    std::array<std::uint32_t, 3> partialThreads;
+
+    [[nodiscard]] bool PartialGroups() const {
+        return partialThreads != std::array<std::uint32_t, 3>{};
+    }
 };
 
 // The SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR bits, in the order the SPI loads their VGPRs.
@@ -413,6 +418,7 @@ struct RecompileResult {
     SharedSpirv spirv;
     std::vector<DescriptorBinding> bindings;
     std::vector<std::byte> pushConstants;
+    std::uint32_t memoryOffsetDword = 0;
     std::uint32_t bdaAbiVersion = 0;
     std::vector<VertexAttribute> vertexAttributes;
     std::int32_t vertexOffsetSgpr = -1;

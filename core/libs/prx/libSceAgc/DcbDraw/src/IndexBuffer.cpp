@@ -14,8 +14,7 @@ std::uint32_t* APS5_VABI sceAgcDcbSetIndexBuffer(CommandBuffer* buf, std::uint64
 }
 
 std::uint32_t APS5_VABI sceAgcDcbSetIndexBufferGetSize() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return 12;
 }
 
 std::uint32_t* APS5_VABI sceAgcDcbSetIndexCount(CommandBuffer* buf, std::uint32_t indexCount) {
@@ -32,23 +31,16 @@ std::uint32_t* APS5_VABI sceAgcDcbSetIndexSize(CommandBuffer* buf, std::uint8_t 
     return Agc::Command::Emit(buf, 0x7au, {0x20000243u, 0x400u | indexSize | (static_cast<std::uint32_t>(cachePolicy) << 6u)}, __func__);
 }
 
-// The export with NID -KRzWekV120 (its name is not known) sets the index size too. Astro Bot calls it
-// as (cb, uses32BitIndices, 0, 0) after sceAgcDcbSetIndexCount whenever its index format changes,
-// and draws a 32-bit index buffer (a star field of 12000 quads) right after one call with 1 and
-// 16-bit ones after a call with 0; no other packet in its command buffers sets VGT_INDEX_TYPE. It
-// was a no-op, so every index buffer was read as 16-bit (the 32-bit one fanned its stars into
-// streaks towards vertex 0). The third argument is taken as the cache policy, like
-// sceAgcDcbSetIndexSize's; the fourth has only been seen as 0.
-std::uint32_t* APS5_VABI sceAgcDcbSetIndexSizeNid_KRzWekV120(CommandBuffer* buf, std::uint32_t indexSize, std::uint64_t cachePolicy, std::uint64_t unknown) {
-    Agc::Command::Require(indexSize <= 2, __func__, "invalid index element size");
-    Agc::Command::CheckBits(cachePolicy, 3, __func__);
-    Agc::Command::Require(unknown == 0, __func__, "unknown fourth argument is not zero");
-    return sceAgcDcbSetIndexSize(buf, static_cast<std::uint8_t>(indexSize), static_cast<std::uint8_t>(cachePolicy));
+std::uint32_t APS5_VABI sceAgcDcbSetIndexSizeGetSize() {
+    return 12;
 }
 
-std::uint32_t APS5_VABI sceAgcDcbSetIndexSizeGetSize() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+APS5_EXPORT("-KRzWekV120", sceAgcUnknown__MKRzWekV120);
+std::uint32_t* APS5_VABI sceAgcUnknown__MKRzWekV120(CommandBuffer* buf, std::uint8_t indexSize, std::uint8_t cachePolicy, std::uint8_t perInstanceObjectId) {
+    Agc::Command::CheckBits(perInstanceObjectId, 1, __func__);
+    auto* packet = sceAgcDcbSetIndexSize(buf, indexSize, cachePolicy);
+    packet[2] |= static_cast<std::uint32_t>(perInstanceObjectId) << 14u;
+    return packet;
 }
 
 std::uint32_t* APS5_VABI sceAgcDcbSetIndexIndirectArgs(CommandBuffer* buf, std::uint32_t dataOffsetInBytes) {
@@ -64,5 +56,3 @@ std::uint32_t APS5_VABI sceAgcDcbSetIndexIndirectArgsGetSize() {
 }
 
 }
-
-APS5_EXPORT("-KRzWekV120", sceAgcDcbSetIndexSizeNid_KRzWekV120);

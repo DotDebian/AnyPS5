@@ -1,6 +1,5 @@
-#define _GLIBCXX_HAS_GTHREADS 0
-#include "MemoryPool.hpp"
-#include "DirectMemory.hpp"
+#include "prx/libkernel/DirectMemory/MemoryPool.hpp"
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include <map>
 #include <mutex>
 
@@ -20,8 +19,9 @@ struct PhysicalMemoryPool {
         uint64_t cur = (start + align - 1) & ~(align - 1);
         while (cur + len <= end && cur + len <= DIRECT_MEMORY_SIZE) {
             if (_isFree(cur, len)) {
+                CreateDirectMemoryBacking(static_cast<int64_t>(cur), len, memoryType);
                 _mark(cur, len, true);
-                _ranges[cur] = {cur, cur + len, memoryType};
+                _blocks[cur] = {cur + len, memoryType};
                 *physOut = static_cast<int64_t>(cur);
                 return 0;
             }
@@ -32,24 +32,28 @@ struct PhysicalMemoryPool {
 
     void Free(uint64_t start, size_t len) {
         std::lock_guard<std::mutex> lock(_mutex);
+        ForgetDirectMemory(static_cast<int64_t>(start), len);
         _mark(start, len, false);
-        auto it = _ranges.upper_bound(start);
-        if (it == _ranges.begin()) return;
-        --it;
-        if (start + len > it->second.end) return;
-        const DirectMemoryBlock block = it->second;
-        _ranges.erase(it);
-        if (block.start < start) _ranges[block.start] = {block.start, start, block.memoryType};
-        if (start + len < block.end) _ranges[start + len] = {start + len, block.end, block.memoryType};
+        const uint64_t end = start + len;
+        auto it = _blocks.upper_bound(start);
+        if (it != _blocks.begin() && std::prev(it)->second.end > start) --it;
+        while (it != _blocks.end() && it->first < end) {
+            const uint64_t blockStart = it->first;
+            const Block block = it->second;
+            it = _blocks.erase(it);
+            if (blockStart < start) _blocks[blockStart] = {start, block.type};
+            if (block.end > end) it = _blocks.emplace(end, Block{block.end, block.type}).first;
+        }
     }
 
-    bool Query(uint64_t offset, DirectMemoryBlock* block) {
+    bool Find(uint64_t offset, bool findNext, int64_t* start, int64_t* end, int* memoryType) {
         std::lock_guard<std::mutex> lock(_mutex);
-        auto it = _ranges.upper_bound(offset);
-        if (it == _ranges.begin()) return false;
-        --it;
-        if (offset >= it->second.end) return false;
-        *block = it->second;
+        auto it = _blocks.upper_bound(offset);
+        if (it != _blocks.begin() && std::prev(it)->second.end > offset) --it;
+        else if (!findNext || it == _blocks.end()) return false;
+        *start = static_cast<int64_t>(it->first);
+        *end = static_cast<int64_t>(it->second.end);
+        *memoryType = it->second.type;
         return true;
     }
 
@@ -81,9 +85,14 @@ private:
             _used[first + i] = used;
     }
 
+    struct Block {
+        uint64_t end;
+        int type;
+    };
+
     std::mutex _mutex;
     bool _used[NUM_PAGES] = {};
-    std::map<uint64_t, DirectMemoryBlock> _ranges;
+    std::map<uint64_t, Block> _blocks;
 };
 
 int DirectMemoryAlloc(int64_t searchStart, int64_t searchEnd, size_t len, size_t alignment, int memoryType, int64_t* physOut) {
@@ -94,8 +103,8 @@ void DirectMemoryFree(int64_t start, size_t len) {
     PhysicalMemoryPool::Instance().Free(static_cast<uint64_t>(start), len);
 }
 
-bool DirectMemoryQueryBlock(uint64_t offset, DirectMemoryBlock* block) {
-    return PhysicalMemoryPool::Instance().Query(offset, block);
+bool DirectMemoryFind(int64_t offset, bool findNext, int64_t* start, int64_t* end, int* memoryType) {
+    return PhysicalMemoryPool::Instance().Find(static_cast<uint64_t>(offset), findNext, start, end, memoryType);
 }
 
 size_t DirectMemoryFreeRun(uint64_t offset, uint64_t limit) {

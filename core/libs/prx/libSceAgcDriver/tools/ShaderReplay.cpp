@@ -52,6 +52,7 @@ bool Replay(const char* path) {
     if (request.request.context.compute.has_value()) {
         const auto& compute = *request.request.context.compute;
         std::printf("  compute: threads %ux%ux%u, lds %u dwords, group ids %d%d%d, tg size %d, thread id components %u\n", compute.numThreads[0], compute.numThreads[1], compute.numThreads[2], compute.ldsSizeDwords, compute.groupIdEnable[0], compute.groupIdEnable[1], compute.groupIdEnable[2], compute.tgSizeEnable, compute.threadIdComponentCount);
+        if (compute.PartialGroups()) std::printf("  partial groups: dispatch of %ux%ux%u threads\n", compute.partialThreads[0], compute.partialThreads[1], compute.partialThreads[2]);
     }
     if (request.request.graphics.has_value()) {
         const auto& graphics = *request.request.graphics;
@@ -124,6 +125,16 @@ bool Replay(const char* path) {
             if (std::FILE* file = std::fopen(name.c_str(), "wb")) {
                 std::fwrite(result.spirv.data(), sizeof(std::uint32_t), result.spirv.size(), file);
                 std::fclose(file);
+            }
+        }
+        if (g_memory) {
+            for (const auto& binding : result.bindings) {
+                if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+                for (std::size_t i = 0; i + 4 <= binding.guestDescriptor.size(); i += 4) {
+                    const auto* v = binding.guestDescriptor.data() + i;
+                    const bool written = i / 4 >= binding.bufferWritten.size() || binding.bufferWritten[i / 4];
+                    std::printf("  buffer %zu: V# %08x %08x %08x %08x%s\n", i / 4, v[0], v[1], v[2], v[3], written ? " written" : "");
+                }
             }
         }
 #if ANYPS5_ENABLE_SPIRV_TOOLS

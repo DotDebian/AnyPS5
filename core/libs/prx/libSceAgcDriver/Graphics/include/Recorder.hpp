@@ -200,6 +200,8 @@ public:
     void FinishUpTo(std::uint64_t serial);
     // Submits and waits for every batch, running completions in order.
     void Sync();
+    void CountSamples();
+    static std::uint64_t SamplesPassed();
     // Waits only for the batches up to the newest one that writes the range (submitting the open
     // batch when it is that one); later batches stay in flight. Fences of one queue signal in
     // submission order, so completions still run in order. Debug aid: APS5_NO_SYNC_THROUGH=1 syncs all.
@@ -537,6 +539,7 @@ private:
         std::uint32_t queue = 0xffffffffu;
         std::chrono::steady_clock::time_point submittedAt{};
         VkQueryPool queries = VK_NULL_HANDLE;
+        VkQueryPool samples = VK_NULL_HANDLE;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
@@ -633,6 +636,9 @@ private:
         bool behindCompletion = false;
     };
     void readGpuTiming(Batch& batch);
+    void beginSamples(Batch& batch);
+    void readSamples(Batch& batch);
+    bool countingSamples = false;
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
     // Commands() would close).
     std::uint32_t beginTiming(std::uint64_t key);

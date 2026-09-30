@@ -45,10 +45,8 @@ struct MemoryInfo {
     bool idxen = false;
     bool offen = false;
     bool planningOnly = false;
-    // A scalar buffer read (ReadConstBuffer) whose V# the program computes at run time from values
-    // it loaded itself (a BVH walk's instance pointer): no binding exists, so the read goes through
-    // the BDA table with the V#'s base and range evaluated in the shader (ResourceTracker).
-    bool runtimeDescriptor = false;
+    bool coherent = false;
+    bool gpuDescriptor = false;
 
     bool operator==(const MemoryInfo& other) const = default;
 };

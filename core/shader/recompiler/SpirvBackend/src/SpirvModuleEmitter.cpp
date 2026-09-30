@@ -40,6 +40,9 @@ std::uint32_t EmitBuiltinU32(SpirvEmitterState& state, StageInputKind kind, std:
     if (kind == StageInputKind::LocalInvocationIndex) {
         return EmitLocalInvocationIndex(state);
     }
+    if (kind == StageInputKind::DispatchThreadLimit) {
+        return EmitShaderDataDwordLoad(state, state.program.Metadata().bindings.DispatchThreadLimitDword() + component);
+    }
     if (state.laneCount == 2 && (kind == StageInputKind::LocalInvocationId || kind == StageInputKind::GlobalInvocationId)) {
         const auto* workgroup = ShaderWorkgroupInputFor(state);
         if (workgroup == nullptr) {
@@ -215,7 +218,8 @@ std::uint32_t ExportRawComponent(SpirvValueEmitContext& ctx, std::uint32_t vecto
 std::uint32_t ExportVector(SpirvValueEmitContext& ctx, std::uint32_t data, const ExportInfo& exp, bool uintOutput) {
     auto& state = ctx.state;
     if (exp.compr && !uintOutput) {
-        const auto unpack = MrtOutputMode(state, exp) == 5u ? GLSLstd450UnpackUnorm2x16 : GLSLstd450UnpackHalf2x16;
+        const auto mode = MrtOutputMode(state, exp);
+        const auto unpack = mode == 5u ? GLSLstd450UnpackUnorm2x16 : mode == 6u ? GLSLstd450UnpackSnorm2x16 : GLSLstd450UnpackHalf2x16;
         std::array<std::uint32_t, 4> f32 {ConstantF32(state, 0u), ConstantF32(state, 0u), ConstantF32(state, 0u), ConstantF32(state, 0x3f800000u)};
         for (std::uint32_t pair = 0; pair < 2u; pair++) {
             if ((exp.en & (3u << (pair * 2u))) == 0u) {
@@ -243,6 +247,8 @@ std::uint32_t ExportVector(SpirvValueEmitContext& ctx, std::uint32_t data, const
         ConstantU32(state, 0u),
         ConstantU32(state, uintOutput ? 1u : 0x3f800000u),
     };
+    const auto mode = MrtOutputMode(state, exp);
+    const auto exported = exp.en & (mode == 1u ? 0x1u : mode == 2u ? 0x3u : mode == 3u ? 0x9u : 0xfu);
     if (exp.compr) {
         for (std::uint32_t pair = 0; pair < 2u; pair++) {
             if ((exp.en & (3u << (pair * 2u))) == 0u) {
@@ -260,7 +266,7 @@ std::uint32_t ExportVector(SpirvValueEmitContext& ctx, std::uint32_t data, const
         }
     } else {
         for (std::uint32_t component = 0; component < 4u; component++) {
-            if (((exp.en >> component) & 1u) != 0u) {
+            if (((exported >> component) & 1u) != 0u) {
                 raw.at(component) = ExportRawComponent(ctx, data, component);
             }
         }

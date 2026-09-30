@@ -12,10 +12,9 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-constexpr std::uint32_t FileMagic = 0x50565041u; // "APVP"
+constexpr std::uint32_t FileMagic = 0x50565041u;
 constexpr std::uint32_t FileFormat = 1;
 
-// The file: this header, then the data vkGetPipelineCacheData returned.
 struct FileHeader {
     std::uint32_t magic;
     std::uint32_t format;
@@ -34,8 +33,6 @@ bool profiling() {
 PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties) : context(context), properties(properties) {
     const auto directory = ShaderRecompiler::ShaderCacheDirectory();
     if (!directory.empty()) {
-        // Vulkan's rule: pipeline cache data is only valid for the same vendor, device and
-        // pipelineCacheUUID (the driver version is in the name too, so an update starts a new file).
         std::string uuid;
         for (const auto byte : properties.pipelineCacheUUID) {
             char digits[3];
@@ -54,7 +51,6 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
     const auto create = context.Function<PFN_vkCreatePipelineCache>("vkCreatePipelineCache");
     VkResult result = create(context.device, &info, nullptr, &cache);
     if (result != VK_SUCCESS && !initialData.empty()) {
-        // A driver may refuse data it accepted the header of; start empty instead.
         std::fprintf(stderr, "[pipeline-cache] the driver refused %s (Vulkan result %d); starting empty\n", path.string().c_str(), static_cast<int>(result));
         info.initialDataSize = 0;
         info.pInitialData = nullptr;
@@ -78,8 +74,6 @@ PipelineCache::~PipelineCache() {
     context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, nullptr);
 }
 
-// The stored data, when its size, checksum and Vulkan header (VkPipelineCacheHeaderVersionOne)
-// match this device; nothing otherwise.
 void PipelineCache::load(std::vector<std::byte>& initialData) {
     std::vector<std::byte> file;
     if (!ShaderRecompiler::ReadWholeFile(path, file)) return;
@@ -109,16 +103,11 @@ void PipelineCache::load(std::vector<std::byte>& initialData) {
     std::fprintf(stderr, "[pipeline-cache] loaded %.1f KiB from %s\n", static_cast<double>(initialData.size()) / 1024.0, path.string().c_str());
 }
 
-// Writes the cache when its data size changed since the last write (a cache only grows while the
-// device lives). vkGetPipelineCacheData needs no external synchronization, so this runs beside
-// pipeline creation on other threads.
 void PipelineCache::save(bool final) {
     const auto getData = context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     std::size_t size = 0;
     if (getData(context.device, cache, &size, nullptr) != VK_SUCCESS || size == 0 || size == savedBytes) return;
     std::vector<std::byte> file(sizeof(FileHeader) + size);
-    // The cache may grow between the two calls: VK_INCOMPLETE then fills what fits, which is a
-    // consistent prefix of whole entries; the next save writes the rest.
     const auto result = getData(context.device, cache, &size, file.data() + sizeof(FileHeader));
     if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;
     file.resize(sizeof(FileHeader) + size);

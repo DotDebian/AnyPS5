@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
+#include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <cstring>
 #include <limits>
 #include <list>
@@ -267,6 +268,11 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
+    if (words.size() >= 4 && ShaderRecompiler::IsDepthBitsTexture(words[1], words[3])) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "AGC graphics: 32-bit integer read of the depth-layout texture 0x%llx is not implemented", static_cast<unsigned long long>(resource.baseAddress));
+        throw std::runtime_error(text);
+    }
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -856,7 +862,14 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                         // vector) counts as written, like imageWritten below.
                         const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                         const bool atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
-                        item.allocations.push_back(addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic));
+                        const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic);
+                        const auto& push = shader.program->pushConstants;
+                        if (!push.empty()) {
+                            const auto position = shader.program->memoryOffsetDword * 4u + element;
+                            Require(position < push.size(), "guest buffer offset lies outside the shader's push constants");
+                            allocations[index].pushByte = static_cast<std::int32_t>(shader.pushConstantOffset + position);
+                        }
+                        item.allocations.push_back(index);
                     }
                 } else if (addressRole) {
                     item.allocations.push_back(allocations.size());
@@ -1000,6 +1013,11 @@ void ShaderResources::buildComplete() {
                 writes.push_back(write);
             }
             context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
+        for (const auto& allocation : allocations) {
+            if (allocation.adjustment == 0) continue;
+            Require(allocation.pushByte >= 0, "a guest buffer off the storage buffer offset alignment in a shader whose shader data is a buffer is not implemented");
+            pushPatches.emplace_back(static_cast<std::uint32_t>(allocation.pushByte), allocation.adjustment);
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         noteReusable();
@@ -2051,8 +2069,10 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     Require(descriptor.Type() == 0u, "buffer descriptor uses an unsupported type");
     const auto address = descriptor.Base48();
     const auto byteSize = descriptor.GetSize();
-    Require(address != 0, "null shader buffer descriptor address");
-    Require(byteSize != 0, "empty shader buffer descriptor");
+    if (byteSize == 0 || address == 0) {
+        allocations.push_back({0, EmptyBufferBytes, false, nullptr, ShaderRecompiler::DescriptorRole::GuestBuffers, false});
+        return allocations.size() - 1;
+    }
     Require(byteSize <= context.limits.maxStorageBufferRange, "shader buffer exceeds descriptor range limit");
     Require(byteSize <= std::numeric_limits<std::size_t>::max(), "shader buffer size exceeds host address space");
     const auto size = static_cast<std::size_t>(byteSize);

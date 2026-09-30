@@ -12,7 +12,6 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "AudioOut2Internal.hpp"
-#include "AudioOut2PadMix.hpp"
 
 // An AudioOut2 context is the hardware output queue: every push mixes the ports' current grain
 // (num_grains samples) and appends it to a queue of queue_depth grains that plays in real time. The
@@ -42,16 +41,7 @@ static constexpr std::uint16_t DEVICE_SAMPLES = 512;
 static constexpr float MASTER_GAIN = 0.5f;
 static constexpr std::size_t OUTPUT_FRAME_BYTES = AUDIO_OUT2_OUTPUT_CHANNELS * sizeof(float);
 static constexpr std::uint32_t OUTPUT_BYTES_PER_MS = AUDIO_OUT2_SAMPLE_RATE * OUTPUT_FRAME_BYTES / 1000;
-// The controller's sound card (AudioOut2PadMix.hpp) takes a grain with every push, next to the main
-// device's. While the context has controller ports and no card is open it looks for one at most this
-// often, so a DualSense plugged in later is picked up.
-// APS5_NO_PAD_AUDIO=1 never opens the card: the controller ports stay in the main mix.
 static constexpr std::chrono::seconds PAD_PROBE_INTERVAL{2};
-// The card runs on its own clock and starts later than the main device, so its queue drifts against
-// the main one: it is primed with the same cushion, and a grain is dropped whenever the card's queue
-// holds more than this many grains beyond the main device's queue (or, without a main device, beyond
-// the cushion and the title's queue depth), which keeps haptics and speaker in step with the TV. SDL
-// takes whole grains off each queue, so the levels of the two differ by up to a grain in step.
 static constexpr std::uint32_t PAD_SLACK_GRAINS = 2;
 
 bool AudioOut2TraceEnabled() {
@@ -78,16 +68,6 @@ static std::uint32_t GrainBytes(const AudioOut2Context& context) {
 
 static std::uint32_t SdlQueuedMs(const AudioOut2Context& context) {
     return context.device ? SDL_GetQueuedAudioSize(context.device) / OUTPUT_BYTES_PER_MS : 0;
-}
-
-static std::uint32_t PadQueuedMs(const AudioOut2Context& context) {
-    const auto bytesPerMs = AUDIO_OUT2_SAMPLE_RATE / 1000 * context.padLayout.channels * sizeof(float);
-    return context.padDevice ? static_cast<std::uint32_t>(SDL_GetQueuedAudioSize(context.padDevice) / bytesPerMs) : 0;
-}
-
-static bool PadAudioDisabled() {
-    static const bool disabled = std::getenv("APS5_NO_PAD_AUDIO") != nullptr;
-    return disabled;
 }
 
 // Retires the modelled grains whose playback finished by now. The caller holds the context lock.
@@ -143,8 +123,6 @@ static void CloseDevice(AudioOut2Context& context) {
     context.device = 0;
 }
 
-// Opens the first DualSense sound card SDL lists, as float at 48 kHz in the backend's pad layout (SDL
-// converts to the card's 16-bit format). A card that does not report 4 channels is skipped.
 static void OpenPadDevice(AudioOut2Context& context) {
     if (SDL_WasInit(SDL_INIT_AUDIO) == 0 && SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) return;
     const int count = SDL_GetNumAudioDevices(0);
@@ -153,14 +131,11 @@ static void OpenPadDevice(AudioOut2Context& context) {
         if (!AudioOut2IsPadAudioDevice(listed)) continue;
         const std::string name(listed);
         SDL_AudioSpec native{};
-        if (SDL_GetAudioDeviceSpec(index, 0, &native) == 0 && native.channels != 0 && native.channels != AUDIO_OUT2_PAD_CHANNELS) {
-            AUDIOOUT2_TRACE("controller sound card '%s' has %u channels, not %u: not used\n", name.c_str(), native.channels, AUDIO_OUT2_PAD_CHANNELS);
-            continue;
-        }
+        if (SDL_GetAudioDeviceSpec(index, 0, &native) == 0 && native.channels != 0 && native.channels != AUDIO_OUT2_PAD_CHANNELS) continue;
+        const auto layout = AudioOut2PadLayoutForDriver(SDL_GetCurrentAudioDriver());
         SDL_AudioSpec desired{};
         desired.freq = static_cast<int>(AUDIO_OUT2_SAMPLE_RATE);
         desired.format = AUDIO_F32SYS;
-        const auto layout = AudioOut2PadLayoutForDriver(SDL_GetCurrentAudioDriver());
         desired.channels = static_cast<Uint8>(layout.channels);
         desired.samples = DEVICE_SAMPLES;
         desired.callback = nullptr;
@@ -174,7 +149,7 @@ static void OpenPadDevice(AudioOut2Context& context) {
         context.padMix.assign(static_cast<std::size_t>(context.grain) * AUDIO_OUT2_PAD_CHANNELS, 0.0f);
         context.padFrames.assign(static_cast<std::size_t>(context.grain) * layout.channels, 0.0f);
         SDL_PauseAudioDevice(context.padDevice, 0);
-        APS5_LOG_OUT("AudioOut2: controller speaker and vibration ports play on '%s' (SDL device %u, %u-channel frames)", name.c_str(), context.padDevice, layout.channels);
+        APS5_LOG_OUT("AudioOut2: controller speaker and vibration ports play on '%s'", name.c_str());
         return;
     }
 }
@@ -187,11 +162,7 @@ static void ClosePadDevice(AudioOut2Context& context) {
     context.padDevice = 0;
 }
 
-// Opens the controller's sound card once the context has controller ports, and lets it go when it
-// disappears (the controller was unplugged): its ports then fall back to the main mix until it is
-// found again. The caller holds the context lock.
 static void UpdatePadDevice(AudioOut2Context& context, Clock::time_point now) {
-    if (PadAudioDisabled()) return;
     if (context.padDevice != 0 && SDL_GetAudioDeviceStatus(context.padDevice) == SDL_AUDIO_STOPPED) {
         APS5_LOG_CHARS_OUT("AudioOut2: the controller sound card went away; its ports play in the main mix");
         ClosePadDevice(context);
@@ -202,35 +173,21 @@ static void UpdatePadDevice(AudioOut2Context& context, Clock::time_point now) {
     if (AudioOut2HasPadPorts(context)) OpenPadDevice(context);
 }
 
-// Queues one grain on an SDL device that plays in real time: a device that ran dry first gets a
-// cushion of silence, and a grain is dropped when the device is already maxQueuedBytes ahead.
-// Returns false when the grain was dropped.
-static bool QueueGrain(SDL_AudioDeviceID device, const float* grain, std::uint32_t grainBytes, std::uint32_t cushionBytes, std::uint32_t maxQueuedBytes, std::uint64_t& primes) {
-    const auto queuedBytes = SDL_GetQueuedAudioSize(device);
-    if (queuedBytes > maxQueuedBytes) return false;
-    if (queuedBytes == 0) {
-        static const std::vector<float> silence(static_cast<std::size_t>(CUSHION_MS) * AUDIO_OUT2_SAMPLE_RATE / 1000 * AUDIO_OUT2_PAD_DEVICE_CHANNELS_MAX, 0.0f);
-        primes++;
-        SDL_QueueAudio(device, silence.data(), std::min<Uint32>(cushionBytes, static_cast<Uint32>(silence.size() * sizeof(float))));
-    }
-    SDL_QueueAudio(device, grain, grainBytes);
-    return true;
-}
-
-// Queues the pad mix's grain on the controller's sound card, in the card's layout. The card's queue is
-// held to the main device's (PAD_SLACK_GRAINS). The caller holds the lock.
 static void QueuePadGrain(AudioOut2Context& context) {
     AudioOut2WritePadFrames(context.padMix.data(), context.padLayout, context.padFrames.data(), context.grain);
     const auto frameBytes = static_cast<std::uint32_t>(context.padLayout.channels * sizeof(float));
     const auto grainBytes = context.grain * frameBytes;
     const auto cushionBytes = CUSHION_MS * (AUDIO_OUT2_SAMPLE_RATE / 1000) * frameBytes;
     const auto mainQueuedBytes = context.device != 0 ? SDL_GetQueuedAudioSize(context.device) / OUTPUT_FRAME_BYTES * frameBytes : cushionBytes + context.queueDepth * grainBytes;
-    const auto maxQueuedBytes = static_cast<std::uint32_t>(mainQueuedBytes) + PAD_SLACK_GRAINS * grainBytes;
-    if (!QueueGrain(context.padDevice, context.padFrames.data(), grainBytes, cushionBytes, maxQueuedBytes, context.padPrimes)) context.padDropped++;
+    const auto queuedBytes = SDL_GetQueuedAudioSize(context.padDevice);
+    if (queuedBytes > mainQueuedBytes + PAD_SLACK_GRAINS * grainBytes) return;
+    if (queuedBytes == 0) {
+        static const std::vector<float> silence(static_cast<std::size_t>(CUSHION_MS) * AUDIO_OUT2_SAMPLE_RATE / 1000 * AUDIO_OUT2_PAD_DEVICE_CHANNELS_MAX, 0.0f);
+        SDL_QueueAudio(context.padDevice, silence.data(), cushionBytes);
+    }
+    SDL_QueueAudio(context.padDevice, context.padFrames.data(), grainBytes);
 }
 
-// Mixes the ports' current grain and queues it on the SDL device, and the controller ports' grain on
-// the controller's sound card when it is open. The caller holds the lock.
 static std::uint32_t Render(AudioOut2Context& context, Clock::time_point now) {
     UpdatePadDevice(context, now);
     float* pad = nullptr;
@@ -246,16 +203,20 @@ static std::uint32_t Render(AudioOut2Context& context, Clock::time_point now) {
     }
     if (pad != nullptr) {
         AudioOut2FinishPadMix(pad, context.grain);
-        if (AudioOut2TraceEnabled()) {
-            for (std::size_t index = 0; index < context.padMix.size(); index++) {
-                auto& peak = context.summaryPadPeak[index % AUDIO_OUT2_PAD_CHANNELS];
-                peak = std::max(peak, std::abs(pad[index]));
-            }
-        }
         QueuePadGrain(context);
     }
     if (context.device == 0) return mixed;
-    if (!QueueGrain(context.device, context.mix.data(), GrainBytes(context), CUSHION_MS * OUTPUT_BYTES_PER_MS, MAX_QUEUED_MS * OUTPUT_BYTES_PER_MS, context.primes)) context.dropped++;
+    const auto queuedBytes = SDL_GetQueuedAudioSize(context.device);
+    if (queuedBytes > MAX_QUEUED_MS * OUTPUT_BYTES_PER_MS) {
+        context.dropped++;
+        return mixed;
+    }
+    if (queuedBytes == 0) {
+        static const std::vector<float> silence(static_cast<std::size_t>(CUSHION_MS) * AUDIO_OUT2_SAMPLE_RATE / 1000 * AUDIO_OUT2_OUTPUT_CHANNELS, 0.0f);
+        context.primes++;
+        SDL_QueueAudio(context.device, silence.data(), static_cast<Uint32>(silence.size() * sizeof(float)));
+    }
+    SDL_QueueAudio(context.device, context.mix.data(), GrainBytes(context));
     return mixed;
 }
 
@@ -267,13 +228,6 @@ static void TraceSummary(AudioOut2Context& context, Clock::time_point now) {
     }
     const auto elapsed = std::chrono::duration<double>(now - context.summaryStart).count();
     if (elapsed < 1.0) return;
-    if (context.padDevice != 0) {
-        std::fprintf(stderr, "[audioout2] t=%.3f ctx %p: controller card queue %u ms, peaks speaker %.3f %.3f vibration %.3f %.3f; totals: primes %llu, dropped %llu\n",
-            AudioOut2TraceSeconds(), static_cast<void*>(&context), PadQueuedMs(context), static_cast<double>(context.summaryPadPeak[0]), static_cast<double>(context.summaryPadPeak[1]),
-            static_cast<double>(context.summaryPadPeak[2]), static_cast<double>(context.summaryPadPeak[3]), static_cast<unsigned long long>(context.padPrimes),
-            static_cast<unsigned long long>(context.padDropped));
-        std::fill(std::begin(context.summaryPadPeak), std::end(context.summaryPadPeak), 0.0f);
-    }
     std::fprintf(stderr, "[audioout2] t=%.3f ctx %p: %.1f pushes/s, %.1f advances/s, %.1f queue polls/s, hw queue %u/%u, sdl queue %u ms, mix peak %.3f; totals: pushes %llu (%llu blocking, %llu queue-full rejects), primes %llu, dropped %llu\n",
         AudioOut2TraceSeconds(), static_cast<void*>(&context), static_cast<double>(context.summaryPushes) / elapsed, static_cast<double>(context.summaryAdvances) / elapsed,
         static_cast<double>(context.summaryPolls) / elapsed, QueueLevel(context, now), context.queueDepth, SdlQueuedMs(context), static_cast<double>(context.summaryPeak),

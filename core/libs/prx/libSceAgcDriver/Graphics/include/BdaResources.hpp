@@ -5,6 +5,8 @@
 
 namespace AgcDriver::Graphics {
 
+bool LoopGuardTripped();
+
 class BdaResources {
 public:
     explicit BdaResources(const Context& context);
@@ -38,6 +40,7 @@ private:
     // The page table is read-only to the shader, so consecutive builds mapping the same ranges to the
     // same device addresses share one buffer while one of them is alive (see the table cache in
     // BdaResources.cpp, which refers to it weakly).
+    void markWrittenPages() const;
     std::shared_ptr<Buffer> table;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;

@@ -1,23 +1,16 @@
 #include <cstdint>
 #include <cstddef>
+#include <mutex>
+#include <set>
+#include <stdexcept>
+#include <string>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
-#include <map>
-#include <mutex>
-#include <stdexcept>
 
 namespace {
 
-constexpr int ImeErrorBusy = static_cast<int>(0x80BC0001);
-constexpr int ImeErrorNotOpened = static_cast<int>(0x80BC0002);
-
-struct KeyboardListener {
-    EventHandler handler;
-    void* arg;
-};
-
 std::mutex g_keyboardMutex;
-std::map<int32_t, KeyboardListener> g_keyboards;
+std::set<int32_t> g_openKeyboards;
 
 }
 
@@ -38,7 +31,8 @@ int APS5_VABI sceImeGetPanelSize(const Param* param, uint32_t* width, uint32_t* 
 
 int APS5_VABI sceImeKeyboardClose(int32_t user_id) {
  std::lock_guard lock(g_keyboardMutex);
- return g_keyboards.erase(user_id) != 0 ? 0 : ImeErrorNotOpened;
+ if (g_openKeyboards.erase(user_id) == 0) throw std::logic_error("sceImeKeyboardClose: keyboard not open for user " + std::to_string(user_id));
+ return 0;
 }
 
 int APS5_VABI sceImeKeyboardGetInfo(uint32_t resource_id, KeyboardInfo* info) {
@@ -56,9 +50,9 @@ int APS5_VABI sceImeKeyboardGetResourceId(int32_t user_id, KeyboardResourceIdArr
 }
 
 int APS5_VABI sceImeKeyboardOpen(int32_t user_id, const KeyboardParam* param) {
- if (param == nullptr || param->handler == nullptr) throw std::invalid_argument("sceImeKeyboardOpen: missing parameter or event handler");
+ if (!param) APS5_INVALID_ARG_EX;
  std::lock_guard lock(g_keyboardMutex);
- if (!g_keyboards.emplace(user_id, KeyboardListener{param->handler, param->arg}).second) return ImeErrorBusy;
+ if (!g_openKeyboards.insert(user_id).second) throw std::logic_error("sceImeKeyboardOpen: keyboard already open for user " + std::to_string(user_id));
  return 0;
 }
 
@@ -102,9 +96,8 @@ int APS5_VABI sceImeSetTextGeometry(TextAreaMode mode, const TextGeometry* geome
 }
 
 int APS5_VABI sceImeUpdate(EventHandler handler) {
- if (handler == nullptr) throw std::invalid_argument("sceImeUpdate: null event handler");
- std::lock_guard lock(g_keyboardMutex);
- return g_keyboards.empty() ? ImeErrorNotOpened : 0;
+ if (!handler) APS5_INVALID_ARG_EX;
+ return 0;
 }
 
 }

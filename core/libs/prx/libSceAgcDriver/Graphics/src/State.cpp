@@ -377,44 +377,47 @@ VkBlendOp blendOp(std::uint32_t value) {
 struct DecodedColorFormat {
     VkFormat format;
     std::uint32_t elementBytes;
+    std::uint8_t componentMapping = 0xe4u;
 };
 
 // CB_COLOR_INFO FORMAT / NUMBER_TYPE / COMP_SWAP to a Vulkan attachment format. AMD formats list
 // components from the least significant bits, as Vulkan's non-packed formats do.
 DecodedColorFormat DecodeColorFormat(std::uint32_t format, std::uint32_t number, std::uint32_t swap) {
-    constexpr std::uint32_t unorm = 0, sint = 5, srgb = 6, floating = 7;
+    constexpr std::uint32_t unorm = 0, snorm = 1, sint = 5, srgb = 6, floating = 7;
     constexpr std::uint32_t uint = 4;
     const auto fail = [&]() -> DecodedColorFormat {
         throw std::runtime_error("AGC graphics: unsupported color format " + std::to_string(format) + " number type " + std::to_string(number) + " component swap " + std::to_string(swap));
     };
     const bool alternate = swap == 1;
-    if (swap > 1) return fail();
+    const auto single = [&](VkFormat vkFormat, std::uint32_t bytes) { return DecodedColorFormat{vkFormat, bytes, static_cast<std::uint8_t>((0xe4u & ~3u) | swap)}; };
+    if (swap > 1 && format != 1 && format != 2 && format != 4) return fail();
     switch (format) {
         case 1:
-            if (swap != 0) return fail();
-            if (number == unorm) return {VK_FORMAT_R8_UNORM, 1};
-            if (number == uint) return {VK_FORMAT_R8_UINT, 1};
+            if (number == unorm) return single(VK_FORMAT_R8_UNORM, 1);
+            if (number == snorm) return single(VK_FORMAT_R8_SNORM, 1);
+            if (number == uint) return single(VK_FORMAT_R8_UINT, 1);
             return fail();
         case 2:
-            if (swap != 0) return fail();
-            if (number == unorm) return {VK_FORMAT_R16_UNORM, 2};
-            if (number == floating) return {VK_FORMAT_R16_SFLOAT, 2};
-            if (number == uint) return {VK_FORMAT_R16_UINT, 2};
+            if (number == unorm) return single(VK_FORMAT_R16_UNORM, 2);
+            if (number == snorm) return single(VK_FORMAT_R16_SNORM, 2);
+            if (number == floating) return single(VK_FORMAT_R16_SFLOAT, 2);
+            if (number == uint) return single(VK_FORMAT_R16_UINT, 2);
             return fail();
         case 3:
             if (swap != 0) return fail();
             if (number == unorm) return {VK_FORMAT_R8G8_UNORM, 2};
+            if (number == snorm) return {VK_FORMAT_R8G8_SNORM, 2};
             return fail();
         case 4:
-            if (swap != 0) return fail();
-            if (number == floating) return {VK_FORMAT_R32_SFLOAT, 4};
-            if (number == uint) return {VK_FORMAT_R32_UINT, 4};
-            if (number == sint) return {VK_FORMAT_R32_SINT, 4};
+            if (number == floating) return single(VK_FORMAT_R32_SFLOAT, 4);
+            if (number == uint) return single(VK_FORMAT_R32_UINT, 4);
+            if (number == sint) return single(VK_FORMAT_R32_SINT, 4);
             return fail();
         case 5:
             if (swap != 0) return fail();
             if (number == floating) return {VK_FORMAT_R16G16_SFLOAT, 4};
             if (number == unorm) return {VK_FORMAT_R16G16_UNORM, 4};
+            if (number == snorm) return {VK_FORMAT_R16G16_SNORM, 4};
             if (number == uint) return {VK_FORMAT_R16G16_UINT, 4};
             return fail();
         case 6:
@@ -427,6 +430,7 @@ DecodedColorFormat DecodeColorFormat(std::uint32_t format, std::uint32_t number,
             return {alternate ? VK_FORMAT_A2R10G10B10_UNORM_PACK32 : VK_FORMAT_A2B10G10R10_UNORM_PACK32, 4};
         case 10:
             if (number == unorm) return {alternate ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM, 4};
+            if (number == snorm) return {alternate ? VK_FORMAT_B8G8R8A8_SNORM : VK_FORMAT_R8G8B8A8_SNORM, 4};
             if (number == srgb) return {alternate ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_R8G8B8A8_SRGB, 4};
             return fail();
         case 11:
@@ -438,6 +442,7 @@ DecodedColorFormat DecodeColorFormat(std::uint32_t format, std::uint32_t number,
             if (swap != 0) return fail();
             if (number == floating) return {VK_FORMAT_R16G16B16A16_SFLOAT, 8};
             if (number == unorm) return {VK_FORMAT_R16G16B16A16_UNORM, 8};
+            if (number == snorm) return {VK_FORMAT_R16G16B16A16_SNORM, 8};
             if (number == uint) return {VK_FORMAT_R16G16B16A16_UINT, 8};
             return fail();
         case 14:
@@ -626,7 +631,7 @@ State DecodeState(const QueueState& queue) {
     for (std::uint32_t slot = 0; slot < slotCount; ++slot) {
         // Export formats only matter for the targets the draw writes.
         const auto slotExport = (exportFormat >> (4u * slot)) & 0xfu;
-        Require(slotExport == 4 || slotExport == 9, "only FP16_ABGR or 32_ABGR color export is supported");
+        if (slotExport == 0 || slotExport == 7 || slotExport == 8 || slotExport > 9) throw std::runtime_error("AGC graphics: color export format " + std::to_string(slotExport) + " is unsupported");
         const auto color = DecodeColorBuffer(cx, slot);
         APS5_LOG_OUT_DEBUG("Color %u address=0x%llx extent=%ux%u bytes=%llu VkFormat=%u", slot, static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.bytes), static_cast<unsigned>(color.format));
         if (slot == 0) {
@@ -681,7 +686,11 @@ State DecodeState(const QueueState& queue) {
         APS5_LOG_OUT_DEBUG("Blend %u control=0x%x", slot, blend);
         Require((blend & 0x0000e000u) == 0, "reserved blend control bits");
         VkPipelineColorBlendAttachmentState state{};
-        state.colorWriteMask = (targetMask >> (4u * slot)) & 0xfu;
+        const auto mapping = result.colors[slot].componentMapping;
+        const auto exportedMask = (targetMask >> (4u * slot)) & 0xfu;
+        for (std::uint32_t component = 0; component < 4; ++component) {
+            if (((exportedMask >> ((mapping >> (2u * component)) & 3u)) & 1u) != 0) state.colorWriteMask |= 1u << component;
+        }
         state.blendEnable = (blend >> 30u) & 1u;
         if (state.blendEnable) {
             Require((read(cx, 0x31c + slot * 0xfu) & 0x10000u) == 0, "blend bypass conflicts with enabled blending");
@@ -692,6 +701,11 @@ State DecodeState(const QueueState& queue) {
             state.srcAlphaBlendFactor = blendFactor(alpha & 0x1fu);
             state.dstAlphaBlendFactor = blendFactor((alpha >> 8u) & 0x1fu);
             state.alphaBlendOp = blendOp((alpha >> 5u) & 7u);
+            if ((mapping & 3u) == 3u) {
+                state.srcColorBlendFactor = state.srcAlphaBlendFactor;
+                state.dstColorBlendFactor = state.dstAlphaBlendFactor;
+                state.colorBlendOp = state.alphaBlendOp;
+            }
             for (std::uint32_t i = 0; i < 4; ++i) result.blendConstants[i] = readFloat(cx, 0x105 + i);
         }
         result.blends.push_back(state);
@@ -720,12 +734,12 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
             std::fprintf(stderr, "[gpu] color targets with CMASK fast clears (CB_COLOR_INFO.FAST_CLEAR) are rendered uncompressed; CMASK clears are not modeled\n");
         }
     }
-    Require((info & ~(0x00029f7cu | 0x00040000u | 0x10000000u | 0x2000u)) == 0, "color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported");
-    Require((info & 0x8000u) != 0 || number == 7, "unclamped normalized color is unsupported");
-    // CB_COLOR_VIEW: MIP_LEVEL (bits 24-27) selects the rendered mip; array slices are not modeled.
+    if ((info & ~(0x00039f7cu | 0x00040000u | 0x10000000u | 0x2000u)) != 0) throw std::runtime_error("AGC graphics: color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported (CB_COLOR_INFO 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", info); return std::string(text); }() + ")");
+    Require((info & 0x8000u) != 0 || number == 7 || number == 4 || number == 5, "unclamped normalized color is unsupported");
+    // CB_COLOR_VIEW: MIP_LEVEL (bits 26-29) selects the rendered mip; array slices are not modeled.
     const auto view = read(cx, 0x31b + stride);
-    Require((view & ~0x0f000000u) == 0, "color array views are unsupported");
-    const auto viewMip = (view >> 24u) & 0xfu;
+    Require((view & ~0x3c000000u) == 0, "color array views are unsupported");
+    const auto viewMip = (view >> 26u) & 0xfu;
     zero(cx, 0x31d + stride, ~0u, "color samples, fragments or destination alpha override");
     const auto attrib2 = read(cx, 0x3b0 + slot);
     const auto maxMip = attrib2 >> 28u;
@@ -735,22 +749,26 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     color.extent = {((attrib2 >> 14u) & 0x3fffu) + 1u, (attrib2 & 0x3fffu) + 1u};
     color.elementBytes = decoded.elementBytes;
     std::uint64_t mipOffset = 0;
+    color.surfaceExtent = color.extent;
+    color.mipCount = maxMip + 1u;
+    color.mip = viewMip;
     if (maxMip != 0) {
         // A mipmapped surface is addressed like a texture; the view renders into one mip of it.
         const auto mips = ComputeElementMipLayout(color.tileMode == ColorTileMode::Linear ? TextureTileMode::kLinear : TextureTileMode::kR64KBX, color.elementBytes, color.extent.width, color.extent.height, maxMip + 1u);
         const auto& mip = mips.at(viewMip);
-        Require(!mip.tail, "rendering into a packed mip tail is unsupported");
         mipOffset = mip.tiledOffset;
+        color.mipTail = mip.tail;
         color.extent = {mip.width, mip.height};
     }
     const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
     const auto high = read(cx, 0x390 + slot);
     Require((high & ~0xffu) == 0, "invalid color address extension");
-    color.address = ((static_cast<std::uint64_t>(high) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x318 + stride)) << 8u)) + mipOffset;
+    color.surfaceAddress = (static_cast<std::uint64_t>(high) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x318 + stride)) << 8u);
+    color.address = color.surfaceAddress + mipOffset;
     color.bytes = colorLayout.Bytes();
     GuestMemory::CheckRange(reinterpret_cast<const void*>(color.address), color.bytes, colorLayout.Alignment(), true);
     color.format = decoded.format;
-    color.componentMapping = 0xe4u;
+    color.componentMapping = decoded.componentMapping;
     for (std::uint32_t word = 0; word < 2; ++word) {
         const auto clear = find(cx, 0x323 + word + stride);
         color.clearWords[word] = clear == cx.end() ? 0u : clear->second;
@@ -837,6 +855,13 @@ bool DepthMetadataBlit(const QueueState& queue) {
     // Z_EXPORT_ENABLE, STENCIL_TEST_VAL/OP_VAL_EXPORT_ENABLE, KILL_ENABLE, MASK_EXPORT_ENABLE, EXEC_ON_NOOP.
     if ((*shaderControl & 0x547u) != 0 || *zFormat != 0 || *colFormat != 0 || (*alphaToMask & 1u) != 0) return false;
     return true;
+}
+
+std::array<std::uint8_t, 8> ExportMappings(const State& state) {
+    std::array<std::uint8_t, 8> mappings{};
+    mappings.fill(0xe4u);
+    for (std::size_t slot = 0; slot < state.colors.size() && slot < mappings.size(); ++slot) mappings[slot] = state.colors[slot].componentMapping;
+    return mappings;
 }
 
 std::string DrawRejection(const QueueState& queue, bool indexed) {

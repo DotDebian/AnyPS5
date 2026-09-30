@@ -96,6 +96,7 @@ public:
         m_info.samplers.clear();
         m_info.sampledPairs.clear();
         m_info.usesDma = false;
+        m_info.bdaWrites = false;
     }
 
     void Run() {
@@ -523,20 +524,8 @@ private:
         source = InternSource(descriptor);
     }
 
-    // A scalar buffer read whose V# is no runtime value the dispatch can evaluate (the program
-    // loads it itself, e.g. per node of a BVH walk) is read through the BDA table instead of a
-    // binding: the SPIR-V evaluates the V#'s base and range per read, as the hardware does, so a
-    // read past the V#'s range returns zero (EmitReadConstBuffer).
-    // Opt-in (APS5_RUNTIME_DESCRIPTORS=1): the programs that need it are Astro Bot's ray-traced
-    // passes (image_bvh_intersect_ray walks, whose instance V#s come from the BVH), and an
-    // address-based program leases every registered guest allocation for its BDA table; in that
-    // title that is ~12 GiB, whose imports and copies exhaust device memory on the first dispatch.
-    bool TryRuntimeScalarDescriptor(IrValue& inst, std::uint32_t memoryIndex) {
-        static const bool enabled = std::getenv("APS5_RUNTIME_DESCRIPTORS") != nullptr;
-        if (!enabled) {
-            return false;
-        }
-        IrValue* handle = inst.Argument(0)->Resolve();
+    bool TakeGpuDescriptor(IrValue& inst, std::uint32_t memoryIndex) {
+        const IrValue* handle = inst.Argument(0)->Resolve();
         if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) {
             return false;
         }
@@ -546,13 +535,16 @@ private:
         if (ValidateSource(descriptor, badDword)) {
             return false;
         }
-        for (std::uint32_t dword = 0; dword < 4u; dword++) {
-            if (descriptor.dwords[dword]->Resolve()->Type() != IrType::U32) {
-                return false;
-            }
+        const auto op = inst.Opcode();
+        const bool load = op == IrOpcode::LoadBufferU32 || op == IrOpcode::LoadBufferU32x2 || op == IrOpcode::LoadBufferU32x3 || op == IrOpcode::LoadBufferU32x4 || op == IrOpcode::ReadConstBuffer;
+        const bool store = op == IrOpcode::StoreBufferU32 || op == IrOpcode::StoreBufferU32x2 || op == IrOpcode::StoreBufferU32x3 || op == IrOpcode::StoreBufferU32x4;
+        auto& memory = m_program.Resources().memoryInfo[memoryIndex];
+        if ((!load && !store) || memory.formatted || memory.typed || memory.dataBits != 32u) {
+            return false;
         }
-        m_program.Resources().memoryInfo[memoryIndex].runtimeDescriptor = true;
+        memory.gpuDescriptor = true;
         m_info.usesDma = true;
+        m_info.bdaWrites = m_info.bdaWrites || store;
         return true;
     }
 
@@ -692,6 +684,10 @@ private:
 
     void Collect(IrValue& inst) {
         const auto op = inst.Opcode();
+        if (op == IrOpcode::ImageBvhIntersectRay) {
+            m_info.usesDma = true;
+            return;
+        }
         const auto buffer = BufferAccessOf(op);
         const auto addressInfo = AddressOpcodeInfoOf(op);
         const auto imageInfo = ImageOpcodeInfoOf(op);
@@ -714,7 +710,7 @@ private:
         std::uint32_t resource = 0;
 
         if (buffer != BufferAccess::None) {
-            if (op == IrOpcode::ReadConstBuffer && TryRuntimeScalarDescriptor(inst, flags.index)) {
+            if (TakeGpuDescriptor(inst, flags.index)) {
                 return;
             }
             GetHandle(inst.Argument(0), IrOpcode::GetBufferResource, 4, handle, source);

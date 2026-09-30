@@ -4,7 +4,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
-#include "DirectMemory.hpp"
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -134,21 +134,12 @@ int APS5_VABI sceKernelAvailableDirectMemorySize(int64_t search_start, int64_t s
 }
 
 int APS5_VABI sceKernelDirectMemoryQuery(int64_t offset, int flags, void* info, size_t info_size) {
- (void)flags;
+ constexpr int SCE_KERNEL_DMQ_FIND_NEXT = 1;
  if (!info || offset < 0) return SCE_KERNEL_ERROR_EINVAL;
  struct DirectMemoryQueryInfo { int64_t start; int64_t end; int memory_type; };
  if (info_size < sizeof(DirectMemoryQueryInfo)) return SCE_KERNEL_ERROR_EINVAL;
  auto* q = static_cast<DirectMemoryQueryInfo*>(info);
- DirectMemoryBlock block{};
- if (DirectMemoryQueryBlock(static_cast<uint64_t>(offset), &block)) {
-  q->start = static_cast<int64_t>(block.start);
-  q->end = static_cast<int64_t>(block.end);
-  q->memory_type = block.memoryType;
- } else {
-  q->start = offset & ~static_cast<int64_t>(PS5_PAGE_SIZE - 1);
-  q->end = q->start + PS5_PAGE_SIZE;
-  q->memory_type = -1;
- }
+ if (!DirectMemoryFind(offset, (flags & SCE_KERNEL_DMQ_FIND_NEXT) != 0, &q->start, &q->end, &q->memory_type)) return SCE_KERNEL_ERROR_EACCES;
  return 0;
 }
 
@@ -225,9 +216,23 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
   info->start = best->allocationAddress;
   info->end = best->allocationAddress + best->allocationBytes;
   info->protection = (best->readable ? 1 : 0) | (best->writable ? 2 : 0) | (!best->releasable ? 4 : 0);
-  info->is_direct = best->releasable ? 1u : 0u;
+  int recorded = 0;
+  if (GuestProtection(std::max<uintptr_t>(address, info->start), &recorded)) info->protection = recorded;
+  std::uintptr_t directStart = 0;
+  std::uintptr_t directEnd = 0;
+  std::uint64_t physicalOffset = 0;
+  int memoryType = 0;
+  const bool direct = QueryDirectMapping(std::max<uintptr_t>(address, info->start), &directStart, &directEnd, &physicalOffset, &memoryType);
+  info->is_direct = direct ? 1u : 0u;
+  info->is_flexible = !direct && best->releasable ? 1u : 0u;
+  if (direct) {
+   info->start = std::max(info->start, directStart);
+   info->end = std::min(info->end, directEnd);
+   info->memory_type = memoryType;
+  }
   info->is_committed = 1;
   ApplyRangeName(std::max<uintptr_t>(address, info->start), info);
+  if (direct) info->offset = physicalOffset + info->start - directStart;
   return 0;
  }
  // Memory the registry does not know (the title's own heap blocks, stacks): the host's committed
@@ -287,11 +292,12 @@ int APS5_VABI sceKernelMtypeprotect(const void* addr, size_t len, int type, int 
 }
 
 int APS5_VABI sceKernelQueryMemoryProtection(void* addr, void** start, void** end, int* prot) {
- (void)addr;
- (void)start;
- (void)end;
- (void)prot;
- NotImplemented_nid_no_patch(__func__);
+ VirtualQueryInfo info{};
+ const int result = sceKernelVirtualQuery(addr, 0, &info, sizeof(info));
+ if (result != 0) return result;
+ if (start) *start = reinterpret_cast<void*>(info.start);
+ if (end) *end = reinterpret_cast<void*>(info.end);
+ if (prot) *prot = info.protection;
  return 0;
 }
 

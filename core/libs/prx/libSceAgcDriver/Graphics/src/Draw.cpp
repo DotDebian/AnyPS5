@@ -43,15 +43,16 @@ std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
 // The color buffer as a single-mip 2D surface descriptor (tile mode SW_64KB_R_X).
 GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
     Require(color.tileMode == ColorTileMode::RenderTarget, "only 64 KiB tiled color targets are resident");
+    const bool chain = color.mipCount > 1;
     GuestTextureResource surface{};
-    surface.baseAddress = color.address;
-    surface.width = color.extent.width;
-    surface.height = color.extent.height;
+    surface.baseAddress = chain ? color.surfaceAddress : color.address;
+    surface.width = chain ? color.surfaceExtent.width : color.extent.width;
+    surface.height = chain ? color.surfaceExtent.height : color.extent.height;
     surface.depthOrLastArray = 0;
     surface.baseArray = 0;
-    surface.mipCount = 1;
+    surface.mipCount = color.mipCount;
     surface.baseLevel = 0;
-    surface.lastLevel = 0;
+    surface.lastLevel = color.mipCount - 1;
     surface.tileMode = TextureTileMode::kR64KBX;
     surface.dimension = TextureDimension::k2D;
     surface.format = GuestFormatFor(color.format, color.elementBytes);
@@ -567,6 +568,7 @@ void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarg
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[offset], words[offset + 1], words[offset + 2], words[offset + 3]}};
                 const auto address = descriptor.Base48();
                 const auto size = descriptor.GetSize();
+                if (size == 0 || address == 0) continue;
                 // As ShaderResources::addGuestBuffer: an element beyond bufferWritten counts as written.
                 const auto element = offset / 4;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
@@ -1155,14 +1157,16 @@ struct RecordedDraw {
 
 // The push constants of a draw: the stages' data (`bytes` and `stages` when a recipe assembled
 // them), and on the mesh path the draw parameters the mesh stage reads at the end of the block.
-void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages) {
+void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages) {
+    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
+    if (bytes == nullptr) {
+        resources.PatchPushConstants(block);
+        stages = PushConstantStages(shaders);
+    }
     if (!state.stages.mesh) {
-        if (bytes != nullptr) pipeline.PushConstants(commands, stages, *bytes);
-        else pipeline.PushConstants(commands, shaders);
+        pipeline.PushConstants(commands, stages, block);
         return;
     }
-    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
-    if (bytes == nullptr) stages = PushConstantStages(shaders);
     const std::array<std::uint32_t, ShaderRecompiler::MeshDrawPushBytes / 4> words{draw.indexCount, draw.firstVertex, draw.firstInstance, draw.indexed ? draw.indexSize : 0u, 0u, 0u};
     static_assert(ShaderRecompiler::MeshDrawPushOffsetBytes + ShaderRecompiler::MeshDrawPushBytes == PipelinePushConstantBytes);
     std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
@@ -1328,7 +1332,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, record.pushBytes, record.pushStages);
+    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (record.depth != nullptr) CountDepthDraw(state.depth);
@@ -1456,15 +1460,16 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
                 auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
-                Require(resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
+                Require(color.mipCount > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
             });
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
-            targetViews.push_back(binding.resident->AttachmentView(color.format));
+            targetViews.push_back(binding.resident->AttachmentView(color.format, color.mip));
             continue;
         }
+        Require(!color.mipTail, "rendering into a packed mip tail needs the resident image of its surface");
         if (binding.gpuTiling) {
             binding.mip = ColorTargetMip(color, colorLayout);
             binding.tiled = std::make_unique<Buffer>(context, colorLayout.Bytes(), copies);
@@ -1662,7 +1667,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             recipe->passKey = renderPassKey(targetViews, depthImage != nullptr ? depthImage->View() : VK_NULL_HANDLE, state.renderExtent);
             recipe->vertexInput = inputs.vertexInput;
             recipe->pushStages = PushConstantStages(shaders);
-            if (recipe->pushStages != 0) recipe->pushBytes = AssemblePushConstants(shaders);
+            if (recipe->pushStages != 0) {
+                recipe->pushBytes = AssemblePushConstants(shaders);
+                resources->PatchPushConstants(recipe->pushBytes);
+            }
             recipe->masked = masked;
             recipe->fragmentOutputs = inputs.fragmentOutputs;
             recipe->shaderStages = inputs.shaderStages;
@@ -1754,7 +1762,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*pipeline, commands, state, draw, shaders, nullptr, 0);
+    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
     if (depthImage != nullptr) CountDepthDraw(state.depth);

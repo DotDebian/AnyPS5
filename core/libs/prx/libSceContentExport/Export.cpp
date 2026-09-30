@@ -1,26 +1,36 @@
 #include <cstdint>
 #include <cstddef>
-#include <atomic>
-#include <stdexcept>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include <atomic>
+#include <stdexcept>
+#include <string>
 
 namespace {
-
 std::atomic<bool> g_initialized{false};
-
 }
 
 extern "C" {
 
 int APS5_VABI sceContentExportInit2(const ContentExportInitParam2* init_param) {
- if (init_param == nullptr) throw std::invalid_argument("sceContentExportInit2: null parameter");
- if (g_initialized.exchange(true)) throw std::logic_error("sceContentExportInit2: already initialized");
+    if (init_param == nullptr) APS5_INVALID_ARG_EX;
+    bool expected = false;
+    if (!g_initialized.compare_exchange_strong(expected, true)) throw std::logic_error(std::string(__func__) + ": already initialized");
+    return 0;
+}
+
+int APS5_VABI sceContentExportFinish(void) {
+ NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 
-int APS5_VABI sceContentExportTerm(void) {
- if (!g_initialized.exchange(false)) throw std::logic_error("sceContentExportTerm: not initialized");
+int APS5_VABI sceContentExportFromFile(void) {
+ NotImplemented_nid_no_patch(__func__);
+ return 0;
+}
+
+int APS5_VABI sceContentExportFromFileWithThumbnail(void) {
+ NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 
@@ -29,14 +39,10 @@ int APS5_VABI sceContentExportStart(void) {
  return 0;
 }
 
-int APS5_VABI sceContentExportFinish(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
-}
-
-int APS5_VABI sceContentExportFromData(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+int APS5_VABI sceContentExportTerm(void) {
+    bool expected = true;
+    if (!g_initialized.compare_exchange_strong(expected, false)) throw std::logic_error(std::string(__func__) + ": not initialized");
+    return 0;
 }
 
 }

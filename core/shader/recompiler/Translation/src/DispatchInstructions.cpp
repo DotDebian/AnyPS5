@@ -13,7 +13,9 @@ void DispatchInstruction(IrBuilder& builder, const RdnaInstruction& instruction,
     throw std::runtime_error("DispatchInstruction not implemented");
 }
 
-void TranslationContext::TranslateInstruction(const RdnaInstruction& instruction) {
+void TranslationContext::TranslateInstruction(const RdnaInstruction& decoded) {
+    RdnaInstruction instruction = decoded;
+    instruction.destination = destinationOperand(decoded);
     currentOpcode = instruction.op;
     currentProgramCounter = instruction.programCounter;
     if (instruction.op == RdnaOpcode::Unknown || instruction.op == RdnaOpcode::Count) {

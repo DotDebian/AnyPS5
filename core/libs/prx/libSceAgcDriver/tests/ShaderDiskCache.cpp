@@ -1,6 +1,3 @@
-// The shader disk cache (core/shader/recompiler/ShaderDiskCache.hpp): the serializer round trip,
-// the key's sensitivity to every input, the rejection of damaged entries, and a variant stored by
-// one process and loaded by the next.
 #include "ShaderDiskCache.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include <array>
@@ -45,7 +42,6 @@ bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<
     return true;
 }
 
-// Every stored field of a result (not the per-process cacheHit and variantId).
 void requireSameResult(const RecompileResult& left, const RecompileResult& right, const char* what) {
     const std::string prefix = std::string(what) + ": ";
     require(left.spirv.Words() == right.spirv.Words(), prefix + "SPIR-V differs");
@@ -100,7 +96,6 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     return binding;
 }
 
-// A result with every field away from its default.
 RecompileResult sampleResult() {
     RecompileResult result;
     std::vector<std::uint32_t> words(1000);
@@ -201,7 +196,6 @@ CompiledVariant sampleVariant() {
     return variant;
 }
 
-// Storage for a request's spans.
 struct SampleRequest {
     std::vector<std::uint32_t> code{0xe0700000u, 0x80000000u, 0xbf810000u, 0x12345678u};
     std::vector<std::uint32_t> userData{0x10000000u, 0x00100000u, 0x40u, 0x00027facu};
@@ -251,7 +245,6 @@ void verifyResultRoundTrip() {
     require(ShaderDiskCache::DecodeResult(bytes, decoded), "an encoded result does not decode");
     requireSameResult(result, decoded, "result round trip");
     require(decoded.variantId == 0 && !decoded.cacheHit, "the per-process fields were stored");
-    // Every truncation, and a trailing byte, is rejected.
     for (std::size_t size = 0; size < bytes.size(); size += size < 256 ? 1 : 97) {
         RecompileResult partial;
         require(!ShaderDiskCache::DecodeResult(std::span(bytes).first(size), partial), "a result truncated to " + std::to_string(size) + " bytes decodes");
@@ -259,7 +252,6 @@ void verifyResultRoundTrip() {
     auto longer = bytes;
     longer.push_back(std::byte{0});
     require(!ShaderDiskCache::DecodeResult(longer, decoded), "a result with a trailing byte decodes");
-    // An empty result round-trips too.
     bytes.clear();
     ShaderDiskCache::EncodeResult(RecompileResult{}, bytes);
     require(ShaderDiskCache::DecodeResult(bytes, decoded), "an empty result does not decode");
@@ -275,12 +267,10 @@ void verifyEntryRoundTrip() {
     require(ShaderDiskCache::DecodeEntry(file, key, decoded) == ShaderDiskCache::LoadStatus::Loaded, "an encoded entry does not decode");
     requireSameVariant(variant, decoded, "entry round trip");
 
-    // Truncated anywhere (the header, the key, the payload): rejected.
     for (std::size_t size = 0; size < file.size(); size += size < 512 ? 1 : 131) {
         CompiledVariant partial;
         require(ShaderDiskCache::DecodeEntry(std::span(file).first(size), key, partial) == ShaderDiskCache::LoadStatus::Rejected, "an entry truncated to " + std::to_string(size) + " bytes is not rejected");
     }
-    // A flipped bit anywhere is rejected (the header's fields, the key's and the payload's checksums).
     for (std::size_t offset = 0; offset < file.size(); offset += offset < 512 ? 1 : 61) {
         auto damaged = file;
         damaged[offset] ^= std::byte{0x10};
@@ -291,7 +281,6 @@ void verifyEntryRoundTrip() {
     auto longer = file;
     longer.push_back(std::byte{0});
     require(ShaderDiskCache::DecodeEntry(longer, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "an entry with a trailing byte is not rejected");
-    // Another key's entry under the same name is a miss, not a load.
     auto otherKey = key;
     otherKey.back() ^= std::byte{1};
     require(ShaderDiskCache::DecodeEntry(file, otherKey, decoded) == ShaderDiskCache::LoadStatus::KeyMismatch, "an entry for another key loads");
@@ -310,7 +299,6 @@ void verifyKeySensitivity() {
         require(changed != key, "the key ignores " + what);
         require(ShaderDiskCache::EntryName(changed) != ShaderDiskCache::EntryName(key), "the entry name ignores " + what);
     };
-    // Every bit of every code byte.
     for (std::size_t word = 0; word < base.code.size(); ++word) {
         for (std::uint32_t bit = 0; bit < 32; ++bit) {
             changes("code word " + std::to_string(word) + " bit " + std::to_string(bit), [&](SampleRequest& sample) { sample.code[word] ^= 1u << bit; });
@@ -359,7 +347,6 @@ void verifyKeySensitivity() {
     changes("an image cube flag", [](SampleRequest& sample) { sample.specialization.images[0].cube = true; });
     changes("an image FMASK flag", [](SampleRequest& sample) { sample.specialization.images[0].fmask = true; });
     changes("the image count", [](SampleRequest& sample) { sample.specialization.images.emplace_back(); });
-    // The pixel input layout: SPI_PS_INPUT_ADDR and the centroid inputs place the VGPRs the entry fills.
     const auto fragment = [](SampleRequest& sample) {
         sample.request.shader.stage = ShaderStage::Fragment;
         sample.request.context.compute.reset();
@@ -385,9 +372,6 @@ void verifyKeySensitivity() {
     pixelChanges("PERSP_CENTROID alone", [](ShaderPixelStageInfo& pixel) { pixel.perspectiveCentroid = true; });
     changes("the bound descriptors", [](SampleRequest& sample) { sample.specialization.boundDescriptors.push_back(1); });
 
-    // The captured words reach a variant only through the specialization (formats, strides, image
-    // shapes): the values of the user data, the addresses and the header stay out of the key, since
-    // they only feed the per-snapshot binding population, which runs on every load.
     SampleRequest moved;
     moved.userData[0] ^= 0x10000u;
     moved.request.shader.codeAddress += 0x1000000u;
@@ -396,7 +380,6 @@ void verifyKeySensitivity() {
     require(moved.Key() == key, "the key depends on the user data values or the addresses");
 }
 
-// Storage and loading through the store, in the directory main() chose.
 void verifyStore() {
     require(ShaderDiskCache::Enabled(), "the disk cache is not enabled");
     SampleRequest sample;
@@ -414,7 +397,6 @@ void verifyStore() {
     requireSameVariant(*variant, loaded, "store round trip");
     require(ShaderDiskCache::Totals().hits == before.hits + 1, "the load was not counted as a hit");
 
-    // A damaged file on disk is rejected and counted.
     std::vector<std::byte> file;
     require(ReadWholeFile(path, file), "cannot read the entry back");
     require(WriteFileAtomically(path, std::span(file).first(file.size() / 2)), "cannot truncate the entry");
@@ -424,14 +406,11 @@ void verifyStore() {
     require(WriteFileAtomically(path, corrupt), "cannot damage the entry");
     require(!ShaderDiskCache::Load(key, loaded), "a corrupt entry loads");
     require(ShaderDiskCache::Totals().loadFailures == before.loadFailures + 2, "the rejected entries were not counted");
-    // The next write replaces it.
     ShaderDiskCache::Store(key, variant);
     ShaderDiskCache::Flush();
     require(ShaderDiskCache::Load(key, loaded), "a rewritten entry does not load");
 }
 
-// A small compute program: buffer_store_dword v0, off, s[0:3], 0; s_endpgm, with the V# in the
-// user data.
 struct ComputeRequest {
     std::vector<std::uint32_t> code{0xe0700000u, 0x80000000u, 0xbf810000u};
     std::array<std::uint32_t, 4> userData{0x10000000u, 0x00000000u, 0x40u, 0x00027facu};
@@ -453,8 +432,6 @@ struct ComputeRequest {
     }
 };
 
-// The first process compiles and stores; a second one (this binary with --load) loads the variant
-// instead of compiling and must produce the fresh compile's result.
 int runLoadingProcess() {
     ComputeRequest cached(true);
     const auto loaded = Recompile(cached.request);
@@ -480,16 +457,27 @@ void verifyAcrossProcesses(const char* self) {
     require(std::system(command.c_str()) == 0, "the loading process failed");
 }
 
+void verifyDefaultDirectory(const char* self) {
+    setEnvironment("ANYPS5_SHADER_CACHE_DIR", "");
+    setEnvironment("ANYPS5_NO_SHADER_CACHE", "1");
+    require(ShaderRecompiler::ShaderCacheDirectory().empty(), "ANYPS5_NO_SHADER_CACHE=1 did not disable the cache");
+    setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
+    const auto directory = ShaderRecompiler::ShaderCacheDirectory();
+    require(directory.filename() == "shader_cache", "the default cache directory is not named shader_cache");
+    std::error_code error;
+    require(std::filesystem::equivalent(directory.parent_path(), std::filesystem::absolute(self).parent_path(), error) && !error, "the default cache directory is not beside the executable");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
-        // A fresh directory per run, removed at the end; the child process inherits it.
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);
-        setEnvironment("APS5_NO_SHADER_DISK_CACHE", "0");
-        setEnvironment("APS5_SHADER_CACHE_DIR", directory.string());
+        verifyDefaultDirectory(argv[0]);
+        setEnvironment("ANYPS5_NO_SHADER_CACHE", "0");
+        setEnvironment("ANYPS5_SHADER_CACHE_DIR", directory.string());
         verifyResultRoundTrip();
         verifyEntryRoundTrip();
         verifyKeySensitivity();

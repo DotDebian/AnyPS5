@@ -102,7 +102,6 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     Require(!prtDefColor, "guest texture descriptor uses a partially resident default color which is not implemented");
     Require(arrayPitch == 0, "guest texture descriptor uses a nonzero array pitch which is not implemented");
     Require(!msaaDepth, "guest texture descriptor uses MSAA which is not implemented");
-    // DCC block sizes only apply with metadata compression, which is rejected above.
     static_cast<void>(maxUncompBlkSize);
     static_cast<void>(maxCompBlkSize);
     // Surfaces are always written uncompressed here (render targets and storage images bypass DCC), so
