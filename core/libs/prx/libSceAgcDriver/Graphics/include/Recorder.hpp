@@ -114,7 +114,9 @@ public:
     // A snapshot's use: the storage-buffer copies of PrepareDrawBindings, or a draw's vertex or
     // index input (Draw.hpp CopyDrawInput). Part of the key: a range read in two ways gets two
     // snapshots, each made with its own buffer usage. An index snapshot also keeps its highest
-    // index (`derived`), which depends on the index size, hence one use per size.
+    // index (`derived`), which depends on the index size, hence one use per size. A vertex snapshot
+    // also serves a shorter read at the same address (the draw binds it but fetches only the
+    // requested prefix, the range the reuse check covers), and a new one replaces the shorter ones.
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32 };
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
     // APS5_PROFILE_DRAW: the snapshot cache's lookups that found no entry, found a stale one
@@ -740,10 +742,10 @@ private:
     std::array<Completed, CompletedRingSize> completed;
     std::uint64_t newestSubmitted = 0;
     std::chrono::steady_clock::time_point newestSubmittedAt{};
-    // See ReusableDrawSnapshot, keyed by guest address, size and use; `recency` lists the keys
+    // See ReusableDrawSnapshot, keyed by guest address, use and size; `recency` lists the keys
     // least recently used first (each entry holds its own position), so an eviction and a use are
     // O(1).
-    using DrawSnapshotKey = std::tuple<std::uint64_t, std::size_t, SnapshotUse>;
+    using DrawSnapshotKey = std::tuple<std::uint64_t, SnapshotUse, std::size_t>;
     struct DrawSnapshot {
         std::uint64_t generation;
         std::uint64_t registryGeneration;

@@ -1982,13 +1982,14 @@ Recorder::DrawSnapshotStatistics Recorder::DrawSnapshotCounts() {
 }
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
-    drawSnapshotBytes -= std::get<1>(entry->first);
+    drawSnapshotBytes -= std::get<2>(entry->first);
     drawSnapshotRecency.erase(entry->second.recent);
     drawSnapshots.erase(entry);
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived) {
-    const auto found = drawSnapshots.find({address, bytes, use});
+    auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
+    if (found != drawSnapshots.end() && (std::get<0>(found->first) != address || std::get<1>(found->first) != use)) found = drawSnapshots.end();
     if (found == drawSnapshots.end()) {
         if (DrawProfiled()) drawSnapshotAbsent.fetch_add(1, std::memory_order_relaxed);
         return {};
@@ -2007,12 +2008,16 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     constexpr std::size_t maxEntries = 1024;
     const auto budget = DrawSnapshotBudget();
     if (generation == 0 || bytes > budget) return;
-    if (const auto found = drawSnapshots.find({address, bytes, use}); found != drawSnapshots.end()) eraseDrawSnapshot(found);
+    if (use == SnapshotUse::Vertex) {
+        for (auto it = drawSnapshots.lower_bound({address, use, 0}); it != drawSnapshots.end() && std::get<0>(it->first) == address && std::get<1>(it->first) == use && std::get<2>(it->first) <= bytes;) eraseDrawSnapshot(it++);
+    } else if (const auto found = drawSnapshots.find({address, use, bytes}); found != drawSnapshots.end()) {
+        eraseDrawSnapshot(found);
+    }
     while (!drawSnapshots.empty() && (drawSnapshotBytes + bytes > budget || drawSnapshots.size() >= maxEntries)) {
         if (DrawProfiled()) drawSnapshotEvicted.fetch_add(1, std::memory_order_relaxed);
         eraseDrawSnapshot(drawSnapshots.find(drawSnapshotRecency.front()));
     }
-    const DrawSnapshotKey key{address, bytes, use};
+    const DrawSnapshotKey key{address, use, bytes};
     drawSnapshotRecency.push_back(key);
     try {
         drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(drawSnapshotRecency.end()), std::move(buffer), derived});

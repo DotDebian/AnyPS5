@@ -862,6 +862,26 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
         mutation.Remove(other);
     }
     Require(!CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused, "a draw input outlived a registry mutation");
+    const auto pool = address + 8192;
+    const auto whole = CopyDrawInput(context, &recorder, pool, 12288, 1, Use::Vertex);
+    Require(!whole.reused && std::memcmp(whole.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "the vertex pool copy is wrong");
+    KeepDrawInput(&recorder, pool, whole, Use::Vertex, 0);
+    const auto prefix = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
+    Require(prefix.reused && prefix.buffer == whole.buffer, "a shorter vertex read did not reuse the longer snapshot");
+    Require(!CopyDrawInput(context, &recorder, pool, 16384, 1, Use::Vertex).reused, "a longer vertex read reused a shorter snapshot");
+    Require(!CopyDrawInput(context, &recorder, pool + 4, 4096, 1, Use::Vertex).reused, "a vertex read at another address reused the snapshot");
+    Require(!CopyDrawInput(context, &recorder, pool, 4096, 4, Use::Index32).reused, "an index read reused a longer snapshot");
+    const auto shorter = CopyDrawInput(context, &recorder, pool, 8192, 4, Use::Index32);
+    KeepDrawInput(&recorder, pool, shorter, Use::Index32, 3);
+    Require(!CopyDrawInput(context, &recorder, pool, 4096, 4, Use::Index32).reused, "an index read reused a longer index snapshot");
+    bytesAt[(8192 + 8192 + 16) / 4] = 0xbeef;
+    const auto prefixAfter = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
+    Require(std::memcmp(prefixAfter.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 4096) == 0, "a shorter vertex read after a store got other bytes");
+    const auto after = CopyDrawInput(context, &recorder, pool, 12288, 1, Use::Vertex);
+    Require(!after.reused && std::memcmp(after.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "a vertex read over the store reused the old bytes");
+    KeepDrawInput(&recorder, pool, after, Use::Vertex, 0);
+    const auto small = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
+    Require(small.reused && small.buffer == after.buffer, "the new vertex snapshot does not serve shorter reads");
     recorder.Sync();
 }
 
