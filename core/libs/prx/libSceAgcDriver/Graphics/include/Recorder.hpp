@@ -111,7 +111,12 @@ public:
     // since (a range unmapped and mapped again holds new bytes no write stamped; registry mutations
     // are rare once a title runs). Kept least recently used under a byte budget
     // (APS5_DRAW_SNAPSHOT_CACHE_MIB, default 256; 0 copies for every draw as before).
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes);
+    // A snapshot's use: the storage-buffer copies of PrepareDrawBindings, or a draw's vertex or
+    // index input (Draw.hpp CopyDrawInput). Part of the key: a range read in two ways gets two
+    // snapshots, each made with its own buffer usage. An index snapshot also keeps its highest
+    // index (`derived`), which depends on the index size, hence one use per size.
+    enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32 };
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
     // APS5_PROFILE_DRAW: the snapshot cache's lookups that found no entry, found a stale one
     // (dropped), and entries evicted to make room (cumulative, all recorders).
     struct DrawSnapshotStatistics {
@@ -119,7 +124,8 @@ public:
     };
     static DrawSnapshotStatistics DrawSnapshotCounts();
     // `registryGeneration`: GuestAllocationsGeneration read before the copy, like `generation`.
-    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer);
+    // `derived`: a value computed from the copied bytes, returned with the snapshot on reuse.
+    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
@@ -728,14 +734,16 @@ private:
     std::array<Completed, CompletedRingSize> completed;
     std::uint64_t newestSubmitted = 0;
     std::chrono::steady_clock::time_point newestSubmittedAt{};
-    // See ReusableDrawSnapshot, keyed by guest address and size; `recency` lists the keys least
-    // recently used first (each entry holds its own position), so an eviction and a use are O(1).
-    using DrawSnapshotKey = std::pair<std::uint64_t, std::size_t>;
+    // See ReusableDrawSnapshot, keyed by guest address, size and use; `recency` lists the keys
+    // least recently used first (each entry holds its own position), so an eviction and a use are
+    // O(1).
+    using DrawSnapshotKey = std::tuple<std::uint64_t, std::size_t, SnapshotUse>;
     struct DrawSnapshot {
         std::uint64_t generation;
         std::uint64_t registryGeneration;
         std::list<DrawSnapshotKey>::iterator recent;
         std::shared_ptr<Buffer> buffer;
+        std::uint32_t derived;
     };
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
     std::list<DrawSnapshotKey> drawSnapshotRecency;

@@ -798,6 +798,73 @@ void drawSnapshotEvictionTests(const Device& device) {
     Require(cache.ReusableDrawSnapshot(address, 1) == nullptr && cache.ReusableDrawSnapshot(address, 1) == nullptr, "a snapshot outlived a CPU store");
 }
 
+// A draw's index and vertex inputs (CopyDrawInput) over write-watched memory: the second draw of
+// an unchanged range binds the first draw's copy (and gets its stored highest index back); a CPU
+// store, a driver or GPU store stamped by MarkWritten, or a registry mutation makes the next draw
+// copy again with the current bytes; each use keeps its own copy; no recorder copies every time.
+void drawInputReuseTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    using Use = Recorder::SnapshotUse;
+    constexpr std::size_t bytes = 65536;
+    if (std::getenv("APS5_NO_DRAW_INPUT_REUSE") != nullptr || (std::getenv("APS5_DRAW_SNAPSHOT_CACHE_MIB") != nullptr && std::strtoull(std::getenv("APS5_DRAW_SNAPSHOT_CACHE_MIB"), nullptr, 10) == 0)) {
+        std::cout << "draw input reuse disabled: not tested\n";
+        return;
+    }
+    void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "write watching unavailable: draw input reuse not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    const auto& context = device.GetContext();
+    auto* bytesAt = static_cast<std::uint32_t*>(block);
+    for (std::uint32_t i = 0; i < 64; ++i) bytesAt[i] = i * 3;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    constexpr std::size_t size = 256;
+    const auto equalsGuest = [&](const DrawInputCopy& copy) {
+        const auto contents = copy.buffer->Bytes();
+        return contents.size() == size && std::memcmp(contents.data(), block, size) == 0;
+    };
+    const auto first = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
+    Require(!first.reused && first.generation != 0 && equalsGuest(first), "the first draw input copy is wrong");
+    KeepDrawInput(&recorder, address, first, Use::Index32, 189);
+    const auto second = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
+    Require(second.reused && second.buffer == first.buffer && second.derived == 189, "an unchanged draw input was copied again");
+    const auto vertex = CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex);
+    const auto narrow = CopyDrawInput(context, &recorder, address, size, 2, Use::Index16);
+    Require(!vertex.reused && !narrow.reused && equalsGuest(vertex) && equalsGuest(narrow), "a draw input reused another use's copy");
+    KeepDrawInput(&recorder, address, vertex, Use::Vertex, 0);
+    Require(CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex).buffer == vertex.buffer && CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).buffer == first.buffer, "the uses' copies displaced each other");
+    Require(!CopyDrawInput(context, nullptr, address, size, 4, Use::Index32).reused, "a draw input was reused without a recorder");
+    // A CPU store inside the range: the next draw copies the new bytes.
+    bytesAt[5] = 0xdead;
+    const auto stored = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
+    Require(!stored.reused && stored.buffer != first.buffer && equalsGuest(stored), "a draw input outlived a CPU store");
+    KeepDrawInput(&recorder, address, stored, Use::Index32, 0xdead);
+    Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).derived == 0xdead, "the new copy was not kept");
+    // A driver or GPU store (stamped, never seen by the page watch).
+    MarkWritten(address + 128, 4);
+    const auto marked = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
+    Require(!marked.reused && equalsGuest(marked), "a draw input outlived a stamped GPU store");
+    KeepDrawInput(&recorder, address, marked, Use::Index32, 1);
+    Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused, "the copy after the GPU store was not kept");
+    // A registry mutation (memory unmapped and mapped again holds bytes no store stamped).
+    alignas(64) static std::byte other[64];
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(other, sizeof(other), true, true);
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(other);
+    }
+    Require(!CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused, "a draw input outlived a registry mutation");
+    recorder.Sync();
+}
+
 // Draw input snapshots kept across draws (Recorder::ReusableDrawSnapshot) over write-watched,
 // host-imported memory: a later draw binds the earlier draw's snapshot while the bytes are
 // unchanged, and a CPU store, a driver store (MarkWritten) or a registry mutation makes the next
@@ -2119,6 +2186,7 @@ int main() {
         resourceReadTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
         drawSnapshotEvictionTests(device);
+        drawInputReuseTests(device, recorder);
         RunViewAliasTests(device.GetContext(), recorder);
         storeRunTests(device, recorder);
         unitShadowTests(device, recorder);

@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
 #include <algorithm>
 #include <array>
@@ -664,6 +665,60 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
     reportDraw(timer.us, built, outcome);
 }
 
+bool DrawInputReuse() {
+    static const bool reuse = std::getenv("APS5_NO_DRAW_INPUT_REUSE") == nullptr;
+    return reuse;
+}
+
+// APS5_PROFILE_DRAW: index and vertex inputs copied and reused (CopyDrawInput), printed every 10 s
+// as [drawinput]. Under GuestMemory::GpuMutex (plain counters).
+void CountDrawInput(bool index, bool reused, std::size_t bytes) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::uint64_t counts[2][2] = {}, sizes[2][2] = {};
+    static auto last = std::chrono::steady_clock::now();
+    ++counts[index][reused];
+    sizes[index][reused] += bytes;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    std::fprintf(stderr, "[drawinput] draw inputs (10 s): index copied %llu (%.1f MiB), reused %llu (%.1f MiB); vertex copied %llu (%.1f MiB), reused %llu (%.1f MiB)\n", static_cast<unsigned long long>(counts[1][0]), sizes[1][0] / 1048576.0, static_cast<unsigned long long>(counts[1][1]), sizes[1][1] / 1048576.0, static_cast<unsigned long long>(counts[0][0]), sizes[0][0] / 1048576.0, static_cast<unsigned long long>(counts[0][1]), sizes[0][1] / 1048576.0);
+    for (auto& row : counts) row[0] = row[1] = 0;
+    for (auto& row : sizes) row[0] = row[1] = 0;
+}
+
+}
+
+DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
+    Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
+    const bool index = use != Recorder::SnapshotUse::Vertex;
+    DrawInputCopy copy;
+    if (recorder != nullptr && bytes != 0 && DrawInputReuse()) {
+        GuestMemory::FlushGpuWrites(address, bytes);
+        // Collected after the flush's stores and before the copy below: a store after the collect
+        // is stamped newer by the next one and makes the snapshot stale then.
+        copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        copy.generation = GuestMemory::CollectWrites(address, bytes);
+        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
+        if (copy.buffer != nullptr) {
+            copy.reused = true;
+            CountDrawInput(index, true, bytes);
+            return copy;
+        }
+    }
+    copy.buffer = std::make_shared<Buffer>(context, bytes, index ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT : VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
+    CountDrawInput(index, false, bytes);
+    return copy;
+}
+
+void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived) {
+    if (recorder == nullptr || copy.reused || copy.generation == 0 || copy.buffer == nullptr) return;
+    recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
+}
+
+namespace {
+
 // The draw's inputs before its resources (prepareDrawInputs): the validated parameters, the index
 // buffer copy with its highest index, the vertex buffer copies and their layout, the fragment
 // outputs and the pipeline stages.
@@ -671,10 +726,10 @@ struct DrawInputs {
     // An empty auto draw: nothing to record.
     bool nothing = false;
     std::uint64_t indexBytes = 0;
-    std::unique_ptr<Buffer> indices;
+    std::shared_ptr<Buffer> indices;
     std::uint32_t maxIndex = 0;
     VertexInputLayout vertexInput;
-    std::vector<std::unique_ptr<Buffer>> vertexBuffers;
+    std::vector<std::shared_ptr<Buffer>> vertexBuffers;
     std::vector<VkBuffer> vertexHandles;
     std::vector<VkDeviceSize> vertexOffsets;
     std::set<std::uint32_t> fragmentOutputs;
@@ -748,20 +803,28 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     timer.phase(PhaseValidate);
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
     if (draw.indexed) {
-        inputs.indices = std::make_unique<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-        GuestMemory::Read(draw.indexAddress, inputs.indices->Bytes(), draw.indexSize);
-        for (std::size_t offset = 0; offset < indexBytes; offset += draw.indexSize) {
-            std::uint32_t index = 0;
-            if (draw.indexSize == 2) {
-                std::uint16_t value = 0;
-                std::memcpy(&value, inputs.indices->Bytes().data() + offset, sizeof(value));
-                index = value;
-            } else {
-                std::memcpy(&index, inputs.indices->Bytes().data() + offset, sizeof(index));
+        const auto use = draw.indexSize == 2 ? Recorder::SnapshotUse::Index16 : Recorder::SnapshotUse::Index32;
+        auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        std::uint32_t highest = copy.derived;
+        if (!copy.reused) {
+            highest = 0;
+            const auto bytes = copy.buffer->Bytes();
+            for (std::size_t offset = 0; offset < indexBytes; offset += draw.indexSize) {
+                std::uint32_t index = 0;
+                if (draw.indexSize == 2) {
+                    std::uint16_t value = 0;
+                    std::memcpy(&value, bytes.data() + offset, sizeof(value));
+                    index = value;
+                } else {
+                    std::memcpy(&index, bytes.data() + offset, sizeof(index));
+                }
+                highest = std::max(highest, index);
             }
-            Require(index <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
-            inputs.maxIndex = std::max(inputs.maxIndex, index);
+            KeepDrawInput(context.recorder, draw.indexAddress, copy, use, highest);
         }
+        Require(highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
+        inputs.maxIndex = highest;
+        inputs.indices = std::move(copy.buffer);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
     const auto& attributes = shaders.front().program->vertexAttributes;
@@ -781,10 +844,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
         Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address, "vertex buffer aliases the render target");
         GuestMemory::CheckRange(reinterpret_cast<const void*>(address), bytes, 1);
-        auto buffer = std::make_unique<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-        GuestMemory::Read(address, buffer->Bytes(), 1);
-        inputs.vertexHandles.push_back(buffer->Handle());
-        inputs.vertexBuffers.push_back(std::move(buffer));
+        auto copy = CopyDrawInput(context, context.recorder, address, bytes, 1, Recorder::SnapshotUse::Vertex);
+        KeepDrawInput(context.recorder, address, copy, Recorder::SnapshotUse::Vertex, 0);
+        inputs.vertexHandles.push_back(copy.buffer->Handle());
+        inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     timer.phase(PhaseVertex);
     return inputs;
@@ -1020,8 +1083,8 @@ struct Kept {
     std::shared_ptr<ShaderResources> resources;
     std::shared_ptr<Pipeline> pipeline;
     std::shared_ptr<Framebuffer> framebuffer;
-    std::unique_ptr<Buffer> indices;
-    std::vector<std::unique_ptr<Buffer>> vertexBuffers;
+    std::shared_ptr<Buffer> indices;
+    std::vector<std::shared_ptr<Buffer>> vertexBuffers;
     std::vector<std::shared_ptr<StorageTexture>> targets;
     std::shared_ptr<DepthImage> depth;
     std::unique_ptr<DeviceBuffer> scratch;
