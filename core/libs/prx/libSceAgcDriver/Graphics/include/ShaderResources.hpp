@@ -242,7 +242,15 @@ private:
         std::vector<std::uint32_t> dataWords;
         std::uint32_t adjustment = 0;
         std::int32_t pushByte = -1;
+        std::int64_t dataAllocation = -1;
+        std::uint32_t dataByte = 0;
     };
+    struct DataPatch {
+        std::size_t allocation;
+        std::uint32_t byte;
+        std::uint32_t adjustment;
+    };
+    void writeDataWords(VkCommandBuffer commands, std::size_t allocation, std::span<const std::uint32_t> words) const;
 
     struct Binding {
         VkDescriptorSetLayoutBinding layout;
@@ -415,6 +423,7 @@ private:
     std::uint64_t dataWordsHash = 14695981039346656037ull;
     void rehashDataWords();
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
+    std::vector<DataPatch> dataPatches;
     BuildTiming timing;
     // Build state carried from stage A to stage B: the bindings in plan order, the image bindings
     // still to look up (index into `bindings`; the DescriptorBinding lives in the compiled shader),

@@ -836,6 +836,8 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             Require(shader.program != nullptr, "missing compiled shader");
             const VkShaderStageFlags flags = VulkanStage(shader.stage);
             std::uint64_t stageDescriptors = 0;
+            std::vector<std::size_t> offsetsInData;
+            std::int64_t shaderData = -1;
             for (const auto& binding : shader.program->bindings) {
                 Require(binding.descriptorSet == 0, "unexpected descriptor set: every shader resource must use descriptor set zero");
                 Require(occupied.insert(binding.binding).second, "duplicate shader binding");
@@ -868,6 +870,9 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                             const auto position = shader.program->memoryOffsetDword * 4u + element;
                             Require(position < push.size(), "guest buffer offset lies outside the shader's push constants");
                             allocations[index].pushByte = static_cast<std::int32_t>(shader.pushConstantOffset + position);
+                        } else {
+                            allocations[index].dataByte = shader.program->memoryOffsetDword * 4u + element;
+                            offsetsInData.push_back(index);
                         }
                         item.allocations.push_back(index);
                     }
@@ -885,9 +890,11 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                     Require(binding.count == 1, "shader data and flattened SRT descriptors must not be arrays");
                     Require(!binding.guestDescriptor.empty(), "empty shader data descriptor");
                     item.allocations.push_back(addDataBuffer(binding.guestDescriptor));
+                    if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) shaderData = static_cast<std::int64_t>(item.allocations.back());
                 }
                 bindings.push_back(std::move(item));
             }
+            for (const auto index : offsetsInData) allocations[index].dataAllocation = shaderData;
         }
         Require(storageBuffers <= context.limits.maxDescriptorSetStorageBuffers, "pipeline descriptors exceed device limits");
         timing.bindingsMs = phase(BuildPhase::Bindings);
@@ -1016,8 +1023,15 @@ void ShaderResources::buildComplete() {
         }
         for (const auto& allocation : allocations) {
             if (allocation.adjustment == 0) continue;
-            Require(allocation.pushByte >= 0, "a guest buffer off the storage buffer offset alignment in a shader whose shader data is a buffer is not implemented");
-            pushPatches.emplace_back(static_cast<std::uint32_t>(allocation.pushByte), allocation.adjustment);
+            if (allocation.pushByte >= 0) {
+                pushPatches.emplace_back(static_cast<std::uint32_t>(allocation.pushByte), allocation.adjustment);
+                continue;
+            }
+            Require(allocation.dataAllocation >= 0, "a guest buffer off the storage buffer offset alignment in a shader without shader data is not implemented");
+            auto& data = allocations[static_cast<std::size_t>(allocation.dataAllocation)];
+            Require(data.buffer != nullptr && allocation.dataByte < data.size, "guest buffer offset lies outside the shader's data buffer");
+            data.buffer->Bytes()[allocation.dataByte] = static_cast<std::byte>(allocation.adjustment);
+            dataPatches.push_back({static_cast<std::size_t>(allocation.dataAllocation), allocation.dataByte, allocation.adjustment});
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         noteReusable();
@@ -2220,7 +2234,7 @@ bool ShaderResources::RefreshData(VkCommandBuffer commands, const CompiledShader
         Require(allocation.buffer != nullptr && !allocation.guest && allocation.size == size && size <= MaxRefreshBytes, "template data buffer cannot take the dispatch's words");
         if (allocation.dataWords.size() == binding.guestDescriptor.size() && std::equal(allocation.dataWords.begin(), allocation.dataWords.end(), binding.guestDescriptor.begin())) continue;
         if (recorder != nullptr && timing == Recorder::NoTiming) timing = recorder->BeginGpuTiming(Recorder::CommandClass::TemplateDataRefresh);
-        context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, allocation.buffer->Handle(), 0, size, binding.guestDescriptor.data());
+        writeDataWords(commands, bindings[index].allocations.front(), binding.guestDescriptor);
         allocation.dataWords.assign(binding.guestDescriptor.begin(), binding.guestDescriptor.end());
         refreshedBytes += size;
         recorded = true;
@@ -2228,6 +2242,21 @@ bool ShaderResources::RefreshData(VkCommandBuffer commands, const CompiledShader
     if (timing != Recorder::NoTiming) recorder->EndGpuTiming(timing, refreshedBytes);
     if (recorded) rehashDataWords();
     return recorded;
+}
+
+void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t allocation, std::span<const std::uint32_t> words) const {
+    const auto& buffer = *allocations[allocation].buffer;
+    const auto size = words.size() * sizeof(std::uint32_t);
+    if (std::none_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == allocation; })) {
+        context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, buffer.Handle(), 0, size, words.data());
+        return;
+    }
+    std::vector<std::uint32_t> patched(words.begin(), words.end());
+    auto* bytes = reinterpret_cast<std::byte*>(patched.data());
+    for (const auto& patch : dataPatches) {
+        if (patch.allocation == allocation && patch.byte < size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+    }
+    context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, buffer.Handle(), 0, size, patched.data());
 }
 
 void ShaderResources::PrecollectSurfaces() const {
