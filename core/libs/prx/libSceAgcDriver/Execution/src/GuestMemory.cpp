@@ -26,6 +26,7 @@
 #else
 #include <fcntl.h>
 #include <fstream>
+#include <pthread.h>
 #include <sstream>
 #include <unistd.h>
 #endif
@@ -74,6 +75,10 @@ std::atomic<std::uint64_t> collectDirty{0};
 std::atomic<std::uint64_t> collectDirtyRuns{0};
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
+// Verifications answered by the calling thread's live stack (onOwnLiveStack), and page runs looked
+// up by scanning /proc/self/maps because no cached table covered them (APS5_PROFILE_DRAW).
+std::atomic<std::uint64_t> ownStackVerifies{0};
+std::atomic<std::uint64_t> uncachedMapsScans{0};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -297,6 +302,7 @@ public:
         }
         std::fprintf(stderr, " collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         std::fprintf(stderr, " collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
+        std::fprintf(stderr, " | verify: own stack %llu, uncached maps scans %llu", static_cast<unsigned long long>(ownStackVerifies.load()), static_cast<unsigned long long>(uncachedMapsScans.load()));
         std::fprintf(stderr, " | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
             std::lock_guard lock(state.callersMutex);
@@ -627,6 +633,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             cursor = run.end;
             continue;
         }
+        if (MemoryProfiled()) uncachedMapsScans.fetch_add(1, std::memory_order_relaxed);
         std::ifstream maps("/proc/self/maps");
         if (!maps.is_open()) return false;
         std::string line;
@@ -654,10 +661,49 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
     return true;
 }
 
+// Whether [address, address + bytes) lies in the calling thread's stack between this frame and the
+// stack's top: those pages hold the frames of every caller, so they are mapped readable and writable
+// while the call lasts. The game passes its submission packets on its own stack, which no page
+// table cache covers (host thread stacks are neither registry mappings nor write-watched): each
+// check there scanned /proc/self/maps. A thread running on another stack (a fiber's, a signal
+// stack) has its frame outside the thread's stack bounds and is answered by the page query.
+bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
+    struct Bounds {
+        std::uintptr_t low = 0;
+        std::uintptr_t high = 0;
+        Bounds() {
+#ifdef _WIN32
+            ULONG_PTR lowLimit = 0;
+            ULONG_PTR highLimit = 0;
+            GetCurrentThreadStackLimits(&lowLimit, &highLimit);
+            low = static_cast<std::uintptr_t>(lowLimit);
+            high = static_cast<std::uintptr_t>(highLimit);
+#else
+            pthread_attr_t attributes;
+            if (pthread_getattr_np(pthread_self(), &attributes) != 0) return;
+            void* base = nullptr;
+            std::size_t size = 0;
+            if (pthread_attr_getstack(&attributes, &base, &size) == 0 && base != nullptr) {
+                low = reinterpret_cast<std::uintptr_t>(base);
+                high = low + size;
+            }
+            pthread_attr_destroy(&attributes);
+#endif
+        }
+    };
+    thread_local const Bounds bounds;
+    const auto frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
+    return bounds.high != 0 && frame >= bounds.low && frame < bounds.high && address >= frame && address < bounds.high && bytes <= bounds.high - address;
+}
+
 // Checks that [address, address + bytes) is mapped with read (and, if asked, write) access. Returns
 // an empty string when it is, otherwise why it is not.
 std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
     const TimedAccess timed(CounterVerify, bytes);
+    if (onOwnLiveStack(address, bytes)) {
+        if (MemoryProfiled()) ownStackVerifies.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
     std::string reason;
     const bool queried = describePages(address, bytes, [&](const PageRun& run) {
         if (!run.readable) {
