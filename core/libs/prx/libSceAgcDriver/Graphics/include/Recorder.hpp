@@ -419,6 +419,11 @@ public:
     // range index to pass to End, or NoTiming when timing is off or the batch's queries are used up.
     static constexpr std::uint32_t NoTiming = 0xffffffffu;
     static bool GpuTimingEnabled();
+    // Whether every batch carries its whole-batch stamps (the Completed record's gpuStartNs and
+    // gpuEndNs, the [present] line's GPU busy and idle gaps): under APS5_PROFILE_GPU with the
+    // other ranges, and under APS5_PROFILE_DRAW alone, where the two stamps are all that is
+    // written (a two-query pool per batch, reused like the command buffers).
+    static bool BatchStampsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
@@ -471,7 +476,7 @@ public:
     // frame record): finish() writes an entry per submitted batch into a ring of the last 128,
     // under GuestMemory::GpuMutex and the ring's own mutex; the readers below take only the ring
     // mutex, so the presenter reads them WITHOUT the GpuMutex. gpuStartNs/gpuEndNs are the
-    // whole-batch stamps (0 without APS5_PROFILE_GPU); `reads` and `readGeneration` (the
+    // whole-batch stamps (0 unless BatchStampsEnabled); `reads` and `readGeneration` (the
     // write-watch generation collected over the noted in-place reads at submit) are filled with
     // APS5_FLIP_READ_CHECK=1 only.
     struct Completed {
@@ -710,6 +715,8 @@ private:
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
+    // Two-query pools of finished batches that carried only their batch stamps, reused likewise.
+    std::vector<VkQueryPool> sparePools;
     mutable std::mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;
     std::uint64_t newestSubmitted = 0;

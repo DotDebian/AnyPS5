@@ -299,6 +299,31 @@ void completionCountTests(const Device& device, Recorder& recorder) {
     Require(memory[0] == 1 && memory[2] == (storeAlways ? 1u : 7u) && memory[16] == 1, "completion stores ran for the wrong labels (overlapped and not-imported ones store, the untouched GPU-stored one skips)");
 }
 
+// Every finished batch leaves a completion record; its whole-batch GPU stamps are real exactly
+// when batch stamps are on (APS5_PROFILE_DRAW or APS5_PROFILE_GPU: run the binary with and
+// without), and a reused stamp pool gives the next batch its own stamps.
+void batchStampTests(Recorder& recorder) {
+    Require(recorder.Idle(), "batch stamps: the recorder is busy");
+    double previousEnd = 0;
+    for (int round = 0; round < 3; ++round) {
+        recorder.NotePendingWrite(0x60000, 0x100);
+        const auto serial = recorder.Submissions() + 1;
+        recorder.Submit();
+        recorder.Sync();
+        std::size_t missing = 0;
+        const auto batches = recorder.CompletedBatches(serial - 1, serial, missing);
+        Require(missing == 0 && batches.size() == 1 && batches.front().serial == serial, "a finished batch has no completion record");
+        const auto& batch = batches.front();
+        if (Recorder::BatchStampsEnabled()) {
+            Require(batch.gpuStartNs > 0 && batch.gpuEndNs >= batch.gpuStartNs && batch.gpuStartNs >= previousEnd, "batch stamps are missing or out of order");
+            previousEnd = batch.gpuEndNs;
+        } else {
+            Require(batch.gpuStartNs == 0 && batch.gpuEndNs == 0, "batch stamps were written with profiling off");
+        }
+    }
+    std::cout << "batch stamps " << (Recorder::BatchStampsEnabled() ? "checked" : "off") << '\n';
+}
+
 void labelTests(Recorder& recorder) {
     const std::array<std::byte, 4> value{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
     Require(!recorder.PendingLabelIn(0x60000, 0x100), "an empty table reports a label");
@@ -2046,6 +2071,7 @@ int main() {
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
+        batchStampTests(recorder);
         labelTests(recorder);
         lateLabelTests(recorder);
         unchangedSinceTests();
