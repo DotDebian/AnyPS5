@@ -1,6 +1,7 @@
 #include "Optimization/ResourceTracker.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
+#include "Recompiler.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
 
 #include <algorithm>
@@ -525,6 +526,9 @@ private:
     }
 
     bool TakeGpuDescriptor(IrValue& inst, std::uint32_t memoryIndex) {
+        if (!GpuSelectedDescriptors()) {
+            return false;
+        }
         const IrValue* handle = inst.Argument(0)->Resolve();
         if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) {
             return false;
