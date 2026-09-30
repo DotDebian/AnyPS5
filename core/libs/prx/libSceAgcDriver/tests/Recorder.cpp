@@ -953,6 +953,95 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+    constexpr std::size_t bytes = 65536;
+    if (alignment < 8 || alignment > 256) {
+        std::cout << "storage buffer offset alignment " << alignment << ": misaligned draw snapshots not tested\n";
+        return;
+    }
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: misaligned draw snapshots not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<std::uint8_t*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = static_cast<std::uint8_t>(at * 7u + 3u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the watched block refused: misaligned draw snapshots not tested\n";
+        return;
+    }
+    constexpr std::uint32_t outer = 4096;
+    constexpr std::uint32_t offset = outer + 4;
+    constexpr std::size_t outerBytes = 128;
+    constexpr std::size_t elementBytes = 64;
+    const auto words = [&](std::uint64_t at, std::size_t size) { return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u) & 0xffffu, static_cast<std::uint32_t>(size), 0x31000000u}; };
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 2;
+    for (const auto word : words(address + outer, outerBytes)) binding.guestDescriptor.push_back(word);
+    for (const auto word : words(address + offset, elementBytes)) binding.guestDescriptor.push_back(word);
+    binding.bufferWritten = {false, false};
+    program.bindings.push_back(binding);
+    program.pushConstants.resize(16);
+    program.memoryOffsetDword = 0;
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    {
+        auto snapshotContext = context;
+        DescriptorCache cache(snapshotContext);
+        snapshotContext.descriptorCache = &cache;
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.Activate();
+        ShaderResources resources(snapshotContext, compute);
+        std::array<std::byte, PipelinePushConstantBytes> push{};
+        resources.PatchPushConstants(push);
+        const auto adjustment = static_cast<std::uint32_t>(push[1]);
+        Require(push[0] == std::byte{0} && adjustment == offset % alignment, "the inner view's push constant offset is not its distance from the binding");
+        const auto check = [&](const std::shared_ptr<ShaderResources::DrawBindings>& bindings) {
+            Require(bindings != nullptr && bindings->snapshots.size() == 2, "read-only draw inputs were not snapshotted");
+            const auto outerContents = bindings->snapshots[0].buffer->Bytes();
+            Require(outerContents.size() >= outerBytes && std::memcmp(outerContents.data(), guest + outer, outerBytes) == 0, "an aligned draw snapshot misses its view's bytes");
+            const auto contents = bindings->snapshots[1].buffer->Bytes();
+            Require(contents.size() >= adjustment + elementBytes, "a draw snapshot ends before the view the shader reads");
+            Require(std::memcmp(contents.data() + adjustment, guest + offset, elementBytes) == 0, "the shader's patched offset into a draw snapshot misses the view's bytes");
+            return bindings->snapshots[1].buffer;
+        };
+        const auto first = check(resources.PrepareDrawBindings(snapshotRecorder));
+        const auto second = check(resources.PrepareDrawBindings(snapshotRecorder));
+        const char* budget = std::getenv("APS5_DRAW_SNAPSHOT_CACHE_MIB");
+        Require(budget != nullptr && std::strtoull(budget, nullptr, 10) == 0 ? second != first : second == first, "an unchanged misaligned draw input was not reused");
+        guest[offset] ^= 0xffu;
+        check(resources.PrepareDrawBindings(snapshotRecorder));
+        snapshotRecorder.Sync();
+    }
+    recorder.Activate();
+}
+
 // Unit shadows (UnitShadow.hpp) over a host import of write-watched arena memory: a retile piece's
 // slab destination and its seeds, freshness from the tracker (a publish never stamps, a CPU write
 // makes the unit stale), the scopes, the slab boundary, and the retire publish. With
@@ -2185,6 +2274,7 @@ int main() {
         keyProofTests(device, recorder);
         resourceReadTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
+        misalignedSnapshotTests(device, recorder);
         drawSnapshotEvictionTests(device);
         drawInputReuseTests(device, recorder);
         RunResidentPresentTests(device.GetContext());
