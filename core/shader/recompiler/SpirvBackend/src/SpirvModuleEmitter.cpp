@@ -932,6 +932,12 @@ void EmitProgram(SpirvEmitterState& state) {
     if (state.splitWave) {
         EmitWaveExchangeEntry(state);
     }
+    if (state.workgroupReserveVariable != 0u) {
+        const auto slot = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitLocalInvocationIndex(state), ConstantU32(state, state.workgroupReserveDwords - 1u));
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, spv::StorageClassWorkgroup), pointer, state.workgroupReserveVariable, slot);
+        state.module.AddFunction(spv::OpStore, pointer, ConstantU32(state, 0u));
+    }
     if (program.BlockOrder().empty()) {
         if (state.pixelValidMaskVariable != 0u) {
             const auto maskValue = state.module.AllocateId();

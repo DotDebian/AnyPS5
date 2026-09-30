@@ -296,6 +296,7 @@ void encodeResult(Writer& writer, const RecompileResult& result) {
         out.Value(parameter.perVertex);
     });
     writer.Value(static_cast<std::uint8_t>(result.waveLayout));
+    writer.Value(result.workgroupReserveBytes);
 }
 
 void decodeResult(Reader& reader, RecompileResult& result) {
@@ -330,6 +331,7 @@ void decodeResult(Reader& reader, RecompileResult& result) {
     });
     const auto waveLayout = reader.Get<std::uint8_t>();
     result.waveLayout = waveLayout <= static_cast<std::uint8_t>(WaveLayout::SingleLane) ? static_cast<WaveLayout>(waveLayout) : WaveLayout::Auto;
+    reader.Value(result.workgroupReserveBytes);
     result.cacheHit = false;
     result.variantId = 0;
 }

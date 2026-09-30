@@ -293,6 +293,13 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         const bool oneSubgroup = !state.splitWave && (state.laneCount == 2u || (program.WaveSize() == workgroup->hostSubgroupSize && workgroup->hostSubgroupSize <= 32u));
         state.tableIndexNonUniform = threads > program.WaveSize() || !oneSubgroup;
     }
+    if (target.workgroupReserveBytes != 0u) {
+        if (program.Resources().stage != IrShaderStage::Compute || workgroup == nullptr) FailProgram(program, "a workgroup memory reserve needs a compute program");
+        if (!std::has_single_bit(target.workgroupReserveBytes) || target.workgroupReserveBytes < 4u) FailProgram(program, "a workgroup memory reserve must be a power of two of at least one dword");
+        state.workgroupReserveDwords = target.workgroupReserveBytes / 4u;
+        state.workgroupReserveVariable = state.module.DefineGlobalVariable(TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, state.workgroupReserveDwords), spv::StorageClassWorkgroup);
+        state.module.AddName(state.workgroupReserveVariable, "workgroup_reserve");
+    }
     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount, state.splitWave);
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
     state.loopGuardProgram = target.codeAddress;

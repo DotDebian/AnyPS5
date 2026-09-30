@@ -437,6 +437,7 @@ struct RecompileResult {
     std::uint64_t variantId = 0;
     // The layout a wave64 compute program took on a 32-wide host (Auto: not applicable).
     WaveLayout waveLayout = WaveLayout::Auto;
+    std::uint32_t workgroupReserveBytes = 0;
 };
 
 [[nodiscard]] RecompileResult Recompile(const RecompileRequest& request);

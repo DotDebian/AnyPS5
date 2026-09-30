@@ -89,6 +89,8 @@ struct SpirvEmitterState {
     bool splitWaveCounters = false;
     std::uint32_t splitThreads = 0;
     std::uint32_t waveExchangeVariable = 0;
+    std::uint32_t workgroupReserveVariable = 0;
+    std::uint32_t workgroupReserveDwords = 0;
     std::uint32_t waveExchangeGeneration = 0;
     // Entry block values: whether the invocation is in its wave's lanes 0-31, its own and the other
     // half's first slot index of generation 0, the other half's arrival counter index and whether

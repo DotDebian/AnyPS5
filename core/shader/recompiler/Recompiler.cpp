@@ -246,6 +246,7 @@ struct SourceEntry {
     // The layout an Auto wave64 program settled on (under mutex): its first variant's, so later
     // variants skip the spill probe (see compileVariant).
     WaveLayout settledLayout = WaveLayout::Auto;
+    std::uint32_t settledWorkgroupReserve = 0;
     // A plan build that threw (an unsupported resource chain or control flow) is remembered and
     // rethrown: the front end ran every pass before failing, ~13 ms per dispatch of a shader the
     // title issues every frame (0x1048947300 at the intro video). APS5_NO_FAILURE_MEMO=1 rebuilds.
@@ -345,10 +346,29 @@ std::uint64_t nextVariantId() {
     return variants.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
+CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, const ResourceSnapshot& resourceSnapshot, const ResourceSpecialization& resourceSpecialization, bool chooseLayout, std::optional<std::uint32_t>* localMemory = nullptr, std::uint32_t workgroupReserveBytes = 0);
+
+constexpr std::uint32_t MinimumWorkgroupReserveBytes = 4096;
+constexpr std::uint32_t MaximumWorkgroupReserveBytes = 32768;
+
+std::optional<CompiledVariant> compileWithoutLocalMemory(const RecompileRequest& request, const ResourceSnapshot& resourceSnapshot, const ResourceSpecialization& resourceSpecialization) {
+    const auto limit = request.target.maxWorkgroupSharedMemoryBytes;
+    const auto threads = SplitWorkgroupThreads(request);
+    const auto exchange = CompiledLayout(request) == WaveLayout::SingleLane ? SingleLaneExchangeDwords(threads) : 0u;
+    const auto used = (request.context.compute->ldsSizeDwords + exchange) * 4u;
+    for (std::uint32_t reserve = MinimumWorkgroupReserveBytes; reserve <= MaximumWorkgroupReserveBytes && (limit == 0u || used + reserve <= limit); reserve *= 2u) {
+        std::optional<std::uint32_t> bytes;
+        auto variant = compileVariant(request, PrepareResourceProgram(request), resourceSnapshot, resourceSpecialization, false, &bytes, reserve);
+        std::fprintf(stderr, "[wave64] program 0x%llx: %s bytes of local memory per invocation with %u bytes of workgroup memory reserved\n", static_cast<unsigned long long>(request.shader.codeAddress), bytes ? std::to_string(*bytes).c_str() : "unknown", reserve);
+        if (bytes.has_value() && *bytes == 0u) return variant;
+    }
+    return std::nullopt;
+}
+
 // With `chooseLayout`, an Auto wave64 program whose TwoLane module needs local memory is compiled as
 // SingleLane too, and the module needing less local memory is kept (see WaveLayoutFor). With
 // `localMemory`, the module's local memory as the target's probe reports it.
-CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, const ResourceSnapshot& resourceSnapshot, const ResourceSpecialization& resourceSpecialization, bool chooseLayout, std::optional<std::uint32_t>* localMemory = nullptr) {
+CompiledVariant compileVariant(const RecompileRequest& request, IrProgram program, const ResourceSnapshot& resourceSnapshot, const ResourceSpecialization& resourceSpecialization, bool chooseLayout, std::optional<std::uint32_t>* localMemory, std::uint32_t workgroupReserveBytes) {
     const auto inputInfo = RequestInputInfo(request);
     constexpr DeadCodeEliminator deadCodeEliminator;
     constexpr ResourceMaterializer resourceMaterializer;
@@ -375,6 +395,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.supportedExtensions = request.target.supportedExtensions;
     targetOptions.nonConstantImageOffsets = request.target.nonConstantImageOffsets;
     targetOptions.codeAddress = request.shader.codeAddress;
+    targetOptions.workgroupReserveBytes = workgroupReserveBytes;
 
     constexpr SpirvEmitter spirvEmitter;
     RecompileResult result;
@@ -385,13 +406,14 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
         auto twoLane = request;
         twoLane.waveLayout = WaveLayout::TwoLane;
         std::fprintf(stderr, "[wave64] program 0x%llx: %s; compiling it two lanes per invocation\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
-        return compileVariant(twoLane, PrepareResourceProgram(twoLane), resourceSnapshot, resourceSpecialization, false, localMemory);
+        return compileVariant(twoLane, PrepareResourceProgram(twoLane), resourceSnapshot, resourceSpecialization, false, localMemory, workgroupReserveBytes);
     }
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets);
 #endif
     result.waveLayout = CompiledLayout(request);
+    result.workgroupReserveBytes = workgroupReserveBytes;
     const auto& probe = request.target.localMemoryProbe;
     // Only single-wave workgroups: their halves meet at workgroup barriers. With several waves the
     // halves pair through counters in workgroup memory, exact on its own (agc_driver_wave_tests)
@@ -407,6 +429,10 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
             auto singleVariant = compileVariant(single, PrepareResourceProgram(single), resourceSnapshot, resourceSpecialization, false, &singleBytes);
             const bool takeSingle = singleBytes.has_value() && *singleBytes < *bytes;
             std::fprintf(stderr, "[wave64] program 0x%llx: %u bytes of local memory per invocation at two lanes, %s at one; %s\n", static_cast<unsigned long long>(request.shader.codeAddress), *bytes, singleBytes ? std::to_string(*singleBytes).c_str() : "unknown", takeSingle ? "taking one lane per invocation" : "keeping two lanes per invocation");
+            const auto keptBytes = takeSingle ? singleBytes : bytes;
+            if (keptBytes.has_value() && *keptBytes != 0u) {
+                if (auto reserved = compileWithoutLocalMemory(takeSingle ? single : request, resourceSnapshot, resourceSpecialization)) return std::move(*reserved);
+            }
             if (takeSingle) return singleVariant;
         }
     }
@@ -491,10 +517,14 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         const bool settledSingle = source.settledLayout == WaveLayout::SingleLane && WaveLayoutFor(request) == WaveLayout::Auto;
         const auto& compiled = settledSingle ? SingleLaneRequest(request) : request;
         auto program = PrepareResourceProgram(compiled);
-        variant = std::make_shared<const CompiledVariant>(compileVariant(compiled, std::move(program), snapshot, specialization, source.settledLayout == WaveLayout::Auto));
+        const bool settle = source.settledLayout == WaveLayout::Auto;
+        variant = std::make_shared<const CompiledVariant>(compileVariant(compiled, std::move(program), snapshot, specialization, settle, nullptr, settle ? 0u : source.settledWorkgroupReserve));
         if (disk) ShaderDiskCache::Store(std::move(diskKey), variant);
     }
-    if (source.settledLayout == WaveLayout::Auto && WaveLayoutFor(request) == WaveLayout::Auto) source.settledLayout = variant->result.waveLayout;
+    if (source.settledLayout == WaveLayout::Auto && WaveLayoutFor(request) == WaveLayout::Auto) {
+        source.settledLayout = variant->result.waveLayout;
+        source.settledWorkgroupReserve = variant->result.workgroupReserveBytes;
+    }
     source.variants.push_back(variant);
     return variant;
 }

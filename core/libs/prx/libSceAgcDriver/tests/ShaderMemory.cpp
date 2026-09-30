@@ -15,9 +15,12 @@
 #include <iostream>
 #include <future>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -511,6 +514,85 @@ void verifyConditionalUnmappedSlot() {
 
 }
 
+struct LocalMemoryDevice {
+    std::uint32_t reserveNeeded = 0;
+    std::uint32_t probes = 0;
+};
+
+std::uint32_t WorkgroupBytes(std::span<const std::uint32_t> spirv) {
+    std::unordered_map<std::uint32_t, std::uint32_t> constants;
+    std::unordered_map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> arrays;
+    std::unordered_map<std::uint32_t, std::uint32_t> pointees;
+    std::uint32_t bytes = 0;
+    for (std::size_t cursor = 5; cursor < spirv.size();) {
+        const auto count = spirv[cursor] >> 16u;
+        require(count != 0 && count <= spirv.size() - cursor, "workgroup reserve: truncated SPIR-V instruction");
+        const auto op = spirv[cursor] & 0xffffu;
+        const auto* operands = spirv.data() + cursor + 1;
+        if (op == spv::OpConstant && count == 4) constants[operands[1]] = operands[2];
+        if (op == spv::OpTypeArray) arrays[operands[0]] = {operands[1], operands[2]};
+        if (op == spv::OpTypePointer && operands[1] == spv::StorageClassWorkgroup) pointees[operands[0]] = operands[2];
+        if (op == spv::OpVariable && operands[2] == spv::StorageClassWorkgroup) {
+            const auto array = arrays.find(pointees.at(operands[0]));
+            require(array != arrays.end(), "workgroup reserve: a workgroup variable is not an array");
+            bytes += 4u * constants.at(array->second.second);
+        }
+        cursor += count;
+    }
+    return bytes;
+}
+
+std::optional<std::uint32_t> ProbeLocalMemory(void* context, std::span<const std::uint32_t> spirv, std::span<const ShaderRecompiler::DescriptorBinding>, std::uint64_t) {
+    auto& device = *static_cast<LocalMemoryDevice*>(context);
+    ++device.probes;
+    return WorkgroupBytes(spirv) >= device.reserveNeeded ? 0u : 32u;
+}
+
+void verifyWorkgroupReserve() {
+    using namespace ShaderRecompiler;
+    static const std::array<std::uint32_t, 1> code{0xbf810000u};
+    const std::array<std::uint32_t, 1> capabilities{29u};
+    const auto compile = [&](LocalMemoryDevice& device, std::uint32_t sharedLimit) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x30000u, code, 0, {}};
+        request.context.waveSize = 64;
+        request.context.userDataBaseRegister = 0;
+        request.context.compute = ShaderComputeStageInfo{{32u, 2u, 1u}, 0u, {false, false, false}, false, 2u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.target.maxWorkgroupSharedMemoryBytes = sharedLimit;
+        request.target.localMemoryProbe = &ProbeLocalMemory;
+        request.target.localMemoryProbeContext = &device;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = false;
+        return Recompile(request);
+    };
+
+    LocalMemoryDevice spilling{8192u};
+    const auto reserved = compile(spilling, 49152u);
+    require(reserved.waveLayout == WaveLayout::TwoLane, "workgroup reserve: the two-lane layout was not kept");
+    require(reserved.workgroupReserveBytes == 8192u, "workgroup reserve: the smallest spill-free reserve was not taken");
+    require(WorkgroupBytes(reserved.spirv) == 8192u, "workgroup reserve: the module does not declare the reserve");
+    require(spilling.probes == 4u, "workgroup reserve: the probes were not two layouts and two reserves");
+
+    LocalMemoryDevice clean{0u};
+    const auto unreserved = compile(clean, 49152u);
+    require(unreserved.workgroupReserveBytes == 0u && WorkgroupBytes(unreserved.spirv) == 0u, "workgroup reserve: a spill-free module was reserved");
+    require(clean.probes == 1u, "workgroup reserve: a spill-free module was probed again");
+
+    LocalMemoryDevice hopeless{1u << 20u};
+    const auto kept = compile(hopeless, 49152u);
+    require(kept.workgroupReserveBytes == 0u && WorkgroupBytes(kept.spirv) == 0u, "workgroup reserve: a reserve that does not help was kept");
+    require(hopeless.probes == 6u, "workgroup reserve: the reserves up to 32 KiB were not all probed");
+
+    LocalMemoryDevice limited{1u << 20u};
+    static_cast<void>(compile(limited, 12288u));
+    require(limited.probes == 4u, "workgroup reserve: a reserve past the device's workgroup memory was probed");
+}
+
 int main() {
     try {
         using namespace ShaderRecompiler;
@@ -520,6 +602,7 @@ int main() {
         verifyProgramCounterRelativeData();
         verifyPassthroughPixelInputs();
         verifyConditionalUnmappedSlot();
+        verifyWorkgroupReserve();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{
             0x07230203u, 0x00010000u, 0u, 5u, 0u,

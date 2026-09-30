@@ -23,6 +23,7 @@ struct SpirvTargetOptions {
     bool nonConstantImageOffsets = false;
     // The guest program's address, for the loop guard's report (APS5_LOOP_GUARD).
     std::uint64_t codeAddress = 0;
+    std::uint32_t workgroupReserveBytes = 0;
 };
 
 // What Emit throws for a SingleLane program whose wave halves could take a branch apart (see
