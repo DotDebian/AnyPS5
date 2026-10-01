@@ -14,6 +14,7 @@ Throughout the project, every function at every stage either **does exactly what
 - [libSceSaveDataDialog.native](../../core/libs/prx/libSceSaveDataDialog.native/Export.cpp)
 - [libSceCommonDialog](../../core/libs/prx/libSceCommonDialog/Export.cpp)
 - [libSceHmd](../../core/libs/prx/libSceHmd/Export.cpp) implements only the disconnected-headset path: initialization succeeds, device queries report `NotDetected`, and opening a device returns `DeviceDisconnected`. Headset support, tracking, rendering and additional HMD exports are not implemented; SDK-level ABI compatibility and in-game behaviour remain unverified.
+- [sceVideoOutOpen](../../core/libs/prx/libSceVideoOut/src/Output.cpp) checks only the size word of the 16-byte open param and ignores its three option words, whose meaning is unknown (Astro Bot passes 1, 0x100 and 1)
 - The shader recompiler [skips baryctric coordinates](../../core/shader/recompiler/Recompiler.cpp) (is not even passed to SpirvTargetOptions at row 212).
 
 ### Unknown function info
