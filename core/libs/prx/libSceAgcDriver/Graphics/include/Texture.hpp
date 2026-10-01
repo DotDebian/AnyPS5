@@ -234,8 +234,6 @@ public:
         std::size_t inside = 0;
     };
     static FillCoverage ClassifyFill(std::uint64_t address, std::size_t bytes);
-    static std::size_t NoteKeysFill(std::uint64_t address, std::size_t bytes, std::uint8_t key);
-    static std::size_t ClearByKeysFill(std::uint64_t address, std::size_t bytes, std::uint8_t key);
     // Results pending in images lying wholly inside the range are dead (a fill overwrites every
     // byte of them): they are dropped instead of stored. Returns how many images were.
     static std::size_t DiscardPendingInside(std::uint64_t address, std::size_t bytes);
@@ -383,7 +381,6 @@ private:
     bool skippedResultsInside(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t borrowUnits(StorageTexture& source, const std::vector<bool>& units);
     void forgetBorrowed(std::uint32_t first, std::uint32_t count);
-    bool clearByKeysFill(DccKeys keys, std::uint8_t key);
     bool overlaps(std::uint64_t address, std::size_t bytes) const;
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
     VkImageView createView(std::uint32_t mip, bool firstLayer = false) const;

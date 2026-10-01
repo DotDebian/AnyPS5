@@ -2389,7 +2389,7 @@ StorageTexture::FillCoverage StorageTexture::ClassifyFill(std::uint64_t address,
     } else if (overlapping.empty()) {
         constexpr std::uint64_t keyBytes = 256;
         for (const auto* texture : live.textures) {
-            if (!texture->released && texture->descriptor.dccAddress == address && texture->guestBytes / keyBytes != 0 && bytes >= texture->guestBytes / keyBytes) coverage.cover = FillCover::Keys;
+            if (!texture->released && texture->descriptor.dccAddress == address && texture->guestBytes / keyBytes == bytes) coverage.cover = FillCover::Keys;
         }
     } else if (overlapping.size() > 1) {
         coverage.cover = FillCover::Several;
@@ -2417,127 +2417,6 @@ StorageTexture::FillCoverage StorageTexture::ClassifyFill(std::uint64_t address,
         std::fprintf(stderr, "\n");
     }
     return coverage;
-}
-
-std::size_t StorageTexture::NoteKeysFill(std::uint64_t address, std::size_t bytes, std::uint8_t key) {
-    static const bool disabled = std::getenv("APS5_NO_KEYS_REFILL") != nullptr;
-    if (disabled) return 0;
-    DccKeys keys = DccKeys::Mixed;
-    switch (key) {
-        case 0x00: keys = DccKeys::Clear0000; break;
-        case 0x40: keys = DccKeys::Clear0001; break;
-        case 0x80: keys = DccKeys::Clear1110; break;
-        case 0xc0: keys = DccKeys::Clear1111; break;
-        case 0x20: keys = DccKeys::ClearRegister; break;
-        default: return 0;
-    }
-    constexpr std::uint64_t keyBytes = 256;
-    static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
-    auto& live = Live();
-    std::lock_guard lock(live.mutex);
-    std::size_t marked = 0;
-    for (auto* texture : live.textures) {
-        if (texture->released || texture->descriptor.dccAddress != address || texture->guestBytes / keyBytes == 0 || bytes < texture->guestBytes / keyBytes || texture->uploadedKeys != keys) continue;
-        texture->uploadedKeys = DccKeys::Uncompressed;
-        ++marked;
-        if (traceKeys) std::fprintf(stderr, "[dcc-keys] same-value %s key fill re-clears 0x%llx+0x%llx (dirty %d)\n", DccKeysName(keys), static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), texture->dirty ? 1 : 0);
-    }
-    return marked;
-}
-
-// Off unless APS5_KEYS_FILL_CLEAR=1: a key fill changes only the DCC metadata, so a read that does
-// not go through the keys (a view without the DCC address, a copy) still sees the texels the
-// surface's memory holds on hardware, including results still pending here. Clearing the image
-// and dropping those results at the fill lost them for such readers (Astro Bot's title logo and
-// its glow went dim and ghosted); the fill's code reaches DCC-aware reads through the keys as
-// before (the memo below and the refresh).
-std::size_t StorageTexture::ClearByKeysFill(std::uint64_t address, std::size_t bytes, std::uint8_t key) {
-    static const bool enabled = std::getenv("APS5_KEYS_FILL_CLEAR") != nullptr;
-    if (!enabled) return 0;
-    DccKeys keys = DccKeys::Mixed;
-    switch (key) {
-        case 0x00: keys = DccKeys::Clear0000; break;
-        case 0x40: keys = DccKeys::Clear0001; break;
-        case 0x80: keys = DccKeys::Clear1110; break;
-        case 0xc0: keys = DccKeys::Clear1111; break;
-        case 0x20: keys = DccKeys::ClearRegister; break;
-        default: return 0;
-    }
-    constexpr std::uint64_t keyBytes = 256;
-    std::vector<std::shared_ptr<StorageTexture>> covered;
-    {
-        auto& live = Live();
-        std::lock_guard lock(live.mutex);
-        for (auto* texture : live.textures) {
-            if (texture->released || texture->descriptor.dccAddress != address || texture->guestBytes / keyBytes == 0 || bytes < texture->guestBytes / keyBytes) continue;
-            if (auto shared = texture->weak_from_this().lock()) covered.push_back(std::move(shared));
-        }
-    }
-    std::size_t cleared = 0;
-    for (const auto& texture : covered) {
-        if (texture->clearByKeysFill(keys, key)) ++cleared;
-    }
-    return cleared;
-}
-
-bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
-    static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
-    VkClearColorValue clearValue{};
-    auto* recorder = Recorder::Active();
-    const char* refusal = !ClearColorFor(storageFormat, keys, clearValue) ? (keys == DccKeys::ClearRegister ? "clear-register code" : "no clear value in the storage format") : recorder == nullptr ? "no recorder" : nullptr;
-    if (refusal != nullptr) {
-        static std::atomic<bool> reported{false};
-        if (!reported.exchange(true)) std::fprintf(stderr, "[dcc-keys] key fill 0x%02x (%s) over surface 0x%llx+0x%llx (guest format %u, vk format %d, keys 0x%llx) not applied at once: %s\n", key, DccKeysName(keys), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.format, static_cast<int>(storageFormat), static_cast<unsigned long long>(descriptor.dccAddress), refusal);
-        return false;
-    }
-    std::size_t droppedUnits = 0;
-    const bool wasDirty = dirty;
-    {
-        auto& pending = Pending();
-        std::lock_guard lock(pending.mutex);
-        droppedUnits = static_cast<std::size_t>(std::count(layerPending.begin(), layerPending.end(), true));
-        layerPending.assign(trackedLayers, false);
-        if (dirty) {
-            dirty = false;
-            std::erase(pending.textures, this);
-            BumpPendingSerial();
-        }
-    }
-    const auto commands = recorder->Commands();
-    const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::DccClear);
-    if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
-    Recorder::CountBarriers(Recorder::CommandClass::DccClear, 2);
-    if (Recorder::BarrierValidate()) {
-        const std::pair<VkImage, bool> clearedImage{image, true};
-        recorder->NoteAccess(Recorder::CommandClass::DccClear, Recorder::Access{{}, {}, std::span(&clearedImage, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
-    }
-    VkImageMemoryBarrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    toClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toClear.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    toClear.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toClear.image = image;
-    toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
-    context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
-    VkImageMemoryBarrier toGeneral = toClear;
-    toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
-    recorder->EndGpuTiming(timing, guestBytes);
-    originalValid = false;
-    uploadedKeys = keys;
-    keyProof = {};
-    forgetBorrowed(0, trackedLayers);
-    layerGeneration.assign(trackedLayers, GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
-    refreshGeneration();
-    ++version;
-    if (traceKeys) std::fprintf(stderr, "[dcc-keys] key fill %s clears 0x%llx+0x%llx at once (keys 0x%llx, %zu pending units dropped, dirty %d)\n", DccKeysName(keys), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress), droppedUnits, wasDirty ? 1 : 0);
-    return true;
 }
 
 bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal) {
