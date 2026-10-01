@@ -10,6 +10,7 @@
 #include <span>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -81,6 +82,7 @@ struct SpirvEmitterState {
 
     SpirvRequirements requirements;
     std::uint32_t laneCount = 1;
+    std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     // WaveLayout::SingleLane (see SpirvWaveExchange.hpp): each guest wave64 spans two host
     // subgroups; with several waves per workgroup (`splitWaveCounters`) its halves pair up through

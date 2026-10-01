@@ -5,6 +5,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "BdaAbi.hpp"
+#include "SpirvBackend/SpirvWaveExchange.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
@@ -12,8 +13,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <future>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <span>
@@ -603,6 +606,55 @@ void verifyWorkgroupReserve() {
     require(multiWaveClean.workgroupReserveBytes == 0u && WorkgroupBytes(multiWaveClean.spirv) == 0u && cleanWaves.probes == 1u, "workgroup reserve: a spill-free multi-wave module was reserved");
 }
 
+void verifyWaveUniformValues() {
+    using namespace ShaderRecompiler;
+    IrProgram program;
+    program.Resources().stage = IrShaderStage::Compute;
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    MemoryInfo global;
+    global.kind = ResourceKind::Global;
+    program.Resources().memoryInfo = {scalar, global};
+    auto& block = program.CreateBlock();
+    program.SetEntryBlock(block);
+    program.BlockOrder().push_back(&block);
+    const auto emit = [&](IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments, std::uint64_t flags = 0) -> IrValue& {
+        auto& value = program.CreateValue(opcode, type, flags);
+        for (auto* argument : arguments) value.AddArgument(argument);
+        block.AppendInstruction(&value);
+        return value;
+    };
+    const auto memory = [](std::uint32_t index) {
+        MemoryFlags flags{index, 0u};
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &flags, sizeof(flags));
+        return bits;
+    };
+    auto& zero = program.CreateValue(IrOpcode::Void, IrType::U32);
+    zero.SetImmediateU32(0u);
+    auto& active = program.CreateValue(IrOpcode::Void, IrType::U1);
+    active.SetImmediateBool(true);
+    auto& userData = emit(IrOpcode::GetUserData, IrType::U32, {&zero});
+    auto& lane = emit(IrOpcode::LaneId, IrType::U32, {});
+    auto& uniformSum = emit(IrOpcode::IAdd32, IrType::U32, {&userData, &userData});
+    auto& laneSum = emit(IrOpcode::IAdd32, IrType::U32, {&userData, &lane});
+    auto& address = emit(IrOpcode::GetAddressResource, IrType::AddressResource, {&userData, &userData});
+    auto& scalarLoad = emit(IrOpcode::LoadAddressU32, IrType::U32, {&address, &uniformSum, &zero, &active}, memory(0u));
+    auto& laneOffsetLoad = emit(IrOpcode::LoadAddressU32, IrType::U32, {&address, &laneSum, &zero, &active}, memory(0u));
+    auto& globalLoad = emit(IrOpcode::LoadAddressU32, IrType::U32, {&address, &uniformSum, &zero, &active}, memory(1u));
+    auto& fromScalarLoad = emit(IrOpcode::IAdd32, IrType::U32, {&scalarLoad, &uniformSum});
+    auto& fromGlobalLoad = emit(IrOpcode::IAdd32, IrType::U32, {&globalLoad, &uniformSum});
+    auto& compare = emit(IrOpcode::ULessThan32, IrType::U1, {&laneSum, &userData});
+    auto& ballot = emit(IrOpcode::Ballot, IrType::U32x4, {&compare});
+    const auto uniform = WaveUniformValues(program);
+    for (const auto* value : {&userData, &uniformSum, &address, &scalarLoad, &fromScalarLoad, &ballot}) {
+        require(uniform.contains(value), "wave-uniform values: a value every lane of the wave computes alike was not found uniform");
+    }
+    for (const auto* value : {&lane, &laneSum, &laneOffsetLoad, &globalLoad, &fromGlobalLoad, &compare}) {
+        require(!uniform.contains(value), "wave-uniform values: a value that may differ between lanes was found uniform");
+    }
+}
+
 void verifyGpuSelectedBuffer(bool enabled) {
     using namespace ShaderRecompiler;
     require(GpuSelectedDescriptors() == enabled, "GPU-selected V#s: the switch does not match APS5_RUNTIME_DESCRIPTORS");
@@ -658,6 +710,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         verifyGpuSelectedBuffer(true);
+        verifyWaveUniformValues();
         verifyRegisterSources();
         verifyPureFlatSlots();
         verifyBindlessTable();

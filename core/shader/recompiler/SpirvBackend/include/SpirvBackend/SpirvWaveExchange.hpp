@@ -29,6 +29,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -68,6 +69,8 @@ std::uint32_t EmitSplitBallotWord(SpirvEmitterState& state, std::uint32_t predic
 // structurizer conditions) whose condition may differ between the lanes of a wave: a SingleLane
 // wave's halves could take them apart, so such a program cannot take that layout.
 std::vector<const BlockInfo*> LaneVaryingScalarBranches(const IrProgram& program);
+
+std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program);
 
 }
 

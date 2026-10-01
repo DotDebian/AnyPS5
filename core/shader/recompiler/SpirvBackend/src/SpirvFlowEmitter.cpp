@@ -611,9 +611,14 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
                 ldsRead |= access != SharedAccess::Write;
             }
         }
+        const bool shared = state.laneCount == 2u && inst->Type() != IrType::Void && !IrOpcodeHasSideEffects(inst->Opcode()) && state.sharedLaneValues.contains(inst);
         for (std::uint32_t half = 0; half < state.laneCount; half++) {
             if (half != 0 && ctx.otherHalf == nullptr) {
                 ctx.Fail(*inst, "requires a second lane context");
+            }
+            if (half != 0 && shared) {
+                if (const auto found = ctx.definitions.find(inst); found != ctx.definitions.end()) ctx.otherHalf->Define(*inst, found->second);
+                continue;
             }
             SpirvValueEmitContext& lane = half == 0 ? ctx : *ctx.otherHalf;
             state.laneHalf = half;

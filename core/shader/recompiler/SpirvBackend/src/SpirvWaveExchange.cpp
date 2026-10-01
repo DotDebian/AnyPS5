@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ShaderRecompiler {
 
@@ -222,7 +223,9 @@ bool LaneSource(const IrValue& value) {
 
 }
 
-std::vector<const BlockInfo*> LaneVaryingScalarBranches(const IrProgram& program) {
+namespace {
+
+std::unordered_map<const IrValue*, bool> LaneVaryingValues(const IrProgram& program, bool scalarLoadsUniform) {
     std::unordered_map<const IrValue*, bool> varying;
     bool changed = true;
     const auto isVarying = [&](const IrValue* value) {
@@ -231,13 +234,19 @@ std::vector<const BlockInfo*> LaneVaryingScalarBranches(const IrProgram& program
         const auto found = varying.find(resolved);
         return found != varying.end() && found->second;
     };
+    const auto scalarLoad = [&](const IrValue& value) {
+        if (!scalarLoadsUniform || AddressOpcodeInfoOf(value.Opcode()).access != AddressAccess::Read) return false;
+        const auto index = value.Flags<MemoryFlags>().index;
+        const auto& memory = program.Resources().memoryInfo;
+        return index < memory.size() && memory[index].kind == ResourceKind::ScalarAddress;
+    };
     while (changed) {
         changed = false;
         for (const auto* block : program.BlockOrder()) {
             for (const auto* inst : block->Instructions()) {
                 bool lanes = false;
                 if (UniformSource(*inst)) lanes = false;
-                else if (LaneSource(*inst)) lanes = true;
+                else if (LaneSource(*inst) && !scalarLoad(*inst)) lanes = true;
                 else {
                     for (std::size_t i = 0; i < inst->ArgumentCount() && !lanes; ++i) {
                         if (inst->Argument(i) != nullptr) lanes = isVarying(inst->Argument(i));
@@ -251,6 +260,28 @@ std::vector<const BlockInfo*> LaneVaryingScalarBranches(const IrProgram& program
             }
         }
     }
+    return varying;
+}
+
+}
+
+std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program) {
+    const auto varying = LaneVaryingValues(program, true);
+    std::unordered_set<const IrValue*> uniform;
+    for (const auto& [value, lanes] : varying) {
+        if (!lanes) uniform.insert(value);
+    }
+    return uniform;
+}
+
+std::vector<const BlockInfo*> LaneVaryingScalarBranches(const IrProgram& program) {
+    const auto varying = LaneVaryingValues(program, false);
+    const auto isVarying = [&](const IrValue* value) {
+        const auto* resolved = value->Resolve();
+        if (resolved == nullptr || resolved->HasImmediate()) return false;
+        const auto found = varying.find(resolved);
+        return found != varying.end() && found->second;
+    };
     std::vector<const BlockInfo*> result;
     for (const auto& info : program.Metadata().blockInfo) {
         const auto kind = info.terminator.condition;

@@ -271,6 +271,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     const auto* workgroup = ShaderWorkgroupInputFor(state);
     const bool splitHost = workgroup != nullptr && program.WaveSize() == 64u && workgroup->hostSubgroupSize == 32u;
     state.laneCount = splitHost && !workgroup->singleLane ? 2u : 1u;
+    if (state.laneCount == 2u) state.sharedLaneValues = WaveUniformValues(program);
     if (splitHost && workgroup->singleLane && program.Resources().stage == IrShaderStage::Compute) {
         const auto threads = std::max(workgroup->threadsNum[0], 1u) * std::max(workgroup->threadsNum[1], 1u) * std::max(workgroup->threadsNum[2], 1u);
         // A workgroup of at most 32 threads holds its wave in one subgroup.
