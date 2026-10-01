@@ -1241,6 +1241,11 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
     std::fprintf(stderr, "[dcc-keys] uncompressed store by %s (%s) for surface 0x%llx+0x%llx: keys 0x%llx+0x%llx (packet 0x%x queue 0x%x)\n", path, flushReason != nullptr ? flushReason : "?", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress), static_cast<unsigned long long>(guestBytes / 256), packet.opcode, packet.queue);
 }
 
+bool keepsFilledKeys(DccKeys filledKeys) {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_KEYS_FILL_WRITEBACK_KEEP"); return text != nullptr && std::strcmp(text, "1") == 0; }();
+    return enabled && IsDccClear(filledKeys);
+}
+
 }
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
@@ -3139,7 +3144,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             if (profile) Profile().storageGpu += timer.lap();
             originalValid = false;
             traceKeyStore("block write-back", descriptor, guestBytes);
-            if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+            if (!keepsFilledKeys(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
             uploadedKeys = DccKeys::Uncompressed;
             for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
             settle(true);
@@ -3234,7 +3239,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // metadata is host-imported (no CPU wait for the title's key-writing kernels), else a CPU
         // store (APS5_CPU_DCC_KEYS=1 keeps the CPU store; see DccMetadata.hpp).
         traceKeyStore("layer write-back", descriptor, guestBytes);
-        if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+        if (!keepsFilledKeys(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
         uploadedKeys = DccKeys::Uncompressed;
         for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
         // The walk covers this surface's pages only: an adjacent image's later CPU write is stamped
@@ -3342,7 +3347,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // The texels now hold the whole image, so later reads must see them rather than a fast clear
     // (the keys may be host-imported although the texels were not: then a recorded fill, else a CPU store).
     traceKeyStore("cpu write-back", descriptor, guestBytes);
-    if (!IsDccClear(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
+    if (!keepsFilledKeys(filledKeys)) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes);
     uploadedKeys = DccKeys::Uncompressed;
     // The store above is the only write to these pages, so `original` is current at a fresh
     // generation, unless blocks were kept for the CPU: then the image is stale there.
