@@ -629,12 +629,25 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     devices.resize(count);
     VkPhysicalDevice selected = VK_NULL_HANDLE;
     std::uint32_t family = 0;
+    int selectedRank = -1;
+    const auto rankDeviceType = [](VkPhysicalDeviceType type) {
+        switch (type) {
+            case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU: return 3;
+            case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return 2;
+            case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU: return 1;
+            default: return 0;
+        }
+    };
     const std::array<const char*, 1> presentationExtensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     for (auto physical : devices) {
         VkPhysicalDeviceProperties properties{};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(physical, &properties);
-        APS5_LOG_OUT("Physical device candidate=%p name=%s api=0x%x", reinterpret_cast<void*>(physical), properties.deviceName, properties.apiVersion);
+        APS5_LOG_OUT("Physical device candidate=%p name=%s api=0x%x type=%d", reinterpret_cast<void*>(physical), properties.deviceName, properties.apiVersion, static_cast<int>(properties.deviceType));
         if (properties.apiVersion < VK_API_VERSION_1_1) {
+            continue;
+        }
+        const int rank = rankDeviceType(properties.deviceType);
+        if (rank <= selectedRank) {
             continue;
         }
         if (window != nullptr) {
@@ -662,11 +675,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
                 }
                 selected = physical;
                 family = i;
+                selectedRank = rank;
                 break;
             }
-        }
-        if (selected != VK_NULL_HANDLE) {
-            break;
         }
     }
     if (selected == VK_NULL_HANDLE) {
