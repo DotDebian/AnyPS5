@@ -85,7 +85,10 @@ bool DebugProbeActive() {
 }
 
 bool GpuSelectedDescriptors() {
-    static const bool enabled = std::getenv("APS5_RUNTIME_DESCRIPTORS") != nullptr;
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_RUNTIME_DESCRIPTORS");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
     return enabled;
 }
 

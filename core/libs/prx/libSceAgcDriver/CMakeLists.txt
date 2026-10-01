@@ -404,6 +404,12 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    add_test(NAME agc_shader_memory_runtime_descriptors_off COMMAND agc_shader_memory_tests --runtime-descriptors-off)
+    set_tests_properties(agc_shader_memory_runtime_descriptors_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RUNTIME_DESCRIPTORS=0")
+    if(WIN32)
+        set_tests_properties(agc_shader_memory_runtime_descriptors_off PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 option(AGC_BUILD_VISUAL_TEST "Enable the standalone AGC SPIR-V visual test" OFF)

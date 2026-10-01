@@ -603,9 +603,61 @@ void verifyWorkgroupReserve() {
     require(multiWaveClean.workgroupReserveBytes == 0u && WorkgroupBytes(multiWaveClean.spirv) == 0u && cleanWaves.probes == 1u, "workgroup reserve: a spill-free multi-wave module was reserved");
 }
 
-int main() {
+void verifyGpuSelectedBuffer(bool enabled) {
+    using namespace ShaderRecompiler;
+    require(GpuSelectedDescriptors() == enabled, "GPU-selected V#s: the switch does not match APS5_RUNTIME_DESCRIPTORS");
+    std::array<std::uint32_t, 4> source{0x3f800000u, 0u, 0u, 0u};
+    std::array<std::uint32_t, 4> output{};
+    const auto bufferDescriptor = [](const void* base, std::uint32_t records) {
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(base));
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), records, 0xfacu};
+    };
+    std::array<std::array<std::uint32_t, 4>, 2> table{bufferDescriptor(source.data(), 16u), bufferDescriptor(source.data(), 16u)};
+    std::array<std::uint32_t, 8> srt{};
+    const auto tableV = bufferDescriptor(table.data(), 32u);
+    const auto outputV = bufferDescriptor(output.data(), 16u);
+    std::copy(tableV.begin(), tableV.end(), srt.begin());
+    std::copy(outputV.begin(), outputV.end(), srt.begin() + 4);
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    static const std::array<std::uint32_t, 13> code{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0x7e200500u, 0x8f108410u, 0xf4280502u, 0x20000000u, 0xe0300000u, 0x80050100u, 0xe0700000u, 0x80020100u, 0xbf810000u};
+    const std::array<std::uint32_t, 3> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    AgcDriver::ShaderMemory memory({});
+    if (!enabled) {
+        expectFailure([&] { static_cast<void>(memory.Capture(request)); }, "GetBufferResource dword 0 is not a valid runtime value", "GPU-selected V#s: a V# read from GPU memory compiled with APS5_RUNTIME_DESCRIPTORS=0");
+        return;
+    }
+    const auto capture = memory.Capture(request);
+    request.context.memory = memory.Regions();
+    const auto result = Recompile(request, *capture);
+    require(std::any_of(result->bindings.begin(), result->bindings.end(), [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::BdaPagetable; }), "GPU-selected V#s: a V# read from GPU memory was not taken through BDA by default");
+}
+
+int main(int argc, char** argv) {
     try {
         using namespace ShaderRecompiler;
+        if (argc > 1 && std::string_view(argv[1]) == "--runtime-descriptors-off") {
+            verifyGpuSelectedBuffer(false);
+            std::cout << "GPU-selected V#s are refused with APS5_RUNTIME_DESCRIPTORS=0\n";
+            return 0;
+        }
+        verifyGpuSelectedBuffer(true);
         verifyRegisterSources();
         verifyPureFlatSlots();
         verifyBindlessTable();
