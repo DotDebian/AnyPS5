@@ -159,12 +159,37 @@ void testDecode() {
     expectFailure([&] { AgcDriver::DisplayBufferSize(buffer); });
 }
 
+void testOpenParam() {
+    using Words = std::array<std::uint32_t, 6>;
+    constexpr auto first = VIDEO_OUT_OPEN_PARAM_FIRST_WORD;
+    for (const Words& rejected : {
+             Words{24, 0, 0, 0, 0, 0},
+             Words{first, 2, 0, 0, 0, 0},
+             Words{first, 0, 0, 0x101, 0, 0},
+             Words{first, 1, 255, 0, 0, 0},
+             Words{first, 1, 768, 0, 0, 0},
+             Words{first, 0, 0, 1, 0, 0},
+             Words{first, 0, 0, 1, 0x2000, 0},
+             Words{first, 0, 0, 1, 0, 1},
+         }) {
+        expectFailure([&] { sceVideoOutOpen(255, 0, 0, rejected.data()); });
+    }
+    std::array<std::uint32_t, 4> zeroed{first, 0, 0, 0};
+    const auto zeroedHandle = sceVideoOutOpen(255, 0, 0, zeroed.data());
+    check(zeroedHandle >= 0, "open with a zeroed param failed");
+    sceVideoOutClose(zeroedHandle);
+    for (const Words& accepted : {Words{first, 1, 767, 0, 0, 0}, Words{first, 0, 0, 1, 1, 0}}) {
+        const auto handle = sceVideoOutOpen(255, 0, 0, accepted.data());
+        check(handle >= 0, "open with a valid service thread setting failed");
+        sceVideoOutClose(handle);
+    }
+}
+
 void testControls() {
-    std::array<std::uint32_t, 4> openParam{VIDEO_OUT_OPEN_PARAM_SIZE, 0, 0, 0};
+    testOpenParam();
+    const std::array<std::uint32_t, 22> openParam{VIDEO_OUT_OPEN_PARAM_FIRST_WORD, 1, 0x100, 1, 0x1FFF};
     const auto handle = sceVideoOutOpen(255, 0, 0, openParam.data());
-    check(handle >= 0, "open with a zeroed param failed");
-    openParam[0] = 24;
-    expectFailure([&] { sceVideoOutOpen(255, 0, 0, openParam.data()); });
+    check(handle >= 0, "open with the highest priority on every CPU failed");
     const auto cfg = VideoOutDriver::Get().GetConfig(handle);
     for (int rate = 0; rate <= 2; ++rate) {
         check(sceVideoOutSetFlipRate(handle, rate) == 0 && cfg->flipRate == rate, "flip rate was not applied");
