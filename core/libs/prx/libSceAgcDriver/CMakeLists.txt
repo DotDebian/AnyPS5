@@ -366,6 +366,18 @@ target_link_libraries(agc_driver_gds_tests PRIVATE shader_recompiler_agc_driver 
 set_target_properties(agc_driver_gds_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_gds_tests)
 
+add_executable(agc_driver_mix_precision_tests EXCLUDE_FROM_ALL
+        tests/MixPrecision.cpp
+)
+target_include_directories(agc_driver_mix_precision_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
+        ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
+)
+target_link_libraries(agc_driver_mix_precision_tests PRIVATE libSceAgcDriver SDL2-static libc)
+set_target_properties(agc_driver_mix_precision_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_driver_mix_precision_tests)
+
 # Wave64 programs recompiled in both layouts of a 32-wide host and run on the GPU (run by hand).
 add_executable(agc_driver_wave_tests EXCLUDE_FROM_ALL
         tests/WaveLayout.cpp
@@ -382,7 +394,7 @@ set_target_properties(agc_driver_wave_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_wave_tests)
 
 if(BUILD_TESTING)
-    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_shader_control_flow_tests agc_structurizer_tests agc_dpp_write_tests agc_shader_disk_cache_tests agc_driver_flip_tests agc_driver_pm4_tests)
+    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_shader_control_flow_tests agc_structurizer_tests agc_dpp_write_tests agc_shader_disk_cache_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_mix_precision_tests)
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})
