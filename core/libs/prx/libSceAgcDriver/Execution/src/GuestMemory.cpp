@@ -647,7 +647,14 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             char separator = 0;
             std::string permissions;
             if (!(fields >> std::hex >> first >> separator >> last >> permissions) || separator != '-' || first >= last || permissions.size() < 2) return false;
-            if (last <= cursor || first > cursor) continue;
+            if (last <= cursor) continue;
+            if (first > cursor) {
+                const auto gapEnd = std::min(end, first);
+                if (!emit(PageRun{cursor, gapEnd, false, false})) return true;
+                cursor = gapEnd;
+                found = true;
+                break;
+            }
             const auto next = std::min(end, last);
             if (!emit(PageRun{cursor, next, permissions[0] == 'r', permissions[0] == 'r' && permissions[1] == 'w'})) return true;
             cursor = next;

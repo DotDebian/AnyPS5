@@ -6,6 +6,8 @@
 #include <cstring>
 #include <array>
 #include <algorithm>
+#include <utility>
+#include <vector>
 #if defined(__linux__)
 #include <pthread.h>
 #include <sys/mman.h>
@@ -182,5 +184,23 @@ void RunLiveStackAccessTests() {
     Require(AgcDriver::GuestMemory::Accessible(block, 64, true) && !AgcDriver::GuestMemory::Accessible(block + stackBytes, 16), "the released test stack is misreported");
     munmap(block, stackBytes + page);
     Require(arguments.failure.empty(), arguments.failure.c_str());
+#endif
+}
+
+void RunUnwatchedGapTests() {
+#if defined(__linux__)
+    namespace GuestMemory = AgcDriver::GuestMemory;
+    const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    auto* block = static_cast<std::byte*>(mmap(nullptr, 3 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    Require(block != MAP_FAILED, "cannot map the gap test pages");
+    Require(munmap(block + page, page) == 0, "cannot unmap the gap test's middle page");
+    const auto base = reinterpret_cast<std::uint64_t>(block);
+    const auto ranges = GuestMemory::CommittedRanges(base, 3 * page);
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> expected{{base, base + page}, {base + 2 * page, base + 3 * page}};
+    Require(ranges == expected, "the pages after an unmapped gap in host memory were not described");
+    Require(!GuestMemory::Accessible(block, 3 * page) && GuestMemory::Accessible(block + 2 * page, page, true), "an unmapped gap in host memory is misreported");
+    Require(!GuestMemory::Accessible(reinterpret_cast<const void*>(std::uintptr_t{0x18}), 4), "a near-null address counts as accessible");
+    munmap(block, page);
+    munmap(block + 2 * page, page);
 #endif
 }
