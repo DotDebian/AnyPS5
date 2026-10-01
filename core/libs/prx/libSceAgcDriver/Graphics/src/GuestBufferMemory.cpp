@@ -115,6 +115,8 @@ bool addressSpaceCacheEnabled() {
 struct HostImports {
     std::mutex mutex;
     VkDevice device = VK_NULL_HANDLE;
+    PFN_vkDestroyBuffer destroyBuffer = nullptr;
+    PFN_vkFreeMemory freeMemory = nullptr;
     std::map<std::uint64_t, HostImport> imports;
     std::set<std::uint64_t> failed;
     // Registry generation the imports were last reconciled with.
@@ -461,12 +463,20 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
 // guest addresses. Walks the imports only when the registry changed since the last walk.
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
     if (state.device != context.device) {
+        for (const auto& [address, entry] : state.imports) {
+            if (state.device != VK_NULL_HANDLE && state.destroyBuffer != nullptr && state.freeMemory != nullptr) {
+                state.destroyBuffer(state.device, entry.buffer, nullptr);
+                state.freeMemory(state.device, entry.memory, nullptr);
+            }
 #ifdef _WIN32
-        for (const auto& [address, entry] : state.imports) GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
+            GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
+        }
         state.imports.clear();
         state.failed.clear();
         state.device = context.device;
+        state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
+        state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
         state.refreshedGeneration = 0;
         ++state.epoch;
     }
