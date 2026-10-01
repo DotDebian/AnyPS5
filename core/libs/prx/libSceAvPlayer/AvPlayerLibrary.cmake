@@ -14,7 +14,7 @@ function(add_sce_avplayer_library target)
     )
     configure_windows_unwind(${target})
 
-    # FFmpeg from 3rdparty/FFmpeg (FFmpeg.cmake), shared with libSceVideodec2; a system FFmpeg found
+    # FFmpeg from 3rdparty/FFmpeg (FFmpeg.cmake); a system FFmpeg found
     # through pkg-config when the submodule is not there.
     if(TARGET anyps5_ffmpeg)
         target_link_libraries(${target} PRIVATE anyps5_ffmpeg)

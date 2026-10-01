@@ -1,7 +1,6 @@
 # FFmpeg from the 3rdparty/FFmpeg submodule, built once with its own configure and make
-# (ExternalProject) for every library that decodes media: libSceVideodec2 (H.264 access units) and
-# libSceAvPlayer (MP4 files, opened by path or through the title's file callbacks: the file
-# protocol, the mov demuxer, H.264 and AAC, scaled and resampled for the title).
+# (ExternalProject) for libSceAvPlayer (MP4 files, opened by path or through the title's file
+# callbacks: the file protocol, the mov demuxer, H.264 and AAC, scaled and resampled for the title).
 # avcodec, avformat, avutil, swscale and swresample are static PIC archives with only those
 # components; each prx links them with their symbols hidden (--exclude-libs), so no FFmpeg runtime
 # is needed and none is exported. Defines the INTERFACE target anyps5_ffmpeg when the submodule
@@ -11,7 +10,7 @@ if(WIN32)
 else()
     set(ANYPS5_FFMPEG_DEFAULT ON)
 endif()
-option(ANYPS5_ENABLE_FFMPEG "Build FFmpeg from 3rdparty/FFmpeg for libSceVideodec2 and libSceAvPlayer" ${ANYPS5_FFMPEG_DEFAULT})
+option(ANYPS5_ENABLE_FFMPEG "Build FFmpeg from 3rdparty/FFmpeg for libSceAvPlayer" ${ANYPS5_FFMPEG_DEFAULT})
 
 set(ANYPS5_FFMPEG_SOURCE_DIR ${CMAKE_SOURCE_DIR}/3rdparty/FFmpeg)
 find_program(ANYPS5_FFMPEG_SH sh)

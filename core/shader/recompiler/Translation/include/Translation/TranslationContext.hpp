@@ -153,6 +153,7 @@ private:
     bool floatCube(const RdnaInstruction& inst, std::uint32_t resultKind);
     bool integer16Shift(const RdnaInstruction& inst, IrOpcode opcode, bool arithmetic);
     bool integer16Binary(const RdnaInstruction& inst, IrOpcode opcode, bool sign);
+    bool integer16Ternary(const RdnaInstruction& inst, IrOpcode opcode, bool sign);
     bool vMed3I16(const RdnaInstruction& inst);
     bool packedInteger16Shift(const RdnaInstruction& inst, IrOpcode opcode, bool arithmetic);
     bool packedInteger16Binary(const RdnaInstruction& inst, IrOpcode opcode);

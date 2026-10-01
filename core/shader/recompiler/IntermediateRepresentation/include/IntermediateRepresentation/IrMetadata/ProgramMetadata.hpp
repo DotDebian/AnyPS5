@@ -17,8 +17,6 @@ struct IrProgramMetadata {
     std::string failureReason;
     std::vector<BlockInfo> blockInfo;
     std::vector<ExportInfo> exportInfo;
-    // Pixel parameters interpolated through a linear (no perspective) I/J pair and through a
-    // perspective pair, by v_interp source VGPR (bit per parameter).
     std::uint32_t pixelLinearInputs = 0;
     std::uint32_t pixelPerspectiveInputs = 0;
     std::vector<IrValue*> dynamicReads;

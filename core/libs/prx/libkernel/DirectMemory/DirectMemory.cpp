@@ -579,7 +579,7 @@ int DoMunmap(void* addr, size_t len) {
     mutation.Unmap(addr, len, [&](const void* piece, std::size_t pieceBytes, const void* allocation, bool last) {
         auto* pieceAddress = const_cast<void*>(piece);
         std::lock_guard lock(g_directLock);
-        EraseMappings(reinterpret_cast<std::uintptr_t>(pieceAddress), reinterpret_cast<std::uintptr_t>(pieceAddress) + pieceBytes);
+        EraseMappings(reinterpret_cast<std::uintptr_t>(piece), reinterpret_cast<std::uintptr_t>(piece) + pieceBytes);
 #if defined(__linux__)
         Unmap(pieceAddress, pieceBytes);
 #else
@@ -592,11 +592,14 @@ int DoMunmap(void* addr, size_t len) {
     return 0;
 }
 
-int DoReserveVirtual(void** addr, size_t len, size_t alignment) {
+int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
-    void* mapped = MapAligned(nullptr, len, PROT_NONE, 0, alignment);
+    const bool fixed = *addr != nullptr && (flags & GuestMapFixedFlag) != 0;
+    if (fixed) mutation.RequireAvailable(*addr, len);
+    constexpr int GuestMapNoCoalesce = 0x400000;
+    void* mapped = MapAligned(fixed ? *addr : nullptr, len, PROT_NONE, fixed ? GuestMapFixedFlag | (flags & GuestMapNoCoalesce) : 0, alignment);
     try {
         mutation.Add(mapped, len, false, false);
     } catch (...) {
@@ -604,7 +607,7 @@ int DoReserveVirtual(void** addr, size_t len, size_t alignment) {
         throw;
     }
     *addr = mapped;
-    Trace("reserve %p+0x%zx align=0x%zx", mapped, len, alignment);
+    Trace("reserve %p+0x%zx flags=0x%x align=0x%zx", mapped, len, flags, alignment);
     return 0;
 }
 

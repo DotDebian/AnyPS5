@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
@@ -458,7 +459,7 @@ void hardwareScreenOffsetTests() {
 
 void ShaderStageTests() {
     auto queue = makeState();
-    for (const auto routing : {0x2000u, 0x2010u, 0x02002000u, 0x02002010u}) {
+    for (const auto routing : {0x2000u, 0x2010u}) {
         for (const auto vertexWave32 : {false, true}) {
             for (const auto fragmentWave32 : {false, true}) {
                 queue.context[0x2d5] = routing | (vertexWave32 ? 0x00400000u : 0u);
@@ -482,6 +483,17 @@ void ShaderStageTests() {
     auto stages = AgcDriver::Graphics::DecodeState(queue).stages;
     Require(stages.path == AgcDriver::Graphics::ShaderPath::Geometry && stages.mesh && stages.mesh->primitivesPerGroup == 21 && stages.mesh->verticesPerGroup == 63, "geometry assembly changed");
     Require(stages.mesh->maxVertices == 64 && stages.mesh->maxPrimitives == 21 && stages.mesh->threadsPerGroup == 64 && stages.mesh->esgsItemSize == 4, "geometry subgroup outputs changed");
+    for (const auto routing : {0x02002000u, 0x02002010u, 0x02402000u, 0x02402010u}) {
+        queue.context[0x2d5] = routing;
+        queue.context[0x2ce] = 0;
+        queue.context[0x29b] = 0;
+        const auto pass = AgcDriver::Graphics::DecodeState(queue).stages;
+        Require(pass.path == AgcDriver::Graphics::ShaderPath::Geometry && pass.mesh && pass.mesh->passthrough && pass.mesh->verticesPerGroup == 63 && pass.mesh->primitivesPerGroup == 21, "passthrough subgroup assembly changed");
+        Require(pass.vertexWaveSize == ((routing & 0x00400000u) ? 32u : 64u), "passthrough wave size changed");
+    }
+    queue.context[0x2d5] = 0x2020;
+    queue.context[0x2ce] = 3;
+    queue.context[0x29b] = 2;
     queue.context[0x2ab] = 0;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "invalid VGT_ESGS_RING_ITEMSIZE");
     queue.context[0x2ab] = 4;
@@ -518,8 +530,6 @@ void ShaderStageTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register");
 }
 
-// Recompiles a pixel shader that exports v<source> to MRT0 under SPI_PS_INPUT_ENA/ADDR and returns
-// the builtins its SPIR-V reads (the loads and access chains of builtin input variables).
 constexpr std::array<std::uint8_t, 8> IdentityExports{0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u};
 
 std::vector<spv::BuiltIn> pixelBuiltinsRead(std::uint32_t ena, std::uint32_t addr, std::uint32_t source) {
@@ -527,7 +537,6 @@ std::vector<spv::BuiltIn> pixelBuiltinsRead(std::uint32_t ena, std::uint32_t add
     queue.context[0x1b3] = ena;
     queue.context[0x1b4] = addr;
     const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, IdentityExports);
-    // exp mrt0 v<source> x4 done vm; s_endpgm.
     const std::array<std::uint32_t, 3> code{0xf800180fu, source * 0x01010101u, 0xbf810000u};
     ShaderRecompiler::RecompileRequest request{};
     request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x30000u, code, 0, {}};
@@ -557,8 +566,6 @@ bool readsBuiltin(const std::vector<spv::BuiltIn>& read, spv::BuiltIn builtin) {
     return std::find(read.begin(), read.end(), builtin) != read.end();
 }
 
-// The NoPerspective decorations of a pixel shader that interpolates parameter 0 through the
-// PERSP_CENTER pair (v0/v1) and parameter 1 through the LINEAR_CENTER pair (v2/v3).
 std::vector<std::uint32_t> pixelNoPerspectiveLocations(bool barycentricEnabled) {
     auto queue = makeState();
     queue.context[0x1b3] = 0x22u;
@@ -601,29 +608,7 @@ std::vector<std::uint32_t> pixelNoPerspectiveLocations(bool barycentricEnabled) 
     return result2;
 }
 
-// s_cbranch_cdbgsys/cdbguser/cdbgsys_or_user/cdbgsys_and_user branch only while a debugger sets
-// the conditional debug bits, so they translate as never taken.
-bool recompilesDebugBranch(std::uint32_t opcode) {
-    auto queue = makeState();
-    queue.context[0x1b3] = 0x2u;
-    queue.context[0x1b4] = 0x2u;
-    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, IdentityExports);
-    const std::array<std::uint32_t, 4> code{0xbf800000u | (opcode << 16u) | 1u, 0xf800180fu, 0x00000000u, 0xbf810000u};
-    ShaderRecompiler::RecompileRequest request{};
-    request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x30000u, code, 0, {}};
-    request.context.waveSize = 64;
-    request.context.pixel = pixel;
-    request.target.vulkanVersion = 0x00401000u;
-    request.target.spirvVersion = 0x00010300u;
-    request.target.subgroupSize = 64;
-    request.target.fragmentShaderBarycentricEnabled = true;
-    request.layout.pushConstantSizeBytes = 128;
-    request.useCache = false;
-    return !ShaderRecompiler::Recompile(request).spirv.Words().empty();
-}
-
-// SPI_PS_INPUT_ADDR lays the input VGPRs out (I/J pairs, then POS_X...), ENA & ADDR loads them.
-void pixelInputLayoutTests() {
+void PixelInputLayoutTests() {
     using ShaderRecompiler::PixelInput;
     using ShaderRecompiler::PixelInputVgpr;
     auto queue = makeState();
@@ -632,22 +617,16 @@ void pixelInputLayoutTests() {
         queue.context[0x1b4] = addr;
         return AgcDriver::Graphics::DecodePixelStageInfo(queue.context, IdentityExports);
     };
-    // Astro Bot's PERSP_CENTER | PERSP_CENTROID | LINEAR_CENTER | POS_X | POS_Y: three I/J pairs
-    // before the position.
     auto pixel = decode(0x326u, 0x326u);
     Require(pixel.inputAddr == 0x326u && pixel.hasPerspectiveCenterVgpr && pixel.perspectiveCentroid && pixel.noPerspective && !pixel.linearCentroid && pixel.posX && pixel.posY && !pixel.posZ, "the centroid input flags were not decoded");
     Require(PixelInputVgpr(pixel.inputAddr, PixelInput::PerspectiveCenter) == 0u && PixelInputVgpr(pixel.inputAddr, PixelInput::PerspectiveCentroid) == 2u && PixelInputVgpr(pixel.inputAddr, PixelInput::LinearCenter) == 4u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionX) == 6u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionY) == 7u, "the centroid layout moved the inputs");
     pixel = decode(0x1146u, 0x1146u);
     Require(pixel.linearCentroid && !pixel.noPerspective && PixelInputVgpr(pixel.inputAddr, PixelInput::LinearCentroid) == 4u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionX) == 6u && PixelInputVgpr(pixel.inputAddr, PixelInput::FrontFace) == 7u, "the linear centroid layout moved the inputs");
-    // An input only ADDR names keeps its VGPRs unloaded, whatever it is (PERSP_SAMPLE, the 3-VGPR
-    // pull model, POS_Y).
     pixel = decode(0x506u, 0x7afu);
     Require(pixel.inputAddr == 0x7afu && !pixel.posY && pixel.posZ && PixelInputVgpr(pixel.inputAddr, PixelInput::PerspectiveCentroid) == 4u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionX) == 12u && PixelInputVgpr(pixel.inputAddr, PixelInput::PositionZ) == 14u, "ADDR-only inputs did not reserve their VGPRs");
-    // Loading an input with no translation is still refused.
     for (const auto bit : {0x8u, 0x80u, 0x4000u, 0x8000u}) {
         expectFailure([&] { static_cast<void>(decode(0x2u | bit, 0x2u | bit)); }, "unsupported SPI_PS_INPUT_ENA/ADDR");
     }
-    // The layout survives request serialization.
     pixel = decode(0x546u, 0x7c7u);
     {
         ShaderRecompiler::RecompileRequest request{};
@@ -660,24 +639,19 @@ void pixelInputLayoutTests() {
         const auto& p = *back.request.context.pixel;
         Require(p.inputAddr == 0x7c7u && p.hasPerspectiveCenterVgpr && p.perspectiveCentroid && p.linearCentroid && !p.noPerspective && p.posX && !p.posY && p.posZ, "the pixel input layout did not survive serialization");
     }
-    // The recompiled entry fills the VGPRs at those places: with PERSP_CENTER | PERSP_CENTROID |
-    // POS_X, v2/v3 carry the (center) barycentrics and POS_X lands in v4, not v0.
     for (const auto source : {0u, 2u, 3u}) {
         const auto read = pixelBuiltinsRead(0x106u, 0x106u, source);
         Require(readsBuiltin(read, spv::BuiltInBaryCoordKHR) && !readsBuiltin(read, spv::BuiltInFragCoord), "a centroid-layout I/J VGPR does not hold the barycentrics: v" + std::to_string(source));
     }
-    for (const auto opcode : {0x17u, 0x18u, 0x19u, 0x1au}) Require(recompilesDebugBranch(opcode), "a conditional debug branch did not recompile");
     const auto noPerspective = pixelNoPerspectiveLocations(false);
     Require(noPerspective.size() == 1 && noPerspective[0] == 1u, "only the parameter interpolated through the linear pair must be NoPerspective");
     Require(pixelNoPerspectiveLocations(true).empty(), "explicit interpolation must not interpolate parameter arrays a second time");
     auto read = pixelBuiltinsRead(0x106u, 0x106u, 4u);
     Require(readsBuiltin(read, spv::BuiltInFragCoord) && !readsBuiltin(read, spv::BuiltInBaryCoordKHR), "POS_X is not in v4 after the center and centroid pairs");
-    // The game's layout: LINEAR_CENTER's pair holds the linear barycentrics, POS_X is v6.
     read = pixelBuiltinsRead(0x326u, 0x326u, 5u);
     Require(readsBuiltin(read, spv::BuiltInBaryCoordNoPerspKHR) && !readsBuiltin(read, spv::BuiltInFragCoord), "LINEAR_CENTER's J is not v5");
     read = pixelBuiltinsRead(0x326u, 0x326u, 6u);
     Require(readsBuiltin(read, spv::BuiltInFragCoord) && !readsBuiltin(read, spv::BuiltInBaryCoordKHR) && !readsBuiltin(read, spv::BuiltInBaryCoordNoPerspKHR), "POS_X is not in v6 after three I/J pairs");
-    // An ADDR-only PERSP_CENTROID still pushes POS_X to v4, and its pair stays unloaded.
     read = pixelBuiltinsRead(0x102u, 0x106u, 4u);
     Require(readsBuiltin(read, spv::BuiltInFragCoord), "an ADDR-only centroid pair did not reserve v2/v3");
     read = pixelBuiltinsRead(0x102u, 0x106u, 2u);
@@ -699,98 +673,6 @@ void DisabledColorTests() {
     Require(partial.hasColorTarget && partial.blend.colorWriteMask == 3, "partial color write mask changed");
     queue.context.erase(0x31c);
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register");
-}
-
-// CB metadata passes (CB_COLOR_CONTROL.MODE ELIMINATE_FAST_CLEAR / DCC_DECOMPRESS).
-alignas(256) std::array<std::uint8_t, 4> dccKeys{};
-
-void metadataPassTests() {
-    using AgcDriver::Graphics::ColorMetadataPass;
-    using AgcDriver::Graphics::DecodeColorMetadataPass;
-    auto queue = makeState();
-    queue.context[0x0] = 0;
-    Require(!DecodeColorMetadataPass(queue).has_value(), "normal color rendering decoded as a metadata pass");
-    queue.context[0x202] = 0xcc0020;
-    queue.context[0x323] = 0x11223344;
-    queue.context[0x324] = 0x55667788;
-    auto pass = DecodeColorMetadataPass(queue);
-    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::EliminateFastClear && pass->targets.size() == 1, "fast-clear eliminate did not decode");
-    Require(pass->targets[0].address == reinterpret_cast<std::uintptr_t>(colorMemory.data()) && pass->targets[0].extent.width == 64 && pass->targets[0].extent.height == 4, "fast-clear eliminate target changed");
-    Require(pass->targets[0].clearWords[0] == 0x11223344 && pass->targets[0].clearWords[1] == 0x55667788, "fast-clear eliminate lost CB_COLOR_CLEAR_WORD");
-    // The pass ignores what the shader exports (a blit's export format need not be a color one).
-    queue.context[0x1c5] = 2;
-    queue.context[0x8f] = 1;
-    Require(DecodeColorMetadataPass(queue).has_value(), "the blit's export format refused a metadata pass");
-    queue.context[0x202] = 0xcc0060;
-    pass = DecodeColorMetadataPass(queue);
-    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::DccDecompress, "DCC decompress did not decode");
-    queue.context[0x8e] = 0;
-    Require(DecodeColorMetadataPass(queue)->targets.empty(), "a disabled target joined the metadata pass");
-    queue.context[0x8e] = 0xf;
-    queue.context[0x202] = 0xcc0061;
-    expectFailure([&] { DecodeColorMetadataPass(queue); }, "nonstandard ROP");
-    queue.context[0x202] = 0x330060;
-    expectFailure([&] { DecodeColorMetadataPass(queue); }, "nonstandard ROP");
-    queue.context[0x202] = 0xcc0060;
-    queue.context[0x200] = 2;
-    expectFailure([&] { DecodeColorMetadataPass(queue); }, "depth or stencil work");
-    queue.context[0x200] = 0x70;
-    Require(DecodeColorMetadataPass(queue).has_value(), "an always-pass depth function without a test refused the pass");
-    queue.context[0x91] = 0x40020;
-    expectFailure([&] { DecodeColorMetadataPass(queue); }, "over part of a color target");
-    queue.context[0x91] = 0x40040;
-    queue.context[0x10f] = std::bit_cast<std::uint32_t>(16.0f);
-    expectFailure([&] { DecodeColorMetadataPass(queue); }, "over part of a color target");
-    queue.context[0x10f] = std::bit_cast<std::uint32_t>(32.0f);
-    // Modes other than the metadata passes keep the rejection, naming the mode.
-    queue.context[0x202] = 0xcc0030;
-    queue.context[0x1c5] = 9;
-    queue.context[0x8f] = 0xf;
-    Require(!DecodeColorMetadataPass(queue).has_value(), "resolve decoded as a metadata pass");
-    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("mode resolve") != std::string::npos, "the resolve rejection does not name the mode");
-
-    // The pass within the DCC model, on the CPU (no resident image without a detiler): register
-    // clear keys become the CB_COLOR_CLEAR_WORD texel, code keys their value, keys read uncompressed.
-    queue = makeState();
-    queue.context[0x0] = 0;
-    queue.context[0x202] = 0xcc0020;
-    queue.context[0x31c] |= 0x10000000;
-    const auto keysAddress = reinterpret_cast<std::uintptr_t>(dccKeys.data());
-    queue.context[0x325] = static_cast<std::uint32_t>(keysAddress >> 8u);
-    queue.context[0x3a8] = static_cast<std::uint32_t>(keysAddress >> 40u);
-    queue.context[0x323] = 0x11223344;
-    queue.context[0x324] = 0;
-    pass = DecodeColorMetadataPass(queue);
-    Require(pass.has_value() && pass->targets.size() == 1 && pass->targets[0].dccAddress == keysAddress, "the metadata pass lost the target's DCC keys");
-    const AgcDriver::Graphics::Context context{};
-    const auto texels = [&](std::uint32_t value) {
-        for (std::size_t offset = 0; offset < colorMemory.size(); offset += 4) {
-            std::uint32_t texel = 0;
-            std::memcpy(&texel, colorMemory.data() + offset, 4);
-            if (texel != value) return false;
-        }
-        return true;
-    };
-    const auto keysAre = [&](std::uint8_t key) { return std::all_of(dccKeys.begin(), dccKeys.end(), [&](std::uint8_t value) { return value == key; }); };
-    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
-    dccKeys.fill(0x20);
-    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
-    Require(texels(0x11223344) && keysAre(0xff), "a register fast clear was not eliminated into the texels");
-    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
-    dccKeys.fill(0xc0);
-    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
-    Require(texels(0xffffffffu) && keysAre(0xff), "a 1111 fast clear was not eliminated into the texels");
-    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
-    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
-    Require(texels(0x5a5a5a5au) && keysAre(0xff), "a pass over uncompressed keys changed the texels");
-    dccKeys = {0x20, 0xff, 0x20, 0x20};
-    expectFailure([&] { AgcDriver::Graphics::RunColorMetadataPass(context, *pass); }, "per-block metadata");
-    Require(texels(0x5a5a5a5au), "a refused pass changed the texels");
-    // Without DCC (a CMASK fast clear, not modeled) the target reads as its texels already.
-    pass->targets[0].dccAddress = 0;
-    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
-    Require(texels(0x5a5a5a5au), "a pass over a target without DCC changed its texels");
-
 }
 
 // DB metadata blits: DB_RENDER_CONTROL HTILE operations, no depth/stencil/color work, a skipped pixel
@@ -837,6 +719,94 @@ void ColorViewTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "mip exceeds");
     queue.context[0x31b] = 1u << 13u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "array views");
+}
+
+alignas(256) std::array<std::uint8_t, 4> dccKeys{};
+
+void metadataPassTests() {
+    using AgcDriver::Graphics::ColorMetadataPass;
+    using AgcDriver::Graphics::DecodeColorMetadataPass;
+    auto queue = makeState();
+    queue.context[0x0] = 0;
+    Require(!DecodeColorMetadataPass(queue).has_value(), "normal color rendering decoded as a metadata pass");
+    queue.context[0x202] = 0xcc0020;
+    queue.context[0x323] = 0x11223344;
+    queue.context[0x324] = 0x55667788;
+    auto pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::EliminateFastClear && pass->targets.size() == 1, "fast-clear eliminate did not decode");
+    Require(pass->targets[0].address == reinterpret_cast<std::uintptr_t>(colorMemory.data()) && pass->targets[0].extent.width == 64 && pass->targets[0].extent.height == 4, "fast-clear eliminate target changed");
+    Require(pass->targets[0].clearWords[0] == 0x11223344 && pass->targets[0].clearWords[1] == 0x55667788, "fast-clear eliminate lost CB_COLOR_CLEAR_WORD");
+    queue.context[0x1c5] = 2;
+    queue.context[0x8f] = 1;
+    Require(DecodeColorMetadataPass(queue).has_value(), "the blit's export format refused a metadata pass");
+    queue.context[0x202] = 0xcc0060;
+    pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::DccDecompress, "DCC decompress did not decode");
+    queue.context[0x8e] = 0;
+    Require(DecodeColorMetadataPass(queue)->targets.empty(), "a disabled target joined the metadata pass");
+    queue.context[0x8e] = 0xf;
+    queue.context[0x202] = 0xcc0061;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "nonstandard ROP");
+    queue.context[0x202] = 0x330060;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "nonstandard ROP");
+    queue.context[0x202] = 0xcc0060;
+    queue.context[0x200] = 2;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "depth or stencil work");
+    queue.context[0x200] = 0x70;
+    Require(DecodeColorMetadataPass(queue).has_value(), "an always-pass depth function without a test refused the pass");
+    queue.context[0x91] = 0x40020;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "over part of a color target");
+    queue.context[0x91] = 0x40040;
+    queue.context[0x10f] = std::bit_cast<std::uint32_t>(16.0f);
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "over part of a color target");
+    queue.context[0x10f] = std::bit_cast<std::uint32_t>(32.0f);
+    queue.context[0x202] = 0xcc0030;
+    queue.context[0x1c5] = 9;
+    queue.context[0x8f] = 0xf;
+    Require(!DecodeColorMetadataPass(queue).has_value(), "resolve decoded as a metadata pass");
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("mode resolve") != std::string::npos, "the resolve rejection does not name the mode");
+
+    queue = makeState();
+    queue.context[0x0] = 0;
+    queue.context[0x202] = 0xcc0020;
+    queue.context[0x31c] |= 0x10000000;
+    const auto keysAddress = reinterpret_cast<std::uintptr_t>(dccKeys.data());
+    queue.context[0x325] = static_cast<std::uint32_t>(keysAddress >> 8u);
+    queue.context[0x3a8] = static_cast<std::uint32_t>(keysAddress >> 40u);
+    queue.context[0x323] = 0x11223344;
+    queue.context[0x324] = 0;
+    pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->targets.size() == 1 && pass->targets[0].dccAddress == keysAddress, "the metadata pass lost the target's DCC keys");
+    auto mipmapped = queue;
+    mipmapped.context[0x3b0] |= 1u << 28u;
+    expectFailure([&] { DecodeColorMetadataPass(mipmapped); }, "mipmapped DCC");
+    const AgcDriver::Graphics::Context context{};
+    const auto texels = [&](std::uint32_t value) {
+        for (std::size_t offset = 0; offset < colorMemory.size(); offset += 4) {
+            std::uint32_t texel = 0;
+            std::memcpy(&texel, colorMemory.data() + offset, 4);
+            if (texel != value) return false;
+        }
+        return true;
+    };
+    const auto keysAre = [&](std::uint8_t key) { return std::all_of(dccKeys.begin(), dccKeys.end(), [&](std::uint8_t value) { return value == key; }); };
+    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+    dccKeys.fill(0x20);
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0x11223344) && keysAre(0xff), "a register fast clear was not eliminated into the texels");
+    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+    dccKeys.fill(0xc0);
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0xffffffffu) && keysAre(0xff), "a 1111 fast clear was not eliminated into the texels");
+    std::memset(colorMemory.data(), 0x5a, colorMemory.size());
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0x5a5a5a5au) && keysAre(0xff), "a pass over uncompressed keys changed the texels");
+    dccKeys = {0x20, 0xff, 0x20, 0x20};
+    expectFailure([&] { AgcDriver::Graphics::RunColorMetadataPass(context, *pass); }, "per-block metadata");
+    Require(texels(0x5a5a5a5au), "a refused pass changed the texels");
+    pass->targets[0].dccAddress = 0;
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0x5a5a5a5au), "a pass over a target without DCC changed its texels");
 }
 
 void DepthClipTests() {
@@ -1127,6 +1097,12 @@ VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer, std::uint32_t x, std
     mock.lastDispatchGroups = {x, y, z};
 }
 
+VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void* data) {
+    auto& memory = mock.memories.at(mock.bufferMemory.at(buffer));
+    Require(offset + size <= memory.size(), "a buffer update exceeds its buffer");
+    std::memcpy(memory.data() + offset, data, static_cast<std::size_t>(size));
+}
+
 PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
     static const std::map<std::string_view, PFN_vkVoidFunction> table{
         {"vkGetBufferDeviceAddressKHR", reinterpret_cast<PFN_vkVoidFunction>(mockGetBufferDeviceAddress)},
@@ -1156,7 +1132,8 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCreateGraphicsPipelines", reinterpret_cast<PFN_vkVoidFunction>(mockCreateGraphicsPipelines)},
         {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindPipeline)},
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
-        {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)}
+        {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
+        {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)}
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
@@ -1442,6 +1419,35 @@ void resourceTests() {
     }
 }
 
+void misalignedShaderDataTests() {
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.limits.minStorageBufferOffsetAlignment = 16;
+    const auto commands = reinterpret_cast<VkCommandBuffer>(std::uintptr_t{1});
+    alignas(64) std::array<std::uint32_t, 8> guest{1, 2, 3, 4, 5, 6, 7, 8};
+    {
+        ShaderRecompiler::RecompileResult compute;
+        compute.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guest.data(), 32), vsharp(guest.data() + 1, 8))));
+        compute.bindings.push_back(makeBinding(Role::ShaderData, 1, 1, {0x11, 0x22, 0}));
+        compute.memoryOffsetDword = 2;
+        auto live = compute;
+        live.bindings[1].guestDescriptor = {0x33, 0x44, 0};
+        const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &compute, 0};
+        const AgcDriver::Graphics::CompiledShader liveShader{ShaderRecompiler::ShaderStage::Compute, &live, 0};
+        AgcDriver::Graphics::ShaderResources resources(context, shader);
+        const auto& views = findWrite(0);
+        Require(views.buffers.size() == 2 && views.buffers[0].range == 32 && views.buffers[1].range == 12 && views.buffers[1].offset == views.buffers[0].offset, "the misaligned view is not bound from the aligned offset below it");
+        const auto data = findWrite(1).buffers.at(0).buffer;
+        const std::array<std::uint32_t, 3> patched{0x11, 0x22, 0x400};
+        Require(sameBytes(bufferBytes(data), patched.data(), sizeof(patched)), "the shader data buffer does not hold the misaligned view's offset");
+        Require(resources.RefreshData(commands, liveShader), "a refresh with different words recorded nothing");
+        const std::array<std::uint32_t, 3> refreshed{0x33, 0x44, 0x400};
+        Require(sameBytes(bufferBytes(data), refreshed.data(), sizeof(refreshed)), "a data refresh dropped the misaligned view's offset");
+        Require(!resources.DataWordsDiffer(liveShader) && resources.DataWordsHash() == AgcDriver::Graphics::ShaderResources::DataWordsHash(liveShader), "the refreshed template's words are not the dispatch's");
+    }
+    Require(mock.live == 0, "misaligned shader data resources leaked Vulkan objects");
+}
+
 struct ModuleShape {
     bool fragment = false;
     bool push = false;
@@ -1459,6 +1465,7 @@ struct ModuleShape {
     bool parameterOutput = false;
     std::uint32_t parameterLocation = 0;
     bool rectParameters = false;
+    bool secondTarget = false;
 };
 
 void emit(std::vector<std::uint32_t>& out, spv::Op op, std::initializer_list<std::uint32_t> operands) {
@@ -1496,6 +1503,12 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
         emit(declarations, spv::OpVariable, {outputPointer, parameter, spv::StorageClassOutput});
         emit(annotations, spv::OpDecorate, {parameter, spv::DecorationLocation, shape.parameterLocation});
         extraInterface.push_back(parameter);
+    }
+    if (shape.secondTarget) {
+        const auto target = id();
+        emit(declarations, spv::OpVariable, {outputPointer, target, spv::StorageClassOutput});
+        emit(annotations, spv::OpDecorate, {target, spv::DecorationLocation, 1});
+        extraInterface.push_back(target);
     }
     if (shape.rectParameters) {
         const auto pointer = id();
@@ -1832,13 +1845,8 @@ void pixelParameterSlotTests() {
     pixel = recompilePixel({0x403u}, vertices);
     inputs = locatedInputs(pixel.spirv.Words());
     Require(inputs.size() == 1 && inputs[0].location == 3 && inputs[0].perVertex && subtracts(pixel.spirv.Words()) == 2, "v_interp_mov p10/p20 of a flat input did not read differences to vertex 0");
-    // Interpolating pass-through vertices with v_interp_p1/p2 has no exact translation through a
-    // Vulkan-interpolated variable; with fragment barycentrics it is P0 + I*P10 + J*P20 of the
-    // vertices as they were passed through.
     expectFailure([&] { recompilePixel({0x423u, 0x3u}, shared, 9u, false); }, "passes its vertices through unchanged");
-    pixel = recompilePixel({0x423u, 0x3u}, shared);
-    inputs = locatedInputs(pixel.spirv.Words());
-    Require(inputs.size() == 1 && inputs[0].location == 3 && inputs[0].perVertex, "pass-through vertices interpolated explicitly were not read per vertex");
+    expectFailure([&] { recompilePixel({0x423u, 0x3u}, shared); }, "passes its vertices through unchanged");
     // Slot 5 is read but the vertex shader exports only slot 0: the pipeline's pixel module reads
     // zero there, through a private variable.
     pixel = recompilePixel({0x0u, 0x5u}, shared);
@@ -1924,6 +1932,15 @@ void validationTests() {
     }
     {
         ShaderRecompiler::RecompileResult vertex;
+        vertex.spirv = makeModule({});
+        ShaderRecompiler::RecompileResult pixel;
+        pixel.spirv = makeModule({.fragment = true, .secondTarget = true});
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}}};
+        const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        Require(state.colors.empty() && AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false) == std::set<std::uint32_t>{0u}, "an export past the attachments was not dropped");
+    }
+    {
+        ShaderRecompiler::RecompileResult vertex;
         vertex.spirv = makeModule({.vertexInput = true});
         ShaderRecompiler::VertexAttribute attribute{0, 4, {{0x1000, 32u << 16u, 3, 77u << 12u}}, 0};
         const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
@@ -1950,8 +1967,12 @@ void validationTests() {
         expectFailure([&] { AgcDriver::Graphics::DecodeVertexFormat(attribute); }, "unsupported vertex format");
         attribute.resource.fields[3] = 50u << 12u;
         Require(AgcDriver::Graphics::DecodeVertexFormat(attribute).format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && AgcDriver::Graphics::DecodeVertexFormat(attribute).bytes == 4, "2_10_10_10 vertex format was not decoded");
+        attribute.resource.fields[3] = 55u << 12u;
+        Require(AgcDriver::Graphics::DecodeVertexFormat(attribute).format == VK_FORMAT_A2B10G10R10_SINT_PACK32 && std::string_view(AgcDriver::Graphics::DecodeVertexFormat(attribute).scalar) == "i32", "2_10_10_10 sint vertex format was not decoded");
         attribute.resource.fields[3] = 36u << 12u;
-        Require(AgcDriver::Graphics::DecodeVertexFormat(attribute).format == VK_FORMAT_B10G11R11_UFLOAT_PACK32, "11_11_10 float vertex format was not decoded");
+        Require(AgcDriver::Graphics::DecodeVertexFormat(attribute).format == VK_FORMAT_B10G11R11_UFLOAT_PACK32, "10_11_11 float vertex format was not decoded");
+        attribute.resource.fields[3] = 43u << 12u;
+        expectFailure([&] { AgcDriver::Graphics::DecodeVertexFormat(attribute); }, "unsupported vertex format");
         attribute.resource.fields = {0x1000, 32u << 16u, 3, 77u << 12u};
         attribute.components = 2;
         AgcDriver::Graphics::Context context{};
@@ -2101,6 +2122,30 @@ void vertexCopyTests() {
     }
 }
 
+bool recompilesDebugBranch(std::uint32_t opcode) {
+    auto queue = makeState();
+    queue.context[0x1b3] = 0x2u;
+    queue.context[0x1b4] = 0x2u;
+    const auto state = AgcDriver::Graphics::DecodeState(queue);
+    const auto pixel = AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state));
+    const std::array<std::uint32_t, 4> code{0xbf800000u | (opcode << 16u) | 1u, 0xf800180fu, 0x00000000u, 0xbf810000u};
+    ShaderRecompiler::RecompileRequest request{};
+    request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x30000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.pixel = pixel;
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.target.fragmentShaderBarycentricEnabled = true;
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    return !ShaderRecompiler::Recompile(request).spirv.Words().empty();
+}
+
+void debugBranchTests() {
+    for (const auto opcode : {0x17u, 0x18u, 0x19u, 0x1au}) Require(recompilesDebugBranch(opcode), "a conditional debug branch did not recompile");
+}
+
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
@@ -2142,10 +2187,12 @@ int main() {
         depthMetadataBlitTests();
         mimgDecodeTests();
         ShaderStageTests();
-        pixelInputLayoutTests();
+        PixelInputLayoutTests();
         InitialContextTests();
         pushConstantTests();
         resourceTests();
+        misalignedShaderDataTests();
+        debugBranchTests();
         validationTests();
         vertexCopyTests();
         pixelParameterSlotTests();

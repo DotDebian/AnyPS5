@@ -32,8 +32,6 @@ void writeGotStub(std::vector<PeSection>& sections, const std::uint32_t targetRv
     for (auto& section : sections) {
         if (section.Data.size() < 8 || targetRva < section.Rva || targetRva - section.Rva > section.Data.size() - 8)
             continue;
-        // A DIR64 base relocation only adds the load delta to the stored value, so the slot must hold the
-        // preferred-VA form (ImageBase + rva); a bare RVA would end up as (loadBase - ImageBase + rva) at runtime.
         Io::WriteU64(section.Data, targetRva - section.Rva, ImageBase + stubRva);
         return;
     }

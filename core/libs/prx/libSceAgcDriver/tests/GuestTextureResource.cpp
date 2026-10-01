@@ -178,8 +178,6 @@ void RunGuestTextureResourceTests() {
     zeroAddress.base40 = 0;
     rejectFields(zeroAddress, "null base address");
 
-    // MIN_LOD (u4.8, whole-surface levels) decodes; the clamp a view applies is what can bind: above
-    // BASE_LEVEL, at most the view's last level.
     Fields minLod = base;
     minLod.maxMip = 4;
     minLod.baseLevel = 1;

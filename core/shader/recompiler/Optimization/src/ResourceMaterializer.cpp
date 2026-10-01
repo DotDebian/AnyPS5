@@ -43,6 +43,7 @@ struct DecodedImage {
     bool cube = false;
     bool fmask = false;
     bool depthBits = false;
+    bool depthUnorm16 = false;
 };
 
 ShaderBufferResource decodeBufferDescriptor(const DescriptorValue& value) {
@@ -164,6 +165,7 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
     decoded.numericClass = SampledTextureNumericClass(format);
     if (!storage && !base.depthCompare && IsDepthBitsTexture(descriptor.dwords[1], descriptor.dwords[3])) {
         decoded.depthBits = true;
+        decoded.depthUnorm16 = DepthBitsTextureWidth(descriptor.dwords[1], descriptor.dwords[3]) == 16u;
         decoded.numericClass = IrTextureNumericClass::Float;
         decoded.shaderSwizzle = descriptorImageSwizzle(descriptor);
     }
@@ -530,6 +532,7 @@ void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& s
         entry.cube = decoded.cube;
         entry.fmask = decoded.fmask;
         entry.depthBits = decoded.depthBits;
+        entry.depthUnorm16 = decoded.depthUnorm16;
         result.images.push_back(entry);
     }
 
@@ -615,6 +618,7 @@ void ResourceMaterializer::Apply(IrProgram& program, const ResourceSpecializatio
         image.indirectSearchIterations = source.indirectSearchIterations;
         image.cube = source.cube;
         image.depthBits = source.depthBits;
+        image.depthUnorm16 = source.depthUnorm16;
         image.indirectResources.clear();
     }
     for (std::uint32_t index = 0; index < images.size(); index++) {
@@ -880,7 +884,7 @@ bool ResourceSpecialization::Buffer::operator==(const Buffer& other) const {
 }
 
 bool ResourceSpecialization::Image::operator==(const Image& other) const {
-    return numericClass == other.numericClass && dimension == other.dimension && mipCount == other.mipCount && conversionFormat == other.conversionFormat && shaderSwizzle == other.shaderSwizzle && indirectRoot == other.indirectRoot && indirectMappingOffset == other.indirectMappingOffset && indirectSearchIterations == other.indirectSearchIterations && cube == other.cube && fmask == other.fmask && depthBits == other.depthBits;
+    return numericClass == other.numericClass && dimension == other.dimension && mipCount == other.mipCount && conversionFormat == other.conversionFormat && shaderSwizzle == other.shaderSwizzle && indirectRoot == other.indirectRoot && indirectMappingOffset == other.indirectMappingOffset && indirectSearchIterations == other.indirectSearchIterations && cube == other.cube && fmask == other.fmask && depthBits == other.depthBits && depthUnorm16 == other.depthUnorm16;
 }
 
 bool ResourceSpecialization::operator==(const ResourceSpecialization& other) const {

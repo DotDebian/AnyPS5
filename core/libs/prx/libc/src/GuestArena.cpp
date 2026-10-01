@@ -177,6 +177,14 @@ void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, 
     if (!Arena::Get().Contains(pointer, bytes)) throw std::invalid_argument("shared mapping outside the guest arena");
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection);
 }
+
+void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().MapAlias(address, bytes);
+}
+
+void GuestArenaUnmapAlias_nid_postfix(void* alias) {
+    WindowsMappings::Get().UnmapAlias(alias);
+}
 #endif
 
 bool GuestArenaWriteWatched_nid_postfix() {

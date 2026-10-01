@@ -26,6 +26,13 @@ enum class Opcode : std::uint32_t {
     Nop = 0,
     ReadFile = 1,
     WriteAddress = 2,
+    WriteCounter = 3,
+    WaitOnAddress = 4,
+    WaitOnCounter = 5,
+    WriteKernelEventQueue = 6,
+    WriteAddressFromTimeCounter = 7,
+    WriteAddressFromCounter = 8,
+    WriteAddressFromCounterPair = 9,
 };
 
 struct CommandHeader {
@@ -48,6 +55,36 @@ struct WriteAddressCommand {
     std::uint64_t value;
     std::uint32_t flags;
     std::uint32_t reserved;
+};
+
+struct WriteCounterCommand {
+    CommandHeader header;
+    std::uint32_t counter;
+    std::uint32_t value;
+};
+
+struct WaitCommand {
+    CommandHeader header;
+    std::uint64_t address;
+    std::uint64_t reference;
+    std::uint64_t mask;
+    std::uint32_t counter;
+    std::uint32_t compare;
+};
+
+struct WriteKernelEventQueueCommand {
+    CommandHeader header;
+    std::uint64_t equeue;
+    std::uint64_t ident;
+    std::uint64_t data;
+    std::uint64_t userData;
+};
+
+struct WriteAddressFromCounterCommand {
+    CommandHeader header;
+    std::uint64_t address;
+    std::uint32_t counter0;
+    std::uint32_t counter1;
 };
 
 }

@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Query.hpp"
+#include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libkernel/Equeue/Equeue.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -13,6 +15,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+extern "C" int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name);
+extern "C" int APS5_VABI sceKernelDeleteEqueue(KernelEqueue eq);
 
 static_assert(sizeof(Packet) == 16);
 static_assert(offsetof(Packet, addr) == 0);
@@ -146,6 +151,41 @@ void testSubmissions() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
+void testEndOfPipeInterrupts() {
+    KernelEqueue eq = 0;
+    check(sceKernelCreateEqueue(&eq, "AGC test") == 0, "event queue creation failed");
+    auto owner = EqueuePin_nid_postfix(eq);
+    int graphicsTag = 0;
+    int computeTag = 0;
+    check(sceAgcDriverAddEqEvent(eq, 0, &graphicsTag) == 0, "graphics event registration failed");
+    check(sceAgcDriverAddEqEvent(eq, 0x20, &computeTag) == 0, "compute event registration failed");
+    expectFailure([] { sceAgcDriverAddEqEvent(0, 0, nullptr); });
+    std::array<std::uint32_t, 8> words{0xc0064900, 0, 1u << 24u, 0, 0, 0, 0, 0};
+    Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&packet) == 0 && sceAgcDriverSubmitDcb(&packet) == 0, "interrupt submit failed");
+    AgcDriverWaitIdle_nid_postfix();
+    std::array<KernelEvent, 2> events{};
+    check(owner->GetTriggeredEvents(events.data(), 2) == 1, "graphics end-of-pipe interrupt was not delivered to its queue only");
+    check(events[0].filter == -14 && events[0].udata == &graphicsTag && events[0].data == 2 && sceAgcDriverGetEqEventType(events.data()) == 0, "graphics end-of-pipe event encoding is wrong");
+    check(owner->GetTriggeredEvents(events.data(), 2) == 0, "delivered interrupt was not cleared");
+    check(sceAgcDriverSubmitAcb(0x20, &packet) == 0, "compute interrupt submit failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(owner->GetTriggeredEvents(events.data(), 2) == 1 && events[0].udata == &computeTag && sceAgcDriverGetEqEventType(events.data()) == 0x20, "compute end-of-pipe interrupt missing");
+    words[2] = 0;
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "plain release submit failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(owner->GetTriggeredEvents(events.data(), 2) == 0, "release without INT_SEL raised an interrupt");
+    check(sceAgcDriverDeleteEqEvent(eq, 0) == 0, "graphics event deletion failed");
+    expectFailure([&] { sceAgcDriverDeleteEqEvent(eq, 0); });
+    words[2] = 1u << 24u;
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "interrupt submit after deletion failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(owner->GetTriggeredEvents(events.data(), 2) == 0, "deleted event still received interrupts");
+    check(sceAgcDriverDeleteEqEvent(eq, 0x20) == 0, "compute event deletion failed");
+    owner.reset();
+    check(sceKernelDeleteEqueue(eq) == 0, "event queue deletion failed");
+}
+
 std::array<std::uint32_t, 5> writeData(volatile std::uint32_t* address, std::uint32_t value) {
     const auto target = reinterpret_cast<std::uintptr_t>(address);
     return {0xc0033700, 0x00100200, static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(static_cast<std::uint64_t>(target) >> 32u), value};
@@ -182,8 +222,6 @@ std::vector<std::uint32_t> commands(const std::array<std::uint32_t, N>&... packe
     return words;
 }
 
-// A label stored after a wait's submission satisfies the wait although the title wrote the label
-// again before the queue reached it; one stored before the submission never does.
 void testLabelStoredSinceSubmission() {
     alignas(64) static volatile std::uint32_t gate = 0, label = 0, done = 0, late = 0;
     submit(0x20, commands(waitEqual(&gate, 1), waitEqual(&label, 1), writeData(&done, 1)));
@@ -198,9 +236,6 @@ void testLabelStoredSinceSubmission() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
-// A 64-bit wait whose mask leaves the high dword out is satisfied by a 32-bit label stored after
-// its submission (the title reset the label again before the queue reached it); with the high
-// dword in its mask, the 32-bit store alone does not decide it (memory's high dword never matches).
 void testWideLabelStoredSinceSubmission() {
     alignas(64) static volatile std::uint32_t gate = 0, done = 0, late = 0;
     alignas(64) static volatile std::uint32_t label[2] = {0, 0x5eed};
@@ -221,8 +256,6 @@ void testWideLabelStoredSinceSubmission() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
-// A wait whose value memory holds when it is submitted is satisfied although the title resets the
-// label before the queue gets there, unless an earlier packet of its queue stores to the label.
 void testLabelHeldAtSubmission() {
     alignas(64) static volatile std::uint32_t gate = 0, label = 1, done = 0, reset = 0;
     submit(0x20, commands(waitEqual(&gate, 1), waitEqual(&label, 1), writeData(&done, 1)));
@@ -262,6 +295,7 @@ int main() {
         testValidation();
         testClearState();
         testSubmissions();
+        testEndOfPipeInterrupts();
         testLabelStoredSinceSubmission();
         testLabelHeldAtSubmission();
         testWideLabelStoredSinceSubmission();

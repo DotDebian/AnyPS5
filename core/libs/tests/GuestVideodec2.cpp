@@ -89,7 +89,6 @@ namespace {
 
 constexpr std::uint32_t Width = 64;
 constexpr std::uint32_t Height = 40;
-constexpr int DecoderInstanceError = static_cast<int>(0x811d0106u);
 
 constexpr std::array<std::uint8_t, 1477> Stream{
     0x00, 0x00, 0x00, 0x01, 0x09, 0x10, 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9,
@@ -241,6 +240,50 @@ std::vector<std::vector<std::uint8_t>> accessUnits(bool lengthPrefixed) {
     return units;
 }
 
+template <typename TAction>
+void checkThrows(TAction action) {
+    bool threw = false;
+    try {
+        action();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    check(threw, "expected a decoding exception");
+}
+
+void testFailures() {
+    DecoderConfigInfo config{sizeof(DecoderConfigInfo), 0, 2, 100, 0, static_cast<std::int32_t>(Width), static_cast<std::int32_t>(Height), 4, 1};
+    DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
+    std::uint64_t handle = 0;
+    checkThrows([&] { sceVideodec2CreateDecoder_nid_postfix(&config, &memory, &handle); });
+    check(handle == 0, "unsupported codec created a decoder");
+    config.codecType = 1;
+    config.maxFrameWidth = 0;
+    checkThrows([&] { sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory); });
+    config.maxFrameWidth = Width;
+    check(sceVideodec2QueryDecoderMemoryInfo_nid_postfix(&config, &memory) == 0, "memory query failed");
+    check(sceVideodec2CreateDecoder_nid_postfix(&config, &memory, &handle) == 0, "decoder creation failed");
+    std::vector<std::uint8_t> buffer(memory.maxFrameBufferSize);
+    FrameBuffer frame{sizeof(FrameBuffer), buffer.data(), buffer.size(), false};
+    OutputInfo output{sizeof(OutputInfo)};
+    const std::array<std::uint8_t, 5> malformed{0, 0, 0, 8, 0x65};
+    InputData input{sizeof(InputData), malformed.data(), malformed.size(), 0, 0, 0};
+    checkThrows([&] { sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output); });
+    input.auSize = 2;
+    checkThrows([&] { sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output); });
+    check(sceVideodec2Reset_nid_postfix(handle) == 0, "reset failed");
+    frame.frameBufferSize = 1;
+    checkThrows([&] {
+        for (const auto& unit : accessUnits(false)) {
+            input.auData = unit.data();
+            input.auSize = unit.size();
+            sceVideodec2Decode_nid_postfix(handle, &input, &frame, &output);
+        }
+        sceVideodec2Flush_nid_postfix(handle, &frame, &output);
+    });
+    check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0, "delete failed");
+}
+
 void testDecode(bool lengthPrefixed) {
     const DecoderConfigInfo config{sizeof(DecoderConfigInfo), 0, 1, 100, 0, static_cast<std::int32_t>(Width), static_cast<std::int32_t>(Height), 4, 1};
     DecoderMemoryInfo memory{sizeof(DecoderMemoryInfo)};
@@ -281,13 +324,14 @@ void testDecode(bool lengthPrefixed) {
     check(pictures == PictureHashes.size(), "missing pictures after flush");
     check(sceVideodec2Reset_nid_postfix(handle) == 0, "reset failed");
     check(sceVideodec2DeleteDecoder_nid_postfix(handle) == 0, "delete failed");
-    check(sceVideodec2DeleteDecoder_nid_postfix(handle) == DecoderInstanceError, "deleted decoder still accepted");
+    checkThrows([&] { sceVideodec2DeleteDecoder_nid_postfix(handle); });
 }
 
 }
 
 int main() {
     try {
+        testFailures();
         testDecode(false);
         testDecode(true);
         std::puts("Videodec2 tests passed");

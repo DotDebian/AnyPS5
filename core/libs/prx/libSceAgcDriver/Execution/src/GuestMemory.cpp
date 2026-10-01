@@ -71,8 +71,9 @@ std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
 // tracker mutex acquisitions that had to wait (APS5_PROFILE_DRAW; see lockTracker).
 std::atomic<std::uint64_t> collectDirty{0};
-// Runs of written pages the Linux write watch reported (a walk that stamped any counts as dirty).
+#ifndef _WIN32
 std::atomic<std::uint64_t> collectDirtyRuns{0};
+#endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 // Verifications answered by the calling thread's live stack (onOwnLiveStack), and page runs looked
@@ -794,10 +795,6 @@ struct WriteTracker {
     std::vector<std::uint32_t> cpuBlocks;
     std::vector<std::uint32_t> writtenBlocks;
 #else
-    // The same two stamps per 64 KiB block of the user address space: Linux guest mappings are
-    // placed wherever the title's hints or the kernel put them, and each is watched on its own
-    // (GuestWriteWatch). A 4 GiB leaf is made when a block of it is first stamped; the blocks of a
-    // missing leaf read 0, as the arena's blocks do before their first stamp.
     static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
     static constexpr std::size_t LeafCount = std::size_t{1} << 15;
     struct Leaf {
@@ -847,7 +844,6 @@ struct WriteTracker {
 #endif
     }
 
-    // Whether the pages of a non-empty range are watched (callers check `watched` first).
     bool covers(std::uint64_t address, std::size_t bytes) const {
 #ifdef _WIN32
         return address >= base && address - base <= size - bytes;
@@ -856,7 +852,6 @@ struct WriteTracker {
 #endif
     }
 
-    // The block index of an address inside a covered range.
     std::uint64_t blockOf(std::uint64_t address) const {
 #ifdef _WIN32
         return (address - base) / WriteBlockBytes;
@@ -892,8 +887,6 @@ struct WriteTracker {
 #endif
     }
 
-    // Stamps a block with `stampGeneration`: a CPU store (a collect) also in the CPU stamps, anything
-    // but an import window's report also in the written stamps.
     void stamp(std::uint64_t block, std::uint32_t stampGeneration, StampKind kind) {
         const bool cpu = kind != StampKind::Driver;
         const bool written = kind != StampKind::ImportWindow;
@@ -969,8 +962,6 @@ struct StampRuns {
     StampKind kind;
 };
 
-// A run of written pages reported by GuestWriteWatch: every block it touches takes the walk's
-// generation, as a store of the walk's kind.
 void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     auto& [tracker, kind] = *static_cast<StampRuns*>(context);
     if (end <= begin) return;

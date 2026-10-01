@@ -301,9 +301,6 @@ void writePixelInfo(Writer& writer, const ShaderPixelStageInfo& info) {
     }
 }
 
-// Version 4 stores both the version 3 additions: SPI_PS_INPUT_ADDR with the centroid flags, and
-// VGT_ESGS_RING_ITEMSIZE for mesh programs. Version 3 stores SPI_PS_INPUT_ADDR and the centroid flags; earlier versions stored the
-// perspective center's VGPR (2 after PERSP_SAMPLE, else 0) and no centroid inputs.
 ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
     ShaderPixelStageInfo info{};
     info.interpolatorCount = reader.ReadU32();
@@ -313,7 +310,7 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
     info.wave32 = reader.ReadBool();
     const auto inputAddrOrCenterVgpr = reader.ReadU32();
     info.hasPerspectiveCenterVgpr = reader.ReadBool();
-    if (version >= 3u) {
+    if (version >= 5u) {
         info.inputAddr = inputAddrOrCenterVgpr;
         info.perspectiveCentroid = reader.ReadBool();
     }
@@ -325,7 +322,7 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
     info.ancillary = reader.ReadBool();
     info.sampleShading = reader.ReadBool();
     info.noPerspective = reader.ReadBool();
-    if (version >= 3u) info.linearCentroid = reader.ReadBool();
+    if (version >= 5u) info.linearCentroid = reader.ReadBool();
     info.pixelKillEnable = reader.ReadBool();
     info.depthExportEnable = reader.ReadBool();
     info.sampleMaskExportEnable = reader.ReadBool();
@@ -334,9 +331,7 @@ ShaderPixelStageInfo readPixelInfo(Reader& reader, std::uint32_t version) {
     for (std::uint8_t& value : info.targetOutputMode) {
         value = reader.ReadU8();
     }
-    if (version < 3u) {
-        // The loaded inputs as the layout (ENA == ADDR), with PERSP_SAMPLE where the center sat
-        // after it.
+    if (version < 5u) {
         const auto input = [](PixelInput value, bool present) { return present ? PixelInputBit(value) : 0u; };
         info.inputAddr = input(PixelInput::PerspectiveSample, info.hasPerspectiveCenterVgpr && inputAddrOrCenterVgpr == 2u) | input(PixelInput::PerspectiveCenter, info.hasPerspectiveCenterVgpr) |
             input(PixelInput::LinearSample, info.sampleShading) | input(PixelInput::LinearCenter, info.noPerspective) |
@@ -447,6 +442,7 @@ void writeMeshConfiguration(Writer& writer, const MeshConfiguration& configurati
     writer.WriteU32(configuration.ldsSizeDwords);
     writer.WriteU32(configuration.provokingVertex);
     writer.WriteU32(configuration.esgsItemSize);
+    writer.WriteBool(configuration.passthrough);
 }
 
 MeshConfiguration readMeshConfiguration(Reader& reader, std::uint32_t version) {
@@ -459,8 +455,8 @@ MeshConfiguration readMeshConfiguration(Reader& reader, std::uint32_t version) {
     configuration.threadsPerGroup = reader.ReadU32();
     configuration.ldsSizeDwords = reader.ReadU32();
     configuration.provokingVertex = reader.ReadU32();
-    // Version 2 requests predate the field; their programs were all translated with offsets of four.
-    configuration.esgsItemSize = version >= 3u ? reader.ReadU32() : 4u;
+    configuration.esgsItemSize = version >= 4u ? reader.ReadU32() : 4u;
+    configuration.passthrough = version >= 6u ? reader.ReadBool() : false;
     return configuration;
 }
 
@@ -683,7 +679,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(6u);
+    writer.WriteU32(7u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -707,7 +703,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 6u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 7u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -718,8 +714,8 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
         result.request.graphics = readGraphicsCompileContext(reader, *result.graphicsStorage, version);
     }
     if (version >= 2u) result.request.useCache = reader.ReadBool();
-    if (version >= 5u) result.request.target.nonConstantImageOffsets = reader.ReadBool();
-    if (version >= 6u && result.request.context.compute.has_value()) {
+    if (version >= 7u) result.request.target.nonConstantImageOffsets = reader.ReadBool();
+    if (version >= 3u && result.request.context.compute.has_value()) {
         for (std::uint32_t& value : result.request.context.compute->partialThreads) {
             value = reader.ReadU32();
         }

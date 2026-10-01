@@ -13,9 +13,12 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -166,6 +169,7 @@ std::uint64_t libcReferenceLow(const Codegen::Sse4aOperands& operands, const Sta
     }
     sse4a::Instruction instruction;
     instruction.op = operands.Insertq ? sse4a::Op::Insertq : sse4a::Op::Extrq;
+    instruction.registerForm = operands.RegisterForm;
     instruction.destination = operands.Destination;
     instruction.source = operands.Source;
     instruction.length = static_cast<std::uint8_t>(operands.Length == 64 ? 0 : operands.Length);
@@ -174,34 +178,51 @@ std::uint64_t libcReferenceLow(const Codegen::Sse4aOperands& operands, const Sta
     return static_cast<std::uint64_t>(context.FltSave.XmmRegisters[operands.Destination].Low);
 }
 
-Bytes encode(const bool insertq, const std::uint8_t dst, const std::uint8_t src, const std::uint8_t length, const std::uint8_t index) {
-    Bytes bytes = {static_cast<std::uint8_t>(insertq ? 0xF2 : 0x66)};
-    const std::uint8_t reg = insertq ? dst : 0;
-    const std::uint8_t rm = insertq ? src : dst;
-    const auto rex = static_cast<std::uint8_t>(0x40 | (reg >= 8 ? 4 : 0) | (rm >= 8 ? 1 : 0));
-    if (rex != 0x40) bytes.push_back(rex);
-    bytes.insert(bytes.end(), {0x0F, 0x78, static_cast<std::uint8_t>(0xC0 | ((reg & 7) << 3) | (rm & 7)), static_cast<std::uint8_t>(length == 64 ? 0 : length), index});
-    return bytes;
-}
-
 struct Case {
     bool Insertq;
     std::uint8_t Destination;
     std::uint8_t Source;
     std::uint8_t Length;
     std::uint8_t Index;
+    bool RegisterForm = false;
 };
 
+Bytes encode(const Case& item) {
+    Bytes bytes = {static_cast<std::uint8_t>(item.Insertq ? 0xF2 : 0x66)};
+    const std::uint8_t reg = item.Insertq || item.RegisterForm ? item.Destination : 0;
+    const std::uint8_t rm = item.Insertq || item.RegisterForm ? item.Source : item.Destination;
+    const auto rex = static_cast<std::uint8_t>(0x40 | (reg >= 8 ? 4 : 0) | (rm >= 8 ? 1 : 0));
+    if (rex != 0x40) bytes.push_back(rex);
+    bytes.insert(bytes.end(), {0x0F, static_cast<std::uint8_t>(item.RegisterForm ? 0x79 : 0x78), static_cast<std::uint8_t>(0xC0 | ((reg & 7) << 3) | (rm & 7))});
+    if (!item.RegisterForm) bytes.insert(bytes.end(), {static_cast<std::uint8_t>(item.Length == 64 ? 0 : item.Length), item.Index});
+    return bytes;
+}
+
 std::string describe(const Case& item) {
-    return std::string(item.Insertq ? "insertq xmm" : "extrq xmm") + std::to_string(item.Destination) + (item.Insertq ? ", xmm" + std::to_string(item.Source) : "") + ", " + std::to_string(item.Length) + ", " + std::to_string(item.Index);
+    const bool source = item.Insertq || item.RegisterForm;
+    return std::string(item.Insertq ? "insertq xmm" : "extrq xmm") + std::to_string(item.Destination) + (source ? ", xmm" + std::to_string(item.Source) : "") + (item.RegisterForm ? " (register form)" : "") + ", " + std::to_string(item.Length) + ", " + std::to_string(item.Index);
 }
 
 std::size_t g_executions = 0;
 
+void requireEnvironment(const State& input, const State& state, const std::uint16_t written, const std::string& description) {
+    for (unsigned reg = 0; reg < 16; ++reg) {
+        if (((written >> reg) & 1) != 0) continue;
+        require(std::memcmp(state.Xmm[reg], input.Xmm[reg], 16) == 0, "Lowered sequence clobbered xmm" + std::to_string(reg) + ": " + description);
+    }
+    require(((state.FlagsOut ^ input.FlagsIn) & kStatusFlags) == 0, "Lowered sequence changed RFLAGS: " + description);
+    require(state.RspAfter == state.RspBefore, "Lowered sequence did not restore rsp: " + description);
+    for (int slot = 0; slot < 16; ++slot) {
+        std::uint64_t value;
+        std::memcpy(&value, state.RedZone + slot * 8, 8);
+        require(value == kCanary, "Lowered sequence wrote into the red zone: " + description);
+    }
+}
+
 void executeCase(const Harness& harness, const Codegen::IAmd64OnlyInstructionMatcher& matcher, const Case& item, std::mt19937_64& random, const int images) {
-    const auto site = encode(item.Insertq, item.Destination, item.Source, item.Length, item.Index);
+    const auto site = encode(item);
     const auto match = matcher.Match(site.data(), site.size());
-    require(match.has_value() && match->Lowering != Codegen::Amd64OnlyLowering::Unsupported, "Immediate-form SSE4a instruction was not lowered: " + describe(item));
+    require(match.has_value() && match->Lowering != Codegen::Amd64OnlyLowering::Unsupported, "SSE4a instruction was not lowered: " + describe(item));
     Bytes body;
     std::size_t returnBranchOffset = 0;
     if (match->Lowering == Codegen::Amd64OnlyLowering::InPlace) {
@@ -215,29 +236,161 @@ void executeCase(const Harness& harness, const Codegen::IAmd64OnlyInstructionMat
         require(body.size() % 16 == 0 || body.size() == returnBranchOffset + 5, "Stub body with constants is not padded to 16 bytes: " + describe(item));
     }
     const auto operands = Codegen::DecodeSse4a(site.data(), site.size());
+    auto field = operands;
+    if (operands.RegisterForm) {
+        field.Length = item.Length;
+        field.Index = item.Index;
+    }
+    const std::size_t controlOffset = operands.Insertq ? 8 : 0;
+    const std::array<std::uint64_t, 4> flags = {0x202, 0x203, 0x246, 0xAC7};
+    for (int image = 0; image < images; ++image) {
+        State input{};
+        for (auto& lane : input.Xmm) for (auto& byte : lane) byte = static_cast<std::uint8_t>(random());
+        if (operands.RegisterForm) {
+            auto& control = input.Xmm[operands.Source];
+            control[controlOffset] = static_cast<std::uint8_t>((control[controlOffset] & 0xC0) | (item.Length == 64 ? 0 : item.Length));
+            control[controlOffset + 1] = static_cast<std::uint8_t>((control[controlOffset + 1] & 0xC0) | item.Index);
+        }
+        input.FlagsIn = flags[static_cast<std::size_t>(image) % flags.size()];
+        State state = input;
+        harness.Run(body, returnBranchOffset, state);
+        ++g_executions;
+        const auto expected = referenceLow(field, input);
+        require(expected == libcReferenceLow(operands, input), "Transcribed reference disagrees with the libc emulation: " + describe(item));
+        require(low(state.Xmm[operands.Destination]) == expected, "Lowered sequence computed the wrong field: " + describe(item));
+        requireEnvironment(input, state, static_cast<std::uint16_t>(1u << operands.Destination), describe(item));
+    }
+}
+
+struct Sha256Step {
+    std::uint8_t Opcode;
+    std::uint8_t Destination;
+    std::uint8_t Source;
+};
+
+Bytes encodeSha256(const Sha256Step& step) {
+    Bytes bytes;
+    const auto rex = static_cast<std::uint8_t>(0x40 | (step.Destination >= 8 ? 4 : 0) | (step.Source >= 8 ? 1 : 0));
+    if (rex != 0x40) bytes.push_back(rex);
+    bytes.insert(bytes.end(), {0x0F, 0x38, step.Opcode, static_cast<std::uint8_t>(0xC0 | ((step.Destination & 7) << 3) | (step.Source & 7))});
+    return bytes;
+}
+
+std::uint32_t rotr(const std::uint32_t value, const unsigned count) {
+    return (value >> count) | (value << (32 - count));
+}
+
+void sha256Reference(const Sha256Step& step, std::uint8_t (&xmm)[16][16]) {
+    std::uint32_t a[4];
+    std::uint32_t b[4];
+    std::uint32_t k[4];
+    std::uint32_t r[4];
+    std::memcpy(a, xmm[step.Destination], sizeof(a));
+    std::memcpy(b, xmm[step.Source], sizeof(b));
+    std::memcpy(k, xmm[0], sizeof(k));
+    const auto sigma0 = [](const std::uint32_t w) { return rotr(w, 7) ^ rotr(w, 18) ^ (w >> 3); };
+    const auto sigma1 = [](const std::uint32_t w) { return rotr(w, 17) ^ rotr(w, 19) ^ (w >> 10); };
+    if (step.Opcode == 0xCC) {
+        for (int lane = 0; lane < 3; ++lane) r[lane] = a[lane] + sigma0(a[lane + 1]);
+        r[3] = a[3] + sigma0(b[0]);
+    } else if (step.Opcode == 0xCD) {
+        r[0] = a[0] + sigma1(b[2]);
+        r[1] = a[1] + sigma1(b[3]);
+        r[2] = a[2] + sigma1(r[0]);
+        r[3] = a[3] + sigma1(r[1]);
+    } else {
+        std::uint32_t sa = b[3], sb = b[2], sc = a[3], sd = a[2], se = b[1], sf = b[0], sg = a[1], sh = a[0];
+        for (int round = 0; round < 2; ++round) {
+            const auto t1 = sh + (rotr(se, 6) ^ rotr(se, 11) ^ rotr(se, 25)) + ((se & sf) ^ (~se & sg)) + k[round];
+            const auto t2 = (rotr(sa, 2) ^ rotr(sa, 13) ^ rotr(sa, 22)) + ((sa & sb) ^ (sa & sc) ^ (sb & sc));
+            sh = sg; sg = sf; sf = se; se = sd + t1; sd = sc; sc = sb; sb = sa; sa = t1 + t2;
+        }
+        r[0] = sf;
+        r[1] = se;
+        r[2] = sb;
+        r[3] = sa;
+    }
+    std::memcpy(xmm[step.Destination], r, sizeof(r));
+}
+
+std::string describeSha256(const std::vector<Sha256Step>& steps) {
+    std::string text;
+    for (const auto& step : steps)
+        text += std::string(step.Opcode == 0xCB ? "sha256rnds2" : step.Opcode == 0xCC ? "sha256msg1" : "sha256msg2") + " xmm" + std::to_string(step.Destination) + ", xmm" + std::to_string(step.Source) + "; ";
+    return text;
+}
+
+void executeSha256(const Harness& harness, const Codegen::IAmd64OnlyInstructionMatcher& matcher, const std::vector<Sha256Step>& steps, std::mt19937_64& random, const int images) {
+    std::vector<Bytes> sites;
+    for (const auto& step : steps) sites.push_back(encodeSha256(step));
+    const std::vector<std::span<const std::uint8_t>> spans(sites.begin(), sites.end());
+    const auto match = steps.size() == 1 ? matcher.Match(sites[0].data(), sites[0].size()) : matcher.MatchSequence(spans, {});
+    require(match.has_value() && match->Lowering == Codegen::Amd64OnlyLowering::Trampoline, "SHA-256 was not lowered through a stub: " + describeSha256(steps));
+    std::uint16_t written = 0;
+    for (const auto& step : steps) written = static_cast<std::uint16_t>(written | (1u << step.Destination));
     const std::array<std::uint64_t, 4> flags = {0x202, 0x203, 0x246, 0xAC7};
     for (int image = 0; image < images; ++image) {
         State input{};
         for (auto& lane : input.Xmm) for (auto& byte : lane) byte = static_cast<std::uint8_t>(random());
         input.FlagsIn = flags[static_cast<std::size_t>(image) % flags.size()];
         State state = input;
-        harness.Run(body, returnBranchOffset, state);
+        harness.Run(match->StubBody, match->ReturnBranchOffset, state);
         ++g_executions;
-        const auto expected = referenceLow(operands, input);
-        require(expected == libcReferenceLow(operands, input), "Transcribed reference disagrees with the libc emulation: " + describe(item));
-        require(low(state.Xmm[operands.Destination]) == expected, "Lowered sequence computed the wrong field: " + describe(item));
-        for (unsigned reg = 0; reg < 16; ++reg) {
-            if (reg == operands.Destination) continue;
-            require(std::memcmp(state.Xmm[reg], input.Xmm[reg], 16) == 0, "Lowered sequence clobbered xmm" + std::to_string(reg) + ": " + describe(item));
-        }
-        require(((state.FlagsOut ^ input.FlagsIn) & kStatusFlags) == 0, "Lowered sequence changed RFLAGS: " + describe(item));
-        require(state.RspAfter == state.RspBefore, "Lowered sequence did not restore rsp: " + describe(item));
-        for (int slot = 0; slot < 16; ++slot) {
-            std::uint64_t value;
-            std::memcpy(&value, state.RedZone + slot * 8, 8);
-            require(value == kCanary, "Lowered sequence wrote into the red zone: " + describe(item));
+        State expected = input;
+        for (const auto& step : steps) sha256Reference(step, expected.Xmm);
+        for (unsigned reg = 0; reg < 16; ++reg)
+            if (((written >> reg) & 1) != 0) require(std::memcmp(state.Xmm[reg], expected.Xmm[reg], 16) == 0, "Lowered SHA-256 computed the wrong xmm" + std::to_string(reg) + ": " + describeSha256(steps));
+        requireEnvironment(input, state, written, describeSha256(steps));
+    }
+}
+
+void clzeroExecution(const Harness& harness, const Codegen::IAmd64OnlyInstructionMatcher& matcher, std::mt19937_64& random) {
+    const Bytes plain = {0x0F, 0x01, 0xFC};
+    const Bytes addressSize32 = {0x67, 0x0F, 0x01, 0xFC};
+    const std::vector<std::span<const std::uint8_t>> pair = {plain, plain};
+    constexpr std::size_t size = 3 * 4096;
+    auto* high = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    std::uint8_t* low = nullptr;
+    for (std::uintptr_t hint = 0x10000000; low == nullptr && hint < 0x80000000; hint += 0x10000000)
+        low = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    require(high != nullptr && low != nullptr, "Cannot allocate the CLZERO buffers");
+    struct ClzeroCase {
+        std::optional<Codegen::Amd64OnlyMatch> Match;
+        std::uint8_t* Buffer;
+        std::uint64_t Junk;
+        std::string Name;
+    };
+    const std::vector<ClzeroCase> cases = {
+        {matcher.Match(plain.data(), plain.size()), high, 0, "clzero"},
+        {matcher.Match(addressSize32.data(), addressSize32.size()), low, 0x5A5A5A5A00000000ull, "67h clzero"},
+        {matcher.MatchSequence(pair, {}), high, 0, "clzero; clzero"}};
+    const std::array<std::uint64_t, 4> flags = {0x202, 0x203, 0x246, 0xAC7};
+    for (const auto& item : cases) {
+        require(item.Match.has_value() && item.Match->Lowering == Codegen::Amd64OnlyLowering::Trampoline, "CLZERO was not lowered through a stub: " + item.Name);
+        for (int image = 0; image < 64; ++image) {
+            const auto address = reinterpret_cast<std::uint64_t>(item.Buffer) + 64 + random() % (size - 128);
+            Bytes body = {0x48, 0xB8};
+            for (std::size_t index = 0; index < 8; ++index) body.push_back(static_cast<std::uint8_t>((address | item.Junk) >> (index * 8)));
+            body.insert(body.end(), {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00});
+            const auto prefix = body.size();
+            body.insert(body.end(), item.Match->StubBody.begin(), item.Match->StubBody.end());
+            State input{};
+            for (auto& lane : input.Xmm) for (auto& byte : lane) byte = static_cast<std::uint8_t>(random());
+            input.FlagsIn = flags[static_cast<std::size_t>(image) % flags.size()];
+            State state = input;
+            std::memset(item.Buffer, 0xA5, size);
+            harness.Run(body, prefix + item.Match->ReturnBranchOffset, state);
+            ++g_executions;
+            const auto line = address & ~std::uint64_t{63};
+            for (std::size_t index = 0; index < size; ++index) {
+                const auto at = reinterpret_cast<std::uint64_t>(item.Buffer + index);
+                require(item.Buffer[index] == (at >= line && at < line + 64 ? 0x00 : 0xA5), "Lowered CLZERO did not clear exactly the addressed line: " + item.Name);
+            }
+            requireEnvironment(input, state, 0, item.Name);
         }
     }
+    VirtualFree(high, 0, MEM_RELEASE);
+    VirtualFree(low, 0, MEM_RELEASE);
 }
 
 void cpuExecution() {
@@ -251,8 +404,20 @@ void cpuExecution() {
         for (std::uint8_t index = 0; index + length <= 64; ++index) {
             for (const auto& [dst, src] : pairs) executeCase(harness, *matcher, {true, dst, src, length, index}, random, 2);
             for (const std::uint8_t dst : std::array<std::uint8_t, 4>{0, 3, 9, 15}) executeCase(harness, *matcher, {false, dst, dst, length, index}, random, 2);
+            const auto& [dst, src] = pairs[(length * 65u + index) % pairs.size()];
+            executeCase(harness, *matcher, {true, dst, src, length, index, true}, random, 2);
         }
     }
+    for (const std::uint8_t opcode : {std::uint8_t{0xCB}, std::uint8_t{0xCC}, std::uint8_t{0xCD}})
+        for (std::uint8_t dst = 0; dst < 16; ++dst)
+            for (std::uint8_t src = 0; src < 16; ++src)
+                executeSha256(harness, *matcher, {{opcode, dst, src}}, random, 2);
+    for (int sequence = 0; sequence < 256; ++sequence) {
+        std::vector<Sha256Step> steps(2 + random() % 2);
+        for (auto& step : steps) step = {static_cast<std::uint8_t>(0xCB + random() % 3), static_cast<std::uint8_t>(random() % 16), static_cast<std::uint8_t>(random() % 16)};
+        executeSha256(harness, *matcher, steps, random, 2);
+    }
+    clzeroExecution(harness, *matcher, random);
 }
 
 Bytes elfFixture(const Bytes& text) {

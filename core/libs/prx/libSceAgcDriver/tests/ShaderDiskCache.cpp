@@ -31,7 +31,7 @@ void setEnvironment(const char* name, const std::string& value) {
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -90,6 +90,7 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.readOnly = seed % 2 == 0;
     binding.imageShape = DescriptorImageShape::Image2DArray;
     binding.samplerDepthCompare = {true, false, true};
+    binding.imageDepthCompare = {false, true, false};
     binding.imageWritten = {false, true, true};
     binding.bufferAtomic = {true};
     binding.bufferWritten = {false, false, true, true, false};

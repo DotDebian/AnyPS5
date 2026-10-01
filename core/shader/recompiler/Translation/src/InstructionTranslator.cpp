@@ -251,6 +251,9 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         const std::uint32_t size = mesh.InputPrimitiveSize();
         const std::uint32_t stepCount = mesh.InputPrimitiveStep();
         const std::uint32_t waveSize = options.waveSize;
+        if (mesh.passthrough && mesh.inputPrimitive != 4u && mesh.inputPrimitive != 6u) {
+            throw std::runtime_error("passthrough mesh translation requires triangle list or strip topology");
+        }
         if (mesh.primitivesPerGroup == 0u || mesh.verticesPerGroup != mesh.InputVertexCount(mesh.primitivesPerGroup) || mesh.verticesPerGroup > totalThreads || mesh.primitivesPerGroup > totalThreads || totalThreads % waveSize != 0u || totalThreads > 15u * waveSize || mesh.esgsItemSize == 0u || mesh.esgsItemSize * mesh.verticesPerGroup > 0xffffu) {
             throw std::runtime_error("mesh shader translation configuration is not supported (wave " + std::to_string(options.waveSize) + ", primitives per group " + std::to_string(mesh.primitivesPerGroup) + ", vertices per group " + std::to_string(mesh.verticesPerGroup) + ", threads " + std::to_string(totalThreads) + ", ESGS item size " + std::to_string(mesh.esgsItemSize) + ")");
         }
@@ -271,11 +274,8 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         IrValue& firstPrimitive = entryIr.IMul(builtin(StageInputKind::WorkgroupId, 0u), u32(mesh.primitivesPerGroup));
         IrValue& step = u32(stepCount);
         IrValue& firstVertex = entryIr.IMul(firstPrimitive, step);
-        // The subgroup's ES vertices and GS primitives: the last group of a draw may be partial.
         IrValue& vertices = minimum(subtractSaturate(draw(0u), firstVertex), u32(mesh.verticesPerGroup));
         IrValue& primitives = entryIr.Select(entryIr.ULessThan(vertices, u32(size)), u32(0u), entryIr.IAdd(entryIr.Emit(IrOpcode::UDiv32, IrOpcodeType(IrOpcode::UDiv32), {&subtractSaturate(vertices, u32(size)), &step}), u32(1u)));
-        // s2 GS_TG_INFO (the subgroup's vertex and primitive counts), s3 the merged wave info: this
-        // wave's ES vertex and GS primitive counts, its index in the subgroup and the wave count.
         entryIr.SetScalarReg(static_cast<ScalarReg>(2), entryIr.BitwiseOr(entryIr.ShiftLeftLogical(vertices, u32(12u)), entryIr.ShiftLeftLogical(primitives, u32(22u))));
         IrValue& wave = entryIr.ShiftRightLogical(local, u32(waveSize == 32u ? 5u : 6u));
         IrValue& waveBase = entryIr.BitwiseAnd(local, u32(~(waveSize - 1u)));
@@ -283,9 +283,6 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         IrValue& primitiveCount = minimum(subtractSaturate(primitives, waveBase), u32(waveSize));
         IrValue& waveInfo = entryIr.BitwiseOr(entryIr.ShiftLeftLogical(wave, u32(24u)), u32((totalThreads / waveSize) << 28u));
         entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.BitwiseOr(waveInfo, entryIr.BitwiseOr(entryIr.ShiftLeftLogical(primitiveCount, u32(8u)), vertexCount)));
-        // The GS inputs: v0/v1 the 16-bit vertex offsets (ES thread index times VGT_ESGS_RING_ITEMSIZE)
-        // of the thread's primitive, an odd strip triangle's first two swapped; v2 the primitive id;
-        // v3 the GS instance.
         IrValue& parity = mesh.inputPrimitive == kTriStripPrimitiveType ? entryIr.BitwiseAnd(entryIr.IAdd(firstPrimitive, local), u32(1u)) : u32(0u);
         IrValue& vertex = entryIr.IMul(local, step);
         IrValue& item = u32(mesh.esgsItemSize);
@@ -294,13 +291,16 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         IrValue& third = size == 3u ? entryIr.IMul(entryIr.IAdd(vertex, u32(2u)), item) : u32(0u);
         entryIr.SetVectorReg(static_cast<VectorReg>(0), entryIr.BitwiseOr(entryIr.BitwiseAnd(first, u32(0xffffu)), entryIr.ShiftLeftLogical(second, u32(16u))));
         entryIr.SetVectorReg(static_cast<VectorReg>(1), entryIr.BitwiseAnd(third, u32(0xffffu)));
+        if (mesh.passthrough) {
+            IrValue& firstIndex = entryIr.IAdd(vertex, parity);
+            IrValue& secondIndex = entryIr.ISub(entryIr.IAdd(vertex, u32(1u)), parity);
+            IrValue& thirdIndex = entryIr.IAdd(vertex, u32(2u));
+            entryIr.SetVectorReg(static_cast<VectorReg>(0), entryIr.BitwiseOr(firstIndex, entryIr.BitwiseOr(entryIr.ShiftLeftLogical(secondIndex, u32(10u)), entryIr.ShiftLeftLogical(thirdIndex, u32(20u)))));
+            entryIr.SetVectorReg(static_cast<VectorReg>(1), u32(0u));
+        }
         entryIr.SetVectorReg(static_cast<VectorReg>(2), entryIr.IAdd(firstPrimitive, local));
         entryIr.SetVectorReg(static_cast<VectorReg>(3), u32(0u));
         entryIr.SetVectorReg(static_cast<VectorReg>(4), u32(0u));
-        // The ES inputs: v5 the vertex id (the index buffer's element for an indexed draw), v8 the
-        // instance id. The driver passes the index buffer as a raw V# in the hidden user words
-        // s[4:7] of the merged program (for a non-indexed draw a four-byte one the load never
-        // reads), which then read zero as the hardware's offchip and scratch offsets would.
         if (options.userDataBaseRegister != 0u || options.userDataCount < 8u) {
             throw std::runtime_error("mesh shader translation requires the merged program's eight hidden user words");
         }
@@ -344,8 +344,6 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         const auto vgpr = [&](PixelInput input) { return ps->psInputVgpr[static_cast<std::uint32_t>(input)]; };
         const auto loaded = [&](PixelInput input) { return vgpr(input) != ShaderPixelInputInfo::NoPixelInputVgpr; };
         if (options.fragmentShaderBarycentricEnabled) {
-            // The I/J pairs as the barycentrics of vertices 1 and 2. Draws are single-sampled, where
-            // the centroid is the pixel center, so the centroid pairs carry the center values.
             for (const auto [input, kind] : {std::pair{PixelInput::PerspectiveCenter, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::PerspectiveCentroid, StageInputKind::BaryCoordSmooth},
                                              std::pair{PixelInput::LinearCenter, StageInputKind::BaryCoordNoPerspective}, std::pair{PixelInput::LinearCentroid, StageInputKind::BaryCoordNoPerspective}}) {
                 if (!loaded(input)) continue;

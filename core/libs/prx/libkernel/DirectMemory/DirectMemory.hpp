@@ -20,7 +20,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
 int DoMapAnon(void** addr, size_t len, int prot, int flags);
 int DoMprotect(const void* addr, size_t len, int prot);
 int DoMunmap(void* addr, size_t len);
-int DoReserveVirtual(void** addr, size_t len, size_t alignment);
+int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment);
 bool GuestProtection(uintptr_t addr, int* prot);
 
 #endif

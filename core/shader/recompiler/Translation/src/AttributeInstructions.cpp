@@ -120,13 +120,16 @@ void TranslationContext::vInterpP2F32(const RdnaInstruction& inst) {
         return;
     }
     if (pixelInput != nullptr && inst.source0.kind == RdnaOperandKind::VectorRegister && inst.source1.value < 32u) {
-        const auto jRegister = inst.source0.reg;
-        bool linear = false;
-        for (const auto input : {PixelInput::LinearSample, PixelInput::LinearCenter, PixelInput::LinearCentroid}) {
+        const auto readsPair = [&](PixelInput input) {
             const auto base = pixelInput->psInputVgpr[static_cast<std::size_t>(input)];
-            if (base != ShaderPixelInputInfo::NoPixelInputVgpr && jRegister == base + 1u) linear = true;
+            return base != ShaderPixelInputInfo::NoPixelInputVgpr && inst.source0.reg == base + 1u;
+        };
+        const auto bit = 1u << inst.source1.value;
+        if (readsPair(PixelInput::LinearCenter) || readsPair(PixelInput::LinearCentroid)) {
+            program.Metadata().pixelLinearInputs |= bit;
+        } else if (readsPair(PixelInput::PerspectiveCenter) || readsPair(PixelInput::PerspectiveCentroid)) {
+            program.Metadata().pixelPerspectiveInputs |= bit;
         }
-        (linear ? program.Metadata().pixelLinearInputs : program.Metadata().pixelPerspectiveInputs) |= 1u << inst.source1.value;
     }
     IrValue& value = ir.Emit(IrOpcode::GetAttribute, IrType::U32, {&ir.Constant(inst.source1.value), &ir.Constant(inst.source2.value)});
     writeOperand(inst.destination, &value);
@@ -156,6 +159,9 @@ void TranslationContext::eXP(const RdnaInstruction& inst) {
 }
 
 bool TranslationContext::emitInterpolation(const RdnaInstruction& inst) {
+    if ((inst.op == RdnaOpcode::VInterpP1F32 || inst.op == RdnaOpcode::VInterpP2F32) && pixelInput != nullptr && pixelInput->InputIsCustom(inst.source1.value)) {
+        throw std::runtime_error("pixel input " + std::to_string(inst.source1.value) + " passes its vertices through unchanged but is read with v_interp_p1/p2");
+    }
     switch (inst.op) {
         case RdnaOpcode::VInterpP1F32:
             vInterpP1F32(inst);

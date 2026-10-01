@@ -417,11 +417,6 @@ bool evictOne(Shadows& registry) {
 }
 
 bool UnitShadowEnabled() {
-    // A slab's unit is fresh only at a generation of the write tracker (MarkShadowed ignores 0), so
-    // without write watching (CollectWrites answers 0: no watched arena on Windows, no userfaultfd
-    // write protection on Linux) a piece retiled into a slab was never marked, published or read
-    // back: the write-back's texels were lost and the next upload re-read the stale import. The
-    // retile then goes into the import itself, as with APS5_NO_UNIT_SHADOW=1.
     static const bool enabled = std::getenv("APS5_NO_UNIT_SHADOW") == nullptr && GuestMemory::WriteWatched();
     return enabled;
 }
@@ -523,8 +518,6 @@ VkDeviceSize SlabOffset(const HostImport& import, const ShadowSlab& slab, std::u
 
 std::optional<ShadowDestination> ShadowDestinationFor(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end) {
     if (!UnitShadowEnabled() || end <= begin || begin < import.base || end > import.base + import.bytes) return std::nullopt;
-    // Likewise per range: memory the tracker does not watch collects as generation 0, so a piece
-    // shadowed there could never be fresh. It is retiled into the import.
     if (!GuestMemory::Watched(begin, static_cast<std::size_t>(end - begin))) return std::nullopt;
     auto& registry = Registry();
     std::shared_ptr<UnitShadow> shadow;

@@ -69,8 +69,6 @@ GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
 
 namespace {
 
-// One texel of what fast-clear `keys` of a target stand for: the code's value, or the register
-// clear's CB_COLOR_CLEAR_WORD texel.
 std::array<std::byte, 16> clearTexel(const ColorTarget& color, DccKeys keys) {
     std::array<std::byte, 16> texel{};
     const auto elementBytes = static_cast<std::size_t>(color.elementBytes);
@@ -84,7 +82,6 @@ std::array<std::byte, 16> clearTexel(const ColorTarget& color, DccKeys keys) {
     return texel;
 }
 
-// A GPU clear of the whole image to `texel` (StorageTexture::FillClear, which leaves it dirty).
 bool clearToTexel(StorageTexture& image, const std::array<std::byte, 16>& texel, std::uint32_t elementBytes, const char*& refusal) {
     std::array<std::byte, 16> repeated{};
     for (std::size_t offset = 0; offset + elementBytes <= repeated.size(); offset += elementBytes) std::memcpy(repeated.data() + offset, texel.data(), elementBytes);
@@ -93,15 +90,11 @@ bool clearToTexel(StorageTexture& image, const std::array<std::byte, 16>& texel,
     return image.FillClear(std::span<const std::uint32_t, 4>(pattern), StorageTexture::WholeImage, refusal);
 }
 
-// The fast-cleared target's texels stored into guest memory on the CPU, its keys then marked
-// uncompressed: results pending over the surface are stored first (a write-back of an image that
-// carries the keys marks them itself) and the keys read again.
 void storeClearTexels(const Context& context, const ColorTarget& color, const std::array<std::byte, 16>& texel) {
     StorageTexture::FlushPending(color.address, color.bytes, nullptr, "fast-clear materialization");
     const auto keys = ReadDccKeys(color.dccAddress, color.bytes);
     if (!IsDccClear(keys)) return;
     const auto current = keys == DccKeys::ClearRegister ? texel : clearTexel(color, keys);
-    // Every element holds the same value, so the fill is the same whatever the tiling.
     const auto elementBytes = static_cast<std::size_t>(color.elementBytes);
     std::vector<std::byte> texels(color.bytes);
     for (std::size_t offset = 0; offset + elementBytes <= texels.size(); offset += elementBytes) std::memcpy(texels.data() + offset, current.data(), elementBytes);
@@ -109,22 +102,10 @@ void storeClearTexels(const Context& context, const ColorTarget& color, const st
     MarkDccUncompressed(context, color.dccAddress, color.bytes);
 }
 
-// A target whose DCC keys are the register clear code reads as CB_COLOR_CLEAR_WORD wherever nothing
-// drew since the clear, a value no descriptor carries (the image's refresh reads the stored texels
-// under that code): the resident image is cleared to it before the draw renders, and the keys then
-// read uncompressed, the image standing for the texels (a later clear is a change of the keys).
-// A texel over 64 bits has no register value; it keeps the stored texels, as before.
 void materializeRegisterClear(const Context& context, const ColorTarget& color, StorageTexture& resident) {
-    // Debug aid: APS5_NO_REGISTER_CLEAR=1 keeps the stored texels under register clear keys, as before.
-    static const bool disabled = std::getenv("APS5_NO_REGISTER_CLEAR") != nullptr;
-    static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
-    if (disabled) return;
-    if (color.dccAddress == 0 || color.elementBytes > sizeof(color.clearWords) || resident.Descriptor().dccAddress != color.dccAddress) return;
-    // The keys as the title's recorded work leaves them: a fast-clear fill still pending would make
-    // a later draw clear over this one's results.
+    if (color.dccAddress == 0 || resident.Descriptor().dccAddress != color.dccAddress) return;
     if (CurrentDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
-    if (trace) std::fprintf(stderr, "[draw] register clear of 0x%llx (%ux%u VkFormat %d) to %08x %08x before the draw\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), color.clearWords[0], color.clearWords[1]);
     const char* refusal = nullptr;
     if (clearToTexel(resident, texel, color.elementBytes, refusal)) {
         MarkDccUncompressed(context, color.dccAddress, color.bytes);
@@ -435,12 +416,9 @@ void countCache(std::uint64_t DrawProfile::*counter) {
 // fragment results the key already names (the pipeline key treats them the same way). `memoized`
 // says whether the memo applied, `hit` whether it answered. APS5_NO_VALIDATE_CACHE=1 validates
 // every draw.
-std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
+bool ValidationKey(const Context& context, std::span<const CompiledShader> shaders, const State& state, std::vector<std::uint64_t>& key) {
     using Stage = ShaderRecompiler::ShaderStage;
     static const bool disabled = std::getenv("APS5_NO_VALIDATE_CACHE") != nullptr;
-    memoized = false;
-    hit = false;
-    std::vector<std::uint64_t> key;
     const auto add = [&](auto value) { key.push_back(static_cast<std::uint64_t>(value)); };
     bool keyed = !disabled;
     if (keyed) {
@@ -490,6 +468,8 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
             add(mesh.threadsPerGroup);
             add(mesh.ldsSizeDwords);
             add(mesh.provokingVertex);
+            add(mesh.esgsItemSize);
+            add(mesh.passthrough);
         }
         add(state.stages.tessellation.has_value());
         if (state.stages.tessellation) {
@@ -501,19 +481,47 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
             add(tessellation.outputTopology);
         }
     }
+    return keyed;
+}
+
+std::mutex& validationMutex() {
     static std::mutex mutex;
+    return mutex;
+}
+
+std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
+    static std::map<std::vector<std::uint64_t>, std::string> failures;
+    return failures;
+}
+
+std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
+    memoized = false;
+    hit = false;
+    std::vector<std::uint64_t> key;
+    const bool keyed = ValidationKey(context, shaders, state, key);
     static std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>> memo;
     if (keyed) {
         memoized = true;
-        std::lock_guard lock(mutex);
+        std::lock_guard lock(validationMutex());
         if (const auto found = memo.find(key); found != memo.end()) {
             hit = true;
             return found->second;
         }
     }
-    auto outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing);
+    std::set<std::uint32_t> outputs;
+    try {
+        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing);
+    } catch (const std::exception& error) {
+        if (keyed) {
+            std::lock_guard lock(validationMutex());
+            auto& failures = validationFailures();
+            if (failures.size() >= 1024) failures.clear();
+            failures.emplace(std::move(key), error.what());
+        }
+        throw;
+    }
     if (keyed) {
-        std::lock_guard lock(mutex);
+        std::lock_guard lock(validationMutex());
         // A handful of configurations recur; a runaway key space is dropped wholesale.
         if (memo.size() >= 1024) memo.clear();
         memo.emplace(std::move(key), outputs);
@@ -569,7 +577,6 @@ void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarg
                 const auto address = descriptor.Base48();
                 const auto size = descriptor.GetSize();
                 if (size == 0 || address == 0) continue;
-                // As ShaderResources::addGuestBuffer: an element beyond bufferWritten counts as written.
                 const auto element = offset / 4;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                 Require(!overlap(address, size, target.address, target.bytes), "shader buffer aliases the render target");
@@ -585,7 +592,6 @@ std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters
     const auto address = draw.indexed ? draw.indexAddress : unreadAddress;
     const auto bytes = draw.indexed ? (static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize + 3u) & ~std::uint64_t{3} : 4u;
     Require(address != 0 && bytes != 0 && bytes <= 0xffffffffu && (address >> 48u) == 0, "invalid mesh index buffer range");
-    // DST_SEL XYZW, FORMAT 32_FLOAT, RESOURCE_LEVEL and OOB_SELECT raw; stride 0.
     constexpr std::uint32_t RawWord3 = 0x31016facu;
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, static_cast<std::uint32_t>(bytes), RawWord3};
 }
@@ -787,7 +793,6 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders OK");
     APS5_LOG_OUT_DEBUG("PipelineStages=0x%x", static_cast<unsigned>(inputs.shaderStages));
     if (state.stages.mesh) {
-        // The mesh stage adds the draw's first vertex and instance itself (MeshDrawPushOffsetBytes).
         APS5_LOG_CHARS_OUT_DEBUG("Mesh path");
         Require(context.meshShader, "device does not support mesh shaders");
         const auto& mesh = *state.stages.mesh;
@@ -1165,8 +1170,6 @@ struct RecordedDraw {
     VkShaderStageFlags pushStages = 0;
 };
 
-// The push constants of a draw: the stages' data (`bytes` and `stages` when a recipe assembled
-// them), and on the mesh path the draw parameters the mesh stage reads at the end of the block.
 void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages) {
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
     if (bytes == nullptr) {
@@ -1404,6 +1407,15 @@ bool RecordDraws() {
 
 }
 
+std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
+    std::vector<std::uint64_t> key;
+    if (!ValidationKey(context, shaders, state, key)) return std::nullopt;
+    std::lock_guard lock(validationMutex());
+    const auto& failures = validationFailures();
+    if (const auto found = failures.find(key); found != failures.end()) return found->second;
+    return std::nullopt;
+}
+
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
     PerformanceTimer timing("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
@@ -1501,15 +1513,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             const auto keys = CurrentDccKeys(color.dccAddress, colorLayout.Bytes());
             if (IsDccClear(keys)) {
                 const auto pixels = binding.gpuTiling ? binding.tiled->Bytes() : binding.transfer->Bytes();
-                // The register code's value is the target's CB_COLOR_CLEAR_WORD texel (64 bits at most).
-                const auto fillRegister = [&] {
-                    static const bool disabled = std::getenv("APS5_NO_REGISTER_CLEAR") != nullptr;
-                    if (disabled || keys != DccKeys::ClearRegister || color.elementBytes > sizeof(color.clearWords)) return false;
+                if (keys == DccKeys::ClearRegister) {
                     const auto texel = clearTexel(color, keys);
                     for (std::size_t offset = 0; offset + color.elementBytes <= pixels.size(); offset += color.elementBytes) std::memcpy(pixels.data() + offset, texel.data(), color.elementBytes);
-                    return true;
-                };
-                if (!fillRegister() && !FillDccClear(color.format, keys, color.dccAlphaOnMsb, pixels)) {
+                } else if (!FillDccClear(color.format, keys, color.dccAlphaOnMsb, pixels)) {
                     static std::set<std::pair<std::uint64_t, int>> reported;
                     if (reported.size() < 32 && reported.insert({color.address, static_cast<int>(keys)}).second) std::fprintf(stderr, "[gpu] color target 0x%llx (VkFormat %d) has %s DCC keys; its stored texels are used\n", static_cast<unsigned long long>(color.address), static_cast<int>(color.format), DccKeysName(keys));
                     if (binding.gpuTiling) std::memcpy(pixels.data(), binding.original.data(), binding.original.size());
@@ -2035,18 +2042,12 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
 }
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass) {
-    static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     for (const auto& color : pass.targets) {
         if (color.dccAddress == 0) continue;
         auto keys = CurrentDccKeys(color.dccAddress, color.bytes);
-        if (trace) std::fprintf(stderr, "[draw] %s over 0x%llx (%ux%u VkFormat %d): DCC keys %s\n", pass.mode == ColorMetadataPass::Mode::EliminateFastClear ? "fast-clear eliminate" : "DCC decompress", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), DccKeysName(keys));
         if (keys == DccKeys::Uncompressed) continue;
         Require(IsDccClear(keys), std::string("CB metadata pass over DCC keys that are ") + DccKeysName(keys) + " (per-block metadata is not modeled)");
         const auto texel = clearTexel(color, keys);
-        // The resident image of the target, when it follows these keys (its own descriptor names
-        // the same metadata): the lookup's refresh made it what a clear code says unless it holds
-        // results made since (pending), which are what the covered pixels hold; the register code
-        // is cleared on the GPU here (its value is in no descriptor).
         std::shared_ptr<StorageTexture> resident;
         if (color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr) {
             try {
@@ -2054,27 +2055,16 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
             } catch (const std::exception&) {
                 resident = nullptr;
             }
-            if (resident != nullptr && (resident->Descriptor().dccAddress != color.dccAddress || resident->GuestBytes() != color.bytes)) {
-                // The surface's image follows other metadata (a texture made it first): draws render
-                // into it over its stored texels, never under these keys, so the texels are what the
-                // draws left and the pass leaves them, as the draws do (the keys stay the title's).
-                if (trace) std::fprintf(stderr, "[draw] metadata pass over 0x%llx: its image follows other DCC metadata (0x%llx); left as the draws leave it\n", static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(resident->Descriptor().dccAddress));
-                continue;
-            }
+            if (resident != nullptr && resident->GuestBytes() != color.bytes) resident = nullptr;
         }
         if (resident != nullptr) {
-            const bool pending = StorageTexture::FindPending(color.address, color.bytes) == resident;
-            bool current = pending || (keys != DccKeys::ClearRegister && resident->UploadedKeys() == keys);
             const char* refusal = nullptr;
-            if (!current && keys == DccKeys::ClearRegister) current = clearToTexel(*resident, texel, color.elementBytes, refusal);
+            const bool current = keys == DccKeys::ClearRegister ? clearToTexel(*resident, texel, color.elementBytes, refusal) : StorageTexture::FindPending(color.address, color.bytes) == resident || resident->UploadedKeys() == keys;
             if (current) {
-                // The image stands for the texels: dirty, its write-back stores them. The keys read
-                // uncompressed from now on, as the pass leaves them (a later clear is then a change).
                 resident->MarkDirty();
                 MarkDccUncompressed(context, color.dccAddress, color.bytes);
                 continue;
             }
-            if (trace) std::fprintf(stderr, "[draw] metadata pass over 0x%llx not done in its image (%s): stored on the CPU\n", static_cast<unsigned long long>(color.address), refusal != nullptr ? refusal : "keys");
         }
         storeClearTexels(context, color, texel);
     }

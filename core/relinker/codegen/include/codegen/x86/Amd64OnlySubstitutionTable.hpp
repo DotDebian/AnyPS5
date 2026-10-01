@@ -27,6 +27,7 @@ AMD64_STUB(Nop4, 0x0F, 0x1F, 0x40, 0x00)
 AMD64_STUB(Nop5, 0x0F, 0x1F, 0x44, 0x00, 0x00)
 AMD64_STUB(Nop6, 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00)
 AMD64_STUB(Nop7, 0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00)
+AMD64_STUB(Pause, 0xF3, 0x90)
 
 #undef AMD64_STUB
 
@@ -43,6 +44,9 @@ inline constexpr Entry kExtrqRegisterForm = {"EXTRQ register form", nullptr, 0};
 inline constexpr Entry kInsertqRegisterForm = {"INSERTQ register form", nullptr, 0};
 inline constexpr Entry kMovntss = {"MOVNTSS", nullptr, 0};
 inline constexpr Entry kMovntsd = {"MOVNTSD", nullptr, 0};
+inline constexpr Entry kSha256rnds2 = {"SHA256RNDS2", nullptr, 0};
+inline constexpr Entry kSha256msg1 = {"SHA256MSG1", nullptr, 0};
+inline constexpr Entry kSha256msg2 = {"SHA256MSG2", nullptr, 0};
 
 inline constexpr std::uint8_t kMovsStoreOpcode = 0x11;
 inline constexpr std::uint8_t kPshufbZero = 0x80;

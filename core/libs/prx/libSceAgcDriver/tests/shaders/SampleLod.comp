@@ -1,7 +1,5 @@
 #version 450
 
-// Samples the bound texture at an explicit level of detail: the recorder tests read back what a
-// view's minimum LOD clamp makes of it.
 layout(local_size_x = 1) in;
 layout(set = 0, binding = 0) uniform sampler2D source;
 layout(set = 0, binding = 1, std430) buffer Result { vec4 texel; };

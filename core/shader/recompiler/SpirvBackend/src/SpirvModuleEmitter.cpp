@@ -554,9 +554,6 @@ void DefineMeshOutputs(SpirvEmitterState& state) {
 void EmitMeshEntryPoint(SpirvEmitterState& state) {
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
-    // A subgroup that sends no GS_ALLOC_REQ outputs nothing; the guest's request is stored by the
-    // same invocation (the first), after this. A primitive thread that exports no `prim` gives a
-    // culled primitive.
     for (std::uint32_t half = 0; half < state.laneCount; half++) {
         state.module.AddFunction(spv::OpStore, MeshElement(state, state.meshPrimitiveData, spv::StorageClassPrivate, TypeU32(state), ConstantU32(state, half)), ConstantU32(state, 0x80000000u));
     }

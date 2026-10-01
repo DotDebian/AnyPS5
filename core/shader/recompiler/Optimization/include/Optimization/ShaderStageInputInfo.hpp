@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -114,8 +115,8 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
     std::uint32_t maxVertices = 0;
     std::uint32_t maxPrimitives = 0;
     std::uint32_t provokingVertex = 0;
-    // VGT_ESGS_RING_ITEMSIZE: the GS vertex offsets are the ES thread index times this value.
     std::uint32_t esgsItemSize = 0;
+    bool passthrough = false;
 
     // The vertices of one input primitive: VGT_PRIMITIVE_TYPE point list (1), line list (2), else
     // a triangle list (4) or strip (6).
@@ -178,8 +179,6 @@ struct ShaderPixelInputInfo {
     std::uint32_t interpolatorSettings[32] = {0};
     std::uint32_t inputNum = 0;
     std::uint32_t customInterpolationMask = 0;
-    // The first VGPR of each loaded SPI_PS_INPUT_ENA/ADDR input (indexed by PixelInput), or
-    // NoPixelInputVgpr for an input the SPI does not load.
     static constexpr std::uint32_t NoPixelInputVgpr = std::numeric_limits<std::uint32_t>::max();
     std::array<std::uint32_t, 16> psInputVgpr = [] {
         std::array<std::uint32_t, 16> vgprs{};
@@ -208,19 +207,14 @@ struct ShaderPixelInputInfo {
         return psPosX || psPosY || psPosZ || psPosW;
     }
 
-    // SPI_PS_INPUT_CNTL_n OFFSET bit 5 without FLAT_SHADE: the input is its DEFAULT_VAL constant.
     [[nodiscard]] bool InputIsDefault(std::uint32_t input) const {
         return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x420u) == 0x20u;
     }
 
-    // OFFSET bit 5 with FLAT_SHADE: the slot in OFFSET's low bits is passed through with its three
-    // vertices unchanged, v_interp_mov P0, P10 and P20 reading vertices 0, 1 and 2 rather than P0,
-    // P1-P0 and P2-P0 (GetAttributeAtVertex). The PS5 compiler writes 0x422 and 0x423.
     [[nodiscard]] bool InputIsPassthrough(std::uint32_t input) const {
         return input < inputNum && input < 32u && (interpolatorSettings[input] & 0x420u) == 0x420u;
     }
 
-    // Inputs whose vertices are read unchanged: pass-through ones, and those the caller marks custom.
     [[nodiscard]] bool InputIsCustom(std::uint32_t input) const {
         return input < 32u && ((customInterpolationMask & (1u << input)) != 0u || InputIsPassthrough(input));
     }
@@ -237,8 +231,10 @@ struct ShaderPixelInputInfo {
 
     [[nodiscard]] bool InputIsLinear(std::uint32_t input, std::uint32_t linearInputs, std::uint32_t perspectiveInputs) const {
         const auto bit = input < 32u ? 1u << input : 0u;
-        const bool recorded = ((linearInputs | perspectiveInputs) & bit) != 0u;
-        return recorded ? (linearInputs & bit) != 0u && (perspectiveInputs & bit) == 0u : psNoPerspective;
+        if ((linearInputs & perspectiveInputs & bit) != 0u) {
+            throw std::runtime_error("pixel input " + std::to_string(input) + " is interpolated through both a perspective and a linear I/J pair");
+        }
+        return (linearInputs & bit) != 0u || ((perspectiveInputs & bit) == 0u && psNoPerspective);
     }
 };
 

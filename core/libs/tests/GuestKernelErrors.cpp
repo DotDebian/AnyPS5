@@ -1,6 +1,7 @@
 #include "SceTypes.hpp"
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 
 extern "C" {
 int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name);
@@ -10,6 +11,7 @@ int APS5_VABI sceKernelDeleteUserEvent(KernelEqueue eq, int id);
 int APS5_VABI scePthreadMutexattrInit(PthreadMutexattr* attr);
 int APS5_VABI scePthreadMutexattrDestroy(PthreadMutexattr* attr);
 int APS5_VABI scePthreadMutexattrSettype(PthreadMutexattr* attr, int type);
+int APS5_VABI scePthreadMutexattrSetprotocol(PthreadMutexattr* attr, int protocol);
 int APS5_VABI scePthreadMutexInit(PthreadMutex* mutex, const PthreadMutexattr* attr, const char* name);
 int APS5_VABI scePthreadMutexDestroy(PthreadMutex* mutex);
 int APS5_VABI scePthreadMutexLock(PthreadMutex* mutex);
@@ -25,6 +27,9 @@ static constexpr int SCE_KERNEL_ERROR_EINVAL = static_cast<int>(0x80020016);
 static constexpr int SCE_KERNEL_ERROR_ETIMEDOUT = static_cast<int>(0x8002003C);
 static constexpr int MUTEX_TYPE_ERRORCHECK = 1;
 static constexpr int MUTEX_TYPE_ADAPTIVE = 4;
+static constexpr int PRIO_NONE = 0;
+static constexpr int PRIO_INHERIT = 1;
+static constexpr int PRIO_PROTECT = 2;
 
 static void Require(bool value) { if (!value) std::abort(); }
 
@@ -47,6 +52,15 @@ int main() {
     PthreadMutexattr attr = nullptr;
     Require(scePthreadMutexattrInit(&attr) == SCE_OK);
     Require(scePthreadMutexattrSettype(&attr, MUTEX_TYPE_ERRORCHECK) == SCE_OK);
+    Require(scePthreadMutexattrSetprotocol(&attr, PRIO_NONE) == SCE_OK);
+    Require(scePthreadMutexattrSetprotocol(&attr, PRIO_INHERIT) == SCE_OK);
+    bool protectionRejected = false;
+    try {
+        scePthreadMutexattrSetprotocol(&attr, PRIO_PROTECT);
+    } catch (const std::invalid_argument&) {
+        protectionRejected = true;
+    }
+    Require(protectionRejected);
     PthreadMutex mutex = nullptr;
     Require(scePthreadMutexInit(&mutex, &attr, nullptr) == SCE_OK);
     Require(scePthreadMutexattrDestroy(&attr) == SCE_OK);

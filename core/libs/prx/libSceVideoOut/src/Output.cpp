@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -30,8 +33,15 @@ static int validateOutputConfig(int handle, uint64_t mode, const VideoOutOutputO
 extern "C" {
 
 int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* param) try {
-    if (param != nullptr && *static_cast<const std::uint32_t*>(param) != VIDEO_OUT_OPEN_PARAM_SIZE) {
-        throw std::runtime_error(std::string(__func__) + ": unsupported param size");
+    if (param != nullptr) {
+        std::array<std::uint32_t, VIDEO_OUT_OPEN_PARAM_SIZE / sizeof(std::uint32_t)> words{};
+        std::memcpy(words.data(), param, sizeof(words));
+        if (words[0] != VIDEO_OUT_OPEN_PARAM_SIZE) {
+            throw std::runtime_error(std::string(__func__) + ": unsupported param size");
+        }
+        if (std::any_of(words.begin() + 1, words.end(), [](std::uint32_t word) { return word != 0; })) {
+            throw std::runtime_error(std::string(__func__) + ": param options not implemented");
+        }
     }
     if (userId != 255 && userId != 0) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_VALUE");

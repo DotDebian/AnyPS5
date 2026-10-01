@@ -16,6 +16,8 @@
 #include <utility>
 #include <vector>
 #if defined(__linux__)
+#include <fstream>
+#include <string>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -35,6 +37,7 @@ int APS5_VABI sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::siz
 int APS5_VABI sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
 int APS5_VABI sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
 int APS5_VABI sceKernelReserveVirtualRange(void**, std::size_t, int, std::size_t);
+int APS5_VABI sceKernelMemoryPoolReserve(void*, std::size_t, std::size_t, int, void**);
 }
 
 static void Require(bool condition, std::source_location location = std::source_location::current()) {
@@ -120,6 +123,22 @@ static void CheckDirectMemoryFollowsPhysicalPages() {
     Require(sceKernelMunmap(fresh, page * 2) == 0);
     Require(sceKernelMunmap(filler, page * 2) == 0);
     Require(sceKernelReleaseDirectMemory(again, page * 2) == 0);
+}
+
+static void CheckFixedVirtualReservation() {
+    constexpr std::size_t page = 0x4000;
+    void* probe = nullptr;
+    Require(sceKernelReserveVirtualRange(&probe, page * 4, 0, 0) == 0);
+    Require(sceKernelMunmap(probe, page * 4) == 0);
+    void* const requested = static_cast<unsigned char*>(probe) + page;
+    void* fixed = requested;
+    Require(sceKernelReserveVirtualRange(&fixed, page * 2, 0x400010, 0) == 0);
+    Require(fixed == requested);
+    Require(sceKernelMunmap(fixed, page * 2) == 0);
+    void* pooled = nullptr;
+    Require(sceKernelMemoryPoolReserve(requested, page * 2, 0, 0x10, &pooled) == 0);
+    Require(pooled == requested);
+    Require(sceKernelMunmap(pooled, page * 2) == 0);
 }
 
 static void CheckSharedDirectMemoryLifecycle() {
@@ -356,6 +375,30 @@ static void CheckWriteWatch() {
     Require(munmap(raw, spanned + tableSpan) == 0);
 }
 
+static std::string BackingOf(const void* address) {
+    std::ifstream maps("/proc/self/maps");
+    std::string line;
+    while (std::getline(maps, line)) {
+        if (std::strtoull(line.c_str(), nullptr, 16) != reinterpret_cast<std::uintptr_t>(address)) continue;
+        const auto path = line.find('/');
+        return path == std::string::npos ? std::string() : line.substr(path);
+    }
+    return {};
+}
+
+static void CheckDirectMemoryBackingNeedsNoFilesystem() {
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page, 0, 0, &phys) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, page, 3, 0, phys, 0) == 0);
+    const auto backing = BackingOf(mapped);
+    if (backing.rfind("/memfd:", 0) != 0) std::fprintf(stderr, "direct memory backing: %s\n", backing.c_str());
+    Require(backing.rfind("/memfd:", 0) == 0);
+    Require(sceKernelMunmap(mapped, page) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page) == 0);
+}
+
 static void CheckDirectMemoryWriteWatch() {
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
         std::puts("write watch unavailable: direct memory not tested");
@@ -410,12 +453,14 @@ static void CheckDirectMemoryWriteWatch() {
 int main() {
     CheckNamedAndHintedMappings();
     CheckDirectMemoryFollowsPhysicalPages();
+    CheckFixedVirtualReservation();
     CheckSharedDirectMemoryLifecycle();
     CheckHeapAfterMappingReuse();
     CheckSharedWriteTracking();
 #if defined(__linux__)
     CheckWriteWatch();
     CheckDirectMemoryWriteWatch();
+    CheckDirectMemoryBackingNeedsNoFilesystem();
 #endif
     constexpr std::size_t page = 0x4000;
     const auto failed = reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1));

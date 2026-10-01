@@ -24,10 +24,6 @@ const char* DccKeysName(DccKeys keys);
 // The keys covering a surface of `surfaceBytes`, when they all agree.
 DccKeys ReadDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
 bool IsDccClear(DccKeys keys);
-// ReadDccKeys once recorded work writing the keys ran (the title's fast-clear fill of the metadata,
-// a key store of the driver's): under GuestMemory::GpuMutex with an active recorder, the batches up
-// to the newest writer of the range are waited for first. For decisions that act on the keys
-// (materializing a clear), which must not see the keys from before a pending write.
 DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
 // Stores "uncompressed" keys over the surface's metadata on the CPU (a guest memory write: it waits
 // for recorded GPU work that writes the keys first).

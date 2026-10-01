@@ -4,7 +4,11 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/Apr/include/AprCommandBuffer.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
+#include "prx/libkernel/Equeue/Equeue.hpp"
+#include "prx/libkernel/Time/include/Time.hpp"
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +18,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #ifdef _WIN32
@@ -132,6 +137,32 @@ void _writeAddress(const Apr::WriteAddressCommand& command) {
     std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(command.address)).store(command.value, std::memory_order_release);
 }
 
+std::array<std::atomic<std::uint32_t>, 256> g_counters{};
+
+std::uint32_t _counter(std::uint32_t index) {
+    return g_counters[index % g_counters.size()].load(std::memory_order_acquire);
+}
+
+bool _waitSatisfied(std::uint32_t compare, std::uint64_t value, std::uint64_t reference) {
+    switch (compare) {
+        case 0: return true;
+        case 1: return value < reference;
+        case 2: return value <= reference;
+        case 3: return value == reference;
+        case 4: return value != reference;
+        case 5: return value >= reference;
+        case 6: return value > reference;
+        default: throw std::runtime_error("APR: wait compare function " + std::to_string(compare) + " not implemented");
+    }
+}
+
+template<class TCommand>
+TCommand _read(const Apr::CommandBufferObject& buffer, std::uint32_t cursor) {
+    TCommand command;
+    std::memcpy(&command, buffer.base + cursor, sizeof(command));
+    return command;
+}
+
 void _execute(const Apr::CommandBufferObject& buffer) {
     std::uint32_t cursor = 0;
     for (std::uint32_t index = 0; index < buffer.numCommands; ++index) {
@@ -152,6 +183,39 @@ void _execute(const Apr::CommandBufferObject& buffer) {
             Apr::WriteAddressCommand command;
             std::memcpy(&command, buffer.base + cursor, sizeof(command));
             _writeAddress(command);
+            break;
+        }
+        case Apr::Opcode::WriteCounter: {
+            const auto command = _read<Apr::WriteCounterCommand>(buffer, cursor);
+            g_counters[command.counter % g_counters.size()].store(command.value, std::memory_order_release);
+            break;
+        }
+        case Apr::Opcode::WaitOnAddress:
+        case Apr::Opcode::WaitOnCounter: {
+            const auto command = _read<Apr::WaitCommand>(buffer, cursor);
+            const auto current = [&]() -> std::uint64_t {
+                if (header.opcode == Apr::Opcode::WaitOnCounter) return _counter(command.counter);
+                return std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(command.address)).load(std::memory_order_acquire);
+            };
+            while (!_waitSatisfied(command.compare, current() & command.mask, command.reference & command.mask)) std::this_thread::sleep_for(std::chrono::microseconds(50));
+            break;
+        }
+        case Apr::Opcode::WriteKernelEventQueue: {
+            const auto command = _read<Apr::WriteKernelEventQueueCommand>(buffer, cursor);
+            EqueueTriggerEvent_nid_postfix(static_cast<KernelEqueue>(command.equeue), static_cast<uintptr_t>(command.ident), EVFILT_USER, reinterpret_cast<void*>(command.data));
+            break;
+        }
+        case Apr::Opcode::WriteAddressFromTimeCounter: {
+            const auto command = _read<Apr::WriteAddressFromCounterCommand>(buffer, cursor);
+            std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(command.address)).store(sceKernelGetProcessTimeCounter(), std::memory_order_release);
+            break;
+        }
+        case Apr::Opcode::WriteAddressFromCounter:
+        case Apr::Opcode::WriteAddressFromCounterPair: {
+            const auto command = _read<Apr::WriteAddressFromCounterCommand>(buffer, cursor);
+            std::uint64_t value = _counter(command.counter0);
+            if (header.opcode == Apr::Opcode::WriteAddressFromCounterPair) value |= static_cast<std::uint64_t>(_counter(command.counter1)) << 32u;
+            std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(command.address)).store(value, std::memory_order_release);
             break;
         }
         default:

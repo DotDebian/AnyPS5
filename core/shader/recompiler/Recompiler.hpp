@@ -50,7 +50,6 @@ struct ShaderComputeStageInfo {
     }
 };
 
-// The SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR bits, in the order the SPI loads their VGPRs.
 enum class PixelInput : std::uint32_t {
     PerspectiveSample,
     PerspectiveCenter,
@@ -75,7 +74,6 @@ constexpr std::uint32_t PixelInputBit(PixelInput input) {
     return 1u << static_cast<std::uint32_t>(input);
 }
 
-// The VGPRs an input takes: an I/J pair per barycentric, I/J/W for the pull model, one otherwise.
 constexpr std::uint32_t PixelInputVgprCount(PixelInput input) {
     switch (input) {
     case PixelInput::PerspectiveSample:
@@ -92,9 +90,6 @@ constexpr std::uint32_t PixelInputVgprCount(PixelInput input) {
     }
 }
 
-// The first VGPR of an input under an SPI_PS_INPUT_ADDR layout: every input ADDR names takes its
-// VGPRs in PixelInput order, whether or not SPI_PS_INPUT_ENA has it loaded (LLVM's allocated vs
-// enabled PS inputs); only inputs in both are loaded.
 constexpr std::uint32_t PixelInputVgpr(std::uint32_t inputAddr, PixelInput input) {
     std::uint32_t vgpr = 0;
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(input); ++i) {
@@ -107,12 +102,8 @@ struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
     bool wave32;
-    // SPI_PS_INPUT_ADDR: the input VGPR layout (PixelInputVgpr). It must name every loaded input
-    // below (the flags are ENA & ADDR); an input only ADDR names reserves its VGPRs unloaded.
     std::uint32_t inputAddr;
     bool hasPerspectiveCenterVgpr;
-    // PERSP_CENTROID / LINEAR_CENTROID. Draws are single-sampled, where the centroid is the pixel
-    // center: their VGPRs carry the center barycentrics.
     bool perspectiveCentroid;
     bool posX;
     bool posY;
@@ -248,8 +239,8 @@ struct MeshConfiguration {
     std::uint32_t threadsPerGroup;
     std::uint32_t ldsSizeDwords;
     std::uint32_t provokingVertex;
-    // VGT_ESGS_RING_ITEMSIZE: the scale from an ES thread index to the GS vertex offset VGPR fields.
     std::uint32_t esgsItemSize = 0;
+    bool passthrough = false;
 };
 
 struct TessellationConfiguration {
@@ -260,11 +251,6 @@ struct TessellationConfiguration {
     std::uint32_t outputTopology;
 };
 
-// A mesh-stage program's draw parameters: six dwords at the end of the 128-byte push constant block
-// of its pipeline, which the driver writes per draw (the stages' own push data must stay below
-// them): the vertex (index) count, the base vertex, the base instance, the index element bytes (0
-// for a non-indexed draw) and two reserved zeros. The index buffer itself is a raw V# in hidden
-// user words 4..7 of the program (MeshIndexBufferUserWord).
 inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 104;
 inline constexpr std::uint32_t MeshDrawPushBytes = 24;
 inline constexpr std::uint32_t MeshIndexBufferUserWord = 4;

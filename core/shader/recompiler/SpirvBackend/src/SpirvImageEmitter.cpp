@@ -309,6 +309,11 @@ std::uint32_t ResultVector(SpirvValueEmitContext& ctx, const ImageEmitAccess& ac
         }
         const auto scalar = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeExtract, ImageScalarType(state, valueClass), scalar, value, index);
+        if (access.image.depthUnorm16) {
+            const auto scaled = Binary(state, spv::OpFMul, TypeF32(state), scalar, ConstantF32Value(state, 65535.0f));
+            component[index] = Unary(state, spv::OpConvertFToU, TypeU32(state), Binary(state, spv::OpFAdd, TypeF32(state), scaled, ConstantF32Value(state, 0.5f)));
+            continue;
+        }
         component[index] = SampledComponentBits(ctx, scalar, valueClass);
     }
     const auto result = state.module.AllocateId();

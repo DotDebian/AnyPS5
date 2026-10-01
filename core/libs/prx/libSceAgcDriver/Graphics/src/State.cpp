@@ -333,8 +333,6 @@ bool colorControlSupported(std::uint32_t colorControl, bool hasColorTarget) {
     return colorControl == 0xcc0010u || (!hasColorTarget && (colorControl & ~0x70u) == 0xcc0000u);
 }
 
-// CB_COLOR_CONTROL.MODE names what the CB does instead of normal rendering: the metadata passes
-// (ELIMINATE_FAST_CLEAR 2, DCC_DECOMPRESS 6) never get here (see DecodeColorMetadataPass).
 std::string colorControlMessage(std::uint32_t colorControl) {
     static constexpr const char* modes[8] = {"disable", "normal", "eliminate fast clear", "resolve", "decompress", "FMASK decompress", "DCC decompress", "reserved"};
     char text[160];
@@ -488,7 +486,9 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
     validate((value & 3u) != 3u && ((value >> 3u) & 3u) != 3u && ((value >> 6u) & 3u) != 3u, "reserved LS_EN, ES_EN or VS_EN encoding");
     const auto primitive = read(queue.userConfig, 0x242, RegisterBank::UserConfig);
     const bool tessellation = primitive == 9;
-    const bool geometry = (value & 0x20u) != 0;
+    const bool passthrough = (value & 0x02000000u) != 0;
+    const bool geometry = (value & 0x20u) != 0 || passthrough;
+    validate(!passthrough || (value & 0x2000u) != 0, "passthrough routing without PRIMGEN_EN is unsupported");
     validate(tessellation == ((value & 4u) != 0), "Patch topology and HS_EN disagree");
     validate(!tessellation || !geometry, "combined tessellation and geometry is unsupported by the reference path");
     const auto path = tessellation ? ShaderPath::Tessellation : geometry ? ShaderPath::Geometry : ShaderPath::Vertex;
@@ -507,26 +507,25 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
         validate(tess.domain == 1 && tess.partitioning == 2 && tess.outputTopology == 2, "only triangular, fractional-odd, clockwise tessellation is supported by the reference path");
         result.tessellation = tess;
     } else {
-        validate((value & ~0x0047ec30u) == 0, "unsupported geometry routing, fast launch or wave-ID state");
+        validate((value & ~(passthrough ? 0x02402010u : 0x0047ec30u)) == 0, "unsupported geometry routing, fast launch or wave-ID state");
         const auto group = read(queue.userConfig, 0x25b, RegisterBank::UserConfig);
         const auto vertices = (group >> 9u) & 0x1ffu;
         const auto primitives = group & 0x1ffu;
         const auto maxVertices = read(queue.context, 0x1ff);
-        const auto verticesPerPrimitive = read(queue.context, 0x2ce);
-        validate((primitive == 1 || primitive == 2 || primitive == 4 || primitive == 6) && read(queue.context, 0x29b) == 2 && verticesPerPrimitive >= 3, "unsupported geometry input or output assembly");
+        const auto verticesPerPrimitive = passthrough ? 3u : read(queue.context, 0x2ce);
+        validate(passthrough ? (primitive == 4 || primitive == 6) : ((primitive == 1 || primitive == 2 || primitive == 4 || primitive == 6) && read(queue.context, 0x29b) == 2 && verticesPerPrimitive >= 3), "unsupported geometry input or output assembly");
         const auto inputSize = primitive == 1 ? 1u : primitive == 2 ? 2u : 3u;
         validate(vertices >= inputSize && maxVertices != 0 && maxVertices <= 256 && verticesPerPrimitive <= 256, "invalid geometry subgroup output");
         const auto inputStep = primitive == 6 ? 1u : inputSize;
-        const auto groupPrimitives = std::min({primitives, (vertices - inputSize) / inputStep + 1u, maxVertices / verticesPerPrimitive});
+        const auto groupPrimitives = std::min({primitives, (vertices - inputSize) / inputStep + 1u, passthrough ? (maxVertices >= inputSize ? (maxVertices - inputSize) / inputStep + 1u : 0u) : maxVertices / verticesPerPrimitive});
         validate(groupPrimitives != 0, "geometry subgroup contains no primitives");
         const auto resources = read(queue.shader, 0x8b, RegisterBank::Shader);
         validate(((read(queue.shader, 0x8a, RegisterBank::Shader) >> 29u) & 3u) == 3 && ((resources >> 16u) & 3u) == 3, "unsupported geometry VGPR allocation");
-        // The GS vertex offsets are 16-bit fields of the ES thread index times the item size.
         const auto esgsItemSize = read(queue.context, 0x2ab);
         validate(esgsItemSize != 0 && esgsItemSize * vertices <= 0xffffu, "invalid VGT_ESGS_RING_ITEMSIZE");
-        // One thread per ES vertex, GS primitive, output vertex and output primitive of the subgroup.
         const auto threads = std::max({(groupPrimitives - 1u) * inputStep + inputSize, primitives, maxVertices, primitives * (verticesPerPrimitive - 2u)});
         result.mesh = ShaderRecompiler::MeshConfiguration{primitive, groupPrimitives, (groupPrimitives - 1u) * inputStep + inputSize, maxVertices, primitives * (verticesPerPrimitive - 2u), ((threads + result.vertexWaveSize - 1u) / result.vertexWaveSize) * result.vertexWaveSize, ((resources >> 19u) & 0xffu) * 128u, 0, esgsItemSize};
+        result.mesh->passthrough = passthrough;
     }
     return result;
 }
@@ -819,6 +818,7 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     for (std::uint32_t slot = 0; slot < 8; ++slot) {
         if (((targetMask >> (4u * slot)) & 0xfu) == 0 || ((read(cx, 0x31c + slot * 0xfu) >> 2u) & 0x1fu) == 0) continue;
         const auto target = DecodeColorBuffer(cx, slot);
+        Require((read(cx, 0x31c + slot * 0xfu) & 0x10000000u) == 0 || target.dccAddress != 0, "CB metadata pass over a mipmapped DCC color target, whose keys are not modeled");
         const auto width = static_cast<float>(target.extent.width);
         const auto height = static_cast<float>(target.extent.height);
         const bool viewportCovers = xo - xs <= 0.0f && xo + xs >= width && yo - ys <= 0.0f && yo + ys >= height;

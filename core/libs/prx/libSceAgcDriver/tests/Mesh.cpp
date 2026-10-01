@@ -1,9 +1,5 @@
-// agc_driver_mesh_tests: an NGG geometry program (the merged ES/GS "primitive shader" form the
-// geometry path runs, see State.cpp DecodeShaderStages) recompiled to a mesh shader and drawn on the
-// GPU through VulkanDevice::Draw, with the pixels read back. Needs VK_EXT_mesh_shader.
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "Recompiler.hpp"
-#include "NggProgram.hpp"
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -16,16 +12,35 @@ namespace {
 
 using AgcDriver::Graphics::Require;
 using ShaderRecompiler::ShaderStage;
-using namespace NggTest;
 
 constexpr std::uint32_t Width = 192;
 constexpr std::uint32_t Height = 128;
 constexpr std::array<std::uint8_t, 4> Background{16, 24, 40, 255};
 alignas(256) std::array<std::byte, Width * Height * 4> Pixels{};
 
-// v_interp_mov_f32 v0..v3, p0, attr0.xyzw / exp mrt0 v0, v1, v2, v3 done vm / s_endpgm
+alignas(256) constexpr std::array<std::uint32_t, 104> GeometryCode{
+    0x8f6a9003, 0x94fe6ac1, 0xbf88000b, 0xd7650006, 0x000100c1, 0xd7660006, 0x00020cc1, 0x93ebff03,
+    0x00040018, 0xd7460006, 0x04190c6b, 0x340c0c82, 0xd8340000, 0x00000506, 0xbf8cc07f, 0xbefe04c1,
+    0xbf8a0000, 0x938dff02, 0x00090016, 0x9382ff03, 0x00040018, 0x938cff03, 0x00080008, 0xd7650009,
+    0x000100c1, 0xd7660009, 0x000212c1, 0xd746000a, 0x04250c02, 0x7da8120c, 0xbf88002e, 0x361600ff,
+    0x0000ffff, 0x2c180090, 0x361a02ff, 0x0000ffff, 0xd8d80000, 0x0b00000b, 0xd8d80000, 0x0c00000c,
+    0xd8d80000, 0x0d00000d, 0xbf8cc07f, 0xe0382000, 0x8002100b, 0xe0382010, 0x8002140b, 0xe0382000,
+    0x8002180c, 0xe0382010, 0x80021c0c, 0xe0382000, 0x8002200d, 0xe0382010, 0x8002240d, 0x161c1483,
+    0x161e14ff, 0x00000060, 0xbf8c3f70, 0xdb7c0400, 0x0000100f, 0xdb7c0410, 0x0000140f, 0xdb7c0420,
+    0x0000180f, 0xdb7c0430, 0x00001c0f, 0xdb7c0440, 0x0000200f, 0xdb7c0450, 0x0000240f, 0x4a501c81,
+    0x4a521c82, 0x3450508a, 0x34525294, 0xd772002a, 0x04a6510e, 0xbf8cc07f, 0xbefe04c1, 0xbf8a0000,
+    0x930e830d, 0xbf078002, 0xbf850003, 0x8f0f8c0d, 0x887c0f0e, 0xbf900009, 0x7da8140d, 0xbf880002,
+    0xf8000941, 0x0000002a, 0xbefe04c1, 0x7da8140e, 0xbf88000a, 0x34561485, 0xdbfc0400, 0x2c00002b,
+    0xdbfc0410, 0x3000002b, 0xbf8cc07f, 0xf80008cf, 0x2f2e2d2c, 0xf800020f, 0x33323130, 0xbf810000,
+};
+
 alignas(256) constexpr std::array<std::uint32_t, 7> PixelCode{
     0xc8020002, 0xc8060102, 0xc80a0202, 0xc80e0302, 0xf800180f, 0x03020100, 0xbf810000,
+};
+
+struct Vertex {
+    std::array<float, 4> position;
+    std::array<float, 4> color;
 };
 
 constexpr std::uint32_t Columns = 8;
@@ -36,7 +51,6 @@ std::array<std::uint8_t, 4> TriangleColor(std::uint32_t triangle) {
     return {static_cast<std::uint8_t>(40u + 29u * triangle), static_cast<std::uint8_t>(200u + 53u * triangle), static_cast<std::uint8_t>(triangle % 2u == 0u ? 60u : 200u), 255};
 }
 
-// A triangle in cell `triangle` of a Columns x Rows grid over the viewport, all three vertices in its color.
 std::array<Vertex, 3> TriangleVertices(std::uint32_t triangle) {
     const float cellWidth = 2.0f / Columns;
     const float cellHeight = 2.0f / Rows;
@@ -51,7 +65,6 @@ std::array<Vertex, 3> TriangleVertices(std::uint32_t triangle) {
     }};
 }
 
-// The pixel a point of cell `triangle` inside its triangle lands on (the viewport flips y).
 std::size_t CellPixel(std::uint32_t triangle) {
     const auto column = triangle % Columns;
     const auto row = triangle / Columns;
@@ -60,13 +73,15 @@ std::size_t CellPixel(std::uint32_t triangle) {
     return (static_cast<std::size_t>(y) * Width + x) * 4u;
 }
 
-// Vertices in scrambled order behind an index buffer, and the same triangles in draw order.
 alignas(256) std::array<Vertex, 3 * Triangles> Scrambled{};
 alignas(256) std::array<std::uint16_t, 3 * Triangles> Indices{};
 alignas(256) std::array<Vertex, 3 * Triangles> Ordered{};
-// A strip of two rows of quads (Columns cells wide, one color) over the lower half: 2 * Columns
-// triangles, the odd ones with the hardware's vertex order swap.
 alignas(256) std::array<Vertex, 2 * Columns + 2> Strip{};
+
+std::array<std::uint32_t, 4> VertexBufferDescriptor(const void* vertices, std::uint32_t count) {
+    const auto address = reinterpret_cast<std::uintptr_t>(vertices);
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (32u << 16u), count, 0x01016facu};
+}
 
 void ClearPixels() {
     for (std::size_t i = 0; i < Pixels.size(); i += 4) {
@@ -91,16 +106,11 @@ struct MeshDraw {
     ShaderRecompiler::MeshConfiguration mesh;
     AgcDriver::Pm4::DrawParameters draw;
     std::array<std::uint32_t, 4> vertexBuffer;
-    // The push constant bytes the geometry program's own data may take; 0 leaves it none, so its
-    // user data reach it through a buffer and only the draw parameters use the push block.
     std::uint32_t geometryPushBytes = ShaderRecompiler::MeshDrawPushOffsetBytes;
 };
 
-// Recompiles the geometry and pixel programs for `setup` and draws into Pixels.
 void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
     const auto target = device.Target();
-    // The hidden words of the merged program (the user data pointer, GS_TG_INFO and wave info the
-    // prologue replaces, the index buffer V#), then the user SGPRs s[8:11]: the vertex buffer.
     std::vector<std::uint32_t> userData(12, 0u);
     const auto index = AgcDriver::Graphics::MeshIndexBufferDescriptor(setup.draw, reinterpret_cast<std::uintptr_t>(GeometryCode.data()));
     std::copy(index.begin(), index.end(), userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
@@ -155,9 +165,7 @@ void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
     device.WaitIdle();
 }
 
-// Thirty-two triangles (96 ES and output vertices) per subgroup of two waves: a full and a partial
-// workgroup, the second wave's ES vertices read by the first wave's GS threads across the barrier
-// and its vertex threads exporting vertices 64 and up.
+constexpr ShaderRecompiler::MeshConfiguration SmallSubgroup{4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u};
 constexpr ShaderRecompiler::MeshConfiguration WideSubgroup{4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u};
 
 void CheckTriangles(const char* what) {
@@ -172,7 +180,6 @@ void CheckTriangles(const char* what) {
 
 int main() {
     try {
-        // Tests do not fill the user's shader disk cache.
 #ifdef _WIN32
         _putenv_s("APS5_NO_SHADER_DISK_CACHE", "1");
 #else
@@ -182,7 +189,6 @@ int main() {
             const auto vertices = TriangleVertices(triangle);
             for (std::uint32_t k = 0; k < 3; ++k) {
                 Ordered[3 * triangle + k] = vertices[k];
-                // Scrambled slot of vertex (triangle, k): reversed triangles, rotated corners.
                 const auto slot = 3 * (Triangles - 1 - triangle) + (k + 1) % 3;
                 Scrambled[slot] = vertices[k];
                 Indices[3 * triangle + k] = static_cast<std::uint16_t>(slot);
@@ -212,14 +218,10 @@ int main() {
             CheckTriangles((std::string("non-indexed triangle list, ") + name).c_str());
         }
 
-        // A mesh-stage program with no push data of its own still declares the push block for its
-        // draw parameters (MeshDrawPushOffsetBytes): the draw validates and renders.
         ClearPixels();
         DrawMesh(device, {SmallSubgroup, {0, static_cast<std::uint32_t>(Ordered.size()), 0, 1, 0, false}, VertexBufferDescriptor(Ordered.data(), static_cast<std::uint32_t>(Ordered.size())), 0});
         CheckTriangles("mesh program without push data");
 
-        // A strip: three triangles (five ES vertices) per subgroup, so the sixteen take six
-        // workgroups, every other one starting at an odd triangle (its first two vertices swapped).
         ClearPixels();
         const ShaderRecompiler::MeshConfiguration strip{6u, 3u, 5u, 9u, 3u, 64u, 1024u, 0u, 4u};
         DrawMesh(device, {strip, {0, static_cast<std::uint32_t>(Strip.size()), 0, 1, 0, false}, VertexBufferDescriptor(Strip.data(), static_cast<std::uint32_t>(Strip.size()))});

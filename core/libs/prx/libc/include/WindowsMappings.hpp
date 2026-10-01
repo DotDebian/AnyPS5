@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <algorithm>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -11,6 +12,7 @@
 #include <memory>
 #include <vector>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 
 namespace GuestArena {
@@ -69,6 +71,9 @@ public:
         std::lock_guard lock(mutex);
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         reset(cursor, bytes);
+        HANDLE duplicate = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) fail("keep shared guest section");
+        const auto owned = std::make_shared<Section>(duplicate);
         for (std::size_t done = 0; done < bytes; done += pageBytes) {
             split(cursor + done, pageBytes);
             void* page = reinterpret_cast<void*>(cursor + done);
@@ -83,7 +88,7 @@ public:
             }
             const auto base = cursor + done;
             shared->aliases.push_back(base);
-            views.emplace(base, View{shared, protection, 0, false});
+            views.emplace(base, View{shared, protection, 0, false, owned, offset + done});
             invalidate(*shared);
         }
     }
@@ -108,6 +113,42 @@ public:
         if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, view.protection, &previous)) fail("resume shared memory write");
         view.armed = false;
         return true;
+    }
+
+    void* MapAlias(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        const auto refuse = [&](const char* reason) {
+            char text[192];
+            std::snprintf(text, sizeof(text), "read-write alias of shared guest memory 0x%llx+0x%llx: %s", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), reason);
+            return std::runtime_error(text);
+        };
+        if (address % pageBytes != 0 || bytes % pageBytes != 0 || bytes == 0) throw refuse("the range is not made of whole shared pages");
+        auto view = views.find(address);
+        if (view == views.end()) throw refuse("the range does not start at a shared view");
+        const auto section = view->second.section;
+        const auto offset = view->second.offset;
+        SYSTEM_INFO system{};
+        GetSystemInfo(&system);
+        for (std::size_t done = 0; done < bytes; done += pageBytes, ++view) {
+            if (view == views.end() || view->first != address + done || view->second.offset != offset + done) throw refuse("the range is not one contiguous run of views of a section");
+            if (view->second.section != section && !sameSection(view->second.section->handle, section->handle)) throw refuse("the range spans several sections");
+        }
+        const auto lead = offset % system.dwAllocationGranularity;
+        void* alias = map(section->handle, GetCurrentProcess(), nullptr, offset - lead, lead + bytes, 0, PAGE_READWRITE, nullptr, 0);
+        if (alias == nullptr) {
+            char text[160];
+            std::snprintf(text, sizeof(text), "MapViewOfFile3 of a read-write alias of shared guest memory 0x%llx+0x%llx", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), text);
+        }
+        return static_cast<char*>(alias) + lead;
+    }
+
+    void UnmapAlias(void* alias) {
+        if (alias == nullptr) return;
+        SYSTEM_INFO system{};
+        GetSystemInfo(&system);
+        const auto base = reinterpret_cast<std::uintptr_t>(alias) & ~(static_cast<std::uintptr_t>(system.dwAllocationGranularity) - 1);
+        if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(base), 0)) fail("unmap shared guest alias");
     }
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
@@ -181,11 +222,20 @@ private:
         std::uint64_t generation = 1;
         std::vector<std::uintptr_t> aliases;
     };
+    struct Section {
+        HANDLE handle;
+        explicit Section(HANDLE handle) : handle(handle) {}
+        Section(const Section&) = delete;
+        Section& operator=(const Section&) = delete;
+        ~Section() { CloseHandle(handle); }
+    };
     struct View {
         std::shared_ptr<SharedPage> page;
         DWORD protection;
         std::uint64_t seen;
         bool armed;
+        std::shared_ptr<Section> section;
+        std::uint64_t offset;
     };
     void forgetClean(std::uintptr_t start, std::uintptr_t end) {
         auto it = cleanRanges.lower_bound(start);
@@ -215,12 +265,17 @@ private:
         for (const auto alias : page.aliases) forgetClean(alias, alias + pageBytes);
     }
 
+    bool sameSection(HANDLE first, HANDLE second) const {
+        return compare != nullptr && compare(first, second);
+    }
+
     static bool writable(DWORD protection) {
         return protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE;
     }
     using AllocateFunction = PVOID (WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
     using MapFunction = PVOID (WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
     using UnmapFunction = BOOL (WINAPI*)(HANDLE, PVOID, ULONG);
+    using CompareFunction = BOOL (WINAPI*)(HANDLE, HANDLE);
 
     WindowsMappings() {
         const auto module = GetModuleHandleW(L"KernelBase.dll");
@@ -229,6 +284,7 @@ private:
         map = reinterpret_cast<MapFunction>(GetProcAddress(module, "MapViewOfFile3"));
         unmap = reinterpret_cast<UnmapFunction>(GetProcAddress(module, "UnmapViewOfFile2"));
         if (!allocate || !map || !unmap) throw std::runtime_error("Windows placeholder memory APIs are required");
+        compare = reinterpret_cast<CompareFunction>(GetProcAddress(module, "CompareObjectHandles"));
     }
 
     [[noreturn]] static void fail(const char* operation) {
@@ -300,6 +356,7 @@ private:
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;
+    CompareFunction compare = nullptr;
 };
 
 }

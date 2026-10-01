@@ -213,9 +213,6 @@ VkImageViewType ViewTypeFor(TextureDimension dimension, [[maybe_unused]] std::ui
 
 namespace {
 
-// A sampled view applies the descriptor's MIN_LOD clamp (GuestTextureResource::minLod) through
-// VK_EXT_image_view_min_lod, whose minLod counts levels of the whole image exactly as MIN_LOD counts
-// levels of the whole surface (the image holds every mip; the view starts at BASE_LEVEL).
 void ChainMinLod(const Context& context, const GuestTextureResource& descriptor, VkImageViewCreateInfo& viewInfo, VkImageViewMinLodCreateInfoEXT& minLod) {
     const auto clamp = EffectiveMinLod(descriptor);
     if (clamp == 0.0f) return;
@@ -228,11 +225,12 @@ void ChainMinLod(const Context& context, const GuestTextureResource& descriptor,
 }
 
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
+
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     try {
         const auto colorFormat = ResolveTextureFormat(descriptor.format);
-        if (depthCompare && colorFormat != VK_FORMAT_R32_SFLOAT && colorFormat != VK_FORMAT_R16_UNORM) Require(false, "comparison sampling requires an R32 float or R16 unorm depth texture (guest format " + std::to_string(descriptor.format) + ", VkFormat " + std::to_string(static_cast<int>(colorFormat)) + ")");
+        Require(!depthCompare || colorFormat == VK_FORMAT_R32_SFLOAT || colorFormat == VK_FORMAT_R16_UNORM, "comparison sampling requires an R32 float or R16 unorm depth texture");
         Require(!depthCompare || descriptor.dimension != TextureDimension::k3D, "comparison sampling does not support 3D depth textures");
         const auto vkFormat = depthCompare ? (colorFormat == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM) : colorFormat;
         const VkImageAspectFlags aspect = depthCompare ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -429,6 +427,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         viewInfo.subresourceRange = {aspect, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
+
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView");
         createFirstLayerView(descriptor, viewInfo);
         if (profile) {
@@ -504,12 +503,8 @@ Texture::~Texture() {
 
 void Texture::createFirstLayerView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo) {
     if (descriptor.dimension != TextureDimension::k2DArray) return;
-    // The full view's pNext (the MIN_LOD clamp) was chained from the caller's stack: chain it again.
-    viewInfo.pNext = nullptr;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.subresourceRange.layerCount = 1;
-    VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
-    ChainMinLod(context, descriptor, viewInfo, minLod);
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &firstLayerView), "vkCreateImageView first layer");
 }
 
@@ -1198,9 +1193,6 @@ bool StorageTexture::Refresh() {
         stored[layer] = true;
         anyStored = true;
     }
-    // Results kept under the clear code the image was cleared under are stored whole, as writeBack
-    // stores such an image: the store marks the whole surface's keys uncompressed, so every unit's
-    // texels (the clear where nothing was drawn) must reach memory with it.
     if (anyStored && !keysChanged && descriptor.dccAddress != 0 && IsDccClear(uploadedKeys)) stored.assign(trackedLayers, true);
     if (pendingResults) {
         static std::atomic<int> reports{0};

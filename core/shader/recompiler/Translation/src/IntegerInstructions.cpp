@@ -34,6 +34,15 @@ bool TranslationContext::vMed3I16(const RdnaInstruction& inst) {
     return true;
 }
 
+bool TranslationContext::integer16Ternary(const RdnaInstruction& inst, IrOpcode opcode, bool sign) {
+    const IrU32 first = readU16AsU32(sourceAt(inst, 0u), sign);
+    const IrU32 second = readU16AsU32(sourceAt(inst, 1u), sign);
+    const IrU32 third = readU16AsU32(sourceAt(inst, 2u), sign);
+    const IrU32 result(ir.Emit(opcode, IrType::U32, {&first.Value(), &second.Value(), &third.Value()}));
+    write16Bits(inst.destination, IrU32(ir.BitwiseAnd(result.Value(), ir.Constant(0xffffu))));
+    return true;
+}
+
 bool TranslationContext::packedInteger16Shift(const RdnaInstruction& inst, IrOpcode opcode, bool arithmetic) {
     const auto translateLane = [&](bool highLane) {
         const IrU32 count(ir.BitwiseAnd(readU16LaneAsU32(sourceAt(inst, 0u), highLane, false).Value(), ir.Constant(15u)));

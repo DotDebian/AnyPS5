@@ -180,9 +180,6 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
 }
 
 float EffectiveMinLod(const GuestTextureResource& resource) {
-    // The clamp is on the level chosen from the whole surface's chain: at or below BASE_LEVEL it
-    // never binds (the view starts there). Past the view's last level it selects that level, which
-    // the view's own range would select anyway, so the value is bounded by it (Vulkan requires that).
     if (resource.minLod <= resource.baseLevel * 256u) return 0.0f;
     return std::min(static_cast<float>(resource.minLod) / 256.0f, static_cast<float>(resource.lastLevel));
 }

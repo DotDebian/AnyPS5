@@ -28,6 +28,7 @@ struct HostImport {
     VkBuffer buffer;
     VkDeviceMemory memory;
     VkDeviceAddress address;
+    void* alias = nullptr;
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;

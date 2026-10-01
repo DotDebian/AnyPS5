@@ -266,12 +266,21 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
+std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false);
+
 std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes, bool depthCompare, VkImageAspectFlags depthAspect) {
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
-    if (words.size() >= 4 && ShaderRecompiler::IsDepthBitsTexture(words[1], words[3])) {
+    const auto depthBitsWidth = words.size() >= 4 ? ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) : 0u;
+    if (depthBitsWidth == 32u) {
         char text[160];
         std::snprintf(text, sizeof(text), "AGC graphics: 32-bit integer read of the depth-layout texture 0x%llx is not implemented", static_cast<unsigned long long>(resource.baseAddress));
         throw std::runtime_error(text);
+    }
+    constexpr auto unorm16 = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format16UNorm);
+    if (depthBitsWidth == 16u && resource.format != unorm16) {
+        auto normalized = resource;
+        normalized.format = unorm16;
+        return cachedTexture(context, words, normalized, components, guestBytes, depthCompare);
     }
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     const bool profile = LookupOutcomes::Profiled();
@@ -440,7 +449,7 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
     return texture;
 }
 
-std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
+std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes, bool depthCompare) {
     const auto depthAspect = SampledDepthAspect(context, resource);
     auto texture = cachedTextureLookup(context, words, resource, components, guestBytes, depthCompare, depthAspect);
     if (depthAspect != 0) SampleDepthSurface(context, texture, resource, depthAspect);
@@ -1845,7 +1854,6 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
             return true;
         }
         at += descriptorWords;
-        // imageWritten, samplerDepthCompare and bufferWritten: a count word, then one word per 32 bits.
         for (int flags = 0; flags < 4; ++flags) {
             if (at >= key.size()) {
                 ++profile.layout;
@@ -2116,9 +2124,6 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     Require(target == nullptr || !overlap(address, size, target->address, target->bytes), "shader buffer aliases the render target");
     // APS5_ALL_BUFFERS_WRITTEN=1: every element is noted as written, as before bufferWritten existed.
     static const bool allWritten = std::getenv("APS5_ALL_BUFFERS_WRITTEN") != nullptr;
-    // Before the APS5_ALL_BUFFERS_WRITTEN override (a read-only element, such as a mesh stage's
-    // index buffer, may cover the index range): Draw.cpp's CheckBufferAliases repeats this check on
-    // every resource-cache hit, and a draw must fail its hit exactly when it fails its build.
     Require(!written || !overlap(address, size, indexAddress, indexBytes), "writable shader buffer aliases the index buffer");
     written = written || allWritten;
     if (written) guestMemory.AddWritable(address, size, atomic);
@@ -2475,8 +2480,6 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
             const auto* record = nextRecord();
             const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
-            // As for storage images below: a 2D instruction over a 2D array surface samples the
-            // view's first layer (BASE_ARRAY), which a 2D view of that layer binds.
             const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
             if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
             const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
@@ -2506,12 +2509,9 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         else mipOffset = 0;
         const auto* record = nextRecord();
         const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
-        // A 2D instruction over a 2D array surface addresses no slice: the hardware reads and writes
-        // the view's first layer (BASE_ARRAY), which a 2D view of that layer binds.
         const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
         if (binding.imageShape.has_value() && !firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest storage texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
         const auto mip = std::min(resource.baseLevel + mipOffset, resource.mipCount - 1u);
-        // A storage view addresses one level; a MIN_LOD clamp at or below it cannot change the level.
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
         // The same surface as the previous element: its image was just looked up and refreshed.

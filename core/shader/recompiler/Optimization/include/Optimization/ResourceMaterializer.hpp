@@ -30,6 +30,7 @@ struct ResourceSpecialization {
         bool cube = false;
         bool fmask = false;
         bool depthBits = false;
+        bool depthUnorm16 = false;
 
         bool operator==(const Image& other) const;
     };

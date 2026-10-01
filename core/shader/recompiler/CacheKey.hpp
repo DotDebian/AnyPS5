@@ -76,12 +76,12 @@ public:
     }
 
 private:
-    // The subgroup configuration shapes a mesh-stage program's prologue and outputs.
     static void appendMesh(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
         if (request.shader.stage != ShaderStage::Mesh) return;
         const auto* mesh = request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr;
         append(key, mesh != nullptr);
         if (mesh == nullptr) return;
+        append(key, mesh->passthrough);
         for (const auto value : {mesh->inputPrimitive, mesh->primitivesPerGroup, mesh->verticesPerGroup, mesh->maxVertices, mesh->maxPrimitives, mesh->threadsPerGroup, mesh->ldsSizeDwords, mesh->provokingVertex, mesh->esgsItemSize}) append(key, value);
     }
 

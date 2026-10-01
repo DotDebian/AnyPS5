@@ -117,8 +117,6 @@ void ValidateBdaTarget(const IrProgram& program, const SpirvTargetOptions& targe
     for (const auto extension : {"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"}) {
         if (std::find(target.supportedExtensions.begin(), target.supportedExtensions.end(), extension) == target.supportedExtensions.end()) throw std::runtime_error(std::string("BDA requires unsupported extension ") + extension);
     }
-    // A mesh-stage program's faulting accesses never stop invocations (SpirvEmitter): every
-    // invocation reaches the subgroup's barriers and the output epilogue.
     if (program.Resources().stage == IrShaderStage::TessellationControl) throw std::runtime_error("BDA fault termination requires a barrier-safe tessellation-control execution protocol");
 }
 

@@ -175,8 +175,6 @@ void TranslationContext::sBarrier() {
 }
 
 void TranslationContext::sSendmsg(const RdnaInstruction& inst) {
-    // MSG_GS_ALLOC_REQ (message 9): an NGG subgroup reserves its output vertices (M0 [9:0]) and
-    // primitives (M0 [21:12]), which a mesh-stage program passes on to SetMeshOutputsEXT.
     constexpr std::uint32_t GsAllocReq = 9u;
     if (program.Resources().stage == IrShaderStage::Mesh && (inst.rawWords[0] & 0xfu) == GsAllocReq) {
         (void)ir.Emit(IrOpcode::MeshAllocate, IrType::Void, {&ir.GetM0()});

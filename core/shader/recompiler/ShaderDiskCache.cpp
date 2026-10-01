@@ -307,7 +307,7 @@ void decodeResult(Reader& reader, RecompileResult& result) {
     std::vector<std::uint8_t> pushConstants;
     reader.Values(pushConstants);
     result.pushConstants.resize(pushConstants.size());
-    std::memcpy(result.pushConstants.data(), pushConstants.data(), pushConstants.size());
+    if (!pushConstants.empty()) std::memcpy(result.pushConstants.data(), pushConstants.data(), pushConstants.size());
     reader.Value(result.bdaAbiVersion);
     reader.Value(result.memoryOffsetDword);
     reader.List(result.vertexAttributes, 28, [](Reader& in, VertexAttribute& attribute) {
@@ -403,6 +403,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.cube);
         out.Value(image.r128);
         out.Value(image.depthBits);
+        out.Value(image.depthUnorm16);
         out.Value(image.indirectRoot);
         out.Value(image.indirectMappingOffset);
         out.Value(image.indirectSearchIterations);
@@ -489,6 +490,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(image.cube);
         in.Value(image.r128);
         in.Value(image.depthBits);
+        in.Value(image.depthUnorm16);
         in.Value(image.indirectRoot);
         in.Value(image.indirectMappingOffset);
         in.Value(image.indirectSearchIterations);
@@ -549,7 +551,7 @@ void decodeAllocation(Reader& reader, BindingAllocationResult& allocation) {
     std::vector<std::uint8_t> pushConstants;
     reader.Values(pushConstants);
     allocation.pushConstants.resize(pushConstants.size());
-    std::memcpy(allocation.pushConstants.data(), pushConstants.data(), pushConstants.size());
+    if (!pushConstants.empty()) std::memcpy(allocation.pushConstants.data(), pushConstants.data(), pushConstants.size());
 }
 
 constexpr std::string_view NeutralSwitches[] = {
@@ -800,6 +802,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, c
         out.Value(image.cube);
         out.Value(image.fmask);
         out.Value(image.depthBits);
+        out.Value(image.depthUnorm16);
     });
     writer.Values(std::span<const std::uint32_t>(specialization.boundDescriptors));
     const auto& switches = switchKey();

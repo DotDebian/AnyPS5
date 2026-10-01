@@ -59,8 +59,6 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
     if (state.stages.mesh) {
         Require(context.meshShader, "device does not support VK_EXT_mesh_shader");
         const auto& mesh = *state.stages.mesh;
-        // The recompiler runs a wave64 subgroup on 32-wide host subgroups as two guest lanes per
-        // invocation, halving the workgroup.
         const auto invocations = state.stages.vertexWaveSize == 64u && context.subgroup.subgroupSize == 32u ? mesh.threadsPerGroup / 2u : mesh.threadsPerGroup;
         Require(invocations <= context.meshLimits.maxMeshWorkGroupInvocations && invocations <= context.meshLimits.maxMeshWorkGroupSize[0], "mesh workgroup exceeds device limits");
         Require(mesh.maxVertices <= context.meshLimits.maxMeshOutputVertices && mesh.maxPrimitives <= context.meshLimits.maxMeshOutputPrimitives && static_cast<std::uint64_t>(mesh.ldsSizeDwords) * 4 <= context.meshLimits.maxMeshSharedMemorySize, "mesh output or LDS exceeds device limits");
@@ -404,6 +402,8 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
         append(key, mesh.threadsPerGroup);
         append(key, mesh.ldsSizeDwords);
         append(key, mesh.provokingVertex);
+        append(key, mesh.esgsItemSize);
+        append(key, mesh.passthrough);
     }
     append(key, state.stages.tessellation.has_value());
     if (state.stages.tessellation) {

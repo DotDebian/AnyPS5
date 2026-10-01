@@ -104,7 +104,6 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             pixelStorage.interpolatorSettings[i] = pixel.interpolatorSettings[i];
         }
         pixelStorage.inputNum = pixel.interpolatorCount;
-        // The SPI loads each input ENA & ADDR names at its place in the ADDR layout.
         const auto place = [&](PixelInput input, bool loaded) {
             if (!loaded) return;
             if ((pixel.inputAddr & PixelInputBit(input)) == 0u) {
@@ -186,6 +185,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             target.maxPrimitives = mesh->maxPrimitives;
             target.provokingVertex = mesh->provokingVertex;
             target.esgsItemSize = mesh->esgsItemSize;
+            target.passthrough = mesh->passthrough;
             if (target.threadsNum[0] == 0u || target.maxVertices == 0u || target.maxPrimitives == 0u || target.provokingVertex > 2u) throw std::runtime_error("ShaderInputInfoBuilder: invalid mesh configuration");
         }
         ShaderStageInputInfo result;

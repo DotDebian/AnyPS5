@@ -2419,6 +2419,10 @@ VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
     return {state->drawIndirectFirstInstance, state->multiDrawIndirect, state->drawIndirectCount};
 }
 
+std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
+    return Graphics::KnownValidationFailure(graphicsContext(), shaders, graphics);
+}
+
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
 }

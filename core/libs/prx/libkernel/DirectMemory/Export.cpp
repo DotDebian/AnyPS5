@@ -192,8 +192,7 @@ int APS5_VABI sceKernelReleaseDirectMemory(int64_t start, size_t len) {
 }
 
 int APS5_VABI sceKernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment) {
- (void)flags;
- return DoReserveVirtual(addr, len, alignment);
+ return DoReserveVirtual(addr, len, flags, alignment);
 }
 
 int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info, uint64_t info_size) {

@@ -64,9 +64,6 @@ public:
     Texture& operator=(const Texture&) = delete;
 
     VkImageView View() const;
-    // A 2D view of the first layer (BASE_ARRAY) of a 2D array texture: what an image instruction
-    // whose DIM is 2D samples in an array resource (it supplies no slice coordinate, so the
-    // hardware reads slice 0 of the resource view). Null for other dimensions.
     VkImageView FirstLayerView() const { return firstLayerView; }
     // The layout the image is kept in while sampled.
     VkImageLayout Layout() const { return layout; }
@@ -88,7 +85,6 @@ public:
 
 private:
     void release() noexcept;
-    // Makes firstLayerView for a 2D array texture, from the create info of its full view.
     void createFirstLayerView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
 
     // Held by value: cached textures outlive the Context of the draw that created them.
@@ -126,8 +122,6 @@ public:
     // The image holds every mip of the surface; one storage view per written mip is made on demand,
     // so successive mip writes of a chain share one image and one write-back.
     VkImageView View(std::uint32_t mip);
-    // A 2D view of the first layer (BASE_ARRAY) of an array surface's mip: what an instruction whose
-    // DIM is 2D addresses in an array resource (no slice coordinate: slice 0 of the view).
     VkImageView FirstLayerView(std::uint32_t mip);
     // Render targets live in the same images: draws attach mip 0 through a view of the color
     // buffer's format and mark the image dirty like a storage write.
