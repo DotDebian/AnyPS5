@@ -2549,6 +2549,15 @@ void keysFillTests(const Device& device, Recorder& recorder) {
         image->Refresh();
         Require(holds({0, 0, 0, 0}), "a key fill did not clear the results made before it at the next refresh");
         Require(image->FilledKeys() == DccKeys::Uncompressed, "the image cleared by a refresh still holds the fill");
+        draw({{1.0f, 1.0f, 0.0f, 1.0f}});
+        Require(StorageTexture::NoteKeysFill(keysAddress, keyCount, 0x00) == 1, "a 0000 key fill over results to write back did not cover the surface");
+        StorageTexture::FlushPending(address, surfaceBytes, nullptr, "imported buffer region");
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        Require(std::all_of(keys, keys + keyCount, [](std::uint8_t key) { return key == 0x00; }), "a write-back of results made before a key fill did not leave the keys at the fill's code");
+        image->Refresh();
+        Require(holds({0, 0, 0, 0}), "results written back after a key fill came back through the fill's keys");
         draw({{0.0f, 0.0f, 1.0f, 1.0f}});
         Require(StorageTexture::NoteKeysFill(keysAddress, keyCount, 0x00) == 1, "a second 0000 key fill did not cover the surface");
 #ifdef _WIN32
