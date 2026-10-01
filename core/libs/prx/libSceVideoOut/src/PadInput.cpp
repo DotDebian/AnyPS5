@@ -300,6 +300,7 @@ void PadInput::Update() {
         const bool up = press.state == 1 && scriptNow >= press.at + std::chrono::milliseconds(200);
         if (!down && !up) continue;
         press.state = down ? 1 : 2;
+        if (down) std::fprintf(stderr, "[pad] scripted press %s\n", SDL_GetScancodeName(press.key));
         for (std::size_t index = 0; index < bindings.size(); ++index)
             if (bindings[index].key == press.key) pressed[index] = down;
         publish();
