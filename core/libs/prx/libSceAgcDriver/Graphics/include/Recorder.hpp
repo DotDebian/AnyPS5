@@ -109,7 +109,8 @@ public:
     // GuestMemory::UnchangedSince holds for it (a CPU store stamped by a later collect, a driver or
     // GPU store stamped by MarkWritten, drops it) and the guest allocation registry has not changed
     // since (a range unmapped and mapped again holds new bytes no write stamped; registry mutations
-    // are rare once a title runs). Kept least recently used under a byte budget
+    // are rare once a title runs). A storage snapshot that fails only the write check is still
+    // returned when its bytes equal the guest bytes, and takes `generation`, the caller's collect. Kept least recently used under a byte budget
     // (APS5_DRAW_SNAPSHOT_CACHE_MIB, default 256; 0 copies for every draw as before) and an entry
     // count (APS5_DRAW_SNAPSHOT_CACHE_ENTRIES, default 1024); the vertex and index snapshots are kept
     // apart under their own (APS5_DRAW_INPUT_CACHE_MIB, default 1024, and
@@ -121,11 +122,12 @@ public:
     // also serves a shorter read at the same address (the draw binds it but fetches only the
     // requested prefix, the range the reuse check covers), and a new one replaces the shorter ones.
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32 };
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr);
-    // APS5_PROFILE_DRAW: the snapshot cache's lookups that found no entry, found a stale one
-    // (dropped), and entries evicted to make room (cumulative, all recorders).
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
+    // APS5_PROFILE_DRAW: the snapshot cache's lookups that found no entry, found a stale one, and
+    // entries evicted to make room; of the stale ones, those reused with unchanged bytes
+    // (cumulative, all recorders).
     struct DrawSnapshotStatistics {
-        std::uint64_t absent, stale, evicted;
+        std::uint64_t absent, stale, evicted, revalidated;
     };
     static DrawSnapshotStatistics DrawSnapshotCounts();
     static std::size_t DrawSnapshotBudget(SnapshotUse use);

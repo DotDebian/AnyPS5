@@ -1985,11 +1985,11 @@ std::size_t Recorder::DrawSnapshotEntries(SnapshotUse use) {
 }
 
 namespace {
-std::atomic<std::uint64_t> drawSnapshotAbsent{0}, drawSnapshotStale{0}, drawSnapshotEvicted{0};
+std::atomic<std::uint64_t> drawSnapshotAbsent{0}, drawSnapshotStale{0}, drawSnapshotEvicted{0}, drawSnapshotRevalidated{0};
 }
 
 Recorder::DrawSnapshotStatistics Recorder::DrawSnapshotCounts() {
-    return {drawSnapshotAbsent.load(std::memory_order_relaxed), drawSnapshotStale.load(std::memory_order_relaxed), drawSnapshotEvicted.load(std::memory_order_relaxed)};
+    return {drawSnapshotAbsent.load(std::memory_order_relaxed), drawSnapshotStale.load(std::memory_order_relaxed), drawSnapshotEvicted.load(std::memory_order_relaxed), drawSnapshotRevalidated.load(std::memory_order_relaxed)};
 }
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
@@ -1999,17 +1999,23 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
-std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived) {
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found != drawSnapshots.end() && (std::get<0>(found->first) != address || std::get<1>(found->first) != use)) found = drawSnapshots.end();
     if (found == drawSnapshots.end()) {
         if (DrawProfiled()) drawSnapshotAbsent.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
-    if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
+    const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
         if (DrawProfiled()) drawSnapshotStale.fetch_add(1, std::memory_order_relaxed);
-        eraseDrawSnapshot(found);
-        return {};
+        const auto held = found->second.buffer->Bytes();
+        if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || held.size() != bytes || std::memcmp(held.data(), reinterpret_cast<const void*>(address), bytes) != 0) {
+            eraseDrawSnapshot(found);
+            return {};
+        }
+        found->second.generation = generation;
+        if (DrawProfiled()) drawSnapshotRevalidated.fetch_add(1, std::memory_order_relaxed);
     }
     auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
     recency.splice(recency.end(), recency, found->second.recent);
