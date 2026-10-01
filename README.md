@@ -9,11 +9,12 @@ This fork's `main` mirrors `astrobot`, my integration branch for running Astro B
 | Boot, PlayStation Studios video, logos | Renders |
 | Title screen | Renders; copyright line missing (needs the PS5 system fonts) |
 | NEW GAME menu | Renders |
-| Intro cinematic | Renders; some minor fixes still to make |
-| World map (level selector) | Reached; Astro can be moved with a DualSense |
-| Performance | Low: about 15 to 30 fps in the menus, lower in the cinematic and the map |
+| Intro cinematic | Renders; some minor fixes still to make (it takes about 20 minutes at the current frame rate) |
+| Tutorial (Crash Site) | Playable with a DualSense; tutorial videos render |
+| World map, controller ship flight | Reached |
+| Performance | Low: about 15 to 30 fps in the menus, 4 to 11 fps in the cinematic and gameplay |
 
-Known issues: the copyright line, some artifacts and minor glitches in the cinematic and on the map, and the frame rate.
+Known issues: the copyright line, some artifacts and minor glitches in the cinematic and gameplay, and the frame rate.
 
 ## Upstream contributions
 
