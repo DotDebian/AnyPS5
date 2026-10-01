@@ -2533,6 +2533,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     recorder->EndGpuTiming(timing, guestBytes);
     originalValid = false;
     uploadedKeys = keys;
+    filledKeys = DccKeys::Uncompressed;
     keyProof = {};
     forgetBorrowed(0, trackedLayers);
     layerGeneration.assign(trackedLayers, GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
