@@ -269,10 +269,12 @@ void PadInput::Update() {
     if (controller != nullptr) SDL_GameControllerUpdate();
     applyOutput();
     const auto scriptNow = std::chrono::steady_clock::now();
-    // Debug aid: APS5_PAD_PRESS=<seconds>:<SDL key name>[,...] presses that key's bindings for
-    // 200 ms at the given time after the first update, so unattended runs can get past prompts.
+    // Debug aid: APS5_PAD_PRESS=<seconds>:<SDL key name>[:<hold seconds>][,...] presses that key's
+    // bindings at the given time after the first update and holds them for the given time (200 ms
+    // by default), so unattended runs can get past prompts and move the character.
     struct ScriptedPress {
         std::chrono::steady_clock::time_point at;
+        std::chrono::milliseconds hold;
         SDL_Scancode key;
         int state;
     };
@@ -287,9 +289,13 @@ void PadInput::Update() {
             const auto item = list.substr(start, end - start);
             const auto colon = item.find(':');
             if (colon != std::string::npos) {
-                const auto key = SDL_GetScancodeFromName(item.substr(colon + 1).c_str());
+                const auto holdColon = item.find(':', colon + 1);
+                const auto keyName = item.substr(colon + 1, holdColon == std::string::npos ? std::string::npos : holdColon - colon - 1);
+                const auto key = SDL_GetScancodeFromName(keyName.c_str());
                 const auto at = scriptNow + std::chrono::milliseconds(static_cast<long long>(std::stod(item.substr(0, colon)) * 1000.0));
-                if (key != SDL_SCANCODE_UNKNOWN) result.push_back({at, key, 0});
+                const auto hold = holdColon == std::string::npos ? std::chrono::milliseconds(200)
+                    : std::chrono::milliseconds(static_cast<long long>(std::stod(item.substr(holdColon + 1)) * 1000.0));
+                if (key != SDL_SCANCODE_UNKNOWN) result.push_back({at, hold, key, 0});
             }
             start = end + 1;
         }
@@ -297,10 +303,10 @@ void PadInput::Update() {
     }();
     for (auto& press : script) {
         const bool down = press.state == 0 && scriptNow >= press.at;
-        const bool up = press.state == 1 && scriptNow >= press.at + std::chrono::milliseconds(200);
+        const bool up = press.state == 1 && scriptNow >= press.at + press.hold;
         if (!down && !up) continue;
         press.state = down ? 1 : 2;
-        if (down) std::fprintf(stderr, "[pad] scripted press %s\n", SDL_GetScancodeName(press.key));
+        std::fprintf(stderr, "[pad] scripted %s %s\n", down ? "press" : "release", SDL_GetScancodeName(press.key));
         for (std::size_t index = 0; index < bindings.size(); ++index)
             if (bindings[index].key == press.key) pressed[index] = down;
         publish();
