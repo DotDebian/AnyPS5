@@ -98,7 +98,8 @@ struct DepthState {
 
 struct State {
     ShaderStages stages;
-    // MRT slot 0; `colors`/`blends` hold every written slot, attachment i being slot i.
+    // The first written MRT slot; `colors`/`blends` hold every written slot, attachment i being the
+    // slot of export MRTi (exports go to the slots CB_SHADER_MASK enables, in order).
     ColorTarget color;
     std::vector<ColorTarget> colors;
     std::vector<VkPipelineColorBlendAttachmentState> blends;

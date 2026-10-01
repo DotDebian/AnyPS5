@@ -604,12 +604,16 @@ State DecodeState(const QueueState& queue) {
     // matters where the shader exports.
     const auto targetMask = read(cx, 0x8e) & shaderMask;
     APS5_LOG_OUT_DEBUG("CB_TARGET_MASK=0x%x CB_SHADER_MASK=0x%x", targetMask, shaderMask);
-    // MRT slots 0..n-1 become attachments 0..n-1; a slot between written slots must be written too.
-    std::uint32_t slotCount = 0;
+    std::vector<std::uint32_t> exportSlots;
     for (std::uint32_t slot = 0; slot < 8; ++slot) {
-        if (((targetMask >> (4u * slot)) & 0xfu) != 0) slotCount = slot + 1;
+        if (((shaderMask >> (4u * slot)) & 0xfu) != 0) exportSlots.push_back(slot);
     }
-    for (std::uint32_t slot = 0; slot < slotCount; ++slot) {
+    std::size_t slotCount = 0;
+    for (std::size_t index = 0; index < exportSlots.size(); ++index) {
+        if (((targetMask >> (4u * exportSlots[index])) & 0xfu) != 0) slotCount = index + 1;
+    }
+    exportSlots.resize(slotCount);
+    for (const auto slot : exportSlots) {
         if (((targetMask >> (4u * slot)) & 0xfu) == 0) {
             std::ostringstream message;
             message << "AGC graphics: color targets with gaps are unsupported: CB_TARGET_MASK=0x" << std::hex << targetMask << ", CB_SHADER_MASK=0x" << shaderMask;
@@ -617,7 +621,7 @@ State DecodeState(const QueueState& queue) {
         }
     }
     result.hasColorTarget = slotCount != 0;
-    APS5_LOG_OUT_DEBUG("hasColorTarget=%u slots=%u", result.hasColorTarget ? 1u : 0u, slotCount);
+    APS5_LOG_OUT_DEBUG("hasColorTarget=%u slots=%zu", result.hasColorTarget ? 1u : 0u, slotCount);
 
     // CB_COLOR_CONTROL mode 0 disables color writes, which only matters when a target is written.
     if (const auto colorControl = read(cx, 0x202); !colorControlSupported(colorControl, result.hasColorTarget)) throw std::runtime_error(colorControlMessage(colorControl));
@@ -627,13 +631,14 @@ State DecodeState(const QueueState& queue) {
     // SPI_SHADER_POS_FORMAT: POS0 must be a 4-component position; later vectors carry the misc/clip
     // exports that PA_CL_VS_OUT_CNTL validation above already limits to ignored layer/viewport data.
     Require((read(cx, 0x1c3) & 0xfu) == 4, "additional position exports are unsupported");
-    for (std::uint32_t slot = 0; slot < slotCount; ++slot) {
+    for (std::uint32_t index = 0; index < slotCount; ++index) {
         // Export formats only matter for the targets the draw writes.
-        const auto slotExport = (exportFormat >> (4u * slot)) & 0xfu;
+        const auto slotExport = (exportFormat >> (4u * index)) & 0xfu;
         if (slotExport == 0 || slotExport == 7 || slotExport == 8 || slotExport > 9) throw std::runtime_error("AGC graphics: color export format " + std::to_string(slotExport) + " is unsupported");
+        const auto slot = exportSlots[index];
         const auto color = DecodeColorBuffer(cx, slot);
         APS5_LOG_OUT_DEBUG("Color %u address=0x%llx extent=%ux%u bytes=%llu VkFormat=%u", slot, static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.bytes), static_cast<unsigned>(color.format));
-        if (slot == 0) {
+        if (index == 0) {
             result.renderExtent = color.extent;
         } else {
             result.renderExtent = {std::min(result.renderExtent.width, color.extent.width), std::min(result.renderExtent.height, color.extent.height)};
@@ -680,12 +685,13 @@ State DecodeState(const QueueState& queue) {
     intersect(result.scissor, cx, 0x90, false);
     if ((read(cx, 0x292) & 2u) != 0) intersect(result.scissor, cx, 0x94, false);
     APS5_LOG_OUT_DEBUG("Scissor offset=(%d,%d) extent=%ux%u", result.scissor.offset.x, result.scissor.offset.y, result.scissor.extent.width, result.scissor.extent.height);
-    for (std::uint32_t slot = 0; slot < result.colors.size(); ++slot) {
+    for (std::uint32_t index = 0; index < result.colors.size(); ++index) {
+        const auto slot = exportSlots[index];
         const auto blend = read(cx, 0x1e0 + slot);
         APS5_LOG_OUT_DEBUG("Blend %u control=0x%x", slot, blend);
         Require((blend & 0x0000e000u) == 0, "reserved blend control bits");
         VkPipelineColorBlendAttachmentState state{};
-        const auto mapping = result.colors[slot].componentMapping;
+        const auto mapping = result.colors[index].componentMapping;
         const auto exportedMask = (targetMask >> (4u * slot)) & 0xfu;
         for (std::uint32_t component = 0; component < 4; ++component) {
             if (((exportedMask >> ((mapping >> (2u * component)) & 3u)) & 1u) != 0) state.colorWriteMask |= 1u << component;
