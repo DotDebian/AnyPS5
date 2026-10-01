@@ -28,7 +28,7 @@ namespace AvPlayer {
 
 namespace {
 
-constexpr std::uint32_t VideoPitchAlignment = 64;
+constexpr std::uint32_t VideoPitchAlignment = 256;
 constexpr std::uint32_t VideoHeightAlignment = 16;
 constexpr std::uint32_t VideoBufferAlignment = 0x100;
 constexpr std::uint32_t AudioBufferAlignment = 0x10;
