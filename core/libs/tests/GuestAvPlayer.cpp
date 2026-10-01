@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -459,6 +460,36 @@ void TestFileReplacementAutoStart() {
     Check(!file.stream.is_open(), "replaced file left open");
 }
 
+void TestHandedOutFramesStayIntact() {
+    constexpr int Buffers = 6;
+    constexpr int Retained = Buffers - 2;
+    AvPlayerInitData init = InitData(nullptr);
+    init.num_output_video_framebuffers = Buffers;
+    auto* player = sceAvPlayerInit(&init);
+    Check(player != nullptr, "init failed");
+    Check(sceAvPlayerSetAvSyncMode(player, 1) == 0, "sync mode rejected");
+    Check(sceAvPlayerAddSource(player, "/app0/avplayer.mp4") == 0, "add source failed");
+    struct Taken {
+        const std::uint8_t* luma;
+        int index;
+    };
+    std::deque<Taken> taken;
+    for (int round = 0; round < 16; ++round) {
+        AvPlayerFrameInfoEx frame{};
+        Check(WaitFor([&] { return sceAvPlayerGetVideoDataEx(player, &frame) != 0; }), "no frame for round " + std::to_string(round));
+        CheckVideoFrame(frame);
+        taken.push_back({static_cast<const std::uint8_t*>(frame.p_data), FrameIndex(frame.timestamp)});
+        if (taken.size() > Retained) taken.pop_front();
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        for (std::size_t k = 0; k < taken.size(); ++k) {
+            for (std::size_t other = k + 1; other < taken.size(); ++other) Check(taken[k].luma != taken[other].luma, "one buffer handed out twice among the last " + std::to_string(Retained) + " frames");
+            const int index = taken[k].index;
+            Check(std::abs(taken[k].luma[30 * 128 + 10] - LumaFor(index)) <= 6, "frame " + std::to_string(index) + " was overwritten " + std::to_string(taken.size() - 1 - k) + " frames after it was handed out");
+        }
+    }
+    Check(sceAvPlayerClose(player) == 0, "close failed");
+}
+
 }
 
 int main() {
@@ -467,6 +498,7 @@ int main() {
         Encoder().Write(MoviePath);
         TestPlayback();
         TestFileReplacementAutoStart();
+        TestHandedOutFramesStayIntact();
         std::puts("AvPlayer tests passed");
         return 0;
     } catch (const Skip&) {

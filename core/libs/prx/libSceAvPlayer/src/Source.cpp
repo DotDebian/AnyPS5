@@ -203,6 +203,8 @@ struct Decoder {
     std::vector<std::uint8_t*> free;
     std::vector<std::uint8_t*> allocated;
     std::optional<Frame> current;
+    std::deque<std::uint8_t*> handedOut;
+    std::size_t retained = 0;
     std::uint32_t bufferSize = 0;
     std::uint64_t epoch = 0;
     std::uint64_t skipBefore = 0;
@@ -516,6 +518,7 @@ private:
             bufferHeight = AlignUp(static_cast<std::uint32_t>(decoder.context->height), VideoHeightAlignment);
             decoder.bufferSize = pitch * bufferHeight * 3 / 2;
             count = settings.videoBuffers;
+            decoder.retained = count > 3 ? count - 3 : 0;
             texture = true;
             alignment = VideoBufferAlignment;
         } else {
@@ -542,6 +545,7 @@ private:
             decoder->queuedBytes = 0;
             decoder->frames.clear();
             decoder->current.reset();
+            decoder->handedOut.clear();
             decoder->free.clear();
             for (auto* buffer : decoder->allocated) {
                 if (decoder->video) {
@@ -589,7 +593,11 @@ private:
     }
 
     void present(Decoder& decoder, AvPlayerFrameInfoEx& info) {
-        if (decoder.current) decoder.free.push_back(decoder.current->buffer);
+        if (decoder.current) decoder.handedOut.push_back(decoder.current->buffer);
+        while (decoder.handedOut.size() > decoder.retained) {
+            decoder.free.push_back(decoder.handedOut.front());
+            decoder.handedOut.pop_front();
+        }
         decoder.current = std::move(decoder.frames.front());
         decoder.frames.pop_front();
         info = decoder.current->info;
