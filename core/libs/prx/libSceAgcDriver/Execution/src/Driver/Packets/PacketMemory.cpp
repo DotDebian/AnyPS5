@@ -19,21 +19,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
     endOfPipeInterrupt = opcode == 0x49 && ((packet[2] >> 24u) & 7u) != 0;
     interruptDeferred = false;
-    // An end-of-pipe interrupt (RELEASE_MEM with an interrupt select) reaches the issuing
-    // queue's event once the work before it completed and its label (if any) landed; by
-    // default the packet drains the device for that (a CPU wait for all recorded work, then
-    // the CPU store and the delivery), hundreds of drains per second at Astro Bot's title
-    // stage, which keep the GPU and the worker taking turns. APS5_DEFER_EOP_INTERRUPTS=1 records the
-    // label like any other (on the GPU behind the work, or as a completion action) and
-    // makes the delivery a completion action of the batch holding the work
-    // (Recorder::AfterRecordedWork, behind the label's own completion; at once, after the
-    // CPU store, with nothing unfinished); a label WriteLabelOnGpu refuses (reason 2-4) or
-    // that does not decode still drains. It is 10-20% faster past the title stage, but
-    // Astro Bot's intro then presents a garbage frame in about one run in five (never in
-    // twenty drained runs): the delivery comes after the whole batch completed, i.e. after
-    // the packets recorded behind the RELEASE_MEM ran too, and presumably something the
-    // title does on the interrupt has to happen before those.
-    static const bool deferInterrupts = std::getenv("APS5_DEFER_EOP_INTERRUPTS") != nullptr;
+    static const bool deferInterrupts = std::getenv("APS5_DRAIN_EOP_INTERRUPTS") == nullptr;
     if (!drainAll && deferInterrupts && endOfPipeInterrupt) {
         const auto label = Pm4::DecodeLabelWrite(packet);
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
@@ -59,6 +45,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (reason == 0 || reason == 5 || reason == 6) {
                 const auto queueId = submission.queue;
                 interruptDeferred = localDevice->AfterRecordedWork([queueId] { AgcDriverDeliverEopInterrupt(queueId); }, submission.queue == 0);
+                if (interruptDeferred) localDevice->SubmitRecorded(submission.queue == 0);
                 wroteOnGpu = true;
             } else if (reason == 1) {
                 wroteOnGpu = true;
