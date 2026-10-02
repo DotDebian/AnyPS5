@@ -34,6 +34,7 @@ public:
         append(key, request.target);
         append(key, DebugProbeActive());
         append(key, RayTracingStrict());
+        append(key, RayTracingMiss());
         append(key, GpuSelectedDescriptors());
         append(key, WaveLayoutFor(request));
     }

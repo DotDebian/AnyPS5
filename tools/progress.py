@@ -12,6 +12,7 @@ ISA = Path(__file__).resolve().parent / "rdna_isa.txt"
 SOURCE = f'https://github.com/{os.environ.get("GITHUB_REPOSITORY", "boykopovar/AnyPS5")}/blob/main'
 DEFINITION = re.compile(r"\bAPS5_VABI\s+(\w+)\s*\([^;{]*\)\s*(?:noexcept\s*)?\{")
 STUB = "NotImplemented_nid_no_patch"
+STUB_WRAPPER = re.compile(r"\bstatic\s+(?:\[\[noreturn\]\]\s+)?void\s+(\w+)\s*\([^;{]*\)\s*\{")
 FLAT_SEGMENTS = ("GLOBAL_", "SCRATCH_")
 OPCODE_SENTINELS = {"Invalid", "Count", "Unknown", "Unsupported"}
 OPCODE_ALIASES = {
@@ -50,16 +51,25 @@ def body_end(text, start):
     return len(text)
 
 
+def stub_calls(text):
+    calls = [STUB]
+    for match in STUB_WRAPPER.finditer(text):
+        if STUB in text[match.end() - 1:body_end(text, match.end() - 1)]:
+            calls.append(match.group(1) + "(")
+    return calls
+
+
 def scan_library(path):
     done, todo = set(), set()
     for source in path.rglob("*.cpp"):
         text = source.read_text(errors="ignore")
+        calls = stub_calls(text)
         for match in DEFINITION.finditer(text):
             name = match.group(1)
             if name.endswith("_nid_no_patch"):
                 continue
             body = text[match.end() - 1:body_end(text, match.end() - 1)]
-            (todo if STUB in body else done).add(name)
+            (todo if any(call in body for call in calls) else done).add(name)
     todo -= done
     return {"name": path.name, "label": path.name.removeprefix("libSce"), "done": len(done), "todo": len(todo),
             "done_names": sorted(done), "todo_names": sorted(todo)}
@@ -265,7 +275,7 @@ def compare(title, column, unit, base, head):
     delta = round(head["percent"] - base["percent"], 2)
     icon = "📈" if delta > 0 else "📉" if delta < 0 else "➖"
     counts = [f"{n:+} {label}" for n, label in ((len(implemented), "implemented"), (len(declared), "declared"),
-                                                (-len(removed), "removed")) if n]
+                                                (-len(regressed), "reverted"), (-len(removed), "removed")) if n]
     lines = [f'{icon} **{title}**: {head["percent"]}% ({delta:+}%, {", ".join(counts)} {unit})', ""]
     lines += details("✅", "implemented", column, implemented)
     lines += details("🆕", "declared as stubs", column, declared)

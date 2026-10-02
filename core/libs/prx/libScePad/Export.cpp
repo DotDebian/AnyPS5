@@ -41,6 +41,17 @@ void TracePadOutput(PadOutputKind kind, int handle, int a, int b) {
   std::fprintf(stderr, "\n");
  }
 }
+
+constexpr int PAD_ERROR_DEVICE_NO_HANDLE = static_cast<int>(0x80920008);
+
+bool g_opened = false;
+
+bool ValidPort(int userId, int type, int index) {
+    const bool personalPort = type == PAD_PORT_TYPE_STANDARD || type == PAD_PORT_TYPE_SPECIAL;
+    const bool systemRemote = userId == PAD_USER_ID_SYSTEM && type == PAD_PORT_TYPE_REMOTE;
+    return index == 0 && (personalPort || systemRemote);
+}
+
 }
 
 extern "C" {
@@ -49,6 +60,7 @@ int APS5_VABI scePadClose_nid_postfix(int handle) {
  if (handle != PAD_HANDLE) {
   return PAD_ERROR_INVALID_HANDLE;
  }
+ g_opened = false;
  return PAD_OK;
 }
 
@@ -90,11 +102,8 @@ int APS5_VABI scePadGetControllerInformation(int handle, PadControllerInformatio
 }
 
 int APS5_VABI scePadGetHandle(int user_id, int type, int index) {
- (void)user_id;
- (void)type;
- (void)index;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ if (!g_opened || !ValidPort(user_id, type, index)) return PAD_ERROR_DEVICE_NO_HANDLE;
+ return PAD_HANDLE;
 }
 
 int APS5_VABI scePadGetInfo_nid_postfix(PadInfo* info) {
@@ -153,14 +162,10 @@ int APS5_VABI scePadInit_nid_postfix(void) {
 
 int APS5_VABI scePadOpen_nid_postfix(int userId, int type, int index, const void* param) {
  (void)param;
- if (index != 0) {
+ if (!ValidPort(userId, type, index)) {
   return PAD_ERROR_INVALID_ARG;
  }
- const bool personalPort = (type == PAD_PORT_TYPE_STANDARD || type == PAD_PORT_TYPE_SPECIAL);
- const bool systemRemote = (userId == PAD_USER_ID_SYSTEM && type == PAD_PORT_TYPE_REMOTE);
- if (!personalPort && !systemRemote) {
-  return PAD_ERROR_INVALID_ARG;
- }
+ g_opened = true;
  return PAD_HANDLE;
 }
 
@@ -264,8 +269,7 @@ int APS5_VABI scePadSetVibrationMode(int handle, int mode) {
 
 int APS5_VABI scePadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(bool enabled) {
  (void)enabled;
- NotImplemented_nid_no_patch(__func__);
- return 0;
+ return PAD_OK;
 }
 
 }

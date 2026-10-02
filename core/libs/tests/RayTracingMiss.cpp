@@ -26,5 +26,8 @@ int main() {
         Require(thrown);
     } else {
         context.TranslateInstruction(instruction);
+        if (RayTracingMiss()) {
+            for (auto* value : block.Instructions()) Require(value->Opcode() != IrOpcode::ImageBvhIntersectRay);
+        }
     }
 }

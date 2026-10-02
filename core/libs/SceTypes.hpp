@@ -1036,7 +1036,7 @@ struct MouseData {
     std::uint8_t reserved[8];
 };
 
-constexpr std::uint32_t KEYBOARD_MAX_KEYCODES = 6;
+constexpr std::uint32_t KEYBOARD_MAX_KEYCODES = 16;
 
 struct KeyboardData {
     std::uint64_t timestamp;

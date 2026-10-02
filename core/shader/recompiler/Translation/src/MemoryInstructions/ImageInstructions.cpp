@@ -45,6 +45,13 @@ bool TranslationContext::imageBvhIntersectRay(const RdnaInstruction& inst) {
     if (RayTracingStrict()) {
         throw std::runtime_error("ray tracing is not implemented");
     }
+    if (RayTracingMiss()) {
+        IrValue& miss = ir.Constant(0xffffffffu);
+        for (std::uint32_t i = 0u; i < inst.dataDwordCount; ++i) {
+            writeOperand(offsetOperand(inst.destination, i), &miss);
+        }
+        return true;
+    }
     if (inst.dataDwordCount != 4u || inst.imageD16) {
         throw std::runtime_error("image_bvh_intersect_ray returns four dwords");
     }
