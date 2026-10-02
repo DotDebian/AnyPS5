@@ -382,6 +382,108 @@ void verifyBindlessTable() {
 }
 
 
+void verifyDescriptorPhis() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t Type2D = 9;
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture textures[2];
+    const auto imageDescriptor = [&](const Texture& texture) {
+        const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+        return std::array<std::uint32_t, 8>{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    };
+    const std::array<std::uint32_t, 4> pointWrap{0u, 0u, 0u, 0u};
+    const std::array<std::uint32_t, 4> linearMirror{0x49u, 0u, 0x00500000u, 0u};
+    std::array<std::uint32_t, 4> output{};
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    std::array<std::uint32_t, 32> srt{};
+    const auto first = imageDescriptor(textures[0]);
+    const auto second = imageDescriptor(textures[1]);
+    std::copy(first.begin(), first.end(), srt.begin());
+    std::copy(pointWrap.begin(), pointWrap.end(), srt.begin() + 8);
+    std::copy(linearMirror.begin(), linearMirror.end(), srt.begin() + 12);
+    const std::array<std::uint32_t, 4> outputV{static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
+    std::copy(outputV.begin(), outputV.end(), srt.begin() + 16);
+    srt[20] = 1u;
+    std::copy(second.begin(), second.end(), srt.begin() + 24);
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::array<std::uint32_t, 1> capabilities{29u};
+    const auto makeRequest = [&](const std::vector<std::uint32_t>& code, std::uint32_t waveSize = 32u) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x21000u, code, 0, {}};
+        request.context.waveSize = waveSize;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{waveSize, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        return request;
+    };
+    const auto countOps = [](const std::vector<std::uint32_t>& words, std::uint32_t opcode) {
+        std::size_t count = 0;
+        for (std::size_t cursor = 5; cursor < words.size();) {
+            const auto length = words[cursor] >> 16u;
+            require(length != 0 && length <= words.size() - cursor, "descriptor Phi: truncated SPIR-V instruction");
+            count += (words[cursor] & 0xffffu) == opcode ? 1u : 0u;
+            cursor += length;
+        }
+        return count;
+    };
+    constexpr std::uint32_t OpImageSampleExplicitLod = 88;
+
+    const std::vector<std::uint32_t> samplerCode{0xf40c0200u, 0xfa000000u, 0xf4000400u, 0xfa000050u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u, 0xf4080500u, 0xfa000020u, 0xbf820002u, 0xf4080500u, 0xfa000030u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    const std::vector<std::uint32_t> imageCode{0xf4000400u, 0xfa000050u, 0xf4080500u, 0xfa000020u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u, 0xf40c0200u, 0xfa000000u, 0xbf820002u, 0xf40c0200u, 0xfa000060u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    const std::vector<std::uint32_t> dynamicCode{0xf40c0200u, 0xfa000000u, 0xf4000400u, 0xfa000050u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u, 0xf4080500u, 0xfa000020u, 0xbf820002u, 0xf4080500u, 0x20000000u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+
+    const auto compile = [&](const std::vector<std::uint32_t>& code, std::size_t images, std::size_t samplers) {
+        auto request = makeRequest(code);
+        const auto plan = GetResourcePlan(request);
+        require(plan->info.images.size() == images && plan->info.samplers.size() == samplers && plan->info.sampledPairs.size() == 2u, "descriptor Phi: the edges were not given one resource each");
+        AgcDriver::ShaderMemory memory({});
+        const auto capture = memory.Capture(request);
+        request.context.memory = memory.Regions();
+        const auto compiled = Recompile(request, *capture);
+        require(countOps(compiled->spirv, OpImageSampleExplicitLod) == 2u, "descriptor Phi: the SPIR-V does not sample once per edge");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+        static_cast<void>(ValidateAndOptimizeSpirv(compiled->spirv, request.target.vulkanVersion, request.target.spirvVersion));
+#endif
+        return capture;
+    };
+    const auto samplerCapture = compile(samplerCode, 1u, 2u);
+    const auto& samplers = samplerCapture->snapshot.samplers;
+    require(samplers.size() == 2u, "descriptor Phi: the snapshot does not hold both S#s");
+    const auto holds = [&](const std::array<std::uint32_t, 4>& words) {
+        return std::ranges::any_of(samplers, [&](const DescriptorValue& value) {
+            return value.dwordCount == 4u && std::equal(words.begin(), words.end(), value.dwords.begin());
+        });
+    };
+    require(holds(pointWrap) && holds(linearMirror), "descriptor Phi: the snapshot S#s are not the two edges' S#s");
+
+    const auto imageCapture = compile(imageCode, 2u, 1u);
+    const auto& images = imageCapture->snapshot.images;
+    require(images.size() == 2u, "descriptor Phi: the snapshot does not hold both T#s");
+    const auto holdsImage = [&](const std::array<std::uint32_t, 8>& words) {
+        return std::ranges::any_of(images, [&](const DescriptorValue& value) {
+            return std::equal(words.begin(), words.end(), value.dwords.begin());
+        });
+    };
+    require(holdsImage(first) && holdsImage(second), "descriptor Phi: the snapshot T#s are not the two edges' T#s");
+
+    auto twoLane = makeRequest(samplerCode, 64u);
+    AgcDriver::ShaderMemory twoLaneMemory({});
+    const auto twoLaneCapture = twoLaneMemory.Capture(twoLane);
+    twoLane.context.memory = twoLaneMemory.Regions();
+    require(countOps(Recompile(twoLane, *twoLaneCapture)->spirv, OpImageSampleExplicitLod) == 4u, "descriptor Phi: the two-lane SPIR-V does not sample once per edge and half");
+
+    auto dynamic = makeRequest(dynamicCode);
+    expectFailure([&] { static_cast<void>(GetResourcePlan(dynamic)); }, "GetSamplerResource dword 0 is not a valid runtime value", "descriptor Phi: an edge without an SRT slot was accepted");
+}
+
 void verifyProgramCounterRelativeData() {
     using namespace ShaderRecompiler;
     static const std::array<std::uint32_t, 15> code{
@@ -911,6 +1013,7 @@ int main(int argc, char** argv) {
         verifyRegisterSources();
         verifyPureFlatSlots();
         verifyBindlessTable();
+        verifyDescriptorPhis();
         verifyProgramCounterRelativeData();
         verifyPassthroughPixelInputs();
         verifyConditionalUnmappedSlot();
