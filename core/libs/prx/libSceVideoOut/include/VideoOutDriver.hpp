@@ -121,7 +121,6 @@ struct VideoOutConfig {
     std::stop_token shutdownToken = LibcShutdownToken_nid_postfix();
     int flipRate = 0;
     uint64_t lastFlipVblank = 0;
-    uint64_t lastReleaseVblank = 0;
     std::chrono::steady_clock::time_point lastTimingFlip{};
     uint64_t outputMode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
     float gamma = 1.0f;

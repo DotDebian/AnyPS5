@@ -397,10 +397,10 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         timing.Mark("vblank_wait");
         checkConfig(*req.cfg);
         released = req.cfg->vblankStatus.count;
-        pacing.lostVblanks.fetch_add(LostVblanks(released, req.cfg->lastReleaseVblank, req.readyVblank, req.flipRate), std::memory_order_relaxed);
-        pacing.heldVblanks.fetch_add(HeldVblanks(target, req.cfg->lastReleaseVblank, req.readyVblank, req.flipRate), std::memory_order_relaxed);
+        pacing.lostVblanks.fetch_add(LostVblanks(released, req.cfg->lastFlipVblank, req.readyVblank, req.flipRate), std::memory_order_relaxed);
+        pacing.heldVblanks.fetch_add(HeldVblanks(target, req.cfg->lastFlipVblank, req.readyVblank, req.flipRate), std::memory_order_relaxed);
         pacing.releases.fetch_add(1, std::memory_order_relaxed);
-        req.cfg->lastReleaseVblank = released;
+        req.cfg->lastFlipVblank = released;
     }
     require(req.width != 0 && req.height != 0 && req.width <= static_cast<uint32_t>(std::numeric_limits<int>::max()) && req.height <= static_cast<uint32_t>(std::numeric_limits<int>::max()), "invalid window dimensions");
     window.Ensure(req.width, req.height);
@@ -452,7 +452,6 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     if (req.cfg->vblankStatus.count > released) pacing.presentsCrossingVblank.fetch_add(1, std::memory_order_relaxed);
     triggerEvents(*req.cfg, VIDEO_OUT_EVENT_FLIP, reinterpret_cast<void*>(req.flipArg));
     ++req.cfg->flipStatus.count;
-    req.cfg->lastFlipVblank = req.cfg->vblankStatus.count;
     req.cfg->flipStatus.processTime = sceKernelGetProcessTime();
     req.cfg->flipStatus.processTimeCounter = sceKernelGetProcessTimeCounter();
     req.cfg->flipStatus.flipArg = req.flipArg;

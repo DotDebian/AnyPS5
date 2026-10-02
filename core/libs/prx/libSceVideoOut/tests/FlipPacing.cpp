@@ -29,5 +29,19 @@ int main() {
     Require(HeldVblanks(11, 10, 9, 0) == 0 && HeldVblanks(12, 10, 9, 0) == 1, "a target past the earliest vblank holds the flip back");
     Require(HeldVblanks(12, 10, 12, 0) == 0 && HeldVblanks(13, 10, 12, 0) == 1, "a late flip is held only past the vblank it was queued at");
 
+    std::uint64_t lastFlipVblank = 0;
+    std::uint64_t lastPresentVblank = 0;
+    std::uint64_t lost = 0;
+    std::uint64_t heldByPresent = 0;
+    struct Flip { std::uint64_t ready, released, afterPresent; };
+    for (const Flip flip : {Flip{0, 1, 2}, Flip{1, 2, 3}, Flip{2, 3, 3}, Flip{3, 4, 5}}) {
+        Require(flip.released >= FlipTargetVblank(lastFlipVblank, 0), "a flip is never released before its target");
+        if (FlipTargetVblank(lastPresentVblank, 0) > flip.released) ++heldByPresent;
+        lost += LostVblanks(flip.released, lastFlipVblank, flip.ready, 0);
+        lastFlipVblank = flip.released;
+        lastPresentVblank = flip.afterPresent;
+    }
+    Require(lost == 0 && lastFlipVblank == 4, "presents that cross the next vblank do not move later flips");
+    Require(heldByPresent == 2, "pacing from the vblank after the present would hold two of these flips back");
     return 0;
 }
