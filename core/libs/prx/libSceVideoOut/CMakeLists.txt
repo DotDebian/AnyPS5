@@ -10,6 +10,8 @@ add_library(libSceVideoOut SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/src/KeyboardInput.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/InputMapping.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/LevelMenuModel.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/LevelMenu.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/LevelRelaunch.cpp
 )
 
 target_include_directories(libSceVideoOut PRIVATE
@@ -17,6 +19,7 @@ target_include_directories(libSceVideoOut PRIVATE
         ${CMAKE_SOURCE_DIR}/3rdparty/SDL2/include
         ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
 )
+target_include_directories(libSceVideoOut SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/stb)
 target_link_libraries(libSceVideoOut PRIVATE libSceAgcDriver libScePad libSceMouse libSceKeyboard libc libkernel SDL2-static)
 if(WIN32)
     target_link_libraries(libSceVideoOut PRIVATE comctl32)

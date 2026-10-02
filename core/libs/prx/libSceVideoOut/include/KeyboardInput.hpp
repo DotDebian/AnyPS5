@@ -6,6 +6,7 @@
 class KeyboardInput {
 public:
     void HandleEvent(const SDL_Event& event, unsigned windowId);
+    void ReleaseAll();
 
 private:
     bool focused = true;

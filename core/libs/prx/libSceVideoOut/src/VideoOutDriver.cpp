@@ -12,6 +12,8 @@
 #include "prx/libSceVideoOut/include/PadInput.hpp"
 #include "prx/libSceVideoOut/include/MouseInput.hpp"
 #include "prx/libSceVideoOut/include/KeyboardInput.hpp"
+#include "prx/libSceVideoOut/include/LevelMenu.hpp"
+#include "prx/libSceVideoOut/include/LevelRelaunch.hpp"
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
@@ -468,6 +470,8 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
         PadInput padInput;
         MouseInput mouseInput;
         KeyboardInput keyboardInput;
+        LevelMenu levelMenu;
+        bool menuWasOpen = false;
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
@@ -486,11 +490,22 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
                     LibcRequestExit_nid_postfix(0);
                     throw ProcessShutdown{};
                 }
+                if (levelMenu.HandleEvent(event, window.Handle())) continue;
                 padInput.HandleEvent(event, window);
                 if (window.Handle() != nullptr) {
                     mouseInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
                     keyboardInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
                 }
+            }
+            if (const auto level = levelMenu.Update(window.Handle())) {
+                padInput.StopRumble();
+                LevelRelaunch::RestartIntoLevel(*level);
+                levelMenu.Close(window.Handle());
+            }
+            if (levelMenu.IsOpen() != menuWasOpen) {
+                menuWasOpen = levelMenu.IsOpen();
+                padInput.SetSuppressed(menuWasOpen);
+                if (menuWasOpen) keyboardInput.ReleaseAll();
             }
             padInput.Update();
             if (current) {
