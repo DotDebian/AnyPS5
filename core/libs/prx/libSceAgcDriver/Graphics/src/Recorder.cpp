@@ -2,6 +2,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
@@ -2262,9 +2263,12 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
     thread_local std::vector<std::uint64_t> generations;
     thread_local std::vector<std::uint8_t> changed;
     thread_local std::vector<std::pair<std::size_t, std::size_t>> differing;
+    thread_local std::vector<CompareSpan> spans;
+    thread_local std::vector<std::uint8_t> equal;
     generations.assign(count, entry.generation);
     changed.assign(count, GuestMemory::BlockWritten);
     differing.clear();
+    spans.clear();
     const bool sole = entry.buffer.use_count() == 1;
     GuestMemory::ChangedBlocks(address, bytes, generations, changed);
     for (std::size_t k = 0; k < count; ++k) {
@@ -2272,8 +2276,14 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         const auto from = std::max(address, aligned + k * block);
         const auto to = std::min(end, aligned + (k + 1) * block);
         const auto offset = static_cast<std::size_t>(from - address);
-        const auto length = static_cast<std::size_t>(to - from);
-        if (std::memcmp(held.data() + offset, reinterpret_cast<const void*>(from), length) == 0) continue;
+        spans.push_back({held.data() + offset, reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from)});
+    }
+    equal.assign(spans.size(), 0);
+    CompareSpans(spans, equal);
+    for (std::size_t k = 0; k < spans.size(); ++k) {
+        if (equal[k] != 0) continue;
+        const auto offset = static_cast<std::size_t>(static_cast<const std::byte*>(spans[k].first) - held.data());
+        const auto length = spans[k].bytes;
         if (!sole) return false;
         if (!differing.empty() && differing.back().first + differing.back().second == offset) differing.back().second += length;
         else differing.emplace_back(offset, length);
