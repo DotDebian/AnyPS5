@@ -148,7 +148,12 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     static const bool drawDrain = std::getenv("APS5_DRAW_DRAIN") != nullptr;
     drawPacket = Pm4::DrawOpcode(opcode);
     sampleDump = opcode == 0x46 && (packet[1] & 0x3fu) == 0x39u;
-    if (sampleDump && !drainAll) {
+    // Technical debt: an occlusion counter dump goes to the GPU only when a flip follows it in its
+    // submission, and the flip waits for it (VulkanDevice::SettleSampleDumps). PPSA21564 reads the
+    // counters of queries in submissions without a flip (its levels' early passes) before that flip,
+    // so those still drain; when a title may read counters is not modeled.
+    const bool flipFollows = submission.flips.upper_bound(static_cast<std::size_t>(packet.data() - submission.commands.data())) != submission.flips.end();
+    if (sampleDump && !drainAll && flipFollows) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (const auto localDevice = device.Load()) {

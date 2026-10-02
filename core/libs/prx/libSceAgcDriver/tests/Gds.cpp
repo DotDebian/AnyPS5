@@ -354,6 +354,34 @@ void TransferTests(AgcDriver::VulkanDevice& device) {
     Require(ReadGds(0x310) == 7 && ReadGds(0x314) == 9, "the memory DMA into the GDS stored the wrong dwords");
 }
 
+void SampleDumpSettleTests(AgcDriver::VulkanDevice& device) {
+    constexpr std::size_t bytes = 65536;
+    void* block = std::aligned_alloc(65536, bytes);
+    Require(block != nullptr, "cannot allocate the occlusion counter block");
+    auto* words = static_cast<std::uint64_t*>(block);
+    constexpr std::uint64_t untouched = 0xaaaaaaaaaaaaaaaaull;
+    constexpr std::uint64_t ready = 1ull << 63u;
+    std::fill(words, words + bytes / 8, untouched);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    if (!device.DumpSamplesOnGpu(reinterpret_cast<std::uint64_t>(words))) {
+        std::puts("occlusion counter dumps on the GPU refused: settling not tested");
+        return;
+    }
+    Require(words[0] == untouched, "the occlusion counter dump landed before its batch ran");
+    device.SettleSampleDumps();
+    for (std::size_t db = 0; db < 16; ++db) {
+        Require((words[db * 2] & ready) != 0, "settling did not land counter " + std::to_string(db));
+        Require(words[db * 2 + 1] == untouched, "the dump stored over the next counter");
+    }
+    words[0] = untouched;
+    device.SettleSampleDumps();
+    Require(words[0] == untouched, "settling with no dump made since stored again");
+}
+
 int main() {
     try {
         // Tests do not fill the user's shader disk cache; the device makes its GDS buffer.
@@ -397,6 +425,7 @@ int main() {
         }
 
         TransferTests(device);
+        SampleDumpSettleTests(device);
         std::puts("GDS tests passed");
         return 0;
     } catch (const std::exception& error) {

@@ -198,6 +198,7 @@ struct VulkanDevice::State {
     bool depthClamp = false;
     bool depthBiasClamp = false;
     bool occlusionQueryPrecise = false;
+    std::uint64_t lastSampleDump = 0;
     VkDeviceSize hostImportAlignment = 0;
     bool depthRangeUnrestricted = false;
     bool samplerAnisotropy = false;
@@ -1232,7 +1233,16 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     if (!recorder.DumpSamples(import->address + (address - import->base))) return false;
     recorder.NotePendingWrite(address, bytes);
     GuestMemory::MarkWritten(address, bytes);
+    state->lastSampleDump = address;
     return true;
+}
+
+void VulkanDevice::SettleSampleDumps() {
+    const auto address = std::exchange(state->lastSampleDump, 0);
+    if (address == 0 || !state->recorder) return;
+    constexpr std::size_t bytes = 15 * 16 + 8;
+    auto& recorder = *state->recorder;
+    if (recorder.PendingWriteOverlaps(address, bytes)) recorder.SyncThrough(address, bytes, true);
 }
 
 bool VulkanDevice::TransferGdsOnGpu(const Pm4::GdsTransfer& transfer, bool reapFirst) {
