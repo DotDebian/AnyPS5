@@ -656,6 +656,7 @@ enum class RdnaOpcode : std::uint16_t {
     ImageGather4CLzO,
     ImageGather4h,
     ImageBvhIntersectRay,
+    ImageBvh64IntersectRay,
     VInterpP1F32,
     VInterpP2F32,
     VInterpMovF32,

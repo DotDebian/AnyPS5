@@ -127,6 +127,7 @@ struct SpirvEmitterState {
     std::uint32_t bdaProbeFunction = 0;
     std::uint32_t bdaWritePointerFunction = 0;
     std::uint32_t bdaNoteWriteFunction = 0;
+    std::uint32_t bvhIntersectFunction = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across

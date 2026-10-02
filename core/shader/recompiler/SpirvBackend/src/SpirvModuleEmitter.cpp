@@ -888,6 +888,10 @@ void EmitProgram(SpirvEmitterState& state) {
         state.labels.emplace(block, label);
     }
     DefineGetBdaPointer(state);
+    const auto intersectsRays = std::any_of(program.BlockOrder().begin(), program.BlockOrder().end(), [](const IrBlock* block) {
+        return std::any_of(block->Instructions().begin(), block->Instructions().end(), [](const IrValue* inst) { return inst->Opcode() == IrOpcode::ImageBvhIntersectRay; });
+    });
+    if (intersectsRays) DefineBvhIntersect(state);
     for (const IrBlock* block : program.BlockOrder()) {
         const bool needsScratch = std::any_of(block->Instructions().begin(), block->Instructions().end(), [](const IrValue* inst) {
             return inst->Opcode() == IrOpcode::SwizzleU32 || inst->Opcode() == IrOpcode::SharedAtomicFMin32 || inst->Opcode() == IrOpcode::SharedAtomicFMax32;
