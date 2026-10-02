@@ -144,7 +144,24 @@ void stateTests() {
     queue.context[0x1c5] = 0x999;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register");
     queue.context[0x8e] = 0xf0f;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "gaps");
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register in context bank at DWORD 0x33a");
+    alignas(256) static std::array<std::byte, 1024> slotTwoMemory{};
+    const auto slotTwo = reinterpret_cast<std::uintptr_t>(slotTwoMemory.data());
+    for (const auto offset : {0x31bu, 0x31cu, 0x31du}) queue.context[offset + 2u * 0xfu] = queue.context.at(offset);
+    for (const auto offset : {0x3b0u, 0x3b8u}) queue.context[offset + 2u] = queue.context.at(offset);
+    queue.context[0x318 + 2u * 0xfu] = static_cast<std::uint32_t>(slotTwo >> 8u);
+    queue.context[0x390 + 2u] = static_cast<std::uint32_t>(slotTwo >> 40u);
+    queue.context[0x1e2] = 0x40010001u;
+    for (std::uint32_t i = 0; i < 4; ++i) queue.context[0x105 + i] = 0;
+    queue.context[0x1c5] = 0x909u;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.colors.size() == 2 && state.blends.size() == 3 && state.colors[0].attachment == 0 && state.colors[1].attachment == 2 && state.colors[1].address == slotTwo, "the slots around an unwritten MRT slot did not keep their attachments");
+    Require(state.blends[1].colorWriteMask == 0 && !state.blends[1].blendEnable && state.blends[2].blendEnable && state.blends[2].colorWriteMask == 0xfu && !state.blends[0].blendEnable, "the unwritten MRT slot was not an unused attachment");
+    Require(AgcDriver::Graphics::ExportMappings(state)[2] == state.colors[1].componentMapping && AgcDriver::Graphics::ExportMappings(state)[1] == 0xe4u, "export 2 did not take MRT slot 2's component mapping");
+    queue.context[0x8e] = 0xf00u;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.hasColorTarget && state.colors.size() == 1 && state.blends.size() == 3 && state.colors[0].attachment == 2 && state.color.address == slotTwo && state.blend.blendEnable && state.renderExtent.width == 64, "a draw writing MRT slot 2 alone did not leave slots 0 and 1 unused");
+    Require(state.blends[0].colorWriteMask == 0 && state.blends[1].colorWriteMask == 0, "unwritten MRT slots below the written one have color writes");
     queue = makeState();
     alignas(256) static std::array<std::byte, 1024> slotFourMemory{};
     const auto slotFour = reinterpret_cast<std::uintptr_t>(slotFourMemory.data());
@@ -162,7 +179,8 @@ void stateTests() {
     Require(!state.blends[0].blendEnable && state.blends[1].blendEnable && state.blends[1].colorWriteMask == (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT), "MRT slot 4 did not take its own blend control and target mask");
     Require(AgcDriver::Graphics::ExportMappings(state)[1] == state.colors[1].componentMapping, "export 1 did not take MRT slot 4's component mapping");
     queue.context[0x8e] = 0x30000u;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "gaps");
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.colors.size() == 1 && state.blends.size() == 2 && state.colors[0].attachment == 1 && state.colors[0].address == slotFour && state.blends[0].colorWriteMask == 0 && state.blends[1].blendEnable, "export 1 alone did not reach MRT slot 4 through attachment 1");
     // Without a depth surface (DB_Z_INFO / DB_STENCIL_INFO absent: FORMAT INVALID) the DB passes
     // every test: no attachment (see depthTests for surfaces).
     queue = makeState();
@@ -919,6 +937,8 @@ struct MockVulkan {
     VkPipeline boundPipeline = VK_NULL_HANDLE;
     std::vector<VkAttachmentDescription> renderPassAttachments;
     std::optional<VkAttachmentReference> renderPassDepth;
+    std::vector<VkAttachmentReference> renderPassColors;
+    std::uint32_t blendAttachments = 0;
     std::optional<VkPipelineDepthStencilStateCreateInfo> depthStencil;
     VkPipelineRasterizationStateCreateInfo raster{};
     std::vector<std::vector<std::uint32_t>> shaderModules;
@@ -1074,6 +1094,8 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateRenderPass(VkDevice, const VkRenderPass
     mock.renderPassAttachments.assign(info->pAttachments, info->pAttachments + info->attachmentCount);
     const auto* depth = info->pSubpasses[0].pDepthStencilAttachment;
     mock.renderPassDepth = depth != nullptr ? std::optional<VkAttachmentReference>(*depth) : std::nullopt;
+    const auto& subpass = info->pSubpasses[0];
+    mock.renderPassColors.assign(subpass.pColorAttachments, subpass.pColorAttachments + subpass.colorAttachmentCount);
     *pass = makeHandle<VkRenderPass>();
     ++mock.live;
     return VK_SUCCESS;
@@ -1088,6 +1110,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineC
     const auto* depthStencil = infos[0].pDepthStencilState;
     mock.depthStencil = depthStencil != nullptr ? std::optional<VkPipelineDepthStencilStateCreateInfo>(*depthStencil) : std::nullopt;
     mock.raster = *infos[0].pRasterizationState;
+    mock.blendAttachments = infos[0].pColorBlendState->attachmentCount;
     *pipelines = makeHandle<VkPipeline>();
     ++mock.pipelineCreateCount;
     ++mock.live;
@@ -1924,6 +1947,52 @@ void pixelParameterSlotTests() {
     Require(state.colors.size() == 1 && written == std::set<std::uint32_t>{0u}, "an export past the attachments was not dropped");
 }
 
+void colorGapPipelineTests() {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.limits.maxColorAttachments = 8;
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.spirv = makeModule({});
+    vertex.variantId = 1;
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.spirv = makeModule({.fragment = true, .secondTarget = true});
+    fragment.variantId = 2;
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    const auto plain = DecodeState(makeState());
+    auto gap = plain;
+    gap.blends.insert(gap.blends.begin(), VkPipelineColorBlendAttachmentState{});
+    gap.colors[0].attachment = 1;
+    const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    Require(ValidateShaders(shaders, plain, subgroup, false) == std::set<std::uint32_t>{0u}, "an export past the attachments was not dropped");
+    Require(ValidateShaders(shaders, gap, subgroup, false) == std::set<std::uint32_t>{0u, 1u}, "the export to the attachment after an unused one was dropped");
+    {
+        ShaderResources resources(context, vertex, fragment, gap.color, 0, 0);
+        Pipeline pipeline(context, gap, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        Require(mock.renderPassAttachments.size() == 1 && mock.renderPassColors.size() == 2 && mock.renderPassColors[0].attachment == VK_ATTACHMENT_UNUSED && mock.renderPassColors[1].attachment == 0 && mock.renderPassColors[1].layout == VK_IMAGE_LAYOUT_GENERAL, "the unwritten MRT slot was not an unused attachment of the subpass");
+        Require(mock.blendAttachments == 2, "the blend state does not cover every subpass color attachment");
+        auto inverted = gap;
+        inverted.colors[0].attachment = 2;
+        expectFailure([&] { Pipeline broken(context, inverted, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL); }, "blend states do not match");
+    }
+    {
+        ShaderResources resources(context, vertex, fragment, plain.color, 0, 0);
+        const auto before = mock.pipelineCreateCount;
+        const auto first = CachedPipeline(context, plain, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        Require(CachedPipeline(context, plain, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL) == first && mock.pipelineCreateCount == before + 1, "the same color layout did not share its pipeline");
+        auto second = gap;
+        second.blends[0] = second.blends[1];
+        auto shifted = second;
+        shifted.colors[0].attachment = 0;
+        const auto gapped = CachedPipeline(context, second, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        const auto moved = CachedPipeline(context, shifted, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        Require(gapped != first && moved != gapped && mock.pipelineCreateCount == before + 3, "targets bound to different attachments shared a pipeline");
+        Require(mock.renderPassColors.size() == 2 && mock.renderPassColors[0].attachment == 0 && mock.renderPassColors[1].attachment == VK_ATTACHMENT_UNUSED, "a trailing unused attachment was not kept");
+    }
+    ClearCachedPipelines(context.device);
+    Require(mock.live == 0, "color gap pipelines leaked Vulkan objects");
+}
+
 void validationTests() {
     AgcDriver::Graphics::State state{};
     state.stages.path = AgcDriver::Graphics::ShaderPath::Vertex;
@@ -2285,6 +2354,7 @@ int main() {
         pixelParameterSlotTests();
         rectListTests();
         depthPipelineTests();
+        colorGapPipelineTests();
         mock = MockVulkan{};
         auto bdaContext = mockContext();
         bdaContext.bufferDeviceAddress = true;

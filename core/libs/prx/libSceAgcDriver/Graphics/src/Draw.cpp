@@ -452,7 +452,7 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
         add(state.rectList);
         add(state.topology);
         add(state.cullMode);
-        add(state.colors.size());
+        add(state.blends.size());
         add(context.subgroup.subgroupSize);
         add(context.subgroup.supportedStages);
         add(context.subgroup.supportedOperations);
@@ -891,14 +891,17 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 }
 
 // The render pass a recorded draw begins or continues is named by its attachment views (stable while
-// the kept targets live, so unique within the open batch; the depth view last) and the extent.
-std::uint64_t renderPassKey(std::span<const VkImageView> views, VkImageView depthView, VkExtent2D extent) {
+// the kept targets live, so unique within the open batch; the depth view last), the color attachment
+// slots they are bound to (unused slots make other subpasses incompatible) and the extent.
+std::uint64_t renderPassKey(const State& state, std::span<const VkImageView> views, VkImageView depthView, VkExtent2D extent) {
     std::uint64_t key = 14695981039346656037ull;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
         key *= 1099511628211ull;
     };
     for (const auto view : views) mix(reinterpret_cast<std::uint64_t>(view));
+    mix(state.blends.size());
+    for (const auto& color : state.colors) mix(color.attachment);
     if (depthView != VK_NULL_HANDLE) mix(reinterpret_cast<std::uint64_t>(depthView));
     mix(extent.width);
     mix(extent.height);
@@ -1329,7 +1332,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // continued only when this draw neither reads its attachments (a barrier would be owed, which no
     // pass allows) nor records anything outside a pass (an indirect draw's argument barrier and
     // scratch copies, a pending clear of the depth image).
-    const auto passKey = renderPassKey(record.targetViews, record.depth != nullptr ? record.depth->View() : VK_NULL_HANDLE, state.renderExtent);
+    const auto passKey = renderPassKey(state, record.targetViews, record.depth != nullptr ? record.depth->View() : VK_NULL_HANDLE, state.renderExtent);
     const bool depthClear = record.depth != nullptr && record.depth->ClearPending();
     const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
@@ -1578,7 +1581,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             }
         }
         timer.phase(PhaseReadTarget);
-        binding.target = std::make_unique<RenderTarget>(context, color, state.blends[index].blendEnable != 0);
+        binding.target = std::make_unique<RenderTarget>(context, color, state.blends[color.attachment].blendEnable != 0);
         targetViews.push_back(binding.target->View());
     }
     // The depth attachment is always the resident image of the surface (DepthTarget.hpp).
@@ -1738,7 +1741,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             for (const auto& owner : owners) recipe->targets.emplace_back(owner);
             recipe->targetViews = targetViews;
             recipe->depth = depthImage;
-            recipe->passKey = renderPassKey(targetViews, depthImage != nullptr ? depthImage->View() : VK_NULL_HANDLE, state.renderExtent);
+            recipe->passKey = renderPassKey(state, targetViews, depthImage != nullptr ? depthImage->View() : VK_NULL_HANDLE, state.renderExtent);
             recipe->vertexInput = inputs.vertexInput;
             recipe->pushStages = PushConstantStages(shaders);
             if (recipe->pushStages != 0) {

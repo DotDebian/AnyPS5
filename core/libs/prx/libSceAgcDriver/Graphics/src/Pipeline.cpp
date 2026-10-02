@@ -47,8 +47,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
     // A cached pipeline may outlive its device's teardown (see ClearCachedPipelines); it must not keep
     // the buffer pool, which is reset with the device, alive past it.
     this->context.bufferPool.reset();
-    Require(state.blends.size() == state.colors.size(), "blend states do not match decoded color state");
-    Require(state.colors.size() <= context.limits.maxColorAttachments, "color targets exceed device attachment limits");
+    Require(state.colors.size() <= state.blends.size() && std::all_of(state.colors.begin(), state.colors.end(), [&](const ColorTarget& color) { return color.attachment < state.blends.size(); }), "blend states do not match decoded color state");
+    Require(state.blends.size() <= context.limits.maxColorAttachments, "color targets exceed device attachment limits");
     Require(state.hasColorTarget || state.depth.attached || (context.limits.framebufferNoAttachmentsSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0, "device does not support single-sample rendering without attachments");
     Require(!state.negativeOneToOne || context.depthClipControl, "negative-one-to-one depth clipping requires VK_EXT_depth_clip_control with depthClipControl enabled");
     if (state.rectList) Require(context.tessellationShader && context.limits.maxTessellationPatchSize >= 4, "rect-list requires tessellation with four output control points");
@@ -101,7 +101,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
         Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
         std::vector<VkAttachmentDescription> colors;
-        std::vector<VkAttachmentReference> references;
+        std::vector<VkAttachmentReference> references(state.blends.size(), VkAttachmentReference{VK_ATTACHMENT_UNUSED, attachmentLayout});
         for (std::uint32_t index = 0; index < state.colors.size(); ++index) {
             VkAttachmentDescription color{};
             color.format = state.colors[index].format;
@@ -113,7 +113,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             color.initialLayout = attachmentLayout;
             color.finalLayout = attachmentLayout;
             colors.push_back(color);
-            references.push_back({index, attachmentLayout});
+            references[state.colors[index].attachment] = {index, attachmentLayout};
         }
         VkAttachmentReference depthReference{};
         if (state.depth.attached) {
@@ -373,7 +373,10 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
     for (const auto& blend : state.blends) append(key, blend);
     for (const auto value : state.blendConstants) append(key, value);
     append(key, state.colors.size());
-    for (const auto& color : state.colors) append(key, color.format);
+    for (const auto& color : state.colors) {
+        append(key, color.format);
+        append(key, color.attachment);
+    }
     const auto& depth = state.depth;
     append(key, depth.attached);
     if (depth.attached) {

@@ -49,6 +49,7 @@ struct ColorTarget {
     std::uint32_t mipCount = 1;
     std::uint32_t mip = 0;
     bool mipTail = false;
+    std::uint32_t attachment = 0;
 };
 
 // The depth/stencil surface a draw tests against (DB_Z_INFO, DB_STENCIL_INFO, the DB_*_BASE words,
@@ -98,8 +99,9 @@ struct DepthState {
 
 struct State {
     ShaderStages stages;
-    // The first written MRT slot; `colors`/`blends` hold every written slot, attachment i being the
-    // slot of export MRTi (exports go to the slots CB_SHADER_MASK enables, in order).
+    // The first written MRT slot; `blends` holds one state per attachment, attachment i being the
+    // slot of export MRTi (exports go to the slots CB_SHADER_MASK enables, in order), and `colors`
+    // the written slots with their attachments (an unwritten one is VK_ATTACHMENT_UNUSED).
     ColorTarget color;
     std::vector<ColorTarget> colors;
     std::vector<VkPipelineColorBlendAttachmentState> blends;
