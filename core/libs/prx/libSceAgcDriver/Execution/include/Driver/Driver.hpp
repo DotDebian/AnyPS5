@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PreparedDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -114,7 +116,16 @@ private:
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     std::optional<Graphics::IndirectDrawPath> classifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
-    DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);
+    DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected, std::shared_ptr<PreparedDraw> prepared = nullptr);
+    static void setMeshIndexWords(DrawProgram& front, const Graphics::State& graphics, const Pm4::DrawParameters& parameters);
+    static void foldDrawOffsets(const ShaderRecompiler::RecompileResult& main, const DrawProgram& front, Pm4::DrawParameters& parameters);
+    static void decodeProgramVertexInfo(const DrawProgram& program, ShaderRecompiler::ProgramRole role, std::optional<ShaderRecompiler::ShaderVertexStageInfo>& info, std::vector<Graphics::DecodeRead>& reads);
+    static bool drawAheadEnabled();
+    DrawAhead* frontEnd(std::uint32_t queue);
+    std::shared_ptr<PreparedDraw> prepareDrawAhead(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
+    static ShaderMemory::PendingWrite pendingOverlap(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
+    bool recheckPreparedDraw(const PreparedDraw& prepared, std::uint64_t deviceSerial);
+    void reportDrawAhead();
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
@@ -306,6 +317,11 @@ private:
 
     std::mutex validateMutex;
     ValidateCounters validateCounters;
+
+    std::unique_ptr<DrawAhead> drawAhead;
+    std::atomic<std::uint64_t> aheadRechecks{0};
+    std::array<std::atomic<std::uint64_t>, 5> aheadRecheckFailures{};
+    std::chrono::steady_clock::time_point aheadReported = std::chrono::steady_clock::now();
 
 };
 

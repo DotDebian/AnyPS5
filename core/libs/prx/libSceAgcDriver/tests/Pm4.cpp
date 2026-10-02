@@ -1,13 +1,20 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PreparedDraw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -533,6 +540,213 @@ void testAcquireMem() {
     expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x58, {0, 0, 0, 0, 0, 0, 0, 0}), 0); }, "packet size");
 }
 
+void testStateEffects() {
+    using AgcDriver::Pm4::StateEffect;
+    const auto effect = [](std::uint32_t opcode, std::uint32_t flags = 0) { return AgcDriver::Pm4::PacketStateEffect(makePacket(opcode, {0}, flags)[0]); };
+    for (const auto opcode : {0x11u, 0x12u, 0x13u, 0x26u, 0x2au, 0x2fu, 0x69u, 0x76u, 0x79u, 0x7au, 0x81u}) check(effect(opcode) == StateEffect::Registers, "a register packet is not classed as a register write");
+    for (const auto opcode : {0x63u, 0x64u, 0x9fu}) check(effect(opcode) == StateEffect::Loads, "a register load is not classed as a load");
+    for (const auto opcode : {0x15u, 0x16u, 0x27u, 0x2du, 0x35u, 0x37u, 0x3cu, 0x40u, 0x42u, 0x46u, 0x49u, 0x50u, 0x58u, 0x83u, 0x93u}) check(effect(opcode) == StateEffect::None, "a packet that leaves the state is classed as changing it");
+    check(effect(0x10, 0x24) == StateEffect::Registers && effect(0x10, 0x68) == StateEffect::Registers && effect(0x10, 0x2c) == StateEffect::Registers && effect(0x10, 0x30) == StateEffect::Registers, "a custom state packet is not classed as a register write");
+    check(effect(0x10) == StateEffect::None && AgcDriver::Pm4::PacketStateEffect(0xc004105cu) == StateEffect::None && AgcDriver::Pm4::PacketStateEffect(0xc0021018u) == StateEffect::None, "a NOP, flip or rendering wait is classed as changing the state");
+    check(effect(0x28) == StateEffect::Unknown && effect(0x10, 0x50) == StateEffect::Unknown, "an unmodeled packet is not Unknown");
+    std::array<std::uint32_t, 4> pairs{0x20, 5, 0x21, 6};
+    const auto packet = makePacket(0x9f, {low(pairs.data()), high(pairs.data()), 0x80000000, 2});
+    AgcDriver::QueueState executed, split;
+    execute(executed, packet);
+    const auto read = AgcDriver::Pm4::ReadRegisterPairs(packet);
+    check(read == std::vector<std::uint32_t>(pairs.begin(), pairs.end()), "register load pairs read wrong");
+    AgcDriver::Pm4::ApplyRegisterPairs(packet, split, read);
+    check(executed.context == split.context, "a register load applied apart differs from Execute");
+}
+
+using AgcDriver::DriverDetail::DrawAhead;
+using AgcDriver::DriverDetail::PreparedDraw;
+using AgcDriver::DriverDetail::Submission;
+
+std::uint64_t stateHash(const AgcDriver::QueueState& state) {
+    std::uint64_t key = 0xcbf29ce484222325ull;
+    const auto mix = [&](std::uint64_t value) {
+        key ^= value;
+        key *= 0x100000001b3ull;
+    };
+    for (const auto* bank : {&state.context, &state.shader, &state.userConfig}) {
+        mix(bank->size());
+        for (const auto& [offset, value] : *bank) {
+            mix(offset);
+            mix(value);
+        }
+    }
+    for (const auto value : {state.indexBase, std::uint64_t{state.indexType}, std::uint64_t{state.instanceCount}, std::uint64_t{state.indexBufferSize}, state.markers.size(), std::uint64_t{state.savedContext.has_value()}}) mix(value);
+    return key;
+}
+
+void waitFor(const std::function<bool()>& condition, const char* reason) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!condition()) {
+        check(std::chrono::steady_clock::now() < deadline, reason);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+std::vector<bool> runWorker(DrawAhead& ahead, const Submission& submission, AgcDriver::QueueState& state, const std::function<void(std::size_t)>& beforeDraw = {}) {
+    ahead.Begin(submission, state);
+    std::vector<bool> handed;
+    const auto& commands = submission.commands;
+    for (std::size_t cursor = 0; cursor < commands.size();) {
+        const auto header = commands[cursor];
+        const auto count = AgcDriver::Pm4::PacketWords(header);
+        const auto packet = std::span(commands).subspan(cursor, count);
+        const auto opcode = (header >> 8u) & 0xffu;
+        cursor += count;
+        if (AgcDriver::Pm4::DrawOpcode(opcode)) {
+            if (beforeDraw) beforeDraw(handed.size());
+            const auto prepared = ahead.TakeDraw();
+            check(prepared == nullptr || prepared->drawKey == stateHash(state), "a handed-over draw was prepared from another state");
+            handed.push_back(prepared != nullptr);
+        } else if (AgcDriver::Pm4::RegisterLoadOpcode(opcode)) {
+            const auto pairs = AgcDriver::Pm4::ReadRegisterPairs(packet);
+            AgcDriver::Pm4::ApplyRegisterPairs(packet, state, pairs);
+            ahead.ConfirmLoad(pairs);
+        } else if (AgcDriver::Pm4::PacketStateEffect(header) == AgcDriver::Pm4::StateEffect::Registers) {
+            execute(state, std::vector<std::uint32_t>(packet.begin(), packet.end()));
+        }
+    }
+    ahead.End();
+    return handed;
+}
+
+void testDrawAhead() {
+    std::array<std::uint32_t, 4> firstPairs{0x30, 1, 0x31, 2};
+    std::array<std::uint32_t, 2> shaderPairs{0x40, 3};
+    std::array<std::uint32_t, 2> secondPairs{0x30, 7};
+    std::uint32_t written = 0;
+    Submission submission{};
+    submission.queue = 0;
+    for (const auto& packet : {
+        makePacket(0x69, {0x30, 9}),
+        makePacket(0x2d, {3, 2}),
+        makePacket(0x9f, {low(firstPairs.data()), high(firstPairs.data()), 0x80000000, 2}),
+        makePacket(0x76, {0x50, 11}),
+        makePacket(0x2d, {3, 2}),
+        makePacket(0x10, {1, 0}, 0x68),
+        makePacket(0x63, {low(shaderPairs.data()), high(shaderPairs.data()), 0x80000000, 1}),
+        makePacket(0x2d, {3, 2}),
+        makePacket(0x37, {0x00000500, low(&written), high(&written), 5}),
+        makePacket(0x10, {2, 0}, 0x68),
+        makePacket(0x2f, {4}),
+        makePacket(0x2d, {3, 2}),
+        makePacket(0x9f, {low(secondPairs.data()), high(secondPairs.data()), 0x80000000, 1}),
+        makePacket(0x10, {0x00636261}, 0x2c),
+        makePacket(0x2d, {3, 2}),
+        makePacket(0x10, {0}, 0x30),
+        makePacket(0x79, {0x242, 4}),
+        makePacket(0x2d, {3, 2})
+    }) submission.commands.insert(submission.commands.end(), packet.begin(), packet.end());
+    constexpr std::size_t draws = 6;
+
+    std::atomic<std::size_t> prepares{0};
+    std::atomic<bool> corruptSecondLoad{false};
+    std::atomic<bool> released{true};
+    const auto prepare = [&](const AgcDriver::QueueState& state, std::span<const std::uint32_t>, const Submission&) {
+        auto prepared = std::make_shared<PreparedDraw>();
+        prepared->drawKey = stateHash(state);
+        ++prepares;
+        return prepared;
+    };
+    const auto readPairs = [&](std::span<const std::uint32_t> packet) {
+        auto pairs = AgcDriver::Pm4::ReadRegisterPairs(packet);
+        if (corruptSecondLoad && packet[1] == low(secondPairs.data())) pairs[1] ^= 0xffu;
+        return pairs;
+    };
+    const auto started = [&] { waitFor([&] { return released.load(); }, "the front end was never released"); };
+
+    {
+        DrawAhead ahead(prepare, readPairs, started);
+        AgcDriver::QueueState state;
+        const auto handed = runWorker(ahead, submission, state, [&](std::size_t index) {
+            if (index == 0) waitFor([&] { return prepares.load() == draws; }, "the front end did not prepare every draw");
+        });
+        check(handed == std::vector<bool>(draws, true), "a draw prepared ahead was not handed over");
+        const auto totals = ahead.Totals();
+        check(totals.handed == draws && totals.loadsAhead == 3 && totals.loadMismatches == 0, "front end counters wrong");
+        check(written == 0, "the front end executed a memory store");
+
+        prepares = 0;
+        const auto again = runWorker(ahead, submission, state, [&](std::size_t index) {
+            if (index == 0) waitFor([&] { return prepares.load() == draws; }, "the front end did not prepare every draw again");
+        });
+        check(again == std::vector<bool>(draws, true), "a second submission's draws were not handed over");
+    }
+    {
+        corruptSecondLoad = true;
+        prepares = 0;
+        DrawAhead ahead(prepare, readPairs, started);
+        AgcDriver::QueueState state;
+        const auto handed = runWorker(ahead, submission, state, [&](std::size_t index) {
+            if (index == 0) waitFor([&] { return prepares.load() == draws; }, "the front end did not prepare every draw");
+        });
+        check(handed == std::vector<bool>{true, true, true, true, false, false}, "draws after a differing load were handed over");
+        check(ahead.Totals().loadMismatches == 1 && ahead.Totals().poisonedDraws == 2, "a differing load was not counted");
+        corruptSecondLoad = false;
+    }
+    {
+        corruptSecondLoad = true;
+        released = false;
+        prepares = 0;
+        DrawAhead ahead(prepare, [&](std::span<const std::uint32_t> packet) {
+            check(packet[1] != low(firstPairs.data()) && packet[1] != low(shaderPairs.data()), "the front end read a load the worker had confirmed");
+            return readPairs(packet);
+        }, started);
+        AgcDriver::QueueState state;
+        corruptSecondLoad = false;
+        const auto handed = runWorker(ahead, submission, state, [&](std::size_t index) {
+            if (index != 3) return;
+            released = true;
+            waitFor([&] { return prepares.load() == 3; }, "the released front end did not prepare the remaining draws");
+        });
+        check(handed == std::vector<bool>{false, false, false, true, true, true}, "the worker's own draws or the prepared ones went wrong");
+        const auto totals = ahead.Totals();
+        check(totals.workerOwn == 3 && totals.loadsBehind == 2 && totals.loadsAhead == 1, "worker-first loads were not used by the front end");
+    }
+    {
+        auto stopped = submission;
+        const auto unknown = makePacket(0x28, {0});
+        stopped.commands.insert(stopped.commands.begin() + 2 + 3, unknown.begin(), unknown.end());
+        prepares = 0;
+        DrawAhead ahead(prepare, readPairs, started);
+        AgcDriver::QueueState state;
+        const auto handed = runWorker(ahead, stopped, state, [&](std::size_t index) {
+            if (index == 0) waitFor([&] { return ahead.Totals().stopped == 1; }, "the front end did not stop at an unknown packet");
+        });
+        check(handed == std::vector<bool>{true, false, false, false, false, false}, "draws after an unknown packet were prepared");
+        prepares = 0;
+        const auto failing = [&](std::span<const std::uint32_t> packet) -> std::vector<std::uint32_t> {
+            if (packet[1] == low(shaderPairs.data())) throw std::runtime_error("unreadable");
+            return AgcDriver::Pm4::ReadRegisterPairs(packet);
+        };
+        DrawAhead unreadable(prepare, failing, started);
+        AgcDriver::QueueState other;
+        const auto partial = runWorker(unreadable, submission, other, [&](std::size_t index) {
+            if (index == 0) waitFor([&] { return unreadable.Totals().stopped == 1; }, "the front end did not stop at an unreadable load");
+        });
+        check(partial == std::vector<bool>{true, true, false, false, false, false}, "draws after an unreadable load were handed over");
+    }
+    {
+        DrawAhead ahead([&](const AgcDriver::QueueState& state, std::span<const std::uint32_t> packet, const Submission& job) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            return prepare(state, packet, job);
+        }, readPairs, started);
+        AgcDriver::QueueState state;
+        std::size_t handedTotal = 0;
+        for (int round = 0; round < 200; ++round) {
+            const auto handed = runWorker(ahead, submission, state);
+            handedTotal += static_cast<std::size_t>(std::count(handed.begin(), handed.end(), true));
+        }
+        const auto totals = ahead.Totals();
+        check(totals.handed == handedTotal && totals.handed + totals.workerOwn + totals.poisonedDraws == totals.draws && totals.draws == 200 * draws, "racing submissions lost a draw");
+    }
+}
+
 void testDriverSubmission() {
     std::array<std::uint32_t, 2> source{0x10, 73};
     std::array<std::uint32_t, 1> destination{};
@@ -615,6 +829,8 @@ int main(int argc, char** argv) {
         testEventWrite();
         testGpuTimestampScale();
         testAcquireMem();
+        testStateEffects();
+        testDrawAhead();
         testDriverSubmission();
         LibcRunShutdown_nid_postfix();
         std::puts("PM4 catalog, registers, state, memory and submission tests passed");

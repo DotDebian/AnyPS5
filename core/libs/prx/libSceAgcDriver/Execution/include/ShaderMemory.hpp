@@ -68,6 +68,8 @@ public:
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
+    enum class Recheck : std::uint8_t { Same, Pending, Differs, Unreadable };
+    [[nodiscard]] Recheck RecheckReads(PendingWriteQuery pendingWrite) const;
 
 private:
     static constexpr std::size_t PageBytes = 4096;

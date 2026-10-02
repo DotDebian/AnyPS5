@@ -217,6 +217,41 @@ bool ShaderMemory::readable(void* context, std::uint64_t address) {
     return GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(std::uint32_t));
 }
 
+ShaderMemory::Recheck ShaderMemory::RecheckReads(PendingWriteQuery pendingWrite) const {
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
+    for (const auto& [base, page] : pages) {
+        if (page.read.none()) continue;
+        if (page.wordwise) return Recheck::Pending;
+        if (page.valid.all()) {
+            if (pendingWrite != nullptr && pendingWrite(base, PageBytes, {}) != PendingWrite::None) return Recheck::Pending;
+            GuestMemory::FlushGpuWrites(base, PageBytes);
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) return Recheck::Unreadable;
+            const auto* now = reinterpret_cast<const std::uint32_t*>(base);
+            for (std::size_t index = 0; index < PageWords;) {
+                if (!page.read.test(index)) {
+                    ++index;
+                    continue;
+                }
+                const auto first = index;
+                while (index < PageWords && page.read.test(index)) ++index;
+                if (std::memcmp(now + first, page.words.data() + first, (index - first) * sizeof(std::uint32_t)) != 0) return Recheck::Differs;
+            }
+            continue;
+        }
+        for (std::size_t index = 0; index < PageWords; ++index) {
+            if (!page.read.test(index)) continue;
+            std::uint32_t word = 0;
+            try {
+                GuestMemory::Read(base + index * sizeof(word), std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
+            } catch (const std::runtime_error&) {
+                return Recheck::Unreadable;
+            }
+            if (word != page.words[index]) return Recheck::Differs;
+        }
+    }
+    return Recheck::Same;
+}
+
 ShaderMemory::KnownValueCounts ShaderMemory::KnownValues() {
     auto& totals = CaptureTotals();
     return {totals.wordsKnown.load(std::memory_order_relaxed), totals.wordsKnownVerified.load(std::memory_order_relaxed), totals.wordsKnownMismatches.load(std::memory_order_relaxed)};

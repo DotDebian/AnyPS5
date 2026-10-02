@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
@@ -31,6 +32,14 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 
 namespace {
 
@@ -1000,6 +1009,89 @@ void verifyGpuSelectedBuffer(bool enabled) {
     require(std::any_of(result->bindings.begin(), result->bindings.end(), [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::BdaPagetable; }), "GPU-selected V#s: a V# read from GPU memory was not taken through BDA by default");
 }
 
+std::size_t flushCalls = 0;
+std::uint32_t* flushStore = nullptr;
+std::uint32_t flushValue = 0;
+
+void countingFlush(std::uint64_t, std::size_t) {
+    ++flushCalls;
+    if (flushStore != nullptr) *flushStore = flushValue;
+}
+
+AgcDriver::ShaderMemory::PendingWrite reportPending(std::uint64_t, std::size_t, std::span<std::byte>) { return AgcDriver::ShaderMemory::PendingWrite::Sync; }
+
+AgcDriver::ShaderMemory::PendingWrite reportNothing(std::uint64_t, std::size_t, std::span<std::byte>) { return AgcDriver::ShaderMemory::PendingWrite::None; }
+
+void verifyRecheckReads() {
+    using namespace ShaderRecompiler;
+    using Recheck = AgcDriver::ShaderMemory::Recheck;
+    constexpr std::size_t PageBytes = 4096;
+#ifdef _WIN32
+    auto* page = static_cast<std::byte*>(VirtualAlloc(nullptr, PageBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    require(page != nullptr, "recheck: cannot map a test page");
+#else
+    auto* page = static_cast<std::byte*>(mmap(nullptr, PageBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    require(page != MAP_FAILED, "recheck: cannot map a test page");
+#endif
+    auto* payload = reinterpret_cast<std::uint32_t*>(page + 256);
+    auto* table = reinterpret_cast<std::uint64_t*>(page);
+    *payload = 0x3f800000u;
+    *table = reinterpret_cast<std::uintptr_t>(payload);
+    static const std::array<std::uint32_t, 8> code{0xf4040004u, 0xfa000000u, 0xf4000080u, 0xfa000000u, 0x7e000202u, 0xf80008cfu, 0u, 0xbf810000u};
+    const auto address = reinterpret_cast<std::uintptr_t>(table);
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Vertex, 0x10000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 8;
+    request.context.userData = userData;
+    request.context.vertex = ShaderVertexStageInfo{};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+
+    AgcDriver::GuestMemory::SetFlushHook(&countingFlush);
+    AgcDriver::ShaderMemory ahead({});
+    {
+        const AgcDriver::GuestMemory::UnhookedReadScope unhooked;
+        static_cast<void>(ahead.Capture(request));
+    }
+    require(flushCalls == 0, "recheck: a capture under UnhookedReadScope went through the flush hook");
+    require(ahead.RecheckReads(nullptr) == Recheck::Same, "recheck: unchanged words did not recheck the same");
+    require(flushCalls != 0, "recheck: the recheck did not go through the flush hook");
+    require(ahead.RecheckReads(&reportNothing) == Recheck::Same, "recheck: a query reporting no GPU writes failed the recheck");
+    require(ahead.RecheckReads(&reportPending) == Recheck::Pending, "recheck: recorded GPU writes over a page read whole were not reported");
+
+    *payload = 0x40000000u;
+    require(ahead.RecheckReads(nullptr) == Recheck::Differs, "recheck: a changed read word was not found");
+    *payload = 0x3f800000u;
+    page[512] = std::byte{1};
+    require(ahead.RecheckReads(nullptr) == Recheck::Same, "recheck: a changed word the capture never read failed the recheck");
+
+    flushStore = payload;
+    flushValue = 0x40400000u;
+    require(ahead.RecheckReads(nullptr) == Recheck::Differs, "recheck: the words were compared before the flush hook stored the GPU's results");
+    flushStore = nullptr;
+    *payload = 0x3f800000u;
+    require(ahead.RecheckReads(nullptr) == Recheck::Same, "recheck: restored words did not recheck the same");
+
+#ifdef _WIN32
+    DWORD previous = 0;
+    require(VirtualProtect(page, PageBytes, PAGE_NOACCESS, &previous) != 0, "recheck: cannot protect the test page");
+#else
+    require(mprotect(page, PageBytes, PROT_NONE) == 0, "recheck: cannot protect the test page");
+#endif
+    require(ahead.RecheckReads(nullptr) == Recheck::Unreadable, "recheck: an unmapped page read whole was not reported unreadable");
+    AgcDriver::GuestMemory::SetFlushHook(nullptr);
+#ifdef _WIN32
+    VirtualFree(page, 0, MEM_RELEASE);
+#else
+    munmap(page, PageBytes);
+#endif
+}
+
 int main(int argc, char** argv) {
     try {
         using namespace ShaderRecompiler;
@@ -1009,6 +1101,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         verifyGpuSelectedBuffer(true);
+        verifyRecheckReads();
         verifyWaveUniformValues();
         verifyRegisterSources();
         verifyPureFlatSlots();

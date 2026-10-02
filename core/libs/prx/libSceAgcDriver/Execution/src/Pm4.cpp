@@ -732,6 +732,48 @@ DrawParameters ResolveDraw(std::span<const std::uint32_t> packet, const QueueSta
     return {address, count, indexSize, queue.instanceCount, packet.back(), true, indexOffset->second, 0};
 }
 
+std::vector<std::uint32_t> ReadRegisterPairs(std::span<const std::uint32_t> packet) {
+    require(RegisterLoadOpcode((packet[0] >> 8u) & 0xffu) && packet.size() >= 5, "expected a register load packet");
+    std::vector<std::uint32_t> pairs(static_cast<std::size_t>(packet[4]) * 2);
+    // Named for the [hooksync] attribution (the read goes through the flush hook).
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
+    GuestMemory::Read(address(packet[1], packet[2]), std::as_writable_bytes(std::span(pairs)), 4);
+    return pairs;
+}
+
+void ApplyRegisterPairs(std::span<const std::uint32_t> packet, QueueState& queue, std::span<const std::uint32_t> pairs) {
+    const auto opcode = (packet[0] >> 8u) & 0xffu;
+    require(RegisterLoadOpcode(opcode) && pairs.size() % 2 == 0, "expected a register load packet and whole pairs");
+    for (std::size_t i = 0; i < pairs.size(); i += 2) registerOffset(pairs[i]);
+    for (std::size_t i = 0; i < pairs.size(); i += 2) writeRegister(queue, opcode, registerOffset(pairs[i]), pairs[i + 1]);
+    if (queue.savedContext.has_value() && TraceContextState()) {
+        std::fprintf(stderr, "[context]   indirect 0x%x:", opcode);
+        for (std::size_t i = 0; i < pairs.size(); i += 2) std::fprintf(stderr, " %x", registerOffset(pairs[i]));
+        std::fprintf(stderr, "\n");
+    }
+}
+
+StateEffect PacketStateEffect(std::uint32_t header) {
+    if (FillerPacket(header)) return StateEffect::None;
+    const auto opcode = (header >> 8u) & 0xffu;
+    if (opcode == 0x10) {
+        switch ((header >> 2u) & 0x3fu) {
+            case 0: case 0x06: case 0x17: return StateEffect::None;
+            case 0x09: case 0x0b: case 0x0c: case 0x1a: return StateEffect::Registers;
+            default: return StateEffect::Unknown;
+        }
+    }
+    if (DrawOpcode(opcode)) return StateEffect::None;
+    if (RegisterLoadOpcode(opcode)) return StateEffect::Loads;
+    switch (opcode) {
+        case 0x11: case 0x12: case 0x13: case 0x26: case 0x2a: case 0x2f: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81:
+            return StateEffect::Registers;
+        case 0x15: case 0x16: case 0x37: case 0x3c: case 0x40: case 0x42: case 0x46: case 0x49: case 0x50: case 0x58: case 0x59: case 0x83: case 0x93:
+            return StateEffect::None;
+        default: return StateEffect::Unknown;
+    }
+}
+
 void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     switch (opcode) {
@@ -774,20 +816,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
         case 0x26: queue.indexBase = address(packet[1], packet[2]); return;
         case 0x2a: queue.indexType = packet[1]; return;
         case 0x2f: queue.instanceCount = packet[1]; return;
-        case 0x63: case 0x64: case 0x9f: {
-            std::vector<std::uint32_t> pairs(static_cast<std::size_t>(packet[4]) * 2);
-            // Named for the [hooksync] attribution (the read goes through the flush hook).
-            const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
-            GuestMemory::Read(address(packet[1], packet[2]), std::as_writable_bytes(std::span(pairs)), 4);
-            for (std::size_t i = 0; i < pairs.size(); i += 2) registerOffset(pairs[i]);
-            for (std::size_t i = 0; i < pairs.size(); i += 2) writeRegister(queue, opcode, registerOffset(pairs[i]), pairs[i + 1]);
-            if (queue.savedContext.has_value() && TraceContextState()) {
-                std::fprintf(stderr, "[context]   indirect 0x%x:", opcode);
-                for (std::size_t i = 0; i < pairs.size(); i += 2) std::fprintf(stderr, " %x", registerOffset(pairs[i]));
-                std::fprintf(stderr, "\n");
-            }
-            return;
-        }
+        case 0x63: case 0x64: case 0x9f: ApplyRegisterPairs(packet, queue, ReadRegisterPairs(packet)); return;
         case 0x59: break;
         case 0x3c: case 0x93: {
             // The waited-on value is written by the CPU or another queue; poll it like the CP would.

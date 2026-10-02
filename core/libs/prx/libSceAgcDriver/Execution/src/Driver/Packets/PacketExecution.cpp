@@ -113,6 +113,17 @@ void Driver::execute(const Submission& submission) {
     ++packetProfile.submissions;
 
     bumpEpoch(&EpochBumps::submissions);
+    struct AheadScope {
+        DrawAhead* ahead = nullptr;
+        ~AheadScope() {
+            if (ahead != nullptr) ahead->End();
+        }
+    } aheadScope;
+    if (auto* ahead = submission.rewindTail == nullptr ? frontEnd(submission.queue) : nullptr) {
+        ahead->Begin(submission, queue);
+        aheadScope.ahead = ahead;
+        reportDrawAhead();
+    }
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -232,6 +243,7 @@ void Driver::execute(const Submission& submission) {
                 }
             }
         } else if (drawPacket) {
+            auto prepared = aheadScope.ahead != nullptr ? aheadScope.ahead->TakeDraw() : nullptr;
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] { tolerate("draw", [&] {
                 static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
@@ -266,7 +278,7 @@ void Driver::execute(const Submission& submission) {
                 };
                 try {
                     std::string rejected;
-                    const auto verdict = draw(queue, packet, submission, rejected);
+                    const auto verdict = draw(queue, packet, submission, rejected, std::move(prepared));
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {
@@ -287,7 +299,15 @@ void Driver::execute(const Submission& submission) {
         } else if (sampleDump && !wroteOnGpu) {
             dumpSampleCounters(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u));
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
-            if (!wroteOnGpu) {
+            if (aheadScope.ahead != nullptr && Pm4::RegisterLoadOpcode(opcode)) {
+                if (wroteOnGpu) {
+                    aheadScope.ahead->Poison();
+                } else {
+                    const auto pairs = Pm4::ReadRegisterPairs(packet);
+                    Pm4::ApplyRegisterPairs(packet, queue, pairs);
+                    aheadScope.ahead->ConfirmLoad(pairs);
+                }
+            } else if (!wroteOnGpu) {
                 Pm4::Execute(packet, queue);
                 if (opcode == 0x49 || opcode == 0x37) {
                     if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial);
@@ -299,6 +319,10 @@ void Driver::execute(const Submission& submission) {
         cursor += count;
     }
 
+    if (aheadScope.ahead != nullptr) {
+        aheadScope.ahead->End();
+        aheadScope.ahead = nullptr;
+    }
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
     if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {
         auto& costs = submissionCosts(submission.queue);
