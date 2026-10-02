@@ -154,6 +154,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureTiling.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureResidency.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
@@ -368,6 +369,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/TextureTiling.cpp
         Graphics/src/TextureDetiler.cpp
         Graphics/src/Texture.cpp
+        Graphics/src/TextureResidency.cpp
         Graphics/src/UnitShadow.cpp
         Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
@@ -549,6 +551,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/TextureTiling.cpp
             Graphics/src/TextureDetiler.cpp
             Graphics/src/Texture.cpp
+            Graphics/src/TextureResidency.cpp
             Graphics/src/UnitShadow.cpp
             Graphics/src/Sampler.cpp
             ${agcTextureDetileShaderHeader}

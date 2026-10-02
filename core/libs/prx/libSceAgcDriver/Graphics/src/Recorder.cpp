@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureResidency.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -2844,6 +2845,7 @@ void Recorder::Submit() {
     Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
+    ResidencyClock::NoteSubmission();
     if (TraceRecord()) {
         std::string line;
         for (const auto program : batch->tracePrograms) {

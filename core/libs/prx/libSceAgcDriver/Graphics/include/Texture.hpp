@@ -82,6 +82,10 @@ public:
     // the source image's own (snapshots, views over other metadata); one per cache entry, so every
     // object binding the texture shares it. Under GuestMemory::GpuMutex only.
     DccKeyProof& KeyProof() const { return keyProof; }
+    void NoteResidencyUse(std::uint64_t tick) const {
+        if (residencyUse.load(std::memory_order_relaxed) != tick) residencyUse.store(tick, std::memory_order_relaxed);
+    }
+    std::uint64_t ResidencyUse() const { return residencyUse.load(std::memory_order_relaxed); }
 
 private:
     void release() noexcept;
@@ -101,6 +105,7 @@ private:
     VkImageAspectFlags imageAspect = 0;
     std::uint32_t imageLayers = 0;
     std::atomic<bool> residentDepth{false};
+    mutable std::atomic<std::uint64_t> residencyUse{0};
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;

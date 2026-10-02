@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureResidency.hpp"
 #include "prx/libc/include/General.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -92,6 +93,7 @@ struct CachedTexture {
     std::shared_ptr<StorageTexture> source;
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
+    std::uint64_t lastUse = 0;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -102,6 +104,9 @@ struct TextureCache {
     std::list<CachedTexture> entries;
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::uint64_t bytes = 0;
+    std::uint64_t hostBytes = 0;
+    std::uint64_t sweptDepartures = 0;
+    std::uint64_t maintainedFrame = std::numeric_limits<std::uint64_t>::max();
 };
 
 TextureCache& Textures() {
@@ -127,12 +132,27 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
 
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.bytes -= it->accounted;
+    cache.hostBytes -= it->bytes.size();
     cache.index.erase(it->key);
     cache.entries.erase(it);
 }
 
+std::uint64_t dropDeadViews(TextureCache& cache) {
+    std::uint64_t dropped = 0;
+    for (auto it = cache.entries.begin(); it != cache.entries.end();) {
+        if (it->source == nullptr || it->source->Cached()) {
+            ++it;
+            continue;
+        }
+        eraseTexture(cache, it++);
+        ++dropped;
+    }
+    return dropped;
+}
+
 // Moves an entry to the front (most recently used).
 void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
+    it->lastUse = ResidencyClock::Now();
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
 }
 
@@ -154,6 +174,20 @@ struct TextureCounters {
     // Storage images a Revalidate refreshed directly instead of through the lookups (T1, see
     // ShaderResources::refreshOwnObjects).
     std::atomic<std::uint64_t> ownRefreshes{0};
+    std::atomic<std::uint64_t> sampledEvicted{0};
+    std::atomic<std::uint64_t> sampledEvictedBytes{0};
+    std::atomic<std::uint64_t> sampledRescued{0};
+    std::atomic<std::uint64_t> deadViews{0};
+    std::atomic<std::uint64_t> storageEvicted{0};
+    std::atomic<std::uint64_t> storageEvictedBytes{0};
+    std::atomic<std::uint64_t> sampledBytes{0};
+    std::atomic<std::uint64_t> sampledHostBytes{0};
+    std::atomic<std::uint64_t> storageBytes{0};
+    std::atomic<std::uint64_t> sampledSoft{0};
+    std::atomic<std::uint64_t> sampledHard{0};
+    std::atomic<std::uint64_t> storageSoft{0};
+    std::atomic<std::uint64_t> storageHard{0};
+    std::atomic<std::uint64_t> exhaustedRetries{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -162,15 +196,102 @@ TextureCounters& TextureCounts() {
     return counters;
 }
 
+struct ResidencyConfig {
+    ResidencyPolicy policy;
+    std::uint64_t minIdleTicks = 16;
+    std::uint32_t minIdleFrames = 2;
+    std::optional<std::uint64_t> sampledOverride;
+    std::optional<std::uint64_t> storageOverride;
+    std::uint64_t hostSoft = 0;
+};
+
+const ResidencyConfig& Residency() {
+    static const ResidencyConfig config = [] {
+        ResidencyConfig made;
+        const char* mode = std::getenv("APS5_TEXTURE_EVICTION");
+        made.policy.strictLru = mode != nullptr && std::strcmp(mode, "lru") == 0;
+        if (const char* text = std::getenv("APS5_TEXTURE_IDLE_SUBMISSIONS")) made.minIdleTicks = std::max<std::uint64_t>(1, std::strtoull(text, nullptr, 10));
+        if (const char* text = std::getenv("APS5_TEXTURE_IDLE_FRAMES")) made.minIdleFrames = static_cast<std::uint32_t>(std::max<std::uint64_t>(1, std::strtoull(text, nullptr, 10)));
+        made.sampledOverride = MebibytesFromEnvironment("APS5_TEXTURE_CACHE_MIB");
+        made.storageOverride = MebibytesFromEnvironment("APS5_STORAGE_CACHE_MIB");
+        made.hostSoft = HostSoftLimit(PhysicalMemoryBytes(), MebibytesFromEnvironment("APS5_TEXTURE_HOST_MIB"));
+        if (made.policy.strictLru) {
+            constexpr std::uint64_t oldBudget = 2048ull << 20u;
+            if (!made.sampledOverride.has_value()) made.sampledOverride = oldBudget;
+            if (!made.storageOverride.has_value()) made.storageOverride = oldBudget;
+        }
+        return made;
+    }();
+    return config;
+}
+
+DeviceMemoryBudget SampleDeviceBudget(const Context& context, std::uint64_t& heapBytes) {
+    struct Sample {
+        std::mutex mutex;
+        std::uint64_t frame = std::numeric_limits<std::uint64_t>::max();
+        std::chrono::steady_clock::time_point at{};
+        DeviceMemoryBudget budget;
+        std::uint64_t heapBytes = 0;
+    };
+    static Sample sample;
+    std::lock_guard lock(sample.mutex);
+    const auto now = std::chrono::steady_clock::now();
+    const auto frame = ResidencyClock::Frame();
+    if (frame != sample.frame || now - sample.at > std::chrono::seconds(1)) {
+        sample.budget = QueryDeviceMemoryBudget(context);
+        sample.heapBytes = DeviceLocalHeapBytes(context);
+        sample.frame = frame;
+        sample.at = now;
+    }
+    heapBytes = sample.heapBytes;
+    return sample.budget;
+}
+
+ResidencyLimits CacheLimits(const Context& context, std::uint64_t cacheDeviceBytes, std::uint64_t numerator, std::uint64_t denominator, std::optional<std::uint64_t> deviceOverride, bool holdsHostCopies) {
+    constexpr auto unlimited = std::numeric_limits<std::uint64_t>::max();
+    const auto& config = Residency();
+    ResidencyLimits limits{unlimited, unlimited, unlimited, unlimited};
+    if (config.policy.strictLru) {
+        limits.deviceSoft = *deviceOverride;
+        return limits;
+    }
+    std::uint64_t heapBytes = 0;
+    const auto budget = SampleDeviceBudget(context, heapBytes);
+    limits.deviceHard = DeviceHardLimit(budget, heapBytes, cacheDeviceBytes);
+    limits.deviceSoft = DeviceSoftLimit(budget, heapBytes, numerator, denominator, deviceOverride);
+    if (holdsHostCopies) {
+        limits.hostSoft = config.hostSoft;
+        limits.hostHard = config.hostSoft * 2;
+    }
+    return limits;
+}
+
+ResidencyPolicy ExhaustedPolicy() {
+    ResidencyPolicy policy;
+    policy.criticalEvictionsPerPass = std::numeric_limits<std::size_t>::max();
+    policy.scansPerPass = std::numeric_limits<std::size_t>::max();
+    return policy;
+}
+
+bool ChargeTextureViews() {
+    static const bool charge = std::getenv("APS5_CHARGE_TEXTURE_VIEWS") != nullptr;
+    return charge;
+}
+
+std::atomic<std::uint64_t>& StorageDepartures() {
+    static std::atomic<std::uint64_t> departures{0};
+    return departures;
+}
+
 void reportTextureCounters() {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_TEXTURE_STATS") != nullptr;
     if (!profile) return;
     auto& counters = TextureCounts();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes));
+    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; residency: sampled %llu MiB held (%llu MiB host copies, soft %llu, hard %llu), %llu evicted (%llu MiB), %llu rescued, %llu dead views dropped; storage %llu MiB held (soft %llu, hard %llu), %llu evicted (%llu MiB); %llu retries after device memory ran out\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.sampledBytes) >> 20u, count(counters.sampledHostBytes) >> 20u, count(counters.sampledSoft) >> 20u, count(counters.sampledHard) >> 20u, count(counters.sampledEvicted), count(counters.sampledEvictedBytes) >> 20u, count(counters.sampledRescued), count(counters.deadViews), count(counters.storageBytes) >> 20u, count(counters.storageSoft) >> 20u, count(counters.storageHard) >> 20u, count(counters.storageEvicted), count(counters.storageEvictedBytes) >> 20u, count(counters.exhaustedRetries));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -267,6 +388,36 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false);
+
+EvictionOutcome evictSampled(TextureCache& cache, ResidencyUsage& usage, const ResidencyLimits& limits, const ResidencyPolicy& policy) {
+    const auto& config = Residency();
+    const auto window = ResidencyClock::Window(config.minIdleTicks, config.minIdleFrames);
+    const auto outcome = RunEvictionPass(
+            cache.entries, usage, limits, window, policy,
+            [](const CachedTexture& entry) { return ResidencyEntryState{entry.lastUse, std::max(entry.lastUse, entry.texture->ResidencyUse()), entry.accounted, entry.bytes.size()}; },
+            [&](std::list<CachedTexture>::iterator it) {
+                it->lastUse = std::max(it->lastUse, it->texture->ResidencyUse());
+                cache.entries.splice(cache.entries.begin(), cache.entries, it);
+            },
+            [&](std::list<CachedTexture>::iterator it) { eraseTexture(cache, it); });
+    auto& counters = TextureCounts();
+    counters.sampledEvicted.fetch_add(outcome.evicted, std::memory_order_relaxed);
+    counters.sampledEvictedBytes.fetch_add(outcome.deviceBytes, std::memory_order_relaxed);
+    counters.sampledRescued.fetch_add(outcome.rescued, std::memory_order_relaxed);
+    return outcome;
+}
+
+template<typename Make>
+auto makeWithSampledMemory(TextureCache& cache, Make make) {
+    try {
+        return make();
+    } catch (const DeviceMemoryExhausted&) {
+        ResidencyUsage usage{cache.bytes, cache.hostBytes};
+        evictSampled(cache, usage, ResidencyLimits{}, ExhaustedPolicy());
+        TextureCounts().exhaustedRetries.fetch_add(1, std::memory_order_relaxed);
+        return make();
+    }
+}
 
 std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes, bool depthCompare, VkImageAspectFlags depthAspect) {
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
@@ -383,6 +534,11 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     std::lock_guard lock(cache.mutex);
+    if (const auto frame = ResidencyClock::Frame(); frame != cache.maintainedFrame && !Residency().policy.strictLru) {
+        cache.maintainedFrame = frame;
+        ResidencyUsage usage{cache.bytes, cache.hostBytes};
+        evictSampled(cache, usage, CacheLimits(context, cache.bytes, 3, 8, Residency().sampledOverride, true), Residency().policy);
+    }
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         if (it->source != nullptr) {
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
@@ -419,11 +575,11 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
         eraseTexture(cache, it);
     }
     CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
-    entry.accounted = guestBytes;
+    entry.accounted = source != nullptr && !ChargeTextureViews() ? 0u : guestBytes;
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
-        entry.texture = std::make_shared<Texture>(context, source, resource, components);
+        entry.texture = makeWithSampledMemory(cache, [&] { return std::make_shared<Texture>(context, source, resource, components); });
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
@@ -435,12 +591,24 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
             for (std::size_t i = 0; i < entry.bytes.size(); i += 64) nonzero += entry.bytes[i] != std::byte{0};
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
         }
-        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
+        entry.texture = makeWithSampledMemory(cache, [&] { return std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare); });
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
-    constexpr std::uint64_t budget = 2048ull << 20u;
-    while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) eraseTexture(cache, std::prev(cache.entries.end()));
+    const auto& residency = Residency();
+    if (const auto departures = StorageDepartures().load(std::memory_order_relaxed); !residency.policy.strictLru && departures != cache.sweptDepartures) {
+        cache.sweptDepartures = departures;
+        counters.deadViews.fetch_add(dropDeadViews(cache), std::memory_order_relaxed);
+    }
+    const auto limits = CacheLimits(context, cache.bytes, 3, 8, residency.sampledOverride, true);
+    ResidencyUsage usage{cache.bytes + entry.accounted, cache.hostBytes + entry.bytes.size()};
+    evictSampled(cache, usage, limits, residency.policy);
     cache.bytes += entry.accounted;
+    cache.hostBytes += entry.bytes.size();
+    entry.lastUse = ResidencyClock::Now();
+    counters.sampledBytes.store(cache.bytes, std::memory_order_relaxed);
+    counters.sampledHostBytes.store(cache.hostBytes, std::memory_order_relaxed);
+    counters.sampledSoft.store(limits.deviceSoft, std::memory_order_relaxed);
+    counters.sampledHard.store(limits.deviceHard, std::memory_order_relaxed);
     auto texture = entry.texture;
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
     cache.entries.push_front(std::move(entry));
@@ -475,6 +643,7 @@ struct CachedStorageTexture {
     StorageKey key;
     std::uint32_t mip;
     std::shared_ptr<StorageTexture> texture;
+    std::uint64_t lastUse = 0;
 };
 
 // As TextureCache: use order with a hash index by key, plus one by image for StorageImageCached.
@@ -484,6 +653,7 @@ struct StorageTextureCache {
     std::unordered_map<StorageKey, std::list<CachedStorageTexture>::iterator, StorageKeyHash> index;
     std::unordered_map<const StorageTexture*, std::list<CachedStorageTexture>::iterator> byImage;
     std::uint64_t bytes = 0;
+    std::uint64_t maintainedFrame = std::numeric_limits<std::uint64_t>::max();
 };
 
 StorageTextureCache& StorageTextures() {
@@ -515,12 +685,39 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
 void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
+    StorageDepartures().fetch_add(1, std::memory_order_relaxed);
     it->texture->SetCached(false);
     it->texture->Flush();
     cache.bytes -= it->texture->GuestBytes();
     cache.index.erase(it->key);
     cache.byImage.erase(it->texture.get());
     cache.entries.erase(it);
+}
+
+EvictionOutcome evictStorageImages(StorageTextureCache& cache, ResidencyUsage& usage, const ResidencyLimits& limits, const ResidencyPolicy& policy) {
+    const auto& config = Residency();
+    const auto window = ResidencyClock::Window(config.minIdleTicks, config.minIdleFrames);
+    const auto outcome = RunEvictionPass(
+            cache.entries, usage, limits, window, policy,
+            [](const CachedStorageTexture& entry) { return ResidencyEntryState{entry.lastUse, entry.lastUse, entry.texture->GuestBytes(), 0}; },
+            [](std::list<CachedStorageTexture>::iterator) {},
+            [&](std::list<CachedStorageTexture>::iterator it) { evictStorage(cache, it); });
+    auto& counters = TextureCounts();
+    counters.storageEvicted.fetch_add(outcome.evicted, std::memory_order_relaxed);
+    counters.storageEvictedBytes.fetch_add(outcome.deviceBytes, std::memory_order_relaxed);
+    return outcome;
+}
+
+template<typename Make>
+auto makeWithStorageMemory(StorageTextureCache& cache, Make make) {
+    try {
+        return make();
+    } catch (const DeviceMemoryExhausted&) {
+        ResidencyUsage usage{cache.bytes, 0};
+        evictStorageImages(cache, usage, ResidencyLimits{}, ExhaustedPolicy());
+        TextureCounts().exhaustedRetries.fetch_add(1, std::memory_order_relaxed);
+        return make();
+    }
 }
 
 // Whether a descriptor names DCC metadata other than the keys `image` follows. The image stands
@@ -592,6 +789,11 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     const StorageKey key{context.device, SurfaceKey(context, resource)};
     auto& cache = StorageTextures();
     std::lock_guard lock(cache.mutex);
+    if (const auto frame = ResidencyClock::Frame(); frame != cache.maintainedFrame && !Residency().policy.strictLru) {
+        cache.maintainedFrame = frame;
+        ResidencyUsage usage{cache.bytes, 0};
+        evictStorageImages(cache, usage, CacheLimits(context, cache.bytes, 1, 4, Residency().storageOverride, false), Residency().policy);
+    }
     if (resource.mipCount > AllocatedLevels(resource)) {
         auto allocated = resource;
         allocated.mipCount = AllocatedLevels(resource);
@@ -606,6 +808,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         evictStorage(cache, it);
     } else if (it != cache.entries.end()) {
         it->texture->Refresh();
+        it->lastUse = ResidencyClock::Now();
         cache.entries.splice(cache.entries.begin(), cache.entries, it);
         counters.storageHits.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
@@ -616,16 +819,22 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     // import buffer without the flush hook. The flush is recorded ahead of the upload in the batch.
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
     if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
-    CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip)};
+    CachedStorageTexture entry{key, mip, makeWithStorageMemory(cache, [&] { return std::make_shared<StorageTexture>(context, *context.detiler, resource, mip); })};
     // The constructor's upload may have recorded into the open batch (a GPU clear, a direct
     // detile) before the image could keep itself (no weak_from_this yet): the batch keeps it here,
     // so an eviction or a failed view before it ran cannot destroy a referenced image.
     // APS5_NO_KEEP_NEW_STORAGE=1 leaves the image to its cache entry alone, as before.
     static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
     if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
-    constexpr std::uint64_t budget = 2048ull << 20u;
-    while (!cache.entries.empty() && cache.bytes + entry.texture->GuestBytes() > budget) evictStorage(cache, std::prev(cache.entries.end()));
+    const auto& residency = Residency();
+    const auto limits = CacheLimits(context, cache.bytes, 1, 4, residency.storageOverride, false);
+    ResidencyUsage usage{cache.bytes + entry.texture->GuestBytes(), 0};
+    evictStorageImages(cache, usage, limits, residency.policy);
     cache.bytes += entry.texture->GuestBytes();
+    entry.lastUse = ResidencyClock::Now();
+    counters.storageBytes.store(cache.bytes, std::memory_order_relaxed);
+    counters.storageSoft.store(limits.deviceSoft, std::memory_order_relaxed);
+    counters.storageHard.store(limits.deviceHard, std::memory_order_relaxed);
     auto texture = entry.texture;
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
@@ -678,6 +887,7 @@ bool StorageImageCached(const Context& context, const StorageTexture* image) {
     std::lock_guard lock(cache.mutex);
     const auto it = findStorageByImage(cache, context.device, image);
     if (it == cache.entries.end()) return false;
+    it->lastUse = ResidencyClock::Now();
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
     return true;
 }
@@ -692,6 +902,7 @@ bool StorageImagesCached(const Context& context, std::span<const StorageTexture*
     for (const auto* image : images) {
         const auto it = findStorageByImage(cache, context.device, image);
         if (it == cache.entries.end()) return false;
+        it->lastUse = ResidencyClock::Now();
         cache.entries.splice(cache.entries.begin(), cache.entries, it);
     }
     return true;
@@ -1752,6 +1963,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
     }
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
+    if (fast) {
+        const auto now = ResidencyClock::Now();
+        for (const auto& texture : textures) {
+            if (texture != nullptr) texture->NoteResidencyUse(now);
+        }
+    }
     if (!fast) {
         countFullWalk(reason);
         if (!fullWalk()) {

@@ -29,8 +29,16 @@ inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
 }
 
+class DeviceMemoryExhausted : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 inline void Check(VkResult result, const char* operation) {
-    if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
+    if (result == VK_SUCCESS) return;
+    const auto message = std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) throw DeviceMemoryExhausted(message);
+    throw std::runtime_error(message);
 }
 
 inline void Require(bool condition, const char* reason) {
@@ -141,6 +149,8 @@ struct Context {
     // The device's GDS buffer (Pm4::GdsBytes, the CP's GDS backing, see Pm4::InstallGdsBacking), which
     // shaders' GDS bindings name; null when the device has none (tests).
     VkBuffer gdsBuffer = VK_NULL_HANDLE;
+    PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
+    bool memoryBudget = false;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

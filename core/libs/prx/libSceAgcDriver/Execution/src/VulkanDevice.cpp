@@ -198,6 +198,7 @@ struct VulkanDevice::State {
     bool depthClamp = false;
     bool depthBiasClamp = false;
     bool depthBounds = false;
+    bool memoryBudget = false;
     bool occlusionQueryPrecise = false;
     std::uint64_t lastSampleDump = 0;
     VkDeviceSize hostImportAlignment = 0;
@@ -737,6 +738,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     // Indirect draws with a GPU-side count (DRAW_INDIRECT_MULTI with count_indirect); a device
     // without it resolves such draws on the CPU.
     state->drawIndirectCount = hasExtension(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+    state->memoryBudget = hasExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (state->memoryBudget) deviceExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     if (state->drawIndirectCount) deviceExtensions.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
     // Guest memory is host memory: importing it lets address-based shaders use it in place instead of
     // copying every registered allocation per draw.
@@ -2490,6 +2493,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.depthBounds = state->depthBounds;
     context.imageViewMinLod = state->imageViewMinLod;
     context.gdsBuffer = state->gds != nullptr ? state->gds->Handle() : VK_NULL_HANDLE;
+    context.memoryBudget = state->memoryBudget;
+    context.memoryProperties2 = state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;
     return context;
 }
 
