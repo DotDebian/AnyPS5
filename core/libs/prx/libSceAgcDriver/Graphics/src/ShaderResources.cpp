@@ -2452,6 +2452,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     if (keys != record.entryKeys) return nullptr;
     if (record.source != nullptr) {
         if (!StorageImageCached(context, record.source.get()) || !GuestMemory::UnchangedSince(address, bytes, record.source->Generation())) return nullptr;
+        if (record.resource.dccAddress != 0 && IsDccClear(record.source->FilledKeys())) return nullptr;
         // Under fast-clear keys the view holds only while its image's results are still pending over
         // the surface; flushed, the clear the image cannot see makes the lookup take a snapshot.
         if (keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, record.guestBytes) != record.source) return nullptr;

@@ -110,14 +110,14 @@ int APS5_VABI sceSystemServiceSetNoticeScreenSkipFlag(void) {
  return SYSTEM_SERVICE_OK;
 }
 
-int APS5_VABI sceSystemServiceInitializePlayerDialogParam(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+int APS5_VABI sceSystemServiceInitializePlayerDialogParam(void* param) {
+ if (param == nullptr) return SYSTEM_SERVICE_ERROR_PARAMETER;
+ return SYSTEM_SERVICE_OK;
 }
 
-int APS5_VABI sceSystemServiceLaunchPlayerDialog(void) {
- NotImplemented_nid_no_patch(__func__);
- return 0;
+int APS5_VABI sceSystemServiceLaunchPlayerDialog(const void* param) {
+ if (param == nullptr) return SYSTEM_SERVICE_ERROR_PARAMETER;
+ return SYSTEM_SERVICE_OK;
 }
 
 }

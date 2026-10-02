@@ -15,6 +15,7 @@ Throughout the project, every function at every stage either **does exactly what
 - [libSceCommonDialog](../../core/libs/prx/libSceCommonDialog/Export.cpp)
 - [libSceHmd](../../core/libs/prx/libSceHmd/Export.cpp) implements only the disconnected-headset path: initialization succeeds, device queries report `NotDetected`, and opening a device returns `DeviceDisconnected`. Headset support, tracking, rendering and additional HMD exports are not implemented; SDK-level ABI compatibility and in-game behaviour remain unverified.
 - [sceVideoOutOpen](../../core/libs/prx/libSceVideoOut/src/Output.cpp) validates the priority and CPU affinity that the open param requests for the VideoOut service thread but does not apply them: the port's present and vblank threads are host threads, and guest priorities and affinities do not reach host scheduling
+- [libSceNpCommerce](../../core/libs/prx/libSceNpCommerce/Export.cpp) - the PS Store icon show/hide calls do nothing
 - The shader recompiler [skips baryctric coordinates](../../core/shader/recompiler/Recompiler.cpp) (is not even passed to SpirvTargetOptions at row 212).
 
 ### Unknown function info
@@ -47,4 +48,5 @@ Throughout the project, every function at every stage either **does exactly what
 - The libc [SSE4a trap emulation](../../core/libs/prx/libc/src/specifics/windows/Sse4aEmulation.hpp) on Windows is superseded by `--to-intel` and remains only until the relinked title has been verified without it.
 - `--to-intel` guest module trampolines are covered only by a synthetic relinker test; no game title has been verified with them on Linux or Windows.
 - [sceKeyboardGetKey2Char](../../core/libs/prx/libSceKeyboard/src/keyboard_impl.cpp) (libSceKeyboard) translates only the 101-key (US) arrangement and throws for the 106-key (Japanese) one; Ctrl and Alt do not change the character.
+- [libSceAudiodec](../../core/libs/prx/libSceAudiodec/Export.cpp) throws for the 24-bit PCM word size (`iBwPcm` 0): its sample layout is unknown. ATRAC9 decoding is covered only by configuration and error tests, as no ATRAC9 encoder is available for a fixture.
 - [libScePlayerInvitationDialog](../../core/libs/prx/libScePlayerInvitationDialog/libScePlayerInvitationDialog.cpp) simulates dialog completion without displaying UI or sending invitations; its parameter ABI remains unverified.

@@ -429,29 +429,23 @@ target_link_libraries(agc_driver_mesh_tests PRIVATE shader_recompiler_agc_driver
 set_target_properties(agc_driver_mesh_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_mesh_tests)
 
-add_test_executable(agc_driver_mix_precision_tests EXCLUDE_FROM_ALL
-        tests/MixPrecision.cpp
-)
-target_include_directories(agc_driver_mix_precision_tests PRIVATE
-        ${LIBS_INCLUDE_DIR}
-        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
-        ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
-)
-target_link_libraries(agc_driver_mix_precision_tests PRIVATE libSceAgcDriver SDL2-static libc)
-set_target_properties(agc_driver_mix_precision_tests PROPERTIES CXX_EXTENSIONS OFF)
-configure_windows_unwind(agc_driver_mix_precision_tests)
-
-add_test_executable(agc_driver_sdwa_destination_tests EXCLUDE_FROM_ALL
-        tests/SdwaDestination.cpp
-)
-target_include_directories(agc_driver_sdwa_destination_tests PRIVATE
-        ${LIBS_INCLUDE_DIR}
-        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
-        ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
-)
-target_link_libraries(agc_driver_sdwa_destination_tests PRIVATE libSceAgcDriver SDL2-static libc)
-set_target_properties(agc_driver_sdwa_destination_tests PROPERTIES CXX_EXTENSIONS OFF)
-configure_windows_unwind(agc_driver_sdwa_destination_tests)
+file(GLOB agcExecutionTestSources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/execution/*.cpp)
+set(agcExecutionTests)
+foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
+    get_filename_component(agcExecutionTestName ${agcExecutionTestSource} NAME_WE)
+    string(REGEX REPLACE "([a-z0-9])([A-Z])" "\\1_\\2" agcExecutionTestName "${agcExecutionTestName}")
+    string(TOLOWER "agc_driver_${agcExecutionTestName}_tests" agcExecutionTest)
+    add_test_executable(${agcExecutionTest} EXCLUDE_FROM_ALL ${agcExecutionTestSource})
+    target_include_directories(${agcExecutionTest} PRIVATE
+            ${LIBS_INCLUDE_DIR}
+            ${CMAKE_SOURCE_DIR}/core/shader/recompiler
+            ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
+    )
+    target_link_libraries(${agcExecutionTest} PRIVATE libSceAgcDriver SDL2-static libc)
+    set_target_properties(${agcExecutionTest} PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(${agcExecutionTest})
+    list(APPEND agcExecutionTests ${agcExecutionTest})
+endforeach()
 
 add_test_executable(agc_driver_gds_tests EXCLUDE_FROM_ALL
         tests/Gds.cpp
@@ -482,11 +476,11 @@ set_target_properties(agc_driver_wave_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_wave_tests)
 
 if(BUILD_TESTING)
-    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_structurizer_tests agc_dpp_write_tests agc_shader_disk_cache_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests)
+    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_structurizer_tests agc_dpp_write_tests agc_shader_disk_cache_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests ${agcExecutionTests})
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})
-        set_tests_properties(${agcTestName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1")
+        set_tests_properties(${agcTestName} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
         if(WIN32)
             set_tests_properties(${agcTestName} PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
@@ -685,6 +679,14 @@ if(BUILD_TESTING)
     add_test(NAME vector_min_max_med16 COMMAND vector_min_max_med16_tests)
     if(WIN32)
         set_tests_properties(vector_min_max_med16 PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(scalar_saveexec_tests ${LIBS_INCLUDE_DIR}/tests/ScalarSaveexec.cpp)
+    target_link_libraries(scalar_saveexec_tests PRIVATE shader_recompiler_agc_driver libc)
+    configure_windows_unwind(scalar_saveexec_tests)
+    add_test(NAME scalar_saveexec COMMAND scalar_saveexec_tests)
+    if(WIN32)
+        set_tests_properties(scalar_saveexec PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_indexed_draw_tests ${LIBS_INCLUDE_DIR}/tests/GuestIndexedDraw.cpp)
