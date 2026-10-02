@@ -18,6 +18,8 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceVideoOut/include/DisplayWindow.hpp"
 #include "prx/libSceVideoOut/include/BufferReuseTracker.hpp"
+#include "prx/libSceVideoOut/include/FlipPacing.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PresentPacing.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 
 #include "SDL.h"
@@ -119,6 +121,7 @@ struct VideoOutConfig {
     std::stop_token shutdownToken = LibcShutdownToken_nid_postfix();
     int flipRate = 0;
     uint64_t lastFlipVblank = 0;
+    uint64_t lastReleaseVblank = 0;
     std::chrono::steady_clock::time_point lastTimingFlip{};
     uint64_t outputMode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
     float gamma = 1.0f;
@@ -151,6 +154,7 @@ struct FlipRequest final : AgcDriver::IFlipRequest, std::enable_shared_from_this
     int flipMode = 0;
     int flipRate = 0;
     int64_t flipArg = 0;
+    uint64_t readyVblank = 0;
     uint32_t width = 0;
     uint32_t height = 0;
     VideoOutBuffer buffer;
@@ -210,6 +214,7 @@ private:
     std::array<std::shared_ptr<VideoOutConfig>, VIDEO_OUT_NUM_MAX> contexts;
     std::array<std::shared_ptr<AgcDriver::IVideoOutput>, VIDEO_OUT_NUM_MAX> outputs;
     std::shared_ptr<FlipQueue> flipQueue = std::make_shared<FlipQueue>();
+    AgcDriver::PresentPacing pacing;
 
     DisplayWindow window;
 

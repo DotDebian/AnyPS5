@@ -123,7 +123,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         }
         gpuReady(context);
         timing.Mark("release_and_callback");
-        if (profile) reportPresents(waitedMs, inFlight);
+        if (profile) reportPresents(waitedMs, inFlight, window.pacing);
         CheckFailure();
     } catch (const ProcessShutdown&) {
         throw;
@@ -133,10 +133,11 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     }
 }
 
-void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
+void Driver::reportPresents(double waitedMs, std::size_t inFlight, PresentPacing* pacing) {
     static std::vector<double> waits;
     static VulkanDevice::PresentStatistics previous{};
     static std::uint64_t previousFlips = 0, windowSerial = 0, previousUnsignaled = 0;
+    static std::uint64_t previousReleases = 0, previousLost = 0, previousHeld = 0, previousCrossing = 0;
     static auto lastReport = std::chrono::steady_clock::now();
     waits.push_back(waitedMs);
     if (waits.size() == 1) windowSerial = flipSerial.load();
@@ -151,7 +152,20 @@ void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
     const auto flips = flipsCounted.load() - previousFlips;
     const double perFlip = flips != 0 ? 1.0 / static_cast<double>(flips) : 0.0;
     const auto serial = flipSerial.load();
-    std::fprintf(stderr, "[present] %llu presents over 10 s (%zu may trail on the GPU); %s p50 %.2f ms, p90 %.2f ms, max %.2f ms over %zu; per present: GPU busy %.1f ms, idle gaps %.1f ms (%llu batches without a completion record); per flip: %.1f batches recorded (%.1f unsignaled at the flip); per present: %.1f batches ahead of the blit, %.1f after it; after the flip packet: last submit %.1f ms, blit submit %.1f ms; in-place reads overwritten before execution: %llu of %llu checked\n", static_cast<unsigned long long>(presents), inFlight, inFlight != 0 ? "inflight_wait" : "render_fence_wait", percentile(0.5), percentile(0.9), waits.empty() ? 0.0 : waits.back(), waits.size(), (counts.gpuBusyMs - previous.gpuBusyMs) * perPresent, (counts.gpuGapMs - previous.gpuGapMs) * perPresent, static_cast<unsigned long long>(counts.gpuUnread - previous.gpuUnread), static_cast<double>(serial - windowSerial) * perFlip, static_cast<double>(flipBatchesUnsignaled.load() - previousUnsignaled) * perFlip, static_cast<double>(counts.batchesAheadOfBlit - previous.batchesAheadOfBlit) * perPresent, static_cast<double>(counts.batchesAfterFlip - previous.batchesAfterFlip) * perPresent, (counts.lastSubmitAfterFlipMs - previous.lastSubmitAfterFlipMs) * perPresent, (counts.blitSubmitAfterFlipMs - previous.blitSubmitAfterFlipMs) * perPresent, static_cast<unsigned long long>(counts.readsOverwritten - previous.readsOverwritten), static_cast<unsigned long long>(counts.readsChecked - previous.readsChecked));
+    char pacingText[256] = "";
+    if (pacing != nullptr) {
+        const auto releases = pacing->releases.load();
+        const auto lost = pacing->lostVblanks.load();
+        const auto held = pacing->heldVblanks.load();
+        const auto crossing = pacing->presentsCrossingVblank.load();
+        const auto lateNs = pacing->vblankLateMaxNs.exchange(0);
+        std::snprintf(pacingText, sizeof(pacingText), "; flip pacing: %llu flips released, %llu vblanks lost by the presenter (%llu held by the flip bookkeeping; %llu lost in total), %llu presents crossed a vblank, vblank thread late max %.3f ms", static_cast<unsigned long long>(releases - previousReleases), static_cast<unsigned long long>(lost - previousLost), static_cast<unsigned long long>(held - previousHeld), static_cast<unsigned long long>(lost), static_cast<unsigned long long>(crossing - previousCrossing), static_cast<double>(lateNs) / 1e6);
+        previousReleases = releases;
+        previousLost = lost;
+        previousHeld = held;
+        previousCrossing = crossing;
+    }
+    std::fprintf(stderr, "[present] %llu presents over 10 s (%zu may trail on the GPU); %s p50 %.2f ms, p90 %.2f ms, max %.2f ms over %zu; per present: GPU busy %.1f ms, idle gaps %.1f ms (%llu batches without a completion record); per flip: %.1f batches recorded (%.1f unsignaled at the flip); per present: %.1f batches ahead of the blit, %.1f after it; after the flip packet: last submit %.1f ms, blit submit %.1f ms; in-place reads overwritten before execution: %llu of %llu checked%s\n", static_cast<unsigned long long>(presents), inFlight, inFlight != 0 ? "inflight_wait" : "render_fence_wait", percentile(0.5), percentile(0.9), waits.empty() ? 0.0 : waits.back(), waits.size(), (counts.gpuBusyMs - previous.gpuBusyMs) * perPresent, (counts.gpuGapMs - previous.gpuGapMs) * perPresent, static_cast<unsigned long long>(counts.gpuUnread - previous.gpuUnread), static_cast<double>(serial - windowSerial) * perFlip, static_cast<double>(flipBatchesUnsignaled.load() - previousUnsignaled) * perFlip, static_cast<double>(counts.batchesAheadOfBlit - previous.batchesAheadOfBlit) * perPresent, static_cast<double>(counts.batchesAfterFlip - previous.batchesAfterFlip) * perPresent, (counts.lastSubmitAfterFlipMs - previous.lastSubmitAfterFlipMs) * perPresent, (counts.blitSubmitAfterFlipMs - previous.blitSubmitAfterFlipMs) * perPresent, static_cast<unsigned long long>(counts.readsOverwritten - previous.readsOverwritten), static_cast<unsigned long long>(counts.readsChecked - previous.readsChecked), pacingText);
     previous = counts;
     previousFlips = flipsCounted.load();
     previousUnsignaled = flipBatchesUnsignaled.load();

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -161,6 +162,7 @@ void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameT
         require(reserved && !ready && !terminal && cfg->generation == generation, "invalid flip readiness transition");
         readiness.Mark("locks_validate");
         queuedAt = AgcDriver::FrameTiming::Clock::now();
+        readyVblank = cfg->vblankStatus.count;
         queue->requests.push_back(shared_from_this());
         ready = true;
     }
@@ -383,18 +385,22 @@ void VideoOutDriver::vblankEnd() {
 void VideoOutDriver::processFlip(FlipRequest& req) {
     AgcDriver::PerformanceContext timingContext(req.timing.get());
     AgcDriver::PerformanceTimer timing("VideoOut.Flip");
+    uint64_t released = 0;
     {
         std::unique_lock lock(req.cfg->mutex);
         timing.Mark("config_mutex_wait");
         checkConfig(*req.cfg);
         require(req.ready && !req.terminal && req.generation == req.cfg->generation, "stale or incomplete flip request");
-        const auto interval = static_cast<uint64_t>(req.flipRate + 1);
-        require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
-        const auto target = req.cfg->lastFlipVblank + interval;
+        const auto target = FlipTargetVblank(req.cfg->lastFlipVblank, req.flipRate);
         timing.Mark("validate");
         req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
         timing.Mark("vblank_wait");
         checkConfig(*req.cfg);
+        released = req.cfg->vblankStatus.count;
+        pacing.lostVblanks.fetch_add(LostVblanks(released, req.cfg->lastReleaseVblank, req.readyVblank, req.flipRate), std::memory_order_relaxed);
+        pacing.heldVblanks.fetch_add(HeldVblanks(target, req.cfg->lastReleaseVblank, req.readyVblank, req.flipRate), std::memory_order_relaxed);
+        pacing.releases.fetch_add(1, std::memory_order_relaxed);
+        req.cfg->lastReleaseVblank = released;
     }
     require(req.width != 0 && req.height != 0 && req.width <= static_cast<uint32_t>(std::numeric_limits<int>::max()) && req.height <= static_cast<uint32_t>(std::numeric_limits<int>::max()), "invalid window dimensions");
     window.Ensure(req.width, req.height);
@@ -418,7 +424,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         SDL_Vulkan_GetDrawableSize(static_cast<SDL_Window*>(context), &drawableWidth, &drawableHeight);
         *width = drawableWidth > 0 ? static_cast<std::uint32_t>(drawableWidth) : 0;
         *height = drawableHeight > 0 ? static_cast<std::uint32_t>(drawableHeight) : 0;
-    }, req.width, req.height, req.timing};
+    }, req.width, req.height, req.timing, &pacing};
     timing.Mark("window_prepare");
     const auto gpuReady = [](void* context) {
         auto& request = *static_cast<FlipRequest*>(context);
@@ -443,6 +449,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     require(!req.terminal && req.cfg->generation == req.generation, "flip cancelled during presentation");
     require(req.gpuComplete, "flip submitted before GPU completion");
     require(req.cfg->flipStatus.count != std::numeric_limits<uint64_t>::max(), "flip counter overflow");
+    if (req.cfg->vblankStatus.count > released) pacing.presentsCrossingVblank.fetch_add(1, std::memory_order_relaxed);
     triggerEvents(*req.cfg, VIDEO_OUT_EVENT_FLIP, reinterpret_cast<void*>(req.flipArg));
     ++req.cfg->flipStatus.count;
     req.cfg->lastFlipVblank = req.cfg->vblankStatus.count;
@@ -561,6 +568,9 @@ void VideoOutDriver::vblankLoop(std::stop_token token) {
                 if (token.stop_requested() || flipQueue->failure) return;
             }
             vblankEnd();
+            const auto lateNs = static_cast<uint64_t>(std::max<int64_t>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - next).count()));
+            auto worst = pacing.vblankLateMaxNs.load(std::memory_order_relaxed);
+            while (lateNs > worst && !pacing.vblankLateMaxNs.compare_exchange_weak(worst, lateNs, std::memory_order_relaxed)) {}
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[videoout] vblank failed: %s\n", error.what());

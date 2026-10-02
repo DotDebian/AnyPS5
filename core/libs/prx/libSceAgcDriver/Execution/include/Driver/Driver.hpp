@@ -76,7 +76,7 @@ private:
     void enqueue(Submission submission);
     void noteHeldAtSubmit(Submission& submission, std::size_t cursor);
     static void forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission);
-    void reportPresents(double waitedMs, std::size_t inFlight);
+    void reportPresents(double waitedMs, std::size_t inFlight, PresentPacing* pacing);
     static bool stampValidate();
     static bool dataHits();
     static bool verifyDataHits();

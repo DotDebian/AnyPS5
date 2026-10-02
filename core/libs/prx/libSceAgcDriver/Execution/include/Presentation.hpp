@@ -8,6 +8,7 @@
 #include <span>
 #include <memory>
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PresentPacing.hpp"
 
 namespace AgcDriver {
 
@@ -21,6 +22,7 @@ struct PresentationWindow {
     std::uint32_t width;
     std::uint32_t height;
     std::shared_ptr<FrameTiming> timing;
+    PresentPacing* pacing = nullptr;
 };
 
 }

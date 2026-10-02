@@ -47,6 +47,12 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
+    add_test_executable(video_out_flip_pacing_tests tests/FlipPacing.cpp)
+    target_include_directories(video_out_flip_pacing_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    add_test(NAME video_out_flip_pacing COMMAND video_out_flip_pacing_tests)
+endif()
+
+if(BUILD_TESTING)
     add_test_executable(guest_buffer_reuse_tests ${LIBS_INCLUDE_DIR}/tests/GuestBufferReuse.cpp)
     target_include_directories(guest_buffer_reuse_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_buffer_reuse_tests PRIVATE libc)
