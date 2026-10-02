@@ -2346,6 +2346,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
         ++snapshotCovered;
         return false;
     }
+    unpublished.emplace_back(address, end);
     return true;
 }
 
@@ -2353,7 +2354,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     if (bytes == 0) return;
     if (&batch == open.get()) {
         if (!noteWrite(address, bytes, ownLabel)) return;
-        publishPendingWrites();
+        publishNotedWrites();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return;
     }
@@ -2364,7 +2365,10 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writeNotes.push_back(++writeNoteCount);
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
-    if (!SnapshotCovers(address, address + bytes)) publishPendingWrites();
+    if (!SnapshotCovers(address, address + bytes)) {
+        unpublished.emplace_back(address, address + bytes);
+        publishNotedWrites();
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
@@ -2377,7 +2381,7 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
 
 void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
     if (!noteWrite(address, bytes)) return;
-    publishPendingWrites();
+    publishNotedWrites();
     // The note precedes this thread's vkQueueSubmit and the label another queue polls for; the
     // fence makes that order hold without relying on x86 store ordering.
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2389,13 +2393,14 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
         if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin))) publish = true;
     }
     if (!publish) return;
-    publishPendingWrites();
+    publishNotedWrites();
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 void Recorder::publishPendingWrites() const {
     // Only the active recorder owns the snapshot: one torn down after its successor was activated,
     // or one a worker still dispatches into after device.reset(), must not publish its ranges.
+    unpublished.clear();
     if (activeRecorder != this) return;
     const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto merged = std::make_shared<WriteRanges>();
@@ -2409,6 +2414,43 @@ void Recorder::publishPendingWrites() const {
         else (*merged)[out++] = {begin, end};
     }
     merged->resize(out);
+    pendingWrites.store(std::move(merged), std::memory_order_release);
+    publishGeneration.fetch_add(1, std::memory_order_release);
+    ++snapshotRebuilds;
+    if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+}
+
+void Recorder::publishNotedWrites() const {
+    static const bool full = std::getenv("APS5_FULL_WRITE_SNAPSHOT") != nullptr;
+    static const bool verify = std::getenv("APS5_VERIFY_WRITE_SNAPSHOT") != nullptr;
+    const auto current = activeRecorder == this ? pendingWrites.load(std::memory_order_acquire) : nullptr;
+    if (full || current == nullptr || unpublished.empty()) {
+        publishPendingWrites();
+        return;
+    }
+    const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::sort(unpublished.begin(), unpublished.end());
+    auto merged = std::make_shared<WriteRanges>();
+    merged->reserve(current->size() + unpublished.size());
+    const auto add = [&](const std::pair<std::uint64_t, std::uint64_t>& range) {
+        if (!merged->empty() && range.first <= merged->back().second) merged->back().second = std::max(merged->back().second, range.second);
+        else merged->push_back(range);
+    };
+    auto kept = current->begin();
+    for (const auto& range : unpublished) {
+        for (; kept != current->end() && *kept < range; ++kept) add(*kept);
+        add(range);
+    }
+    for (; kept != current->end(); ++kept) add(*kept);
+    unpublished.clear();
+    if (verify) {
+        static std::atomic<std::uint64_t> mismatches{0};
+        const auto merge = merged;
+        publishPendingWrites();
+        const auto rebuilt = pendingWrites.load(std::memory_order_acquire);
+        if (rebuilt != nullptr && *rebuilt != *merge && mismatches.fetch_add(1) < 20) std::fprintf(stderr, "[recorder] verify: merged write snapshot (%zu ranges) differs from the rebuild (%zu ranges)\n", merge->size(), rebuilt->size());
+        return;
+    }
     pendingWrites.store(std::move(merged), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
