@@ -38,12 +38,14 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
 
     static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
     static const std::size_t inFlight = VulkanDevice::FlipInFlight();
+    static const bool flipBeforeGpu = std::getenv("APS5_FLIP_BEFORE_GPU") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::shared_ptr<VulkanDevice> presenting;
     timing.Mark("validate");
     try {
         bool submitted = false;
         bool presentable = false;
+        bool trailing = false;
         double waitedMs = 0;
         {
             std::unique_lock replacing(deviceReplacement, std::defer_lock);
@@ -102,8 +104,13 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
 
                 presenting->QueuePresent();
                 timing.Mark("queue_present");
+                trailing = !syncFlip && !flipBeforeGpu;
                 submitted = false;
             }
+        }
+        if (trailing) {
+            waitedMs += presenting->FinishPresent();
+            timing.Mark("render_fence_wait");
         }
         if (submitted) {
             waitedMs = presenting->FinishPresent();
