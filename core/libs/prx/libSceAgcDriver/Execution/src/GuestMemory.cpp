@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -894,6 +895,44 @@ struct WriteTracker {
 #endif
     }
 
+    std::uint64_t blockBegin(std::uint64_t block) const {
+#ifdef _WIN32
+        return base + block * WriteBlockBytes;
+#else
+        return block * WriteBlockBytes;
+#endif
+    }
+
+    struct DriverPiece {
+        std::uint32_t generation = 0;
+        std::uint32_t begin = 0;
+        std::uint32_t end = 0;
+    };
+    struct DriverPieces {
+        std::uint32_t whole = 0;
+        std::uint32_t dropped = 0;
+        std::uint32_t next = 0;
+        std::array<DriverPiece, 4> pieces{};
+    };
+    std::unordered_map<std::uint64_t, DriverPieces> driverPieces;
+
+    void noteDriverStore(std::uint64_t block, std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration) {
+        const auto begin = blockBegin(block);
+        const auto from = static_cast<std::uint32_t>(std::max(address, begin) - begin);
+        const auto to = static_cast<std::uint32_t>(std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin);
+        if (from == 0 && to == WriteBlockBytes) {
+            if (const auto found = driverPieces.find(block); found != driverPieces.end()) {
+                found->second = DriverPieces{};
+                found->second.whole = stampGeneration;
+            }
+            return;
+        }
+        auto& entry = driverPieces[block];
+        auto& slot = entry.pieces[entry.next++ % entry.pieces.size()];
+        entry.dropped = std::max(entry.dropped, slot.generation);
+        slot = {stampGeneration, from, to};
+    }
+
     std::uint32_t stampOf(std::uint64_t block) const {
 #ifdef _WIN32
         return blocks[block];
@@ -1209,8 +1248,36 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
     ++tracker.generation;
-    for (auto block = first; block <= last; ++block) tracker.stamp(block, tracker.generation, StampKind::Driver);
+    for (auto block = first; block <= last; ++block) {
+        tracker.stamp(block, tracker.generation, StampKind::Driver);
+        tracker.noteDriverStore(block, address, address + bytes, tracker.generation);
+    }
     return tracker.generation;
+}
+
+bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return true;
+    const auto end = address + bytes;
+    const auto first = tracker.blockOf(address);
+    const auto last = tracker.blockOf(end - 1);
+    for (auto block = first; block <= last; ++block) {
+        if (tracker.writtenStampOf(block) <= generation) continue;
+        if (tracker.cpuStampOf(block) > generation) return true;
+        const auto found = tracker.driverPieces.find(block);
+        if (found == tracker.driverPieces.end()) return true;
+        const auto& entry = found->second;
+        if (entry.whole > generation || entry.dropped > generation) return true;
+        const auto begin = tracker.blockBegin(block);
+        const auto from = std::max(address, begin) - begin;
+        const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin;
+        for (const auto& piece : entry.pieces) {
+            if (piece.generation > generation && piece.begin < to && from < piece.end) return true;
+        }
+    }
+    return false;
 }
 
 std::uint64_t TrackerGeneration() {

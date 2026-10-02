@@ -1156,7 +1156,11 @@ bool StorageTexture::Refresh() {
     // clear).
     const auto droppable = [&](std::uint32_t unit) {
         if (keysChanged && IsDccClear(keys)) return true;
-        return tracked && layerGeneration[unit] != 0 && unit < stampedBlocks.size() && stampedBlocks[unit] == GuestMemory::BlockWritten;
+        if (!tracked || layerGeneration[unit] == 0 || unit >= stampedBlocks.size() || stampedBlocks[unit] != GuestMemory::BlockWritten) return false;
+        const auto begin = layerBegin(unit);
+        const auto bytes = layerBytes(unit);
+        const bool edge = begin % 65536 != 0 || bytes != 65536;
+        return !edge || GuestMemory::StoredOver(begin, static_cast<std::size_t>(bytes), layerGeneration[unit]);
     };
     // A clear code -> uncompressed flip on an image with results pending: an unstamped pending
     // unit's results ARE the uncompressed texels (nothing wrote its memory since), so it keeps
@@ -3092,7 +3096,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             const auto from = std::max(at, begin);
             const auto to = std::min(at + block, end);
             if (from >= to) continue;
-            if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten) {
+            const bool edge = from != at || to != at + block;
+            if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten && (!edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer]))) {
                 skippedAny = true;
                 skippedLayer[layer] = true;
                 ++skipped;
