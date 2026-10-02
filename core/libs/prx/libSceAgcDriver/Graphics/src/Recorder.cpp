@@ -1909,8 +1909,8 @@ void Recorder::NoteSampledDraw() {
 bool Recorder::gpuSampleCounter() {
     if (sampleCounterState != 0) return sampleCounterState > 0;
     sampleCounterState = -1;
-    static const bool cpuCounter = std::getenv("APS5_CPU_SAMPLE_COUNTER") != nullptr;
-    if (cpuCounter || !context.bufferDeviceAddress) return false;
+    static const bool gpuCounter = std::getenv("APS5_GPU_SAMPLE_COUNTER") != nullptr;
+    if (!gpuCounter || !context.bufferDeviceAddress) return false;
     VkShaderModule module = VK_NULL_HANDLE;
     try {
         sampleCounter = std::make_unique<Buffer>(context, 16 + 8 * SampleFoldCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
