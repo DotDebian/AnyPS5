@@ -330,7 +330,9 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 const auto guestLayerOffset = geometry.GuestLayerOffset(layer);
                 const auto linearLayerOffset = geometry.LinearLayerOffset(layer);
-                for (const auto& mip : mips) {
+                for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+                    if (layer >= geometry.LevelLayers(level)) continue;
+                    const auto& mip = mips[level];
                     detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled->Handle(), guestLayerOffset + mip.tiledOffset, linear->Handle(), linearLayerOffset + mip.linearOffset, mip, false, layer, geometry.thick);
                 }
             }
@@ -360,6 +362,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 const auto linearLayerOffset = static_cast<std::uint64_t>(layer) * sliceLinearBytes;
                 for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+                    if (layer >= geometry.LevelLayers(level)) continue;
                     const auto& mip = mips[level];
                     VkBufferImageCopy region{};
                     region.bufferOffset = linearLayerOffset + mip.linearOffset;
@@ -639,6 +642,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
         Require(mipLevel < descriptor.mipCount, "storage texture mip level is outside the texture");
+        Require(descriptor.dimension != TextureDimension::k3D || descriptor.mipCount == 1, "mipmapped 3D storage images are not implemented");
         const auto vkFormat = StorageFormatFor(context, ResolveTextureFormat(descriptor.format));
         storageFormat = vkFormat;
         APS5_LOG_OUT("StorageTexture address=0x%llx %ux%u mips=%u mip=%u layers=%u base=%u dim=%d tile=%d format=%u vk=%d", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, mipLevel,
