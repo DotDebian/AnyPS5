@@ -102,7 +102,7 @@ public:
     // Draw input snapshots (ShaderResources::PrepareDrawBindings) kept across draws: a recorded
     // draw reads a copy of its read-only in-place inputs, taken when it is recorded, and the draws
     // of a frame bind the same multi-MiB buffers (light lists a compute pass wrote) hundreds of
-    // times, which copied them again for every draw. A snapshot is immutable once filled, so a
+    // times, which copied them again for every draw. A snapshot never changes while anything but the cache holds it, so a
     // later draw may bind it while the guest bytes are unchanged since the copy: `generation` is
     // the GuestMemory::CollectWrites value taken right before the copy, and ReusableDrawSnapshot
     // (called after the caller's own collect of the range) returns it only while
@@ -110,7 +110,9 @@ public:
     // GPU store stamped by MarkWritten, drops it) and the guest allocation registry has not changed
     // since (a range unmapped and mapped again holds new bytes no write stamped; registry mutations
     // are rare once a title runs). A storage snapshot that fails only the write check is still
-    // returned when its bytes equal the guest bytes, and takes `generation`, the caller's collect. Kept least recently used under a byte budget
+    // returned when its bytes equal the guest bytes, and takes `generation`, the caller's collect. Only the 64 KiB tracker blocks stamped since
+    // its generation are compared; when some differ and the cache holds the only reference (no recorded draw binds it), those
+    // blocks are copied into it in place instead of copying the whole range again. Kept least recently used under a byte budget
     // (APS5_DRAW_SNAPSHOT_CACHE_MIB, default 256; 0 copies for every draw as before) and an entry
     // count (APS5_DRAW_SNAPSHOT_CACHE_ENTRIES, default 1024); the vertex and index snapshots are kept
     // apart under their own (APS5_DRAW_INPUT_CACHE_MIB, default 1024, and
@@ -124,10 +126,10 @@ public:
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32 };
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
     // APS5_PROFILE_DRAW: the snapshot cache's lookups that found no entry, found a stale one, and
-    // entries evicted to make room; of the stale ones, those reused with unchanged bytes
+    // entries evicted to make room; of the stale ones, those reused with unchanged bytes and those patched in place
     // (cumulative, all recorders).
     struct DrawSnapshotStatistics {
-        std::uint64_t absent, stale, evicted, revalidated;
+        std::uint64_t absent, stale, evicted, revalidated, patched;
     };
     static DrawSnapshotStatistics DrawSnapshotCounts();
     static std::size_t DrawSnapshotBudget(SnapshotUse use);
@@ -767,6 +769,7 @@ private:
     };
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
 };
 
 }
