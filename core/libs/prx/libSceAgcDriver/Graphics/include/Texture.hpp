@@ -279,6 +279,7 @@ public:
     DccKeys UploadedKeys() const { return uploadedKeys; }
     DccKeys FilledKeys() const { return filledKeys; }
     DccKeyProof& KeyProof() const { return keyProof; }
+    bool ServesKeysAt(std::uint64_t dccAddress) const;
     // Brings the image up to date with guest memory before another use; returns whether its content
     // was still current (nothing uploaded).
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
@@ -402,6 +403,12 @@ private:
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     DccKeys filledKeys = DccKeys::Uncompressed;
     mutable DccKeyProof keyProof;
+    struct ForeignKeyProof {
+        std::uint64_t dccAddress = 0;
+        DccKeyProof proof;
+    };
+    mutable std::array<ForeignKeyProof, 4> foreignKeyProofs{};
+    mutable std::uint32_t nextForeignKeyProof = 0;
     // Write generation `original` is known current at (the oldest of layerGeneration).
     std::uint64_t generation = 0;
     std::uint32_t trackedLayers = 1;

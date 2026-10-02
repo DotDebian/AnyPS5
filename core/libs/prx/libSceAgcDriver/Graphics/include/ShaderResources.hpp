@@ -30,6 +30,7 @@ std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, con
 // Whether `image` is still the storage cache's image of its surface (what CachedStorageSurface
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
+bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
 
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
 // a storage image other than `except` has results pending in [address, address + bytes).
@@ -403,6 +404,7 @@ private:
     std::vector<bool> textureFirstLayer;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
     std::vector<std::uint32_t> storageMips;
+    std::vector<std::uint64_t> storageKeys;
     std::vector<bool> storageFirstLayer;
     std::vector<bool> storageWritten;
     std::vector<std::shared_ptr<Sampler>> samplers;

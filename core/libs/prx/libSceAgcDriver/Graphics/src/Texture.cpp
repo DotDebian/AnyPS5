@@ -1226,6 +1226,27 @@ bool StorageTexture::Refresh() {
     return false;
 }
 
+bool StorageTexture::ServesKeysAt(std::uint64_t dccAddress) const {
+    const bool locked = GuestMemory::GpuMutex().HeldByThisThread();
+    const auto readFollowed = [&] {
+        DccKeyProof unlocked;
+        return ProvedClearKeys(descriptor, guestBytes, locked ? keyProof : unlocked);
+    };
+    const auto readNamed = [&] {
+        auto named = descriptor;
+        named.dccAddress = dccAddress;
+        DccKeyProof unlocked;
+        if (!locked) return ProvedClearKeys(named, guestBytes, unlocked);
+        auto slot = std::find_if(foreignKeyProofs.begin(), foreignKeyProofs.end(), [&](const ForeignKeyProof& entry) { return entry.dccAddress == dccAddress; });
+        if (slot == foreignKeyProofs.end()) {
+            slot = foreignKeyProofs.begin() + nextForeignKeyProof++ % foreignKeyProofs.size();
+            *slot = ForeignKeyProof{dccAddress, {}};
+        }
+        return ProvedClearKeys(named, guestBytes, slot->proof);
+    };
+    return KeysServeSurface(descriptor.dccAddress, uploadedKeys, filledKeys, dccAddress, readFollowed, readNamed);
+}
+
 namespace {
 
 // Debug aid (APS5_TRACE_DCC_KEYS=1): who stores uncompressed keys over a surface (recommendation
