@@ -29,6 +29,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             const auto localDevice = device.Load();
             recordDeferredLabels(localDevice.get(), submission.queue);
+            static const bool submitOwnBatch = std::getenv("APS5_EOP_SUBMIT_OWN_BATCH") != nullptr;
+            const bool workOpen = submitOwnBatch || Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
             int reason = localDevice != nullptr ? 0 : 1;
             if (label.has_value()) {
                 const auto bytes = label->Bytes();
@@ -45,7 +47,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (reason == 0 || reason == 5 || reason == 6) {
                 const auto queueId = submission.queue;
                 interruptDeferred = localDevice->AfterRecordedWork([queueId] { AgcDriverDeliverEopInterrupt(queueId); }, submission.queue == 0);
-                if (interruptDeferred) localDevice->SubmitRecorded(submission.queue == 0);
+                if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
                 wroteOnGpu = true;
             } else if (reason == 1) {
                 wroteOnGpu = true;
