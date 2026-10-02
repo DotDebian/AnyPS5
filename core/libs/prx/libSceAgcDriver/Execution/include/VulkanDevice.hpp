@@ -186,10 +186,10 @@ public:
     // values are refused; 0 when APS5_SYNC_FLIP is set).
     static std::size_t FlipInFlight();
     double RetirePresents(std::size_t keepInFlight);
-    // Whether presenting `buffer` will use the single scaler source, staging or upload objects (a
-    // GPU frame dump, the guest-memory path, a source-size change) while an in-flight blit still
-    // reads them, i.e. wait for every slot: the presenter then retires them before taking the
-    // mutex (the same wait under it is only the fallback when the answer changes in between).
+    // Whether presenting `buffer` will use the single scaler source, staging or upload objects (the
+    // guest-memory path) while an in-flight blit still reads them, i.e. wait for every slot: the
+    // presenter then retires them before taking the mutex (the same wait under it is only the
+    // fallback when the answer changes in between).
     bool PresentWaitsForSlots(const DisplayBuffer* buffer) const;
     bool AcquireImage();
     bool PresentClear(std::uint32_t width, std::uint32_t height, bool opaque);
@@ -315,7 +315,7 @@ private:
     // The tail of a dispatch's device call from the open batch's command buffer to the completion
     // registration: keeps, the template data refresh, barriers, bind, push, dispatch, marks.
     void recordDispatch(RecordedDispatch& record);
-    // `residentConvert`: the resident image presents through the color transfer's conversion
+    // `residentConvert`: the resident image presents through PresentationPass
     // (ResidentPresent::Convert) instead of a blit of the image itself.
     bool present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display = nullptr, const std::shared_ptr<Graphics::StorageTexture>& resident = nullptr, VkFilter residentFilter = VK_FILTER_LINEAR, bool dumpFrame = false, bool residentConvert = false);
     struct State;

@@ -15,7 +15,6 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
-#include "ResidentPresent.hpp"
 #include "SampleLod_spv.h"
 #include <SDL_loadso.h>
 #ifdef _WIN32
@@ -2977,7 +2976,6 @@ int main() {
             misalignedSnapshotTests(device, recorder);
             drawSnapshotEvictionTests(device);
             drawInputReuseTests(device, recorder);
-            RunResidentPresentTests(device.GetContext());
             storeRunTests(device, recorder);
             movedMetadataTests(device, recorder);
             unitShadowTests(device, recorder);

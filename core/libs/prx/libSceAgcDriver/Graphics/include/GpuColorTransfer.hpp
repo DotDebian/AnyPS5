@@ -14,12 +14,6 @@ public:
     GpuColorTransfer& operator=(const GpuColorTransfer&) = delete;
     void Upload(std::uint64_t address, std::uint32_t width, std::uint32_t height, ColorTileMode mode);
     void Detile(VkCommandBuffer commands, bool swapRedBlue = false, bool tenBit = false);
-    // Detile's conversion from an image instead of guest memory: the image's texels (one 2D level
-    // of `width` x `height`, 4 bytes each, in `layout`, readable by transfers) are copied raw, in
-    // row order, and converted as Detile converts the words of an untiled surface, into the same
-    // linear buffer. The buffers are sized for (width, height, mode), as an Upload of the surface
-    // sizes them, so switching between the two sources reallocates nothing.
-    void DetileImage(VkCommandBuffer commands, VkImage image, VkImageLayout layout, std::uint32_t width, std::uint32_t height, ColorTileMode mode, bool swapRedBlue, bool tenBit);
     void Tile(VkCommandBuffer commands);
     void WriteBack(std::uint64_t address);
     VkBuffer LinearBuffer() const;

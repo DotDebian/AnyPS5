@@ -4,6 +4,9 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <functional>
+#include <optional>
+#include <span>
 
 namespace AgcDriver {
 
@@ -19,11 +22,12 @@ bool DisplayRedLow(std::uint64_t pixelFormat);
 // holds the display's 8-bit texel format and can be a blit source, so the blit to the swapchain is
 // exact. Convert: the image holds the display's 32-bit texels in another type (a 10-bit display,
 // whose blit would round where the guest-memory path drops the low two bits of each channel; the
-// other 8-bit channel order; an sRGB type the blit would decode): a raw copy of its texels goes
-// through the guest-memory path's own conversion (GpuColorTransfer::DetileImage), so both paths
-// present the same pixels. None: the image cannot present the buffer.
+// other 8-bit channel order; an sRGB type the blit would decode): PresentationPass reads its raw
+// texels and converts them as the guest-memory path does, so both paths present the same pixels.
+// None: the image cannot present the buffer.
 enum class ResidentPresent : std::uint8_t { None, Blit, Convert };
 ResidentPresent ResidentPresentPath(VkFormat storage, std::uint64_t pixelFormat, bool blitSource);
+std::optional<VkFormat> SwapchainFormat(std::span<const VkSurfaceFormatKHR> formats, const std::function<bool(VkFormat)>& usable);
 
 }
 

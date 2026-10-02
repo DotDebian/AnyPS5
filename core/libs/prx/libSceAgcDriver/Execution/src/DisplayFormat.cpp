@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
+#include <algorithm>
 
 namespace AgcDriver {
 namespace {
@@ -38,6 +39,14 @@ ResidentPresent ResidentPresentPath(VkFormat storage, std::uint64_t pixelFormat,
         default:
             return ResidentPresent::None;
     }
+}
+
+std::optional<VkFormat> SwapchainFormat(std::span<const VkSurfaceFormatKHR> formats, const std::function<bool(VkFormat)>& usable) {
+    for (const auto format : {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_A2R10G10B10_UNORM_PACK32, VK_FORMAT_B8G8R8A8_UNORM}) {
+        const bool offered = std::any_of(formats.begin(), formats.end(), [&](const VkSurfaceFormatKHR& candidate) { return candidate.format == format && candidate.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; });
+        if (offered && usable(format)) return format;
+    }
+    return std::nullopt;
 }
 
 }
