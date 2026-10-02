@@ -18,7 +18,7 @@ Known issues: the copyright line, some artifacts and minor glitches in the cinem
 
 ## Upstream contributions
 
-58 pull requests from this work are merged into [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), among them Linux write tracking (#120, #121), the shader disk and pipeline cache (#129), NGG geometry as mesh shaders (#133), structurizer cloning (#134), pixel input layout (#136, #137), geometry shader fusion (#124), recompiler fixes for v_fma_mix (#205) and SDWA results (#214), rendering fixes (#131, #132, #176, #177, #178, #181, #202, #204), DualSense output and audio (#179, #180) and Linux direct memory through memfd (#203). Open: #246, #275, #276, #277, #278, #297, #303, #304, #305, #306, #307, #322.
+59 pull requests from this work are merged into [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), among them Linux write tracking (#120, #121), the shader disk and pipeline cache (#129), NGG geometry as mesh shaders (#133), structurizer cloning (#134), pixel input layout (#136, #137), geometry shader fusion (#124), recompiler fixes for v_fma_mix (#205) and SDWA results (#214), rendering fixes (#131, #132, #176, #177, #178, #181, #202, #204), DualSense output and audio (#179, #180) and Linux direct memory through memfd (#203). Open: #275, #276, #277, #278, #297, #303, #304, #305, #306, #307, #322.
 
 ---
 
