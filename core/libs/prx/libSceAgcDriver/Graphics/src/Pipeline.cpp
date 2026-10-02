@@ -43,13 +43,20 @@ void ValidateViewport(const Context& context, const VkViewport& viewport) {
     Require(std::min(viewport.y, viewport.y + viewport.height) >= context.limits.viewportBoundsRange[0] && std::max(viewport.y, viewport.y + viewport.height) <= context.limits.viewportBoundsRange[1], "viewport Y exceeds device bounds");
 }
 
-Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size()), depthAttachment(state.depth.attached) {
+void ValidateDepthBounds(const Context& context, const DepthState& depth) {
+    if (!depth.attached || !depth.depthBounds) return;
+    Require(context.depthBounds, "depth bounds require the depthBounds feature");
+    Require(context.depthRangeUnrestricted || (depth.depthBoundsMin >= 0 && depth.depthBoundsMin <= 1 && depth.depthBoundsMax >= 0 && depth.depthBoundsMax <= 1), "depth bounds outside [0, 1] require VK_EXT_depth_range_unrestricted");
+}
+
+Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size()), depthAttachment(state.depth.attached), depthBounds(state.depth.attached && state.depth.depthBounds) {
     // A cached pipeline may outlive its device's teardown (see ClearCachedPipelines); it must not keep
     // the buffer pool, which is reset with the device, alive past it.
     this->context.bufferPool.reset();
     Require(state.colors.size() <= state.blends.size() && std::all_of(state.colors.begin(), state.colors.end(), [&](const ColorTarget& color) { return color.attachment < state.blends.size(); }), "blend states do not match decoded color state");
     Require(state.blends.size() <= context.limits.maxColorAttachments, "color targets exceed device attachment limits");
     Require(state.hasColorTarget || state.depth.attached || (context.limits.framebufferNoAttachmentsSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0, "device does not support single-sample rendering without attachments");
+    Require(!depthBounds || context.depthBounds, "depth bounds require the depthBounds feature");
     Require(!state.negativeOneToOne || context.depthClipControl, "negative-one-to-one depth clipping requires VK_EXT_depth_clip_control with depthClipControl enabled");
     if (state.rectList) Require(context.tessellationShader && context.limits.maxTessellationPatchSize >= 4, "rect-list requires tessellation with four output control points");
     if (state.stages.tessellation) {
@@ -161,9 +168,9 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         if (state.negativeOneToOne) viewports.pNext = &depthClip;
         viewports.viewportCount = 1;
         viewports.scissorCount = 1;
-        const std::array<VkDynamicState, 2> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        const std::array<VkDynamicState, 3> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BOUNDS};
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
+        dynamic.dynamicStateCount = depthBounds ? 3u : 2u;
         dynamic.pDynamicStates = dynamicStates.data();
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         raster.polygonMode = VK_POLYGON_MODE_FILL;
@@ -185,6 +192,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         depthStencil.stencilTestEnable = state.depth.stencilTest ? VK_TRUE : VK_FALSE;
         depthStencil.front = state.depth.front;
         depthStencil.back = state.depth.back;
+        depthStencil.depthBoundsTestEnable = depthBounds ? VK_TRUE : VK_FALSE;
         depthStencil.minDepthBounds = 0;
         depthStencil.maxDepthBounds = 1;
         VkPipelineMultisampleStateCreateInfo samples{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -297,19 +305,20 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     return framebuffer;
 }
 
-void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const VkViewport& viewport, const VkRect2D& scissor) const {
+void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, const State& state) const {
     VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     begin.renderPass = renderPass;
     begin.framebuffer = framebuffer.Handle();
-    begin.renderArea = {{0, 0}, extent};
+    begin.renderArea = {{0, 0}, state.renderExtent};
     context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
-    Continue(commands, viewport, scissor);
+    Continue(commands, state);
 }
 
-void Pipeline::Continue(VkCommandBuffer commands, const VkViewport& viewport, const VkRect2D& scissor) const {
+void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &viewport);
-    context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &scissor);
+    context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
+    context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
+    if (depthBounds) context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.depth.depthBoundsMin, state.depth.depthBoundsMax);
 }
 
 void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
@@ -393,6 +402,7 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
             append(key, depth.depthBiasSlope);
             append(key, context.depthBiasClamp ? depth.depthBiasClamp : 0.0f);
         }
+        append(key, depth.depthBounds);
     }
     append(key, state.stages.mesh.has_value());
     if (state.stages.mesh) {

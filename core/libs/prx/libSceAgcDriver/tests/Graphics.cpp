@@ -192,8 +192,12 @@ void stateTests() {
         Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "a depth test without a depth surface was rejected");
     }
     queue.context[0x200] = 8;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "depth bounds");
-    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("depth bounds") != std::string::npos, "the precheck accepted depth bounds");
+    Require(!AgcDriver::Graphics::DecodeState(queue).depth.attached && AgcDriver::Graphics::DrawRejection(queue, false).empty(), "depth bounds without a depth surface needed a depth target");
+    for (const auto control : {0x40000000u, 0x80000000u}) {
+        queue.context[0x200] = control;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "depth-conditional color writes");
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).find("depth-conditional color writes") != std::string::npos, "the precheck accepted depth-conditional color writes");
+    }
     queue = makeState();
     queue.context[0x10f] = 0x7fc00000;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "non-finite");
@@ -378,7 +382,7 @@ void depthTests() {
     state = DecodeState(queue);
     Require(state.depth.attached && state.depthTarget.zFormat == 1 && !state.depthTarget.stencil && state.depthTarget.stencilAddress == 0 && state.depthTarget.slice == 2, "a Z_16 array layer was not decoded");
     // Unsupported surfaces and modes, rejected alike by the decode and the precheck.
-    const std::array<std::tuple<std::uint32_t, std::uint32_t, const char*>, 8> rejected{{
+    const std::array<std::tuple<std::uint32_t, std::uint32_t, const char*>, 9> rejected{{
         {0x10, 0xa0000187u, "multisampled depth"},
         {0x10, 0xa0000182u, "Z_24"},
         {0x14, 0x51357u, "separate depth read and write"},
@@ -386,7 +390,8 @@ void depthTests() {
         {0x2, (3u << 13u) | 1u, "layered depth rendering"},
         {0x2, 1u << 26u, "depth mip"},
         {0x0, 1u << 12u, "decompress"},
-        {0x200, 0x007007beu, "depth bounds"},
+        {0x200, 0x407007b6u, "depth-conditional color writes"},
+        {0x200, 0x807007b6u, "depth-conditional color writes"},
     }};
     for (const auto& [offset, value, reason] : rejected) {
         queue = makeDepthState();
@@ -455,9 +460,40 @@ void depthTests() {
     expectDepthRejection(queue, "one face only");
     queue.context[0x205] = 0x240u | 0x800u | 2u;
     Require(DecodeState(queue).depth.depthBias, "depth bias of the only rasterized face was lost");
+    queue = makeDepthState();
+    queue.context[0x200] = 0x007007beu;
+    queue.context[0x8] = std::bit_cast<std::uint32_t>(0.25f);
+    queue.context[0x9] = std::bit_cast<std::uint32_t>(0.75f);
+    state = DecodeState(queue);
+    Require(DrawRejection(queue, false).empty() && state.depth.attached && state.depth.depthBounds && state.depth.depthBoundsMin == 0.25f && state.depth.depthBoundsMax == 0.75f && state.depth.depthTest && state.depth.depthWrite, "depth bounds were not decoded");
+    queue.context[0x200] = 8u;
+    state = DecodeState(queue);
+    Require(DrawRejection(queue, false).empty() && state.depth.attached && state.depth.depthBounds && !state.depth.depthTest && !state.depth.depthWrite && !state.depth.stencilTest, "a depth bounds test alone did not attach the depth surface");
+    queue.context[0x9] = std::bit_cast<std::uint32_t>(0.125f);
+    Require(DecodeState(queue).depth.depthBoundsMax == 0.125f, "inverted depth bounds were not kept");
+    queue.context[0x200] = 0x007007b6u;
+    Require(!DecodeState(queue).depth.depthBounds, "depth bounds were decoded without DEPTH_BOUNDS_ENABLE");
+    queue.context.erase(0x9);
+    Require(!DecodeState(queue).depth.depthBounds, "a disabled depth bounds test read DB_DEPTH_BOUNDS_MAX");
+    queue.context[0x200] = 0x007007beu;
+    expectFailure([&] { DecodeState(queue); }, "missing register in context bank at DWORD 0x9");
+    Require(DrawRejection(queue, false).empty(), "the precheck gave a verdict without DB_DEPTH_BOUNDS_MAX");
+    queue.context[0x9] = 0x7f800000u;
+    expectDepthRejection(queue, "non-finite depth bounds");
+    queue.context[0x9] = std::bit_cast<std::uint32_t>(1.0f);
+    queue.context[0x0] = 1u;
+    expectDepthRejection(queue, "depth bounds on a depth or stencil clear");
+    queue = makeDepthState();
+    queue.context[0x10] = 0;
+    queue.context[0x200] = 8u | 1u | (4u << 8u);
+    queue.context[0x8] = 0;
+    queue.context[0x9] = std::bit_cast<std::uint32_t>(1.0f);
+    expectDepthRejection(queue, "depth bounds without a depth surface");
     // The register facade over a depth state: every register the depth rules read is in the key.
     queue = makeDepthState();
-    queue.context[0x200] = (0x007007b6u & ~0x700u) | 1u | (2u << 8u);
+    queue.context[0x200] = (0x007007b6u & ~0x700u) | 1u | 8u | (2u << 8u);
+    queue.context[0x8] = 0;
+    queue.context[0x9] = std::bit_cast<std::uint32_t>(0.5f);
     queue.context[0x205] = 0x240u | 0x1800u;
     queue.context[0x2de] = 0x1e9;
     queue.context[0x2df] = 0;
@@ -469,7 +505,7 @@ void depthTests() {
     Require(DrawRejection(queue, true).empty(), "precheck rejected the depth reference state");
     RegisterReadLog() = nullptr;
     for (const auto read : log) Require(DrawKeyCovers(read), "DrawKeyRegisters lacks a register the depth decode reads: " + std::string(RegisterBankName(read.bank)) + " " + std::to_string(read.offset));
-    for (const auto offset : {0x0u, 0x2u, 0x5u, 0x7u, 0xau, 0xbu, 0x10u, 0x11u, 0x12u, 0x15u, 0x1au, 0x1eu, 0x10bu, 0x10du, 0x2e3u}) {
+    for (const auto offset : {0x0u, 0x2u, 0x5u, 0x7u, 0x8u, 0x9u, 0xau, 0xbu, 0x10u, 0x11u, 0x12u, 0x15u, 0x1au, 0x1eu, 0x10bu, 0x10du, 0x2e3u}) {
         Require(std::any_of(log.begin(), log.end(), [&](const RegisterRead& read) { return read.bank == RegisterBank::Context && read.offset == offset; }), "the depth decode did not read context register " + std::to_string(offset));
     }
 }
@@ -939,6 +975,8 @@ struct MockVulkan {
     std::optional<VkAttachmentReference> renderPassDepth;
     std::vector<VkAttachmentReference> renderPassColors;
     std::uint32_t blendAttachments = 0;
+    std::vector<VkDynamicState> dynamicStates;
+    std::optional<std::pair<float, float>> depthBounds;
     std::optional<VkPipelineDepthStencilStateCreateInfo> depthStencil;
     VkPipelineRasterizationStateCreateInfo raster{};
     std::vector<std::vector<std::uint32_t>> shaderModules;
@@ -1111,6 +1149,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineC
     mock.depthStencil = depthStencil != nullptr ? std::optional<VkPipelineDepthStencilStateCreateInfo>(*depthStencil) : std::nullopt;
     mock.raster = *infos[0].pRasterizationState;
     mock.blendAttachments = infos[0].pColorBlendState->attachmentCount;
+    mock.dynamicStates.assign(infos[0].pDynamicState->pDynamicStates, infos[0].pDynamicState->pDynamicStates + infos[0].pDynamicState->dynamicStateCount);
     *pipelines = makeHandle<VkPipeline>();
     ++mock.pipelineCreateCount;
     ++mock.live;
@@ -1129,6 +1168,14 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyPipeline(VkDevice, VkPipeline, const VkAll
 
 VKAPI_ATTR void VKAPI_CALL mockCmdBindPipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline pipeline) {
     mock.boundPipeline = pipeline;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCmdSetViewport(VkCommandBuffer, std::uint32_t, std::uint32_t, const VkViewport*) {}
+
+VKAPI_ATTR void VKAPI_CALL mockCmdSetScissor(VkCommandBuffer, std::uint32_t, std::uint32_t, const VkRect2D*) {}
+
+VKAPI_ATTR void VKAPI_CALL mockCmdSetDepthBounds(VkCommandBuffer, float minimum, float maximum) {
+    mock.depthBounds = std::make_pair(minimum, maximum);
 }
 
 VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t size, const void* values) {
@@ -1174,6 +1221,9 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkDestroyRenderPass", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyRenderPass)},
         {"vkCreateGraphicsPipelines", reinterpret_cast<PFN_vkVoidFunction>(mockCreateGraphicsPipelines)},
         {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindPipeline)},
+        {"vkCmdSetViewport", reinterpret_cast<PFN_vkVoidFunction>(mockCmdSetViewport)},
+        {"vkCmdSetScissor", reinterpret_cast<PFN_vkVoidFunction>(mockCmdSetScissor)},
+        {"vkCmdSetDepthBounds", reinterpret_cast<PFN_vkVoidFunction>(mockCmdSetDepthBounds)},
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
         {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)}
@@ -1693,6 +1743,53 @@ void depthPipelineTests() {
         Require(depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT && depth.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && depth.storeOp == VK_ATTACHMENT_STORE_OP_STORE && depth.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD && depth.stencilStoreOp == VK_ATTACHMENT_STORE_OP_STORE && depth.initialLayout == VK_IMAGE_LAYOUT_GENERAL && depth.finalLayout == VK_IMAGE_LAYOUT_GENERAL, "the depth attachment does not keep its contents in GENERAL");
         Require(mock.depthStencil && mock.depthStencil->depthTestEnable && mock.depthStencil->depthWriteEnable && mock.depthStencil->depthCompareOp == VK_COMPARE_OP_LESS_OR_EQUAL && !mock.depthStencil->stencilTestEnable && !mock.depthStencil->depthBoundsTestEnable, "the pipeline's depth-stencil state was not built");
         Require(mock.raster.depthBiasEnable && mock.raster.depthBiasSlopeFactor == 2.0f && mock.raster.depthBiasConstantFactor == 3.0f, "the pipeline lacks the depth bias");
+        Require(std::find(mock.dynamicStates.begin(), mock.dynamicStates.end(), VK_DYNAMIC_STATE_DEPTH_BOUNDS) == mock.dynamicStates.end(), "a pipeline without depth bounds made them dynamic");
+        mock.depthBounds.reset();
+        pipeline.Continue(VK_NULL_HANDLE, state);
+        Require(!mock.depthBounds, "a pipeline without depth bounds set them");
+    }
+    {
+        auto bounded = queue;
+        bounded.context[0x200] = 8u;
+        bounded.context[0x8] = std::bit_cast<std::uint32_t>(0.25f);
+        bounded.context[0x9] = std::bit_cast<std::uint32_t>(0.5f);
+        auto boundsState = DecodeState(bounded);
+        ShaderResources resources(context, vertex, fragment, boundsState.color, 0, 0);
+        expectFailure([&] { Pipeline pipeline(context, boundsState, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL); }, "depthBounds feature");
+        expectFailure([&] { ValidateDepthBounds(context, boundsState.depth); }, "depthBounds feature");
+        context.depthBounds = true;
+        ValidateDepthBounds(context, boundsState.depth);
+        {
+            Pipeline pipeline(context, boundsState, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+            Require(mock.renderPassDepth && mock.depthStencil && mock.depthStencil->depthBoundsTestEnable && !mock.depthStencil->depthTestEnable && !mock.depthStencil->depthWriteEnable, "the pipeline lacks the depth bounds test");
+            Require(std::find(mock.dynamicStates.begin(), mock.dynamicStates.end(), VK_DYNAMIC_STATE_DEPTH_BOUNDS) != mock.dynamicStates.end(), "the depth bounds are not dynamic state");
+            pipeline.Continue(VK_NULL_HANDLE, boundsState);
+            Require(mock.depthBounds && mock.depthBounds->first == 0.25f && mock.depthBounds->second == 0.5f, "the draw's depth bounds were not set");
+            boundsState.depth.depthBoundsMax = 0.75f;
+            pipeline.Continue(VK_NULL_HANDLE, boundsState);
+            Require(mock.depthBounds->second == 0.75f, "a continued draw kept the previous depth bounds");
+        }
+        boundsState.depth.depthBoundsMax = 1.5f;
+        expectFailure([&] { ValidateDepthBounds(context, boundsState.depth); }, "VK_EXT_depth_range_unrestricted");
+        context.depthRangeUnrestricted = true;
+        ValidateDepthBounds(context, boundsState.depth);
+        context.depthRangeUnrestricted = false;
+        const auto before = mock.pipelineCreateCount;
+        vertex.variantId = 1;
+        fragment.variantId = 2;
+        auto unbounded = DecodeState(queue);
+        unbounded.depth.depthTest = boundsState.depth.depthTest;
+        unbounded.depth.depthWrite = boundsState.depth.depthWrite;
+        unbounded.depth.depthCompare = boundsState.depth.depthCompare;
+        unbounded.depth.depthBias = false;
+        auto lowered = boundsState;
+        lowered.depth.depthBoundsMin = 0.0f;
+        const auto withBounds = CachedPipeline(context, boundsState, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        Require(CachedPipeline(context, lowered, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL) == withBounds, "draws differing only in their depth bounds values did not share a pipeline");
+        Require(CachedPipeline(context, unbounded, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL) != withBounds && mock.pipelineCreateCount == before + 2, "the depth bounds test did not separate pipelines");
+        ClearCachedPipelines(context.device);
+        vertex.variantId = fragment.variantId = 0;
+        context.depthBounds = false;
     }
     // Without a depth attachment the pipeline carries no depth-stencil state.
     {

@@ -197,6 +197,7 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::Buffer> gds;
     bool depthClamp = false;
     bool depthBiasClamp = false;
+    bool depthBounds = false;
     bool occlusionQueryPrecise = false;
     std::uint64_t lastSampleDump = 0;
     VkDeviceSize hostImportAlignment = 0;
@@ -842,6 +843,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     // PA_SU_POLY_OFFSET_CLAMP maps to the depth bias clamp.
     enabled.depthBiasClamp = available.depthBiasClamp;
     state->depthBiasClamp = enabled.depthBiasClamp == VK_TRUE;
+    enabled.depthBounds = available.depthBounds;
+    state->depthBounds = enabled.depthBounds == VK_TRUE;
     enabled.occlusionQueryPrecise = available.occlusionQueryPrecise;
     state->occlusionQueryPrecise = enabled.occlusionQueryPrecise == VK_TRUE;
     // Recompiled storage-image access declares no format (the guest descriptor decides it).
@@ -2484,6 +2487,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.descriptorIndexing = state->descriptorIndexing;
     context.primitiveListRestart = state->primitiveListRestart;
     context.depthBiasClamp = state->depthBiasClamp;
+    context.depthBounds = state->depthBounds;
     context.imageViewMinLod = state->imageViewMinLod;
     context.gdsBuffer = state->gds != nullptr ? state->gds->Handle() : VK_NULL_HANDLE;
     return context;

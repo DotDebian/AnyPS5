@@ -145,7 +145,8 @@ std::string decodeDepth(TRequired required, TOptional optional, DepthDecode& out
     const auto depthControl = required(0x200);
     if (!depthControl) return {};
     const auto dc = *depthControl;
-    if ((dc & 0xc0000008u) != 0) return "AGC graphics: depth bounds or depth-conditional color writes are unsupported";
+    if ((dc & 0xc0000000u) != 0) return depthMessage("depth-conditional color writes are unsupported", 0x200, dc);
+    const bool depthBounds = (dc & 8u) != 0;
     if (IgnoreDepthTest()) {
         if ((dc & 3u) != 0) reportOnce(DepthReport::Ignored, "[gpu] depth/stencil tests are ignored (APS5_IGNORE_DEPTH_TEST; DB_DEPTH_CONTROL=0x%08x)\n", dc);
         return {};
@@ -238,6 +239,18 @@ std::string decodeDepth(TRequired required, TOptional optional, DepthDecode& out
     if (state.clearStencil) {
         state.stencilTest = true;
         stencilNeeded = true;
+    }
+    if (depthBounds) {
+        if (!hasZ) return depthMessage("depth bounds without a depth surface are unsupported", 0x200, dc);
+        if (state.clearDepth || state.clearStencil) return depthMessage("depth bounds on a depth or stencil clear are unsupported", 0x0, *renderControl);
+        const auto minimum = required(0x8);
+        const auto maximum = required(0x9);
+        if (!minimum || !maximum) return {};
+        state.depthBoundsMin = std::bit_cast<float>(*minimum);
+        state.depthBoundsMax = std::bit_cast<float>(*maximum);
+        if (!std::isfinite(state.depthBoundsMin) || !std::isfinite(state.depthBoundsMax)) return depthMessage("non-finite depth bounds", 0x8, *minimum);
+        state.depthBounds = true;
+        depthNeeded = true;
     }
     if (!depthNeeded && !stencilNeeded) {
         if ((dc & 3u) != 0) reportOnce(DepthReport::PassThrough, "[gpu] always-pass depth/stencil state is rendered without a depth target (DB_DEPTH_CONTROL=0x%08x)\n", dc);
