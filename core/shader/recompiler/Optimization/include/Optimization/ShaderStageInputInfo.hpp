@@ -119,13 +119,13 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
     bool passthrough = false;
 
     // The vertices of one input primitive: VGT_PRIMITIVE_TYPE point list (1), line list (2), else
-    // a triangle list (4) or strip (6).
+    // a triangle list (4), fan (5) or strip (6).
     [[nodiscard]] std::uint32_t InputPrimitiveSize() const {
         return inputPrimitive == 1u ? 1u : inputPrimitive == 2u ? 2u : 3u;
     }
     // The vertices between the first vertices of consecutive input primitives.
     [[nodiscard]] std::uint32_t InputPrimitiveStep() const {
-        return inputPrimitive == 6u ? 1u : InputPrimitiveSize();
+        return inputPrimitive == 5u || inputPrimitive == 6u ? 1u : InputPrimitiveSize();
     }
     [[nodiscard]] std::uint32_t InputPrimitiveCount(std::uint32_t vertices) const {
         return vertices < InputPrimitiveSize() ? 0u : (vertices - InputPrimitiveSize()) / InputPrimitiveStep() + 1u;

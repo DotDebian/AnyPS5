@@ -565,6 +565,39 @@ void ShaderStageTests() {
         Require(pass.path == AgcDriver::Graphics::ShaderPath::Geometry && pass.mesh && pass.mesh->passthrough && pass.mesh->verticesPerGroup == 63 && pass.mesh->primitivesPerGroup == 21, "passthrough subgroup assembly changed");
         Require(pass.vertexWaveSize == ((routing & 0x00400000u) ? 32u : 64u), "passthrough wave size changed");
     }
+    {
+        auto fan = makeState();
+        fan.userConfig[0x242] = 5;
+        fan.userConfig[0x24b] = 1;
+        fan.context[0x103] = 0xffffffffu;
+        fan.context[0x2d5] = 0x2030;
+        fan.userConfig[0x25b] = 0x4020;
+        fan.context[0x1ff] = 256;
+        fan.context[0x2ce] = 8;
+        fan.context[0x29b] = 2;
+        fan.context[0x2ab] = 4;
+        fan.shader[0x8a] = 3u << 29u;
+        fan.shader[0x8b] = 3u << 16u;
+        fan.context[0x1b3] = 2;
+        fan.context[0x1b4] = 2;
+        const auto state = AgcDriver::Graphics::DecodeState(fan);
+        Require(AgcDriver::Graphics::DrawRejection(fan, true).empty(), "the precheck rejected an indexed triangle fan with restart into a geometry shader");
+        Require(state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && state.primitiveRestart && state.stages.path == AgcDriver::Graphics::ShaderPath::Geometry && state.stages.mesh && !state.stages.mesh->passthrough, "a triangle fan did not decode as geometry input");
+        const auto& mesh = *state.stages.mesh;
+        Require(mesh.inputPrimitive == 5 && mesh.primitivesPerGroup == 30 && mesh.verticesPerGroup == 32 && mesh.maxVertices == 256 && mesh.maxPrimitives == 192 && mesh.threadsPerGroup == 256 && mesh.esgsItemSize == 4, "triangle fan subgroup assembly changed");
+        fan.userConfig[0x25b] = (3u << 9u) | 3u;
+        Require(AgcDriver::Graphics::DecodeState(fan).stages.mesh->primitivesPerGroup == 1, "a three-vertex subgroup did not take one fan triangle");
+        fan.userConfig[0x25b] = (2u << 9u) | 3u;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(fan); }, "invalid geometry subgroup");
+        fan.userConfig[0x25b] = 0x4020;
+        for (const auto routing : {0x02002000u, 0x02402010u}) {
+            fan.context[0x2d5] = routing;
+            expectFailure([&] { AgcDriver::Graphics::DecodeState(fan); }, "unsupported geometry input or output assembly");
+        }
+        fan.context[0x2d5] = 0x2030;
+        fan.userConfig[0x242] = 3;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(fan); }, "unsupported geometry input or output assembly");
+    }
     queue.context[0x2d5] = 0x2020;
     queue.context[0x2ce] = 3;
     queue.context[0x29b] = 2;
@@ -2464,6 +2497,7 @@ void meshArgumentTests() {
     const ShaderRecompiler::MeshConfiguration points{1u, 1u, 1u, 1u, 1u, 64u, 1024u, 0u, 4u};
     const ShaderRecompiler::MeshConfiguration triangles{4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u};
     const ShaderRecompiler::MeshConfiguration strip{6u, 8u, 10u, 10u, 8u, 64u, 1024u, 0u, 4u};
+    const ShaderRecompiler::MeshConfiguration fan{5u, 30u, 32u, 256u, 192u, 256u, 1024u, 0u, 4u};
     const auto same = [](const MeshArguments& a, const MeshArguments& b) { return a.groups == b.groups && a.instances == b.instances && a.layers == b.layers && a.indexCount == b.indexCount && a.firstIndex == b.firstIndex; };
     const auto rules = [&](const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t indexCount) { return AgcDriver::Graphics::MeshArgumentRulesFor(context, mesh, indexCount); };
     const auto record = [](std::uint32_t count, std::uint32_t instances, std::uint32_t first) { return AgcDriver::Pm4::DrawArguments{count, instances, first, 0, 0}; };
@@ -2477,6 +2511,10 @@ void meshArgumentTests() {
     Require(same(ResolveMeshArguments(record(2, 1, 0), rules(triangles, 300)), {0, 0, 0, 2, 0}), "no complete triangle draws nothing");
     Require(same(ResolveMeshArguments(record(10, 1, 0), rules(strip, 64)), {1, 1, 1, 10, 0}), "eight strip triangles are one group");
     Require(same(ResolveMeshArguments(record(11, 1, 0), rules(strip, 64)), {2, 1, 1, 11, 0}), "a ninth strip triangle starts a group");
+    Require(same(ResolveMeshArguments(record(6, 1, 0), rules(fan, 6)), {1, 1, 1, 6, 0}), "a four-triangle fan is one group");
+    Require(same(ResolveMeshArguments(record(32, 1, 0), rules(fan, 64)), {1, 1, 1, 32, 0}), "thirty fan triangles are one group");
+    Require(same(ResolveMeshArguments(record(33, 1, 0), rules(fan, 64)), {2, 1, 1, 33, 0}), "a thirty-first fan triangle starts a group");
+    Require(same(ResolveMeshArguments(record(2, 1, 0), rules(fan, 64)), {0, 0, 0, 2, 0}), "a fan without a triangle draws nothing");
     Require(same(ResolveMeshArguments(record(1, 601, 0), rules(points, 1)), {0, 0, 0, 1, 0}), "instances over the device limit draw nothing");
     Require(same(ResolveMeshArguments(record(96 * 7, 600, 0), rules(triangles, 96 * 7)), {0, 0, 0, 96 * 7, 0}), "groups times instances over the device limit draw nothing");
     Require(same(ResolveMeshArguments(record(96 * 6, 600, 0), rules(triangles, 96 * 6)), {6, 600, 1, 96 * 6, 0}), "groups times instances at the device limit");

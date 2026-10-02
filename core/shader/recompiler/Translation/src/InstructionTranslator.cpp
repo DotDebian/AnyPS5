@@ -245,7 +245,9 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         // One workgroup is one NGG geometry subgroup of a merged ES/GS program: it takes the draw's
         // input primitives [group * primitivesPerGroup, +primitivesPerGroup) with no vertex reuse,
         // so ES thread i shades input vertex group * primitivesPerGroup * step + i and GS thread p
-        // assembles primitive p from ES threads p * step + (0, 1, 2). The draw parameters are the
+        // assembles primitive p from ES threads p * step + (0, 1, 2). A triangle fan's ES thread 0
+        // shades the draw's vertex 0 instead, and GS thread p takes ES threads (p + 1, p + 2, 0),
+        // the order the hardware gives with the first vertex provoking. The draw parameters are the
         // push dwords MeshDrawParameter reads (see MeshDrawPushOffsetBytes in Recompiler.hpp).
         const auto& mesh = options.inputInfo.vertex->mesh;
         const std::uint32_t size = mesh.InputPrimitiveSize();
@@ -257,7 +259,9 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         if (mesh.primitivesPerGroup == 0u || mesh.verticesPerGroup != mesh.InputVertexCount(mesh.primitivesPerGroup) || mesh.verticesPerGroup > totalThreads || mesh.primitivesPerGroup > totalThreads || totalThreads % waveSize != 0u || totalThreads > 15u * waveSize || mesh.esgsItemSize == 0u || mesh.esgsItemSize * mesh.verticesPerGroup > 0xffffu) {
             throw std::runtime_error("mesh shader translation configuration is not supported (wave " + std::to_string(options.waveSize) + ", primitives per group " + std::to_string(mesh.primitivesPerGroup) + ", vertices per group " + std::to_string(mesh.verticesPerGroup) + ", threads " + std::to_string(totalThreads) + ", ESGS item size " + std::to_string(mesh.esgsItemSize) + ")");
         }
+        constexpr std::uint32_t kTriFanPrimitiveType = 5u;
         constexpr std::uint32_t kTriStripPrimitiveType = 6u;
+        const bool fan = mesh.inputPrimitive == kTriFanPrimitiveType;
         const auto u32 = [&entryIr](std::uint32_t value) -> IrValue& {
             return entryIr.Constant(value);
         };
@@ -292,9 +296,9 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         IrValue& parity = mesh.inputPrimitive == kTriStripPrimitiveType ? entryIr.BitwiseAnd(entryIr.IAdd(firstPrimitive, local), u32(1u)) : u32(0u);
         IrValue& vertex = entryIr.IMul(local, step);
         IrValue& item = u32(mesh.esgsItemSize);
-        IrValue& first = entryIr.IMul(entryIr.IAdd(vertex, parity), item);
-        IrValue& second = size >= 2u ? entryIr.IMul(entryIr.ISub(entryIr.IAdd(vertex, u32(1u)), parity), item) : u32(0u);
-        IrValue& third = size == 3u ? entryIr.IMul(entryIr.IAdd(vertex, u32(2u)), item) : u32(0u);
+        IrValue& first = fan ? entryIr.IMul(entryIr.IAdd(vertex, u32(1u)), item) : entryIr.IMul(entryIr.IAdd(vertex, parity), item);
+        IrValue& second = fan ? entryIr.IMul(entryIr.IAdd(vertex, u32(2u)), item) : size >= 2u ? entryIr.IMul(entryIr.ISub(entryIr.IAdd(vertex, u32(1u)), parity), item) : u32(0u);
+        IrValue& third = fan ? u32(0u) : size == 3u ? entryIr.IMul(entryIr.IAdd(vertex, u32(2u)), item) : u32(0u);
         entryIr.SetVectorReg(static_cast<VectorReg>(0), entryIr.BitwiseOr(entryIr.BitwiseAnd(first, u32(0xffffu)), entryIr.ShiftLeftLogical(second, u32(16u))));
         entryIr.SetVectorReg(static_cast<VectorReg>(1), entryIr.BitwiseAnd(third, u32(0xffffu)));
         if (mesh.passthrough) {
@@ -310,7 +314,7 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         if (options.userDataBaseRegister != 0u || options.userDataCount < 8u) {
             throw std::runtime_error("mesh shader translation requires the merged program's eight hidden user words");
         }
-        IrValue& inputVertex = entryIr.IAdd(firstVertex, local);
+        IrValue& inputVertex = fan ? entryIr.Select(entryIr.IEqual(local, u32(0u)), u32(0u), entryIr.IAdd(firstVertex, local)) : entryIr.IAdd(firstVertex, local);
         IrValue& indexBytes = draw(3u);
         IrValue& indexed = entryIr.INotEqual(indexBytes, u32(0u));
         IrValue& byteOffset = entryIr.IMul(entryIr.IAdd(inputVertex, firstIndex), indexBytes);
