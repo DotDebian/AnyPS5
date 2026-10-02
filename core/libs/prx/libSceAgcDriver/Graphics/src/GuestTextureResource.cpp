@@ -1,6 +1,7 @@
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -57,7 +58,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     const auto dstSelZ = (words[3] >> 6u) & 0x7u;
     const auto dstSelW = (words[3] >> 9u) & 0x7u;
     const auto baseLevel = (words[3] >> 12u) & 0xfu;
-    auto lastLevel = (words[3] >> 16u) & 0xfu;
+    const auto lastLevel = (words[3] >> 16u) & 0xfu;
     const auto tileModeRaw = (words[3] >> 20u) & 0x1fu;
     const auto bcSwizzle = (words[3] >> 25u) & 0x7u;
     const auto typeRaw = (words[3] >> 28u) & 0xfu;
@@ -129,10 +130,6 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string(error.what()) + describe());
     }
-    Require(baseLevel <= maxMip, "guest texture descriptor starts past the surface's last mip level" + describe());
-    // Views may name levels past MAX_MIP (a 512x512 view through 1x1 over a 9-level surface); the
-    // hardware never addresses them, so the view ends at the surface's last level.
-    lastLevel = std::min(lastLevel, maxMip);
     // XOR swizzles fold a pipe/bank XOR into the low address bits; only unmodified 64 KiB bases are modeled.
     Require(XorSwizzleMode(tileMode) == 0 || (baseAddress & 0xffffu) == 0, "guest texture descriptor combines an XOR swizzle with a pipe/bank XOR base which is not implemented");
 
@@ -176,6 +173,14 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     result.dccAddress = metaCompress ? metaAddr << 8u : 0u;
     result.dccAlphaOnMsb = dccAlphaPos;
     result.minLod = minLod;
+    if (baseLevel > maxMip) {
+        Require(LevelsFitAllocation(result, lastLevel + 1u), "guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe());
+        result.mipCount = lastLevel + 1u;
+    } else {
+        // Views may name levels past MAX_MIP (a 512x512 view through 1x1 over a 9-level surface); the
+        // hardware never addresses them, so the view ends at the surface's last level.
+        result.lastLevel = std::min(lastLevel, maxMip);
+    }
     return result;
 }
 

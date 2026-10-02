@@ -399,6 +399,25 @@ SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor) {
     return geometry;
 }
 
+bool LevelsFitAllocation(const GuestTextureResource& surface, std::uint32_t levels) {
+    Require(levels >= surface.mipCount && levels <= 16u, "a view's mip chain must cover the surface's levels and at most 16");
+    auto view = surface;
+    view.mipCount = levels;
+    const auto allocated = DescribeSurface(surface);
+    const auto extended = DescribeSurface(view);
+    if (allocated.guestBytes != extended.guestBytes || allocated.layerBytes != extended.layerBytes || allocated.layers != extended.layers) return false;
+    for (std::uint32_t level = 0; level < surface.mipCount; ++level) {
+        const auto& before = allocated.mips[level];
+        const auto& after = extended.mips[level];
+        if (before.tiledOffset != after.tiledOffset || before.tiledSize != after.tiledSize || before.blocksPerRow != after.blocksPerRow || before.tail != after.tail || before.tailX != after.tailX || before.tailY != after.tailY) return false;
+    }
+    for (auto level = surface.mipCount; level < levels; ++level) {
+        const auto& mip = extended.mips[level];
+        if (mip.tiledOffset + mip.tiledSize > extended.layerBytes) return false;
+    }
+    return true;
+}
+
 std::vector<TileMipLayout> ComputeElementMipLayout(TextureTileMode tileMode, std::uint32_t bytesPerElement, std::uint32_t width, std::uint32_t height, std::uint32_t mipCount) {
     Require(width != 0 && height != 0 && mipCount != 0 && mipCount <= 16u, "invalid surface mip chain");
     if (tileMode == TextureTileMode::kLinear) return ComputeLinearMipLayout(bytesPerElement, 1u, 1u, width, height, mipCount);

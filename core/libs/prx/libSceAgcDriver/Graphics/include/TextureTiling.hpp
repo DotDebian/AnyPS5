@@ -67,6 +67,7 @@ struct SurfaceGeometry {
     std::uint32_t LevelLayers(std::uint32_t level) const { return imageDepth > 1 ? std::max(imageDepth >> level, 1u) : layers; }
 };
 SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor);
+bool LevelsFitAllocation(const GuestTextureResource& surface, std::uint32_t levels);
 
 }
 
