@@ -217,6 +217,7 @@ public:
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target);
     void NoteSampledDraw();
+    bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
     // Waits only for the batches up to the newest one that writes the range (submitting the open
     // batch when it is that one); later batches stay in flight. Fences of one queue signal in
     // submission order, so completions still run in order. Debug aid: APS5_NO_SYNC_THROUGH=1 syncs all.
@@ -672,6 +673,9 @@ private:
     VkPipelineLayout sampleLayout = VK_NULL_HANDLE;
     VkPipeline samplePipeline = VK_NULL_HANDLE;
     std::shared_ptr<void> samplePools;
+    int meshArgumentState = 0;
+    VkPipelineLayout meshArgumentLayout = VK_NULL_HANDLE;
+    VkPipeline meshArgumentPipeline = VK_NULL_HANDLE;
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
     // Commands() would close).
     std::uint32_t beginTiming(std::uint64_t key);
