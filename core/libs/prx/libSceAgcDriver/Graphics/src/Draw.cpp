@@ -452,7 +452,7 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
         add(state.rectList);
         add(state.topology);
         add(state.cullMode);
-        add(state.colors.size());
+        add(state.blends.size());
         add(context.subgroup.subgroupSize);
         add(context.subgroup.supportedStages);
         add(context.subgroup.supportedOperations);
@@ -827,6 +827,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (state.stages.tessellation) Require(draw.indexCount % state.stages.tessellation->inputControlPoints == 0, "incomplete tessellation patch");
     // Viewport and scissor are dynamic pipeline state, so their limits are checked here per draw.
     ValidateViewport(context, state.viewport);
+    ValidateDepthBounds(context, state.depth);
     timer.phase(PhaseValidate);
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
     if (draw.indexed) {
@@ -891,14 +892,17 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 }
 
 // The render pass a recorded draw begins or continues is named by its attachment views (stable while
-// the kept targets live, so unique within the open batch; the depth view last) and the extent.
-std::uint64_t renderPassKey(std::span<const VkImageView> views, VkImageView depthView, VkExtent2D extent) {
+// the kept targets live, so unique within the open batch; the depth view last), the color attachment
+// slots they are bound to (unused slots make other subpasses incompatible) and the extent.
+std::uint64_t renderPassKey(const State& state, std::span<const VkImageView> views, VkImageView depthView, VkExtent2D extent) {
     std::uint64_t key = 14695981039346656037ull;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
         key *= 1099511628211ull;
     };
     for (const auto view : views) mix(reinterpret_cast<std::uint64_t>(view));
+    mix(state.blends.size());
+    for (const auto& color : state.colors) mix(color.attachment);
     if (depthView != VK_NULL_HANDLE) mix(reinterpret_cast<std::uint64_t>(depthView));
     mix(extent.width);
     mix(extent.height);
@@ -1329,7 +1333,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // continued only when this draw neither reads its attachments (a barrier would be owed, which no
     // pass allows) nor records anything outside a pass (an indirect draw's argument barrier and
     // scratch copies, a pending clear of the depth image).
-    const auto passKey = renderPassKey(record.targetViews, record.depth != nullptr ? record.depth->View() : VK_NULL_HANDLE, state.renderExtent);
+    const auto passKey = renderPassKey(state, record.targetViews, record.depth != nullptr ? record.depth->View() : VK_NULL_HANDLE, state.renderExtent);
     const bool depthClear = record.depth != nullptr && record.depth->ClearPending();
     const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
@@ -1371,7 +1375,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (continued) {
-        record.pipeline->Continue(commands, state.viewport, state.scissor);
+        record.pipeline->Continue(commands, state);
     } else {
         // With a depth attachment the depth tests also wait for earlier depth writes (a previous
         // pass over the same image) and the pending clear below.
@@ -1390,7 +1394,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
-        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state.viewport, state.scissor);
+        record.pipeline->Begin(commands, *record.framebuffer, state);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {
@@ -1578,7 +1582,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             }
         }
         timer.phase(PhaseReadTarget);
-        binding.target = std::make_unique<RenderTarget>(context, color, state.blends[index].blendEnable != 0);
+        binding.target = std::make_unique<RenderTarget>(context, color, state.blends[color.attachment].blendEnable != 0);
         targetViews.push_back(binding.target->View());
     }
     // The depth attachment is always the resident image of the surface (DepthTarget.hpp).
@@ -1738,7 +1742,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             for (const auto& owner : owners) recipe->targets.emplace_back(owner);
             recipe->targetViews = targetViews;
             recipe->depth = depthImage;
-            recipe->passKey = renderPassKey(targetViews, depthImage != nullptr ? depthImage->View() : VK_NULL_HANDLE, state.renderExtent);
+            recipe->passKey = renderPassKey(state, targetViews, depthImage != nullptr ? depthImage->View() : VK_NULL_HANDLE, state.renderExtent);
             recipe->vertexInput = inputs.vertexInput;
             recipe->pushStages = PushConstantStages(shaders);
             if (recipe->pushStages != 0) {
@@ -1845,7 +1849,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         countBarrier();
     }
     APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
-    pipeline->Begin(commands, *framebuffer, state.renderExtent, state.viewport, state.scissor);
+    pipeline->Begin(commands, *framebuffer, state);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");

@@ -49,6 +49,7 @@ struct ColorTarget {
     std::uint32_t mipCount = 1;
     std::uint32_t mip = 0;
     bool mipTail = false;
+    std::uint32_t attachment = 0;
 };
 
 // The depth/stencil surface a draw tests against (DB_Z_INFO, DB_STENCIL_INFO, the DB_*_BASE words,
@@ -94,12 +95,16 @@ struct DepthState {
     float depthBiasConstant = 0;
     float depthBiasSlope = 0;
     float depthBiasClamp = 0;
+    bool depthBounds = false;
+    float depthBoundsMin = 0;
+    float depthBoundsMax = 1;
 };
 
 struct State {
     ShaderStages stages;
-    // The first written MRT slot; `colors`/`blends` hold every written slot, attachment i being the
-    // slot of export MRTi (exports go to the slots CB_SHADER_MASK enables, in order).
+    // The first written MRT slot; `blends` holds one state per attachment, attachment i being the
+    // slot of export MRTi (exports go to the slots CB_SHADER_MASK enables, in order), and `colors`
+    // the written slots with their attachments (an unwritten one is VK_ATTACHMENT_UNUSED).
     ColorTarget color;
     std::vector<ColorTarget> colors;
     std::vector<VkPipelineColorBlendAttachmentState> blends;
@@ -184,10 +189,11 @@ struct DrawKeyRange {
     std::uint32_t first;
     std::uint32_t count;
 };
-inline constexpr std::array<DrawKeyRange, 47> DrawKeyRegisters{{
-    // DB_RENDER_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_DEPTH_SIZE_XY, DB_STENCIL_CLEAR and
-    // DB_DEPTH_CLEAR with PA_SC_SCREEN_SCISSOR, DB_Z_INFO .. DB_STENCIL_WRITE_BASE, the *_BASE_HI words.
-    {RegisterBank::Context, 0x000, 1}, {RegisterBank::Context, 0x002, 1}, {RegisterBank::Context, 0x005, 1}, {RegisterBank::Context, 0x007, 1}, {RegisterBank::Context, 0x00a, 4}, {RegisterBank::Context, 0x010, 6}, {RegisterBank::Context, 0x01a, 5},
+inline constexpr std::array<DrawKeyRange, 46> DrawKeyRegisters{{
+    // DB_RENDER_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_DEPTH_SIZE_XY, DB_DEPTH_BOUNDS_MIN/MAX,
+    // DB_STENCIL_CLEAR and DB_DEPTH_CLEAR with PA_SC_SCREEN_SCISSOR, DB_Z_INFO .. DB_STENCIL_WRITE_BASE,
+    // the *_BASE_HI words.
+    {RegisterBank::Context, 0x000, 1}, {RegisterBank::Context, 0x002, 1}, {RegisterBank::Context, 0x005, 1}, {RegisterBank::Context, 0x007, 7}, {RegisterBank::Context, 0x010, 6}, {RegisterBank::Context, 0x01a, 5},
     // The window offset/scissor and clip rect, the edge rule, the hardware screen offset,
     // CB_TARGET_MASK/CB_SHADER_MASK, the generic and viewport 0 scissors, the viewport 0 depth clamp,
     // the blend constants, DB_STENCIL_CONTROL and DB_STENCILREFMASK(_BF), the viewport 0 transform.

@@ -544,17 +544,59 @@ std::array<std::uint32_t, 8> SurfaceKey(const Context& context, const GuestTextu
     return {static_cast<std::uint32_t>(resource.baseAddress), static_cast<std::uint32_t>(resource.baseAddress >> 32u), resource.width, resource.height, (resource.depthOrLastArray << 16u) | (resource.mipCount & 0xffffu), (static_cast<std::uint32_t>(resource.tileMode) << 12u) | (static_cast<std::uint32_t>(resource.dimension) << 20u), resource.baseArray, static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format))};
 }
 
+struct ExtendedSurfaces {
+    std::mutex mutex;
+    std::map<std::array<std::uint32_t, 8>, std::uint32_t> levels;
+    std::atomic<bool> any{false};
+};
+
+ExtendedSurfaces& ExtendedChains() {
+    static ExtendedSurfaces surfaces;
+    return surfaces;
+}
+
+std::uint32_t AllocatedLevels(const GuestTextureResource& resource) {
+    return resource.allocatedMipCount != 0 ? resource.allocatedMipCount : resource.mipCount;
+}
+
+GuestTextureResource StorageSurface(const Context& context, const GuestTextureResource& viewed) {
+    auto& surfaces = ExtendedChains();
+    const bool extended = viewed.mipCount > AllocatedLevels(viewed);
+    if (!extended && !surfaces.any.load(std::memory_order_acquire)) return viewed;
+    auto surface = viewed;
+    surface.mipCount = AllocatedLevels(viewed);
+    const auto identity = SurfaceKey(context, surface);
+    std::lock_guard lock(surfaces.mutex);
+    if (extended) {
+        auto& levels = surfaces.levels[identity];
+        levels = std::max(levels, viewed.mipCount);
+        surfaces.any.store(true, std::memory_order_release);
+        surface.mipCount = levels;
+    } else if (const auto it = surfaces.levels.find(identity); it != surfaces.levels.end()) {
+        surface.mipCount = it->second;
+    } else {
+        surface.mipCount = viewed.mipCount;
+    }
+    return surface;
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes) {
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    if (disabled) return std::make_shared<StorageTexture>(context, *context.detiler, resource, mip);
+    if (disabled) return std::make_shared<StorageTexture>(context, *context.detiler, viewed, mip);
     static_cast<void>(words);
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto& counters = TextureCounts();
+    const auto resource = StorageSurface(context, viewed);
     const StorageKey key{context.device, SurfaceKey(context, resource)};
     auto& cache = StorageTextures();
     std::lock_guard lock(cache.mutex);
+    if (resource.mipCount > AllocatedLevels(resource)) {
+        auto allocated = resource;
+        allocated.mipCount = AllocatedLevels(resource);
+        if (const auto it = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); it != cache.entries.end()) evictStorage(cache, it);
+    }
     if (auto it = findStorage(cache, key); it != cache.entries.end() && MetadataMoved(*it->texture, resource)) {
         // The old image leaves with its pending results stored (as the hardware's rendering left the
         // memory), and a new one is made below from memory under the keys the descriptor names; views

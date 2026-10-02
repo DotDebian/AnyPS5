@@ -717,7 +717,7 @@ std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders,
     // writes storage images or buffers instead; its attachments are then left untouched. An export
     // to an MRT slot past the draw's targets (CB_TARGET_MASK & CB_SHADER_MASK leave it out) is
     // dropped by the color backend; Vulkan discards an output without an attachment the same way.
-    const auto attachments = std::max<std::size_t>(state.colors.size(), 1u);
+    const auto attachments = std::max<std::size_t>(state.blends.size(), 1u);
     std::set<std::uint32_t> locations;
     for (const auto& [location, signature] : previous.outputs) {
         if (location >= attachments) continue;

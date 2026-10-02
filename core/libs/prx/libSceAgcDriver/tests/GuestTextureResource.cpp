@@ -1,5 +1,6 @@
 #include "GraphicsTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <array>
 #include <string>
 #include <string_view>
@@ -268,6 +269,37 @@ void RunGuestTextureResourceTests() {
     partialMips.maxMip = 2;
     const auto partial = DecodeTextureResource(pack(partialMips));
     Require(partial.lastLevel == 1 && partial.mipCount == 3, "a view over part of the mip chain decoded wrongly");
+
+    Fields pastLast = base;
+    pastLast.base40 = 0x55ea000ull;
+    pastLast.format = 71;
+    pastLast.width = 1920;
+    pastLast.height = 1080;
+    pastLast.tileModeRaw = 0x1b;
+    pastLast.maxMip = 5;
+    pastLast.baseLevel = 6;
+    pastLast.lastLevel = 6;
+    const auto tailView = DecodeTextureResource(pack(pastLast));
+    Require(tailView.baseLevel == 6 && tailView.lastLevel == 6 && tailView.mipCount == 7, "a view one level past the last mip must address that level of the chain");
+    auto allocated = tailView;
+    allocated.mipCount = 6;
+    const auto viewSurface = DescribeSurface(tailView);
+    Require(viewSurface.guestBytes == DescribeSurface(allocated).guestBytes && viewSurface.guestBytes == 23330816, "a level in the mip tail must not grow the surface");
+    Require(viewSurface.mips[6].tail && viewSurface.mips[6].tiledOffset == 0 && viewSurface.mips[6].tailX == 0 && viewSurface.mips[6].tailY == 32, "the level past the last mip must sit in its addrlib tail slot");
+    pastLast.lastLevel = 8;
+    Require(DecodeTextureResource(pack(pastLast)).mipCount == 9, "a view past the last mip must cover every level it names");
+
+    Fields pastLinear = base;
+    pastLinear.maxMip = 1;
+    pastLinear.baseLevel = 2;
+    pastLinear.lastLevel = 2;
+    rejectFields(pastLinear, "would move the surface's own");
+
+    Fields pastUntailed = pastLast;
+    pastUntailed.maxMip = 0;
+    pastUntailed.baseLevel = 1;
+    pastUntailed.lastLevel = 1;
+    rejectFields(pastUntailed, "would move the surface's own");
 
     std::array<std::uint32_t, 4> shortWords{};
     reject([&] { DecodeTextureResource(shortWords); }, "8 dwords");

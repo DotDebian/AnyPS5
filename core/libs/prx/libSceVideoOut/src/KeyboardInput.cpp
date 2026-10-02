@@ -3,6 +3,12 @@
 
 #include "SDL_keyboard.h"
 
+void KeyboardInput::ReleaseAll() {
+    KeyboardInputEvent input{};
+    input.resetKeys = true;
+    KeyboardPublishInput_nid_postfix(input);
+}
+
 void KeyboardInput::HandleEvent(const SDL_Event& event, unsigned windowId) {
     KeyboardInputEvent input{};
     switch (event.type) {

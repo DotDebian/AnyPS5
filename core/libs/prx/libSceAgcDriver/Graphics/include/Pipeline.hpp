@@ -47,11 +47,12 @@ public:
     // and reused when every owner is still the same object; any other set is built per call. `depth`
     // is the depth attachment of a pipeline made with one (resident by construction), after the colors.
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, const std::shared_ptr<DepthImage>& depth = nullptr);
-    // Begins the render pass on the framebuffer, binds the pipeline and sets viewport and scissor.
-    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const VkViewport& viewport, const VkRect2D& scissor) const;
+    // Begins the render pass on the framebuffer over the state's render extent, binds the pipeline
+    // and sets the state's viewport, scissor and depth bounds.
+    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, const State& state) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
     // construction: the attachment formats alone decide).
-    void Continue(VkCommandBuffer commands, const VkViewport& viewport, const VkRect2D& scissor) const;
+    void Continue(VkCommandBuffer commands, const State& state) const;
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
@@ -73,6 +74,7 @@ private:
     VkPipeline pipeline = VK_NULL_HANDLE;
     std::size_t attachments = 0;
     bool depthAttachment = false;
+    bool depthBounds = false;
     std::vector<CachedFramebuffer> framebuffers;
 };
 
@@ -89,6 +91,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 void ClearCachedPipelines(VkDevice device);
 // Device limit checks of the viewport, which is dynamic state and so no longer checked by Pipeline.
 void ValidateViewport(const Context& context, const VkViewport& viewport);
+void ValidateDepthBounds(const Context& context, const DepthState& depth);
 
 void ValidateShaderPair(const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment);
 // The input locations of the pixel shader `fragment` that the stage before it (`previous`) has no

@@ -54,6 +54,7 @@ struct DeviceFunctions {
     PFN_vkCmdEndRenderPass cmdEndRenderPass = nullptr;
     PFN_vkCmdSetViewport cmdSetViewport = nullptr;
     PFN_vkCmdSetScissor cmdSetScissor = nullptr;
+    PFN_vkCmdSetDepthBounds cmdSetDepthBounds = nullptr;
     PFN_vkCmdBindVertexBuffers cmdBindVertexBuffers = nullptr;
     PFN_vkCmdBindIndexBuffer cmdBindIndexBuffer = nullptr;
     PFN_vkCmdDraw cmdDraw = nullptr;
@@ -133,6 +134,7 @@ struct Context {
     bool primitiveListRestart = false;
     // The depthBiasClamp feature (PA_SU_POLY_OFFSET_CLAMP).
     bool depthBiasClamp = false;
+    bool depthBounds = false;
     // VK_EXT_image_view_min_lod with minLod enabled: sampled views clamp their level of detail as a
     // texture descriptor's MIN_LOD does.
     bool imageViewMinLod = false;

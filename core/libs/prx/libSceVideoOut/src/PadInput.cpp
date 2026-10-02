@@ -347,7 +347,28 @@ void PadInput::Update() {
     publish();
 }
 
+void PadInput::SetSuppressed(bool value) {
+    if (suppressed == value) return;
+    suppressed = value;
+    std::fill(pressed.begin(), pressed.end(), false);
+    std::fill(wheelReleaseTimes.begin(), wheelReleaseTimes.end(), std::chrono::steady_clock::time_point{});
+    if (mouseEnabled) setMouseMode(false);
+    publish();
+}
+
+void PadInput::StopRumble() {
+    if (controller == nullptr) return;
+    SDL_GameControllerRumble(controller, 0, 0, 0);
+    if (SDL_GameControllerHasRumbleTriggers(controller) == SDL_TRUE) SDL_GameControllerRumbleTriggers(controller, 0, 0, 0);
+}
+
 void PadInput::publish() {
+    if (suppressed) {
+        PadInputState idle;
+        idle.deviceKind = controllerState.deviceKind;
+        PadPublishInput_nid_postfix(idle);
+        return;
+    }
     PadInputState state;
     state.buttons = controllerState.buttons;
     state.sticks = controllerState.sticks;

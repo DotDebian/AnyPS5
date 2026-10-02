@@ -9,6 +9,9 @@ add_library(libSceVideoOut SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/src/MouseInput.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/KeyboardInput.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/InputMapping.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/LevelMenuModel.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/LevelMenu.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/LevelRelaunch.cpp
 )
 
 target_include_directories(libSceVideoOut PRIVATE
@@ -16,6 +19,7 @@ target_include_directories(libSceVideoOut PRIVATE
         ${CMAKE_SOURCE_DIR}/3rdparty/SDL2/include
         ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
 )
+target_include_directories(libSceVideoOut SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/stb)
 target_link_libraries(libSceVideoOut PRIVATE libSceAgcDriver libScePad libSceMouse libSceKeyboard libc libkernel SDL2-static)
 if(WIN32)
     target_link_libraries(libSceVideoOut PRIVATE comctl32)
@@ -36,6 +40,10 @@ if(BUILD_TESTING)
     add_test_executable(pad_sdl_tests tests/PadSdl.cpp)
     target_link_libraries(pad_sdl_tests PRIVATE SDL2-static)
     add_test(NAME pad_sdl COMMAND pad_sdl_tests)
+
+    add_test_executable(level_menu_model_tests tests/LevelMenuModel.cpp src/LevelMenuModel.cpp)
+    target_include_directories(level_menu_model_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    add_test(NAME level_menu_model COMMAND level_menu_model_tests)
 endif()
 
 if(BUILD_TESTING)

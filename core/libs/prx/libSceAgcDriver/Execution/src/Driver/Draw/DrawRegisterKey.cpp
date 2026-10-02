@@ -55,7 +55,7 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
     const auto& s = a.state;
     const auto& t = b.state;
     const auto sameColor = [](const Graphics::ColorTarget& x, const Graphics::ColorTarget& y) {
-        return x.address == y.address && x.extent.width == y.extent.width && x.extent.height == y.extent.height && x.format == y.format && x.bytes == y.bytes && x.componentMapping == y.componentMapping && x.tileMode == y.tileMode && x.elementBytes == y.elementBytes && x.dccAddress == y.dccAddress && x.dccAlphaOnMsb == y.dccAlphaOnMsb;
+        return x.address == y.address && x.extent.width == y.extent.width && x.extent.height == y.extent.height && x.format == y.format && x.bytes == y.bytes && x.componentMapping == y.componentMapping && x.tileMode == y.tileMode && x.elementBytes == y.elementBytes && x.dccAddress == y.dccAddress && x.dccAlphaOnMsb == y.dccAlphaOnMsb && x.attachment == y.attachment;
     };
     const auto sameBlend = [](const VkPipelineColorBlendAttachmentState& x, const VkPipelineColorBlendAttachmentState& y) {
         return x.blendEnable == y.blendEnable && x.srcColorBlendFactor == y.srcColorBlendFactor && x.dstColorBlendFactor == y.dstColorBlendFactor && x.colorBlendOp == y.colorBlendOp && x.srcAlphaBlendFactor == y.srcAlphaBlendFactor && x.dstAlphaBlendFactor == y.dstAlphaBlendFactor && x.alphaBlendOp == y.alphaBlendOp && x.colorWriteMask == y.colorWriteMask;
@@ -85,7 +85,7 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
     };
     const auto& d = s.depth;
     const auto& e = t.depth;
-    if (d.attached != e.attached || d.depthTest != e.depthTest || d.depthWrite != e.depthWrite || d.depthCompare != e.depthCompare || d.stencilTest != e.stencilTest || !sameStencil(d.front, e.front) || !sameStencil(d.back, e.back) || d.clearDepth != e.clearDepth || d.clearStencil != e.clearStencil || std::bit_cast<std::uint32_t>(d.depthClearValue) != std::bit_cast<std::uint32_t>(e.depthClearValue) || d.stencilClearValue != e.stencilClearValue || d.depthBias != e.depthBias || d.depthBiasConstant != e.depthBiasConstant || d.depthBiasSlope != e.depthBiasSlope || d.depthBiasClamp != e.depthBiasClamp) return false;
+    if (d.attached != e.attached || d.depthTest != e.depthTest || d.depthWrite != e.depthWrite || d.depthCompare != e.depthCompare || d.stencilTest != e.stencilTest || !sameStencil(d.front, e.front) || !sameStencil(d.back, e.back) || d.clearDepth != e.clearDepth || d.clearStencil != e.clearStencil || std::bit_cast<std::uint32_t>(d.depthClearValue) != std::bit_cast<std::uint32_t>(e.depthClearValue) || d.stencilClearValue != e.stencilClearValue || d.depthBias != e.depthBias || d.depthBiasConstant != e.depthBiasConstant || d.depthBiasSlope != e.depthBiasSlope || d.depthBiasClamp != e.depthBiasClamp || d.depthBounds != e.depthBounds || std::bit_cast<std::uint32_t>(d.depthBoundsMin) != std::bit_cast<std::uint32_t>(e.depthBoundsMin) || std::bit_cast<std::uint32_t>(d.depthBoundsMax) != std::bit_cast<std::uint32_t>(e.depthBoundsMax)) return false;
     const auto& z = s.depthTarget;
     const auto& w = t.depthTarget;
     if (z.address != w.address || z.stencilAddress != w.stencilAddress || z.htileAddress != w.htileAddress || z.extent.width != w.extent.width || z.extent.height != w.extent.height || z.zFormat != w.zFormat || z.stencil != w.stencil || z.tileMode != w.tileMode || z.slice != w.slice) return false;
