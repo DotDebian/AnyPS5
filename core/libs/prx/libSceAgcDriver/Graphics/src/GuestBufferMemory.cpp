@@ -1516,7 +1516,7 @@ const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address)
     return own;
 }
 
-void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic) {
+void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept) {
     validate(address, bytes);
     switch (baseOverlap(address, address + bytes, nullptr)) {
         case BaseOverlap::Inside:
@@ -1532,6 +1532,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     // the shader stores to them; what is written back is decided by Writes() alone.
     Region region{address, address + bytes, true, {}, nullptr};
     region.atomic = atomic;
+    region.swept = swept;
     auto committed = GuestMemory::DescribeCommitted(address, bytes);
     if (!committed.whole) {
         // A GPU heap bound whole while the guest commits its pages on demand, or a descriptor left
@@ -1542,8 +1543,8 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     regionsSorted = false;
 }
 
-void GuestBufferMemory::AddWritable(std::uint64_t address, std::size_t bytes, bool atomic) {
-    addDescriptorRegion(address, bytes, atomic);
+void GuestBufferMemory::AddWritable(std::uint64_t address, std::size_t bytes, bool atomic, bool swept) {
+    addDescriptorRegion(address, bytes, atomic, swept);
     writes.emplace_back(address, address + bytes);
 }
 
@@ -1551,7 +1552,7 @@ void GuestBufferMemory::AddReadable(std::uint64_t address, std::size_t bytes) {
     // Not in `writes`: no reference copy (copyRegion), no write-back, no pending-write note, no
     // direct-write mark, and UploadPrepare copies it without the device lock. A written descriptor
     // overlapping the range still covers it through its own Writes() entry.
-    addDescriptorRegion(address, bytes, false);
+    addDescriptorRegion(address, bytes, false, false);
 }
 
 void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
@@ -1673,7 +1674,9 @@ VkBufferUsageFlags gpuCopyUsage(bool addressable) {
 // APS5_NO_WRITTEN_SHADOW=1 and APS5_NO_ATOMIC_STAGING=1 bind those elements in place as before;
 // APS5_WRITTEN_SHADOW_MIN_KIB / APS5_WRITTEN_SHADOW_MAX_KIB (16 / 2048) bound the written window
 // (a kernel streaming once through a large buffer, the engine's memcpy kernel over 4-8 MiB video
-// frames, would only gain the two copies), APS5_ATOMIC_STAGE_MAX_KIB (1024) the atomic one.
+// frames, would only gain the two copies), APS5_READ_WRITTEN_SHADOW_MAX_KIB (16384) that of an
+// element the dispatch also reads with enough threads to sweep it (AddWritable's `swept`),
+// APS5_ATOMIC_STAGE_MAX_KIB (1024) the atomic one.
 bool writtenShadowEnabled() {
     static const bool disabled = std::getenv("APS5_NO_WRITTEN_SHADOW") != nullptr;
     return !disabled;
@@ -1696,6 +1699,11 @@ std::uint64_t writtenShadowMin() {
 
 std::uint64_t writtenShadowMax() {
     static const std::uint64_t bytes = kibSetting("APS5_WRITTEN_SHADOW_MAX_KIB", 2048);
+    return bytes;
+}
+
+std::uint64_t readWrittenShadowMax() {
+    static const std::uint64_t bytes = kibSetting("APS5_READ_WRITTEN_SHADOW_MAX_KIB", 16384);
     return bytes;
 }
 
@@ -1809,7 +1817,7 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
     const auto bytes = region.end - region.begin;
     if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
-    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= writtenShadowMax();
+    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(), readWrittenShadowMax()) : writtenShadowMax());
 }
 
 void GuestBufferMemory::UploadPrepare(bool addressable) {
@@ -1849,6 +1857,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             }
             mergeBacked(previous, region);
             previous.atomic = previous.atomic || region.atomic;
+            previous.swept = previous.swept || region.swept;
             // A range starting before the mirror (only possible after the swap) keeps its prefix; the
             // earlier merged region ends at or before it, so the merged list stays sorted.
             previous.begin = std::min(previous.begin, region.begin);

@@ -804,6 +804,79 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+void readWrittenStagingTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: read and written staging not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 8u << 20u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the test block");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: read and written staging not tested\n";
+        return;
+    }
+    const auto boundInPlace = [&](std::uint64_t element, std::size_t elementBytes, bool read) {
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(element, elementBytes, false, read);
+        memory.Upload(false);
+        const auto reads = memory.InPlaceReads();
+        const bool direct = reads.size() == 1 && reads[0].first == element && reads[0].second == element + elementBytes;
+        Require(direct || reads.empty(), "an element was bound neither in place nor staged");
+        memory.RecordCopyBacks(recorder);
+        recorder.Sync();
+        return direct;
+    };
+    Require(!boundInPlace(address + 4096, 1u << 20u, false), "a written 1 MiB element was not staged");
+    Require(boundInPlace(address + 4096, 4u << 20u, false), "a written-only 4 MiB element was staged past the written window");
+    Require(!boundInPlace(address + 4096, 4u << 20u, true), "a read and written 4 MiB element was bound in place");
+    const auto buildInPlace = [&](std::uint64_t dispatchThreads, bool read) {
+        const auto element = address + 4096;
+        constexpr std::uint32_t stride = 16;
+        constexpr std::uint32_t records = (4u << 20u) / stride;
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(element), (static_cast<std::uint32_t>(element >> 32u) & 0xffffu) | (stride << 16u), records, 0x31000000u};
+        binding.bufferWritten = {true};
+        binding.bufferRead = {read};
+        program.bindings.push_back(binding);
+        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources resources(context, compute, {}, false, dispatchThreads);
+        const auto reads = resources.InPlaceReads();
+        const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return range.first <= element && range.second >= element + records * stride; });
+        resources.MarkGpuWrites(recorder);
+        recorder.Sync();
+        return direct;
+    };
+    Require(!buildInPlace((4u << 20u) / 16u, true), "a dispatch sweeping a read and written 4 MiB element bound it in place");
+    Require(buildInPlace(1024, true), "a dispatch touching 16 KiB of a read and written 4 MiB element staged all of it");
+    Require(buildInPlace(0, true), "a dispatch of unknown size staged a read and written 4 MiB element");
+    Require(buildInPlace((4u << 20u) / 16u, false), "a dispatch sweeping a written-only 4 MiB element staged it");
+    Require(std::all_of(static_cast<const std::byte*>(block), static_cast<const std::byte*>(block) + bytes, [](std::byte value) { return value == std::byte{0x11}; }), "a staged copy-back changed the guest bytes");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+}
+
 // The draw snapshot cache evicts least recently used first: a use moves an entry to the back, and
 // the entry past the 1024-entry cap pushes out the oldest untouched one only.
 void drawSnapshotEvictionTests(const Device& device) {
@@ -2972,6 +3045,7 @@ int main() {
             closeRaceTests(device, recorder);
             keyProofTests(device, recorder);
             resourceReadTests(device, recorder);
+            readWrittenStagingTests(device, recorder);
             drawSnapshotReuseTests(device, recorder);
             misalignedSnapshotTests(device, recorder);
             drawSnapshotEvictionTests(device);
