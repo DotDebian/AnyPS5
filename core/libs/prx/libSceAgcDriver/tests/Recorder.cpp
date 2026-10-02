@@ -2633,6 +2633,13 @@ void depthSurfaceSamplingTests(const Device& device, Recorder& recorder) {
     image->NoteWritten();
     SyncDepthSurfaceTextures(context, nullptr, bound);
     expectRed(depthRed(), 0.75f, "a copy of an unchanged depth image changed the texture");
+    std::vector<float> scribble(depthBytes / sizeof(float), 0.9f);
+    std::memcpy(depthMemory, scribble.data(), depthBytes);
+    Require(SampledDepthAspect(context, depthResource) == VK_IMAGE_ASPECT_DEPTH_BIT, "guest bytes of a resident depth surface took it off its resident image");
+    clear(*image, 0.375f, 0x80);
+    SyncDepthSurfaceTextures(context, nullptr, bound);
+    expectRed(depthRed(), 0.375f, "a registered texture took the guest bytes of a resident depth surface instead of its image");
+    std::memset(depthMemory, 0, depthBytes);
     std::vector<float> half(depthBytes / sizeof(float), 0.5f);
     std::memcpy(depthMemory, half.data(), depthBytes);
     auto storage = std::make_shared<StorageTexture>(context, detiler, depthResource, 0);

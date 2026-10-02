@@ -406,7 +406,8 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
-            if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
+            const bool residentDepth = depthAspect != 0 && it->texture->SamplesResidentDepth();
+            if (*keys != DccKeys::Uncompressed || residentDepth || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
                 it->generation = generation;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
