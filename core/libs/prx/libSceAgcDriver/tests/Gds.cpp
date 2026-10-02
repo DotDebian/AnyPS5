@@ -4,6 +4,9 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "NggProgram.hpp"
 #include <algorithm>
@@ -311,6 +314,46 @@ std::uint32_t CheckPixelIndices(std::uint32_t first) {
 
 }
 
+void TransferTests(AgcDriver::VulkanDevice& device) {
+    using Kind = AgcDriver::Pm4::GdsTransfer::Kind;
+    constexpr std::size_t bytes = 65536;
+    void* block = std::aligned_alloc(65536, bytes);
+    Require(block != nullptr, "cannot allocate the GDS transfer block");
+    auto* words = static_cast<std::uint32_t*>(block);
+    std::fill(words, words + bytes / 4, Sentinel);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    Require(recorder != nullptr, "the device has no active recorder");
+    WriteGds(0x300, 1);
+    WriteGds(0x304, 2);
+    recorder->Commands();
+    Require(device.TransferGdsOnGpu({Kind::FillGds, 0x300, 0, 0x55aau, 8}, true), "an immediate DMA into the GDS was not recorded on the GPU");
+    AgcDriver::QueueState queue;
+    const auto out = packet(0x50, {0x20000000u, 0x300, 0, low(words + 16), high(words + 16), 4});
+    Require(!AgcDriver::Pm4::ResolveStore(out, queue, 65536).has_value(), "a GDS read was resolved on the CPU past a GPU write to the GDS");
+    Require(ReadGds(0x300) == 1, "the GDS fill landed before its batch ran");
+    device.WaitIdle();
+    Require(ReadGds(0x300) == 0x55aau && ReadGds(0x304) == 0x55aau && ReadGds(0x308) != 0x55aau, "the GDS fill stored the wrong dwords");
+    recorder->Commands();
+    if (!device.TransferGdsOnGpu({Kind::GdsToMemory, 0x300, reinterpret_cast<std::uint64_t>(words + 16), 0, 8}, true)) {
+        std::puts("host import of the GDS transfer block refused: GDS transfers with memory not tested");
+        return;
+    }
+    Require(words[16] == Sentinel, "the GDS read landed before its batch ran");
+    device.WaitIdle();
+    Require(words[16] == 0x55aau && words[17] == 0x55aau && words[18] == Sentinel && words[15] == Sentinel, "the GDS read stored the wrong dwords");
+    words[32] = 7;
+    words[33] = 9;
+    recorder->Commands();
+    Require(device.TransferGdsOnGpu({Kind::MemoryToGds, 0x310, reinterpret_cast<std::uint64_t>(words + 32), 0, 8}, true), "a memory DMA into the GDS was not recorded on the GPU");
+    device.WaitIdle();
+    Require(ReadGds(0x310) == 7 && ReadGds(0x314) == 9, "the memory DMA into the GDS stored the wrong dwords");
+}
+
 int main() {
     try {
         // Tests do not fill the user's shader disk cache; the device makes its GDS buffer.
@@ -353,6 +396,7 @@ int main() {
             Require(ReadGds(0x104) == 77 + covered, "ds_append pixel: the GDS counter is " + std::to_string(ReadGds(0x104)) + " for " + std::to_string(covered) + " covered pixels");
         }
 
+        TransferTests(device);
         std::puts("GDS tests passed");
         return 0;
     } catch (const std::exception& error) {

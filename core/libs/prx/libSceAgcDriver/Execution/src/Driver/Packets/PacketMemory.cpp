@@ -128,6 +128,20 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
             }
         }
+        if (drained && opcode == 0x50) {
+            if (const auto transfer = Pm4::DecodeGdsTransfer(packet)) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (const auto localDevice = device.Load()) {
+                    recordDeferredLabels(localDevice.get(), submission.queue);
+                    if (localDevice->TransferGdsOnGpu(*transfer, submission.queue == 0)) {
+                        ++gdsTransfersOnGpu;
+                        wroteOnGpu = true;
+                        drained = false;
+                    }
+                }
+            }
+        }
         if (drained) ++storesDrained;
     }
 
