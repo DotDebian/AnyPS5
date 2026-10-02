@@ -1,5 +1,6 @@
 #include "ShaderDiskCache.hpp"
 #include "ShaderCacheDirectory.hpp"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -27,6 +29,14 @@ void setEnvironment(const char* name, const std::string& value) {
     _putenv_s(name, value.c_str());
 #else
     setenv(name, value.c_str(), 1);
+#endif
+}
+
+void unsetEnvironment(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
 #endif
 }
 
@@ -205,6 +215,7 @@ struct SampleRequest {
     std::array<std::byte, 16> header{};
     RecompileRequest request{};
     ResourceSpecialization specialization;
+    ShaderDiskCache::SettledLayout settled;
     std::uint32_t hostSubgroupSize = 32;
 
     SampleRequest() {
@@ -233,7 +244,7 @@ struct SampleRequest {
         request.context.userData = userData;
         request.target.supportedCapabilities = capabilities;
         std::vector<std::byte> key;
-        ShaderDiskCache::BuildKey(request, hostSubgroupSize, specialization, key);
+        ShaderDiskCache::BuildKey(request, hostSubgroupSize, specialization, settled, key);
         return key;
     }
 };
@@ -381,6 +392,103 @@ void verifyKeySensitivity() {
     require(moved.Key() == key, "the key depends on the user data values or the addresses");
 }
 
+std::optional<std::uint32_t> noLocalMemory(void*, std::span<const std::uint32_t>, std::span<const DescriptorBinding>, std::uint64_t) {
+    return std::nullopt;
+}
+
+void withProbe(SampleRequest& sample) {
+    sample.request.target.localMemoryProbe = &noLocalMemory;
+    sample.request.target.localMemoryProbeDevice = {0x10deu, 0x2684u, 0x99c00000u, {}};
+    sample.request.target.localMemoryProbeDevice.pipelineCacheUuid[0] = 0x5au;
+}
+
+void verifyLayoutKey() {
+    SampleRequest base;
+    const auto key = base.Key();
+    const auto keyWith = [](const std::function<void(SampleRequest&)>& change) {
+        SampleRequest sample;
+        change(sample);
+        return sample.Key();
+    };
+    require(LayoutChosenByProbe(base.request) == false, "a request without a probe has its layout chosen by one");
+    require(keyWith([](SampleRequest& sample) { sample.settled.layout = WaveLayout::TwoLane; }) != key, "the key ignores the settled two-lane layout");
+    require(keyWith([](SampleRequest& sample) { sample.settled.layout = WaveLayout::SingleLane; }) != key, "the key ignores the settled one-lane layout");
+    require(keyWith([](SampleRequest& sample) { sample.settled.layout = WaveLayout::SingleLane; }) != keyWith([](SampleRequest& sample) { sample.settled.layout = WaveLayout::TwoLane; }), "the settled layouts share a key");
+    require(keyWith([](SampleRequest& sample) { sample.settled = {WaveLayout::TwoLane, 1024u}; }) != keyWith([](SampleRequest& sample) { sample.settled.layout = WaveLayout::TwoLane; }), "the key ignores the settled workgroup reserve");
+
+    SampleRequest probed;
+    withProbe(probed);
+    require(LayoutChosenByProbe(probed.request), "a split wave64 Auto program with a probe is not chosen by it");
+    const auto probedKey = probed.Key();
+    require(probedKey != key, "the key does not tell a probed layout choice from an unprobed one");
+    const auto device = [&](const std::string& what, const std::function<void(LocalMemoryProbeDevice&)>& change) {
+        SampleRequest sample;
+        withProbe(sample);
+        change(sample.request.target.localMemoryProbeDevice);
+        require(sample.Key() != probedKey, "the key of a probed layout choice ignores the " + what);
+        SampleRequest settledSample;
+        withProbe(settledSample);
+        settledSample.settled.layout = WaveLayout::SingleLane;
+        const auto settledKey = settledSample.Key();
+        change(settledSample.request.target.localMemoryProbeDevice);
+        require(settledSample.Key() == settledKey, "the key of a settled layout depends on the " + what);
+        SampleRequest unprobed;
+        const auto unprobedKey = unprobed.Key();
+        change(unprobed.request.target.localMemoryProbeDevice);
+        require(unprobed.Key() == unprobedKey, "the key of an unprobed request depends on the " + what);
+    };
+    device("vendor", [](LocalMemoryProbeDevice& value) { value.vendorId = 0x1002u; });
+    device("device", [](LocalMemoryProbeDevice& value) { value.deviceId += 1u; });
+    device("driver version", [](LocalMemoryProbeDevice& value) { value.driverVersion += 1u; });
+    for (std::size_t index = 0; index < 16; ++index) {
+        device("pipeline cache UUID byte " + std::to_string(index), [&](LocalMemoryProbeDevice& value) { value.pipelineCacheUuid[index] ^= 0x01u; });
+    }
+
+    const auto unsplit = [](SampleRequest& sample) {
+        withProbe(sample);
+        sample.request.context.compute->numThreads = {32u, 1u, 1u};
+    };
+    SampleRequest small;
+    unsplit(small);
+    require(!LayoutChosenByProbe(small.request), "a one-subgroup workgroup has its layout chosen by the probe");
+    const auto smallKey = small.Key();
+    SampleRequest smallOther;
+    unsplit(smallOther);
+    smallOther.request.target.localMemoryProbeDevice.driverVersion += 1u;
+    require(smallOther.Key() == smallKey, "the key of a program the probe never sees depends on the device");
+
+    SampleRequest fixed;
+    withProbe(fixed);
+    fixed.request.waveLayout = WaveLayout::TwoLane;
+    require(!LayoutChosenByProbe(fixed.request), "a program with a fixed layout has it chosen by the probe");
+}
+
+void verifySwitchList() {
+    const auto keyed = ShaderDiskCache::KeyedSwitches();
+    const auto has = [&](std::string_view name) { return std::find(keyed.begin(), keyed.end(), name) != keyed.end(); };
+    require(has("APS5_INEXACT_SINGLE_LANE") && has("APS5_LOOP_GUARD") && has("APS5_TWO_LANE"), "a recompiler switch is not keyed");
+    require(!has("APS5_TRACE_LOCAL_MEMORY_PROBE") && !has("APS5_PROFILE_DRAW") && !has("APS5_DUMP_IR"), "a diagnostic switch is keyed");
+}
+
+void verifyFormatDigest() {
+#if defined(__x86_64__) || defined(_M_X64)
+    std::vector<std::byte> result;
+    ShaderDiskCache::EncodeResult(sampleResult(), result);
+    SampleRequest sample;
+    const auto key = sample.Key();
+    const auto file = ShaderDiskCache::EncodeEntry(key, sampleVariant());
+    const auto payload = std::span(file).subspan(48 + key.size());
+    const auto resultDigest = HashBytes(result);
+    const auto payloadDigest = HashBytes(payload);
+    constexpr std::uint32_t DigestFormat = 6;
+    constexpr std::uint64_t ResultDigest = 0x7307993ce01e5663ull;
+    constexpr std::uint64_t PayloadDigest = 0x2544c6b49b6cba07ull;
+    char text[160];
+    std::snprintf(text, sizeof(text), "format %u: result digest 0x%016llx, payload digest 0x%016llx", ShaderDiskCache::FormatVersion, static_cast<unsigned long long>(resultDigest), static_cast<unsigned long long>(payloadDigest));
+    require(ShaderDiskCache::FormatVersion == DigestFormat && resultDigest == ResultDigest && payloadDigest == PayloadDigest, std::string("the entry encoding changed (") + text + "): bump ShaderDiskCache::FormatVersion and record the new digests here");
+#endif
+}
+
 void verifyStore() {
     require(ShaderDiskCache::Enabled(), "the disk cache is not enabled");
     SampleRequest sample;
@@ -433,6 +541,55 @@ struct ComputeRequest {
     }
 };
 
+struct ProbedRequest {
+    std::vector<std::uint32_t> code{0xe0700000u, 0x80000000u, 0xbf800000u, 0xbf810000u};
+    std::array<std::uint32_t, 4> userData{0x10000000u, 0x00000000u, 0x40u, 0x00027facu};
+    std::array<std::uint32_t, 1> capabilities{1u};
+    RecompileRequest request{};
+
+    explicit ProbedRequest(std::uint32_t pushConstantBytes) {
+        request.shader = {ShaderStage::Compute, 0x30000u, code, 0, {}};
+        request.context.waveSize = 64;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{64u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.localMemoryProbe = &noLocalMemory;
+        request.layout.pushConstantSizeBytes = pushConstantBytes;
+    }
+};
+
+int runOrderProcess(bool reversed) {
+    const std::array<std::uint32_t, 2> order = reversed ? std::array<std::uint32_t, 2>{64u, 128u} : std::array<std::uint32_t, 2>{128u, 64u};
+    for (const auto bytes : order) {
+        ProbedRequest probed(bytes);
+        static_cast<void>(Recompile(probed.request));
+    }
+    ShaderDiskCache::Flush();
+    const auto totals = ShaderDiskCache::Totals();
+    std::cout << (reversed ? "reversed" : "same") << " order: " << totals.hits << " hits, " << totals.misses << " misses\n";
+    if (reversed) require(totals.hits == 0 && totals.misses == 2, "variants compiled in another order loaded entries keyed to the first order (hits " + std::to_string(totals.hits) + ")");
+    else require(totals.hits == 2 && totals.misses == 0, "variants compiled in the stored order did not load (hits " + std::to_string(totals.hits) + ", misses " + std::to_string(totals.misses) + ")");
+    return 0;
+}
+
+void verifyRunOrder(const char* self) {
+    const auto before = ShaderDiskCache::Totals();
+    for (const auto bytes : {128u, 64u}) {
+        ProbedRequest probed(bytes);
+        const auto result = Recompile(probed.request);
+        require(result.waveLayout == WaveLayout::TwoLane, "a probed program without local memory did not keep two lanes per invocation");
+    }
+    ShaderDiskCache::Flush();
+    const auto after = ShaderDiskCache::Totals();
+    require(after.misses == before.misses + 2 && after.writes == before.writes + 2, "the probed variants were not looked up and stored");
+    require(std::system(("\"" + std::string(self) + "\" --order-reversed").c_str()) == 0, "the reversed-order process failed");
+    require(std::system(("\"" + std::string(self) + "\" --order-same").c_str()) == 0, "the same-order process failed");
+}
+
 int runLoadingProcess() {
     ComputeRequest cached(true);
     const auto loaded = Recompile(cached.request);
@@ -473,7 +630,10 @@ void verifyDefaultDirectory(const char* self) {
 
 int main(int argc, char** argv) {
     try {
+        for (const auto name : ShaderDiskCache::KeyedSwitches()) unsetEnvironment(std::string(name).c_str());
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
+        if (argc == 2 && std::string_view(argv[1]) == "--order-reversed") return runOrderProcess(true);
+        if (argc == 2 && std::string_view(argv[1]) == "--order-same") return runOrderProcess(false);
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);
         verifyDefaultDirectory(argv[0]);
@@ -482,8 +642,12 @@ int main(int argc, char** argv) {
         verifyResultRoundTrip();
         verifyEntryRoundTrip();
         verifyKeySensitivity();
+        verifyLayoutKey();
+        verifySwitchList();
+        verifyFormatDigest();
         verifyStore();
         verifyAcrossProcesses(argv[0]);
+        verifyRunOrder(argv[0]);
         std::error_code error;
         std::filesystem::remove_all(directory, error);
         std::cout << "shader disk cache tests passed\n";

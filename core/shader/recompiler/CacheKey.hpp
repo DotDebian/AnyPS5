@@ -37,6 +37,7 @@ public:
         append(key, RayTracingMiss());
         append(key, GpuSelectedDescriptors());
         append(key, WaveLayoutFor(request));
+        append(key, InexactSingleLane(request));
     }
 
     // A hash over every field Build appends except the code, the target and the probe flag: the
@@ -55,6 +56,7 @@ public:
         append(key, request.context.vertex);
         appendMesh(key, request);
         append(key, WaveLayoutFor(request));
+        append(key, InexactSingleLane(request));
         std::uint64_t hash = 0xcbf29ce484222325ull;
         for (const auto value : key) {
             hash ^= value;

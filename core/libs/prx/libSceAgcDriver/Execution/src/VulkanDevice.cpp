@@ -2335,6 +2335,9 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     if (state->pipelineStatistics) {
         target.localMemoryProbe = &VulkanDevice::ProbeComputeLocalMemory;
         target.localMemoryProbeContext = state.get();
+        const auto& properties = state->properties;
+        target.localMemoryProbeDevice = {properties.vendorID, properties.deviceID, properties.driverVersion, {}};
+        std::copy(std::begin(properties.pipelineCacheUUID), std::end(properties.pipelineCacheUUID), target.localMemoryProbeDevice.pipelineCacheUuid.begin());
     }
     return target;
 }

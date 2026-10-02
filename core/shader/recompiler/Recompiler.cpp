@@ -117,6 +117,15 @@ WaveLayout WaveLayoutFor(const RecompileRequest& request) {
     return layout;
 }
 
+bool LayoutChosenByProbe(const RecompileRequest& request) {
+    return request.target.localMemoryProbe != nullptr && SplitWorkgroupThreads(request) != 0u && WaveLayoutFor(request) == WaveLayout::Auto;
+}
+
+bool InexactSingleLane(const RecompileRequest& request) {
+    static const std::string inexact = EnvironmentText("APS5_INEXACT_SINGLE_LANE");
+    return ListedProgram(inexact, request);
+}
+
 namespace {
 
 // The layout the request compiles to: its WaveLayoutFor, with an Auto program compiled as TwoLane
@@ -134,8 +143,7 @@ ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
     // listed wave64 programs out at one lane per invocation with each 32-lane half acting as a wave
     // of its own (what APS5_SINGLE_LANE did before SingleLane): NOT exact, since ballots, lane
     // reads and branches only see the invocation's half and lanes 32-63 read as lanes 0-31.
-    static const std::string inexact = EnvironmentText("APS5_INEXACT_SINGLE_LANE");
-    if (ListedProgram(inexact, request)) return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, 64u, mesh, false);
+    if (InexactSingleLane(request)) return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, 64u, mesh, false);
     return BuildShaderStageInputInfo(toShaderStageKind(request.shader.stage), request.context, request.target.subgroupSize, mesh, CompiledLayout(request) == WaveLayout::SingleLane);
 }
 
@@ -508,7 +516,7 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     std::vector<std::byte> diskKey;
     std::shared_ptr<const CompiledVariant> variant;
     if (disk) {
-        ShaderDiskCache::BuildKey(request, request.target.subgroupSize, specialization, diskKey);
+        ShaderDiskCache::BuildKey(request, request.target.subgroupSize, specialization, {source.settledLayout, source.settledWorkgroupReserve}, diskKey);
         CompiledVariant loaded;
         if (ShaderDiskCache::Load(diskKey, loaded)) {
             loaded.specialization = specialization;

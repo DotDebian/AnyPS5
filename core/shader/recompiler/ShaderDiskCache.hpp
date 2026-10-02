@@ -8,11 +8,12 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-inline constexpr std::uint32_t FormatVersion = 5;
+inline constexpr std::uint32_t FormatVersion = 6;
 
 enum class LoadStatus {
     Loaded,
@@ -31,9 +32,16 @@ struct Counters {
     std::uint64_t bytesWritten = 0;
 };
 
+struct SettledLayout {
+    WaveLayout layout = WaveLayout::Auto;
+    std::uint32_t workgroupReserveBytes = 0;
+};
+
 [[nodiscard]] std::uint64_t SourceVersion();
 
-void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, const ResourceSpecialization& specialization, std::vector<std::byte>& key);
+[[nodiscard]] std::span<const std::string_view> KeyedSwitches();
+
+void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, const ResourceSpecialization& specialization, const SettledLayout& settled, std::vector<std::byte>& key);
 
 [[nodiscard]] std::string EntryName(std::span<const std::byte> key);
 

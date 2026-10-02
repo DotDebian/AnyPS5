@@ -184,6 +184,13 @@ struct DescriptorBinding;
 // compiler gives it, when the device reports one.
 using LocalMemoryProbe = std::optional<std::uint32_t> (*)(void* context, std::span<const std::uint32_t> spirv, std::span<const DescriptorBinding> bindings, std::uint64_t codeAddress);
 
+struct LocalMemoryProbeDevice {
+    std::uint32_t vendorId = 0;
+    std::uint32_t deviceId = 0;
+    std::uint32_t driverVersion = 0;
+    std::array<std::uint8_t, 16> pipelineCacheUuid{};
+};
+
 struct SpirvTarget {
     std::uint32_t vulkanVersion;
     std::uint32_t spirvVersion;
@@ -201,6 +208,7 @@ struct SpirvTarget {
     // module needs local memory.
     LocalMemoryProbe localMemoryProbe = nullptr;
     void* localMemoryProbeContext = nullptr;
+    LocalMemoryProbeDevice localMemoryProbeDevice{};
     // VK_KHR_maintenance8's maintenance8 feature: OpImageSample* take a non-constant Offset image
     // operand (texel offsets the guest computes into a VGPR).
     bool nonConstantImageOffsets = false;
@@ -442,6 +450,10 @@ struct RecompileResult {
 // common. Both layouts are exact; SingleLane pays a workgroup-memory exchange per wave-wide value,
 // so it is kept for those programs.
 [[nodiscard]] WaveLayout WaveLayoutFor(const RecompileRequest& request);
+
+[[nodiscard]] bool LayoutChosenByProbe(const RecompileRequest& request);
+
+[[nodiscard]] bool InexactSingleLane(const RecompileRequest& request);
 
 // The resource plan, snapshot and specialization a driver captured for the request (see
 // CaptureResources in Optimization/ResourceProgram.hpp): this overload reuses them instead of

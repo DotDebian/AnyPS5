@@ -81,6 +81,19 @@ static_assert(sizeof(ResourceSpecialization) == 72, "ResourceSpecialization chan
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16, "ResourceSpecialization::Buffer changed: update BuildKey");
 static_assert(sizeof(ResourceSpecialization::Image) == 36, "ResourceSpecialization::Image changed: update BuildKey");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
+static_assert(sizeof(RecompileRequest) == 1712, "RecompileRequest changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(SpirvTarget) == 200, "SpirvTarget changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(LocalMemoryProbeDevice) == 28, "LocalMemoryProbeDevice changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(GuestContext) == 1304, "GuestContext changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(ShaderBinary) == 56, "ShaderBinary changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(ShaderComputeStageInfo) == 36, "ShaderComputeStageInfo changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(ShaderPixelStageInfo) == 172, "ShaderPixelStageInfo changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(ShaderVertexStageInfo) == 1040, "ShaderVertexStageInfo changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(ShaderVertexResourceDestination) == 16, "ShaderVertexResourceDestination changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(GraphicsCompileContext) == 120, "GraphicsCompileContext changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(MeshConfiguration) == 40, "MeshConfiguration changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(MeshTargetLimits) == 44, "MeshTargetLimits changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(TessellationTargetLimits) == 28, "TessellationTargetLimits changed: key the new field in BuildKey or RecompileCacheKey::Build");
 #endif
 
 namespace {
@@ -563,12 +576,22 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_TRACE_LOCAL_MEMORY_PROBE",
 };
 
+const std::vector<std::string_view>& keyedSwitches() {
+    static const std::vector<std::string_view> names = [] {
+        std::vector<std::string_view> keyed;
+        for (const auto name : Generated::RecompilerSwitches) {
+            if (std::find(std::begin(NeutralSwitches), std::end(NeutralSwitches), name) == std::end(NeutralSwitches)) keyed.push_back(name);
+        }
+        return keyed;
+    }();
+    return names;
+}
+
 const std::vector<std::byte>& switchKey() {
     static const std::vector<std::byte> key = [] {
         std::vector<std::byte> bytes;
         Writer writer(bytes);
-        for (const auto name : Generated::RecompilerSwitches) {
-            if (std::find(std::begin(NeutralSwitches), std::end(NeutralSwitches), name) != std::end(NeutralSwitches)) continue;
+        for (const auto name : keyedSwitches()) {
             const char* value = std::getenv(std::string(name).c_str());
             if (value == nullptr) continue;
             writer.Text(std::string(name));
@@ -770,7 +793,11 @@ std::uint64_t SourceVersion() {
     return Generated::SourceVersion;
 }
 
-void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, const ResourceSpecialization& specialization, std::vector<std::byte>& key) {
+std::span<const std::string_view> KeyedSwitches() {
+    return keyedSwitches();
+}
+
+void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, const ResourceSpecialization& specialization, const SettledLayout& settled, std::vector<std::byte>& key) {
     key.clear();
     Writer writer(key);
     writer.Value(FileMagic);
@@ -806,6 +833,17 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, c
         out.Value(image.depthUnorm16);
     });
     writer.Values(std::span<const std::uint32_t>(specialization.boundDescriptors));
+    writer.Value(settled.layout);
+    writer.Value(settled.workgroupReserveBytes);
+    const bool probed = settled.layout == WaveLayout::Auto && LayoutChosenByProbe(request);
+    writer.Value(probed);
+    if (probed) {
+        const auto& device = request.target.localMemoryProbeDevice;
+        writer.Value(device.vendorId);
+        writer.Value(device.deviceId);
+        writer.Value(device.driverVersion);
+        for (const auto byte : device.pipelineCacheUuid) writer.Value(byte);
+    }
     const auto& switches = switchKey();
     key.insert(key.end(), switches.begin(), switches.end());
 }
