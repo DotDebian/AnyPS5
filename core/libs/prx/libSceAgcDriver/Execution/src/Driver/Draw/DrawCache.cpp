@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include <bit>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -53,6 +54,20 @@ void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
         --drawCacheVariants;
         drawCacheVariantBytes -= variantBytes(variant);
     }
+}
+
+bool Driver::admitDrawKey(std::uint64_t key) {
+    static const bool admitAll = std::getenv("APS5_DRAW_CACHE_ADMIT_ALL") != nullptr;
+    if (admitAll) return true;
+    std::lock_guard cacheLock(drawCacheMutex);
+    if (drawCache.contains(key)) return true;
+    if (drawKeysSeen.empty()) drawKeysSeen.assign(std::bit_ceil(drawCacheEntries() * 4), 0);
+    const auto mixed = (key ^ (key >> 29u)) * 0xbf58476d1ce4e5b9ull;
+    auto& slot = drawKeysSeen[static_cast<std::size_t>(mixed >> 20u) & (drawKeysSeen.size() - 1)];
+    if (slot == key) return true;
+    slot = key;
+    ++drawKeysRefused;
+    return false;
 }
 
 void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode) {
