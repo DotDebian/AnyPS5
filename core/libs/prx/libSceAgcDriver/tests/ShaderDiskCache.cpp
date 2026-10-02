@@ -41,7 +41,7 @@ void unsetEnvironment(const char* name) {
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -104,6 +104,7 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.imageWritten = {false, true, true};
     binding.bufferAtomic = {true};
     binding.bufferWritten = {false, false, true, true, false};
+    binding.bufferRead = {true, false, false, true, true, false};
     return binding;
 }
 
@@ -480,9 +481,9 @@ void verifyFormatDigest() {
     const auto payload = std::span(file).subspan(48 + key.size());
     const auto resultDigest = HashBytes(result);
     const auto payloadDigest = HashBytes(payload);
-    constexpr std::uint32_t DigestFormat = 6;
-    constexpr std::uint64_t ResultDigest = 0x7307993ce01e5663ull;
-    constexpr std::uint64_t PayloadDigest = 0x2544c6b49b6cba07ull;
+    constexpr std::uint32_t DigestFormat = 7;
+    constexpr std::uint64_t ResultDigest = 0x9b50e5fd197ec1d9ull;
+    constexpr std::uint64_t PayloadDigest = 0xce05863499a2891aull;
     char text[160];
     std::snprintf(text, sizeof(text), "format %u: result digest 0x%016llx, payload digest 0x%016llx", ShaderDiskCache::FormatVersion, static_cast<unsigned long long>(resultDigest), static_cast<unsigned long long>(payloadDigest));
     require(ShaderDiskCache::FormatVersion == DigestFormat && resultDigest == ResultDigest && payloadDigest == PayloadDigest, std::string("the entry encoding changed (") + text + "): bump ShaderDiskCache::FormatVersion and record the new digests here");

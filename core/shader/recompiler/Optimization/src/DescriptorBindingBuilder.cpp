@@ -230,6 +230,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
                 // (ResourceTracker::Merge), so an element without a store or atomic is read-only
                 // over its whole extent; stores through pointers (BDA) never bind a V#.
                 physical.bufferWritten.push_back(buffer.written || buffer.atomic);
+                physical.bufferRead.push_back(buffer.read);
                 if (buffer.written || buffer.atomic) ++writtenHere;
                 else ++readOnlyHere;
             }

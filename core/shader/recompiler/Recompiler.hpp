@@ -353,6 +353,7 @@ struct DescriptorBinding {
     // skip the write-back and the pending-write note for the element; an element beyond the vector
     // (a producer that does not fill it) must be treated as written.
     std::vector<bool> bufferWritten;
+    std::vector<bool> bufferRead;
 };
 
 struct VertexAttribute {

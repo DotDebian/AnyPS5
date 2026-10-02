@@ -133,7 +133,8 @@ bool Replay(const char* path) {
                 for (std::size_t i = 0; i + 4 <= binding.guestDescriptor.size(); i += 4) {
                     const auto* v = binding.guestDescriptor.data() + i;
                     const bool written = i / 4 >= binding.bufferWritten.size() || binding.bufferWritten[i / 4];
-                    std::printf("  buffer %zu: V# %08x %08x %08x %08x%s\n", i / 4, v[0], v[1], v[2], v[3], written ? " written" : "");
+                    const bool read = i / 4 < binding.bufferRead.size() && binding.bufferRead[i / 4];
+                    std::printf("  buffer %zu: V# %08x %08x %08x %08x%s%s\n", i / 4, v[0], v[1], v[2], v[3], read ? " read" : "", written ? " written" : "");
                 }
             }
         }
