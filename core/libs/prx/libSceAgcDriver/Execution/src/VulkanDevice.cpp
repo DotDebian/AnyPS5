@@ -1216,6 +1216,70 @@ bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirs
     return state->recorder->AfterRecordedWork(std::move(action));
 }
 
+bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
+    if (!state->recorder) return false;
+    auto& recorder = *state->recorder;
+    constexpr std::size_t bytes = 15 * 16 + 8;
+    if (OpportunisticReap()) recorder.Reap();
+    if (state->CopiedWriterOverlaps(address, bytes) || (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes))) return false;
+    const auto context = graphicsContext();
+    Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "occlusion counter dump", Graphics::PublishScope::PartialUnits);
+    const auto* import = Graphics::HostImportFor(context, address, bytes);
+    if (import == nullptr || import->address == 0) return false;
+    if (Graphics::AnyShadowedOverlaps(address, bytes)) Graphics::PublishShadow(address, bytes, Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    recorder.FlushStoresOverlapping(address, bytes);
+    recorder.FlushKeyStoresOverlapping(address, bytes);
+    if (!recorder.DumpSamples(import->address + (address - import->base))) return false;
+    recorder.NotePendingWrite(address, bytes);
+    GuestMemory::MarkWritten(address, bytes);
+    return true;
+}
+
+bool VulkanDevice::TransferGdsOnGpu(const Pm4::GdsTransfer& transfer, bool reapFirst) {
+    using Kind = Pm4::GdsTransfer::Kind;
+    if (!state->recorder || state->gds == nullptr) return false;
+    auto& recorder = *state->recorder;
+    if (reapFirst && OpportunisticReap()) recorder.Reap();
+    if (recorder.Idle()) return false;
+    const auto context = graphicsContext();
+    const Graphics::HostImport* import = nullptr;
+    if (transfer.kind != Kind::FillGds) {
+        if (state->CopiedWriterOverlaps(transfer.memory, transfer.bytes) || (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(transfer.memory, transfer.bytes))) return false;
+        const std::pair<std::uint64_t, std::uint64_t> range{transfer.memory, transfer.memory + transfer.bytes};
+        if (transfer.kind == Kind::GdsToMemory) {
+            Graphics::StorageTexture::FlushPending(transfer.memory, transfer.bytes, nullptr, "GDS transfer", Graphics::PublishScope::PartialUnits);
+        } else if (Graphics::StorageTexture::AnyPendingOverlaps(std::span(&range, 1)) || Graphics::AnyShadowedOverlaps(transfer.memory, transfer.bytes)) {
+            return false;
+        }
+        import = Graphics::HostImportFor(context, transfer.memory, transfer.bytes);
+        if (import == nullptr) return false;
+        if (transfer.kind == Kind::GdsToMemory && Graphics::AnyShadowedOverlaps(transfer.memory, transfer.bytes)) Graphics::PublishShadow(transfer.memory, transfer.bytes, Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+        recorder.FlushStoresOverlapping(transfer.memory, transfer.bytes);
+        recorder.FlushKeyStoresOverlapping(transfer.memory, transfer.bytes);
+    }
+    const auto commands = recorder.Commands();
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    const auto gds = state->gds->Handle();
+    if (transfer.kind == Kind::FillGds) {
+        context.Resolved(&Graphics::DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, gds, transfer.gdsOffset, transfer.bytes, transfer.value);
+    } else {
+        const VkBufferCopy region = transfer.kind == Kind::MemoryToGds ? VkBufferCopy{transfer.memory - import->base, transfer.gdsOffset, transfer.bytes} : VkBufferCopy{transfer.gdsOffset, transfer.memory - import->base, transfer.bytes};
+        context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, transfer.kind == Kind::MemoryToGds ? import->buffer : gds, transfer.kind == Kind::MemoryToGds ? gds : import->buffer, 1, &region);
+    }
+    constexpr VkAccessFlags transferredAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, transferredAccess);
+    Graphics::Recorder::CountBarriers(Graphics::Recorder::CommandClass::Copy, 2);
+    recorder.MarkCovered(transferredAccess);
+    if (transfer.kind == Kind::GdsToMemory) {
+        recorder.NotePendingWrite(transfer.memory, transfer.bytes);
+        GuestMemory::MarkWritten(transfer.memory, transfer.bytes);
+    } else {
+        if (transfer.kind == Kind::MemoryToGds) recorder.NotePendingRead(transfer.memory, transfer.bytes, Graphics::Recorder::ReadKind::CopySource);
+        Pm4::NoteGdsShaderUse();
+    }
+    return true;
+}
+
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
     auto& recorder = *state->recorder;

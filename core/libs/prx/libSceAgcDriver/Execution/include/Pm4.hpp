@@ -138,6 +138,15 @@ struct StoreWrite {
     std::span<const std::byte> Bytes() const { return ownedBytes.empty() ? viewBytes : std::span<const std::byte>(ownedBytes); }
 };
 std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, const QueueState& queue, std::size_t limit);
+struct GdsTransfer {
+    enum class Kind : std::uint8_t { FillGds, MemoryToGds, GdsToMemory };
+    Kind kind;
+    std::uint64_t gdsOffset;
+    std::uint64_t memory;
+    std::uint32_t value;
+    std::size_t bytes;
+};
+std::optional<GdsTransfer> DecodeGdsTransfer(std::span<const std::uint32_t> packet);
 // A DISPATCH_INDIRECT's arguments: the guest address of its three group-count dwords (no memory
 // access, so the GPU can read them in place: VulkanDevice::DispatchIndirect), the DISPATCH_DIRECT
 // packet made by reading them there (through the checked guest memory path, which waits for

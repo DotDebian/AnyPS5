@@ -102,7 +102,7 @@ public:
     // Draw input snapshots (ShaderResources::PrepareDrawBindings) kept across draws: a recorded
     // draw reads a copy of its read-only in-place inputs, taken when it is recorded, and the draws
     // of a frame bind the same multi-MiB buffers (light lists a compute pass wrote) hundreds of
-    // times, which copied them again for every draw. A snapshot is immutable once filled, so a
+    // times, which copied them again for every draw. A snapshot never changes while anything but the cache holds it, so a
     // later draw may bind it while the guest bytes are unchanged since the copy: `generation` is
     // the GuestMemory::CollectWrites value taken right before the copy, and ReusableDrawSnapshot
     // (called after the caller's own collect of the range) returns it only while
@@ -110,7 +110,9 @@ public:
     // GPU store stamped by MarkWritten, drops it) and the guest allocation registry has not changed
     // since (a range unmapped and mapped again holds new bytes no write stamped; registry mutations
     // are rare once a title runs). A storage snapshot that fails only the write check is still
-    // returned when its bytes equal the guest bytes, and takes `generation`, the caller's collect. Kept least recently used under a byte budget
+    // returned when its bytes equal the guest bytes, and takes `generation`, the caller's collect. Only the 64 KiB tracker blocks stamped since
+    // its generation are compared; when some differ and the cache holds the only reference (no recorded draw binds it), those
+    // blocks are copied into it in place instead of copying the whole range again. Kept least recently used under a byte budget
     // (APS5_DRAW_SNAPSHOT_CACHE_MIB, default 256; 0 copies for every draw as before) and an entry
     // count (APS5_DRAW_SNAPSHOT_CACHE_ENTRIES, default 1024); the vertex and index snapshots are kept
     // apart under their own (APS5_DRAW_INPUT_CACHE_MIB, default 1024, and
@@ -124,10 +126,10 @@ public:
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32 };
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
     // APS5_PROFILE_DRAW: the snapshot cache's lookups that found no entry, found a stale one, and
-    // entries evicted to make room; of the stale ones, those reused with unchanged bytes
+    // entries evicted to make room; of the stale ones, those reused with unchanged bytes and those patched in place
     // (cumulative, all recorders).
     struct DrawSnapshotStatistics {
-        std::uint64_t absent, stale, evicted, revalidated;
+        std::uint64_t absent, stale, evicted, revalidated, patched;
     };
     static DrawSnapshotStatistics DrawSnapshotCounts();
     static std::size_t DrawSnapshotBudget(SnapshotUse use);
@@ -144,6 +146,8 @@ public:
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
     // memory; its completion stores are the caller's business, see VulkanDevice::CopyBuffer).
     bool PendingWriteSettled(std::uint64_t address, std::size_t bytes) const;
+    std::uint64_t LastWriteNote(std::uint64_t address, std::size_t bytes) const;
+    std::uint64_t NewestWriteNote(std::uint64_t address, std::size_t bytes) const;
     // Batch read tracking: the guest ranges the recorded work reads IN PLACE through a host import
     // and the GPU has not executed yet (a V# element bound in place, a region the GPU copies out of
     // an import, an address-based build's leased heaps, indirect arguments, a GPU-direct storage
@@ -210,7 +214,9 @@ public:
     // Submits and waits for every batch, running completions in order.
     void Sync();
     void CountSamples();
-    static std::uint64_t SamplesPassed();
+    std::uint64_t SamplesTotal();
+    bool DumpSamples(VkDeviceAddress target);
+    void NoteSampledDraw();
     // Waits only for the batches up to the newest one that writes the range (submitting the open
     // batch when it is that one); later batches stay in flight. Fences of one queue signal in
     // submission order, so completions still run in order. Debug aid: APS5_NO_SYNC_THROUGH=1 syncs all.
@@ -307,6 +313,7 @@ public:
     // inside [address, address + bytes): a range query for large ranges (a fill of megabytes),
     // where a per-dword lookup would not do.
     bool PendingLabelIn(std::uint64_t address, std::size_t bytes) const;
+    bool CompletionLabelIn(std::uint64_t address, std::size_t bytes) const;
     // PendingLabel of the active recorder WITHOUT GuestMemory::GpuMutex: the table has a small mutex
     // of its own (every mutation holds both), so a WAIT_REG_MEM consults it without queueing behind
     // device work. Nothing is done under the table mutex but the lookup (it never takes the GPU mutex).
@@ -531,6 +538,7 @@ private:
         std::vector<std::shared_ptr<void>> kept;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+        std::vector<std::uint64_t> writeNotes;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {
             std::uint64_t begin;
@@ -549,6 +557,9 @@ private:
         std::chrono::steady_clock::time_point submittedAt{};
         VkQueryPool queries = VK_NULL_HANDLE;
         VkQueryPool samples = VK_NULL_HANDLE;
+        std::shared_ptr<void> samplePool;
+        bool sampleActive = false;
+        bool samplesDrawn = false;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
@@ -647,7 +658,20 @@ private:
     void readGpuTiming(Batch& batch);
     void beginSamples(Batch& batch);
     void readSamples(Batch& batch);
+    bool gpuSampleCounter();
+    void endSamples(Batch& batch);
+    void foldSamples(Batch& batch, VkDeviceAddress target);
+    struct SampleSegment {
+        std::shared_ptr<void> pool;
+        VkQueryPool handle;
+    };
+    std::vector<SampleSegment> pendingSamples;
     bool countingSamples = false;
+    int sampleCounterState = 0;
+    std::unique_ptr<Buffer> sampleCounter;
+    VkPipelineLayout sampleLayout = VK_NULL_HANDLE;
+    VkPipeline samplePipeline = VK_NULL_HANDLE;
+    std::shared_ptr<void> samplePools;
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
     // Commands() would close).
     std::uint32_t beginTiming(std::uint64_t key);
@@ -740,6 +764,7 @@ private:
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
     std::uint64_t submissions = 0;
+    std::uint64_t writeNoteCount = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
@@ -767,6 +792,7 @@ private:
     };
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
 };
 
 }

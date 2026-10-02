@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <chrono>
 #include <vector>
 
 namespace {
@@ -986,6 +987,114 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+void drawSnapshotPatchTests(const Device& device) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 4 * 65536;
+    const char* budget = std::getenv("APS5_DRAW_SNAPSHOT_CACHE_MIB");
+    if (budget != nullptr && std::strtoull(budget, nullptr, 10) == 0) {
+        std::cout << "draw snapshot cache disabled: snapshot patching not tested\n";
+        return;
+    }
+    std::unique_lock gpu(GpuMutex());
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: snapshot patching not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<std::uint8_t*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = static_cast<std::uint8_t>(at * 13u + 5u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the watched block refused: snapshot patching not tested\n";
+        return;
+    }
+    constexpr std::size_t elementOffset = 4096;
+    constexpr std::size_t elementBytes = 3 * 65536;
+    const auto element = address + elementOffset;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    binding.bufferWritten = {false};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto snapshotContext = context;
+    DescriptorCache cache(snapshotContext);
+    snapshotContext.descriptorCache = &cache;
+    Recorder snapshotRecorder(snapshotContext);
+    snapshotRecorder.Activate();
+    {
+        ShaderResources resources(snapshotContext, compute);
+        const auto snapshot = [&] {
+            auto bindings = resources.PrepareDrawBindings(snapshotRecorder);
+            Require(bindings != nullptr && bindings->snapshots.size() == 1, "read-only draw input was not snapshotted");
+            auto buffer = bindings->snapshots[0].buffer;
+            const auto contents = buffer->Bytes();
+            Require(contents.size() == elementBytes && std::memcmp(contents.data(), reinterpret_cast<const void*>(element), elementBytes) == 0, "a draw snapshot does not hold the guest bytes of its draw");
+            return buffer;
+        };
+        const auto settle = [&](const std::weak_ptr<Buffer>& buffer) {
+            snapshotRecorder.Sync();
+            gpu.unlock();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (buffer.use_count() > 1 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            gpu.lock();
+            Require(buffer.use_count() == 1, "a finished draw still holds its snapshot");
+        };
+        std::weak_ptr<Buffer> first = snapshot();
+        settle(first);
+        guest[elementOffset + 10] ^= 0xffu;
+        guest[elementOffset + 65536 + 300] ^= 0xffu;
+        guest[elementOffset + 2 * 65536 + 7] = guest[elementOffset + 2 * 65536 + 7];
+        guest[elementOffset + elementBytes - 1] ^= 0x5au;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        {
+            const auto patched = snapshot();
+            Require(patched == first.lock(), "a stale snapshot nothing else holds was copied whole instead of patched");
+        }
+        settle(first);
+        std::memset(guest + elementOffset + 65536, 0x77, 65536);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        {
+            const auto patched = snapshot();
+            Require(patched == first.lock(), "a snapshot whose whole middle block changed was not patched");
+        }
+        settle(first);
+        const auto held = snapshot();
+        Require(held == first.lock(), "an unchanged snapshot was not reused");
+        const std::vector<std::byte> before(held->Bytes().begin(), held->Bytes().end());
+        guest[elementOffset + 2 * 65536 + 100] ^= 0xffu;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto fresh = snapshot();
+        Require(fresh != held, "a snapshot a recorded draw still holds was patched");
+        Require(std::memcmp(held->Bytes().data(), before.data(), before.size()) == 0, "a held snapshot's bytes changed");
+        snapshotRecorder.Sync();
+    }
+}
+
 void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
@@ -1913,6 +2022,123 @@ void importWindowTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
+void sampleDumpTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress) {
+        std::cout << "host imports or buffer device addresses unavailable: occlusion counter dumps on the GPU not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the occlusion counter block");
+    auto* words = static_cast<std::uint64_t*>(block);
+    constexpr std::uint64_t untouched = 0xaaaaaaaaaaaaaaaaull;
+    std::fill(words, words + 64, untouched);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || import->address == 0) {
+        std::cout << "host import of the occlusion counter block refused: occlusion counter dumps on the GPU not tested\n";
+        return;
+    }
+    const auto target = import->address + (address - import->base);
+    recorder.Sync();
+    constexpr std::uint64_t ready = 1ull << 63u;
+    Require(recorder.DumpSamples(target), "the occlusion counters were not dumped on the GPU");
+    Require(words[0] == untouched && !recorder.Idle(), "the occlusion counter dump waited for the GPU or landed before its batch ran");
+    recorder.Sync();
+    const auto begin = recorder.SamplesTotal();
+    for (std::size_t db = 0; db < 16; ++db) {
+        Require(words[db * 2] == ((db == 0 ? begin : 0) | ready), "an occlusion counter dump stored the wrong value");
+        Require(words[db * 2 + 1] == untouched, "an occlusion counter dump stored over the next counter");
+    }
+    Require(recorder.DumpSamples(target + 8), "the second occlusion counter dump was not made on the GPU");
+    recorder.Submit();
+    recorder.Sync();
+    for (std::size_t db = 0; db < 16; ++db) {
+        Require(words[db * 2 + 1] == ((db == 0 ? begin : 0) | ready), "the counters changed with nothing drawn between two dumps");
+        Require(words[db * 2] == ((db == 0 ? begin : 0) | ready), "the second dump stored over the first");
+    }
+    Require(recorder.SamplesTotal() == begin, "the sample total moved with nothing drawn");
+    for (int i = 0; i < 40; ++i) Require(recorder.DumpSamples(target), "a dump past one batch's query slots was not made on the GPU");
+    recorder.Sync();
+    Require(words[0] == (begin | ready) && recorder.SamplesTotal() == begin, "dumps past one batch's query slots moved the total");
+}
+
+void pendingKeyStoreTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: pending key stores not tested\n";
+        return;
+    }
+    constexpr std::size_t surfaceBytes = 65536;
+    constexpr std::size_t keyCount = surfaceBytes / 256;
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the pending key store block");
+    auto* keys = static_cast<std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the pending key store block refused: pending key stores not tested\n";
+        return;
+    }
+    recorder.Sync();
+    std::memset(keys, 0x00, keyCount);
+    MarkDccUncompressed(context, address, surfaceBytes);
+    Require(recorder.PendingWriteOverlaps(address, keyCount) && keys[0] == 0x00, "the uncompressed key store did not stay pending");
+    Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed, "the keys after a pending uncompressed store do not read as uncompressed");
+    Require(recorder.PendingWriteOverlaps(address, keyCount), "reading keys the driver's own pending store wrote waited for the GPU");
+    Require(CurrentDccKeys(address + 16, surfaceBytes / 2) == DccKeys::Uncompressed, "a key range inside the pending store does not read as uncompressed");
+    recorder.NotePendingWrite(address + 16, 16);
+    Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed && !recorder.PendingWriteOverlaps(address, keyCount), "a key read with a later writer over the pending store did not wait for it");
+    Require(std::all_of(keys, keys + keyCount, [](std::uint8_t key) { return key == 0xff; }), "the uncompressed key store did not land");
+    recorder.NotePendingWrite(address, keyCount);
+    NoteKeysFillOnGpu(address, keyCount, DccKeys::Clear0001);
+    Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Clear0001 && recorder.PendingWriteOverlaps(address, keyCount), "the keys of a pending fill did not read as its keys without a wait");
+    recorder.NotePendingWrite(address, 2 * keyCount);
+    Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed && !recorder.PendingWriteOverlaps(address, keyCount), "a later wider writer over a pending fill was not waited for");
+    recorder.Sync();
+}
+
 void metadataPassTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -2675,42 +2901,47 @@ void unimportableRangeTests(const Device& device) {
 int main() {
     try {
         Device device;
-        std::lock_guard gpu(GpuMutex());
-        std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
-        Recorder recorder(device.GetContext());
-        recorder.Activate();
-        readTrackingTests(device, recorder);
-        writeSettledTests(device, recorder);
-        completionCountTests(device, recorder);
-        batchStampTests(recorder);
-        labelTests(recorder);
-        lateLabelTests(recorder);
-        unchangedSinceTests();
-        closeRaceTests(device, recorder);
-        keyProofTests(device, recorder);
-        resourceReadTests(device, recorder);
-        drawSnapshotReuseTests(device, recorder);
-        misalignedSnapshotTests(device, recorder);
-        drawSnapshotEvictionTests(device);
-        drawInputReuseTests(device, recorder);
-        RunResidentPresentTests(device.GetContext());
-        storeRunTests(device, recorder);
-        movedMetadataTests(device, recorder);
-        unitShadowTests(device, recorder);
-        storageRefreshTests(device, recorder, false);
-        storageRefreshTests(device, recorder, true);
-        importWatchTests(device);
-        staleGenerationTests(device, recorder);
-        importWindowTests(device, recorder);
-        dataWordPositionsTests();
-        dataRefreshTests(device, recorder);
-        minLodTests(device, recorder);
-        firstLayerViewTests(device, recorder);
-        depthSurfaceSamplingTests(device, recorder);
-        metadataPassTests(device, recorder);
-        movedMetadataTests(device, recorder);
-        keysFillTests(device, recorder);
-        unimportableRangeTests(device);
+        {
+            std::lock_guard gpu(GpuMutex());
+            std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
+            Recorder recorder(device.GetContext());
+            recorder.Activate();
+            readTrackingTests(device, recorder);
+            writeSettledTests(device, recorder);
+            completionCountTests(device, recorder);
+            batchStampTests(recorder);
+            labelTests(recorder);
+            lateLabelTests(recorder);
+            unchangedSinceTests();
+            closeRaceTests(device, recorder);
+            keyProofTests(device, recorder);
+            resourceReadTests(device, recorder);
+            drawSnapshotReuseTests(device, recorder);
+            misalignedSnapshotTests(device, recorder);
+            drawSnapshotEvictionTests(device);
+            drawInputReuseTests(device, recorder);
+            RunResidentPresentTests(device.GetContext());
+            storeRunTests(device, recorder);
+            movedMetadataTests(device, recorder);
+            unitShadowTests(device, recorder);
+            storageRefreshTests(device, recorder, false);
+            storageRefreshTests(device, recorder, true);
+            importWatchTests(device);
+            staleGenerationTests(device, recorder);
+            importWindowTests(device, recorder);
+            dataWordPositionsTests();
+            dataRefreshTests(device, recorder);
+            minLodTests(device, recorder);
+            firstLayerViewTests(device, recorder);
+            depthSurfaceSamplingTests(device, recorder);
+            metadataPassTests(device, recorder);
+            pendingKeyStoreTests(device, recorder);
+            movedMetadataTests(device, recorder);
+            keysFillTests(device, recorder);
+            unimportableRangeTests(device);
+            sampleDumpTests(device, recorder);
+        }
+        drawSnapshotPatchTests(device);
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {

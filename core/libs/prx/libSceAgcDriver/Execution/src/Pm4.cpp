@@ -554,6 +554,27 @@ std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, co
     }
 }
 
+std::optional<GdsTransfer> DecodeGdsTransfer(std::span<const std::uint32_t> packet) {
+    if (packet.size() != 7 || ((packet[0] >> 8u) & 0xffu) != 0x50) return std::nullopt;
+    const std::size_t bytes = packet[6] & 0x3ffffffu;
+    const auto source = dmaSource(packet);
+    const auto destination = dmaDestination(packet);
+    if (bytes == 0) return std::nullopt;
+    if (destination == DmaSelectGds && source == 2) {
+        if (packet[4] % 4 != 0 || bytes % 4 != 0 || !gdsRange(packet[4], bytes)) return std::nullopt;
+        return GdsTransfer{GdsTransfer::Kind::FillGds, packet[4], 0, packet[2], bytes};
+    }
+    if (destination == DmaSelectGds && memorySelector(source)) {
+        if (!gdsRange(packet[4], bytes)) return std::nullopt;
+        return GdsTransfer{GdsTransfer::Kind::MemoryToGds, packet[4], address(packet[2], packet[3]), 0, bytes};
+    }
+    if (source == DmaSelectGds && memorySelector(destination)) {
+        if (!gdsRange(packet[2], bytes)) return std::nullopt;
+        return GdsTransfer{GdsTransfer::Kind::GdsToMemory, packet[2], address(packet[4], packet[5]), 0, bytes};
+    }
+    return std::nullopt;
+}
+
 bool UsesGpuCacheBarrier(std::span<const std::uint32_t> packet) {
     require(!packet.empty() && ((packet[0] >> 8u) & 0xffu) == 0x58, "cache barrier requires ACQUIRE_MEM");
     Validate(packet, 0);
