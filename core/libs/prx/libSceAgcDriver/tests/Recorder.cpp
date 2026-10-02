@@ -1723,9 +1723,14 @@ void movedMetadataTests(const Device& device, Recorder& recorder) {
     green.float32[1] = 1.0f;
     green.float32[3] = 1.0f;
     draw(moved, green);
+    const auto shared = CachedStorageSurface(context, withKeys(first));
+    Require(shared == moved && shared->Descriptor().dccAddress == second, "a descriptor naming other uncompressed keys remade the image");
+    Require(holds(*shared, {0, 255, 0, 255}), "the shared image lost its pending results");
+    std::memset(firstKeys, 0x00, keyCount);
     const auto back = CachedStorageSurface(context, withKeys(first));
-    Require(back != moved && back->Descriptor().dccAddress == first, "the keys moving back did not remake the image");
-    Require(holds(*back, {0, 255, 0, 255}), "results pending under the old keys were lost when the keys moved");
+    Require(back != moved && back->Descriptor().dccAddress == first, "a fast clear of the other keys did not remake the image");
+    Require(!StorageImageCached(context, moved.get()), "the image of the uncleared keys is still the surface's");
+    Require(holds(*back, {0, 0, 0, 0}), "the fast clear of the other keys did not reach the remade image");
     recorder.Submit();
     device.WaitQueue();
     recorder.Sync();
