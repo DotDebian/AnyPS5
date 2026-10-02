@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PreparedDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include <atomic>
@@ -747,6 +748,35 @@ void testDrawAhead() {
     }
 }
 
+void testStageFailureMemo() {
+    using namespace ShaderRecompiler;
+    static const std::array<std::uint32_t, 8> code{0xf4040004u, 0xfa000000u, 0xf4000080u, 0xfa000000u, 0x7e000202u, 0xf80008cfu, 0u, 0xbf810000u};
+    AgcDriver::DriverDetail::ShaderSnapshot snapshot{0x10000u, 0x20000u, 0, {code.begin(), code.end()}, {}};
+    const std::array<std::uint32_t, 2> userData{0u, 0u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Vertex, 0x10000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 105;
+    request.context.userData = userData;
+    request.context.vertex = ShaderVertexStageInfo{};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.layout.pushConstantSizeBytes = 128;
+    const std::string* poisoned = nullptr;
+    expectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, 1, request, false, &poisoned)); }, "scalar register bank");
+    check(snapshot.handles->poisoned.load() == 1, "a vertex stage's failure was not memoized");
+    check(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, 1, request, false, &poisoned) == nullptr && poisoned != nullptr && poisoned->find("scalar register bank") != std::string::npos, "the memoized failure was not answered without a throw");
+    expectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, 1, request, false)); }, "scalar register bank");
+    poisoned = nullptr;
+    request.context.userDataBaseRegister = 8;
+    try {
+        static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, 1, request, false, &poisoned));
+    } catch (const std::exception&) {
+    }
+    check(poisoned == nullptr, "a failure answered a different context");
+}
+
 void testDriverSubmission() {
     std::array<std::uint32_t, 2> source{0x10, 73};
     std::array<std::uint32_t, 1> destination{};
@@ -831,6 +861,7 @@ int main(int argc, char** argv) {
         testAcquireMem();
         testStateEffects();
         testDrawAhead();
+        testStageFailureMemo();
         testDriverSubmission();
         LibcRunShutdown_nid_postfix();
         std::puts("PM4 catalog, registers, state, memory and submission tests passed");
