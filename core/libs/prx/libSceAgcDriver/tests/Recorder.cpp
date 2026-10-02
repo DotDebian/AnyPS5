@@ -2899,6 +2899,11 @@ void unimportableRangeTests(const Device& device) {
 }
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("APS5_GPU_SAMPLE_COUNTER", "1");
+#else
+    setenv("APS5_GPU_SAMPLE_COUNTER", "1", 1);
+#endif
     try {
         Device device;
         {
