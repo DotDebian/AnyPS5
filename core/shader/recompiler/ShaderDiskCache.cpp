@@ -560,6 +560,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_CODE_HASH_KEY",
     "APS5_NO_FAILURE_MEMO",
     "APS5_NO_RESULT_MEMO",
+    "APS5_TRACE_LOCAL_MEMORY_PROBE",
 };
 
 const std::vector<std::byte>& switchKey() {
