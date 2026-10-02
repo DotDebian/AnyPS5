@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "SaveData.hpp"
@@ -707,6 +708,19 @@ int APS5_VABI sceSaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount_
     const int rc = umount2(mode, mount_point);
     SAVEDATA_TRACE("umount2 mode=0x%x point=%s -> 0x%08x", mode, mount_point != nullptr ? mount_point->data : "(null)", static_cast<unsigned>(rc));
     return rc;
+}
+
+bool SaveDataHoldWrites_nid_no_patch(bool hold, int timeoutMs) {
+    if (!hold) {
+        g_mem_mutex.unlock();
+        return true;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (!g_mem_mutex.try_lock()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
 }
 
 }
