@@ -161,6 +161,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     result.depthOrLastArray = depth;
     result.baseArray = baseArray;
     result.mipCount = maxMip + 1u;
+    result.allocatedMipCount = maxMip + 1u;
     result.baseLevel = baseLevel;
     result.lastLevel = lastLevel;
     result.tileMode = tileMode;
