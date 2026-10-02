@@ -714,6 +714,68 @@ void verifyPixelInputs() {
     }
 }
 
+void verifyDepthExportClamp() {
+    using namespace ShaderRecompiler;
+    static constexpr std::array<std::uint32_t, 3> code{0xf8001881u, 0x00000000u, 0xbf810000u};
+    ShaderPixelStageInfo pixel{};
+    pixel.inputAddr = PixelInputBit(PixelInput::PerspectiveCenter);
+    pixel.hasPerspectiveCenterVgpr = true;
+    pixel.depthExportEnable = true;
+    pixel.depthExportMin = 0.25f;
+    pixel.depthExportMax = 0.75f;
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Fragment, 0x30000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.pixel = pixel;
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    const auto result = Recompile(request);
+    const auto& words = result.spirv.Words();
+    std::map<std::uint32_t, std::uint32_t> floats;
+    std::vector<std::array<std::uint32_t, 3>> clamps;
+    std::vector<std::uint32_t> stored;
+    std::uint32_t depthVariable = 0;
+    bool depthReplacing = false;
+    for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
+        const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+        if (op == spv::OpConstant && (words[at] >> 16u) == 4u) floats[words[at + 2]] = words[at + 3];
+        if (op == spv::OpExtInst && words[at + 4] == 81u) clamps.push_back({words[at + 2], words[at + 6], words[at + 7]});
+        if (op == spv::OpDecorate && words[at + 2] == spv::DecorationBuiltIn && words[at + 3] == spv::BuiltInFragDepth) depthVariable = words[at + 1];
+        if (op == spv::OpStore) stored.push_back(words[at + 1]), stored.push_back(words[at + 2]);
+        if (op == spv::OpExecutionMode && words[at + 2] == spv::ExecutionModeDepthReplacing) depthReplacing = true;
+    }
+    require(depthVariable != 0u && depthReplacing, "depth export: the pixel shader does not replace gl_FragDepth");
+    require(clamps.size() == 1u && floats[clamps[0][1]] == 0x3e800000u && floats[clamps[0][2]] == 0x3f400000u, "depth export: the exported depth was not NClamped to [ZMIN, ZMAX]");
+    bool clampStored = false;
+    for (std::size_t i = 0; i + 1 < stored.size(); i += 2) clampStored = clampStored || (stored[i] == depthVariable && stored[i + 1] == clamps[0][0]);
+    require(clampStored, "depth export: gl_FragDepth was not written from the clamped value");
+    const auto replay = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(request));
+    require(replay.request.context.pixel->depthExportMin == 0.25f && replay.request.context.pixel->depthExportMax == 0.75f, "depth export: the clamp did not survive serialization");
+    std::vector<std::uint64_t> key;
+    RecompileCacheKey::Build(request, key);
+    const auto first = key;
+    auto other = request;
+    auto changed = pixel;
+    changed.depthExportMax = 1.0f;
+    other.context.pixel = changed;
+    RecompileCacheKey::Build(other, key);
+    require(key != first && RecompileCacheKey::ContextHash(request) != RecompileCacheKey::ContextHash(other), "depth export: the cache keys ignore the clamp");
+    auto plain = pixel;
+    plain.depthExportEnable = false;
+    auto unexported = request;
+    unexported.context.pixel = plain;
+    RecompileCacheKey::Build(unexported, key);
+    const auto plainKey = key;
+    plain.depthExportMin = 0.0f;
+    plain.depthExportMax = 1.0f;
+    unexported.context.pixel = plain;
+    RecompileCacheKey::Build(unexported, key);
+    require(key == plainKey, "depth export: the clamp keyed a shader without depth export");
+}
+
 ShaderRecompiler::RecompileResult recompileSlots(std::initializer_list<std::uint32_t> controls, std::span<const std::uint32_t> code) {
     using namespace ShaderRecompiler;
     ShaderPixelStageInfo pixel{};
@@ -1113,6 +1175,7 @@ int main(int argc, char** argv) {
         verifyWorkgroupReserve();
         verifyMeshConfiguration();
         verifyPixelInputs();
+        verifyDepthExportClamp();
         verifyPixelParameterSlots();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{

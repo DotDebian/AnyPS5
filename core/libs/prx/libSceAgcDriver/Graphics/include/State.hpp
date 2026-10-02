@@ -190,10 +190,10 @@ struct DrawKeyRange {
     std::uint32_t count;
 };
 inline constexpr std::array<DrawKeyRange, 46> DrawKeyRegisters{{
-    // DB_RENDER_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_DEPTH_SIZE_XY, DB_DEPTH_BOUNDS_MIN/MAX,
+    // DB_RENDER_CONTROL, DB_DEPTH_VIEW, DB_RENDER_OVERRIDE, DB_HTILE_DATA_BASE, DB_DEPTH_SIZE_XY, DB_DEPTH_BOUNDS_MIN/MAX,
     // DB_STENCIL_CLEAR and DB_DEPTH_CLEAR with PA_SC_SCREEN_SCISSOR, DB_Z_INFO .. DB_STENCIL_WRITE_BASE,
     // the *_BASE_HI words.
-    {RegisterBank::Context, 0x000, 1}, {RegisterBank::Context, 0x002, 1}, {RegisterBank::Context, 0x005, 1}, {RegisterBank::Context, 0x007, 7}, {RegisterBank::Context, 0x010, 6}, {RegisterBank::Context, 0x01a, 5},
+    {RegisterBank::Context, 0x000, 1}, {RegisterBank::Context, 0x002, 2}, {RegisterBank::Context, 0x005, 1}, {RegisterBank::Context, 0x007, 7}, {RegisterBank::Context, 0x010, 6}, {RegisterBank::Context, 0x01a, 5},
     // The window offset/scissor and clip rect, the edge rule, the hardware screen offset,
     // CB_TARGET_MASK/CB_SHADER_MASK, the generic and viewport 0 scissors, the viewport 0 depth clamp,
     // the blend constants, DB_STENCIL_CONTROL and DB_STENCILREFMASK(_BF), the viewport 0 transform.

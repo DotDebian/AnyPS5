@@ -41,6 +41,7 @@ struct Module {
     std::map<std::uint32_t, std::string> outputs;
     bool position = false;
     bool primitiveIndices = false;
+    bool fragDepth = false;
     bool fragmentBarycentric = false;
     std::map<std::uint32_t, std::vector<std::uint32_t>> modes;
 
@@ -117,6 +118,9 @@ struct Module {
         } else if (vertex && storage == spv::StorageClassOutput) {
             Require(value == spv::BuiltInPosition && signature == "f32x4" && !position, "unsupported or duplicate vertex built-in output");
             position = true;
+        } else if (storage == spv::StorageClassOutput && value == spv::BuiltInFragDepth) {
+            Require(stage == Stage::Fragment && signature == "f32" && !fragDepth, "invalid or duplicate fragment depth output");
+            fragDepth = true;
         } else {
             Require(storage == spv::StorageClassInput && ((value == spv::BuiltInFragCoord && signature == "f32x4") || ((value == spv::BuiltInFrontFacing || value == spv::BuiltInHelperInvocation) && signature == "bool")), "unsupported fragment built-in");
         }
@@ -366,7 +370,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
         mode(spv::ExecutionModeVertexOrderCw, {});
         Require(module.modes.size() == 3, "unsupported tessellation-evaluation execution mode");
     } else if (fragment) {
-        for (const auto& [name, operands] : module.modes) Require(operands.empty() && (name == spv::ExecutionModeOriginUpperLeft || name == spv::ExecutionModeEarlyFragmentTests), "unsupported fragment execution mode");
+        for (const auto& [name, operands] : module.modes) Require(operands.empty() && (name == spv::ExecutionModeOriginUpperLeft || name == spv::ExecutionModeEarlyFragmentTests || name == spv::ExecutionModeDepthReplacing), "unsupported fragment execution mode");
     } else Require(module.modes.empty(), "unsupported vertex execution mode");
     std::set<std::pair<std::uint32_t, std::uint32_t>> descriptors;
     bool push = false;
@@ -483,6 +487,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
     Require(push == (!shader.pushConstants.empty() || mesh), "recompiler push constant metadata disagrees with SPIR-V");
     for (const auto id : module.interface) Require(module.variables.contains(id), "entry point interface contains an unknown variable");
     if (mesh) Require(module.primitiveIndices, "mesh shader does not export primitive indices");
+    if (fragment) Require(module.fragDepth == module.modes.contains(spv::ExecutionModeDepthReplacing), "fragment depth output and DepthReplacing disagree");
     if (stage == Stage::Vertex || mesh || evaluation) Require(module.position, "vertex shader does not export position");
     return module;
 }

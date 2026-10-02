@@ -3,6 +3,7 @@
 
 #include "Recompiler.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <bit>
 #include <cstdlib>
 #include <stdexcept>
 #include <type_traits>
@@ -143,6 +144,10 @@ private:
         append(key, value.linearCentroid);
         append(key, value.pixelKillEnable);
         append(key, value.depthExportEnable);
+        if (value.depthExportEnable) {
+            append(key, std::bit_cast<std::uint32_t>(value.depthExportMin));
+            append(key, std::bit_cast<std::uint32_t>(value.depthExportMax));
+        }
         append(key, value.sampleMaskExportEnable);
         append(key, value.earlyZ);
         append(key, value.executeOnNoop);

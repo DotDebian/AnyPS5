@@ -51,6 +51,16 @@ void zero(const Registers& registers, std::uint32_t offset, std::uint32_t mask, 
     if ((value & mask) != 0) throw std::runtime_error(zeroMessage(offset, value, name));
 }
 
+std::string zExportFormatRejection(std::uint32_t shaderControl, std::uint32_t zFormat) {
+    const bool depthExport = (shaderControl & 1u) != 0;
+    if (zFormat == 0 && !depthExport) return {};
+    if (zFormat == 1 && depthExport) return {};
+    if (zFormat > 1) return zeroMessage(0x1c4, zFormat, "depth or sample-mask export");
+    char detail[96];
+    std::snprintf(detail, sizeof(detail), " (DB_SHADER_CONTROL = 0x%08x, SPI_SHADER_Z_FORMAT = 0x%08x)", shaderControl, zFormat);
+    return std::string("AGC graphics: depth export without its Z export format is unsupported") + detail;
+}
+
 std::string vteMessage(std::uint32_t viewportControl) {
     std::ostringstream message;
     message << "AGC graphics: PA_CL_VTE_CNTL=0x" << std::hex << viewportControl << ": expected 0x43f for homogeneous positions and all viewport transforms; pre-divided coordinates, reciprocal W or disabled transforms are unsupported";
@@ -64,7 +74,7 @@ std::string vteMessage(std::uint32_t viewportControl) {
 constexpr std::uint32_t LayerExports = (1u << 18u) | (1u << 19u) | (1u << 21u) | (1u << 24u);
 // EXEC_ON_HIER_FAIL / EXEC_ON_NOOP / EXEC_IF_OVERLAPPED (bits 9, 10, 17) only force the pixel shader
 // to run, which it always does here.
-constexpr std::uint32_t ShaderControlMask = ~(0x00009870u | 0x00020600u);
+constexpr std::uint32_t ShaderControlMask = ~(0x00009870u | 0x00020600u | 1u);
 constexpr std::uint32_t AlphaToCoverageMask = ~0x0001ff00u;
 constexpr std::uint32_t ScanModeMask = ~2u;
 constexpr std::uint32_t ScanControlMask = ~0x06003fffu;
@@ -632,7 +642,7 @@ State DecodeState(const QueueState& queue) {
 
     // CB_COLOR_CONTROL mode 0 disables color writes, which only matters when a target is written.
     if (const auto colorControl = read(cx, 0x202); !colorControlSupported(colorControl, result.hasColorTarget)) throw std::runtime_error(colorControlMessage(colorControl));
-    zero(cx, 0x1c4, ~0u, "depth or sample-mask export");
+    if (auto reason = zExportFormatRejection(read(cx, 0x203), read(cx, 0x1c4)); !reason.empty()) throw std::runtime_error(reason);
     const auto exportFormat = read(cx, 0x1c5);
     APS5_LOG_OUT_DEBUG("Export format=%u", exportFormat);
     // SPI_SHADER_POS_FORMAT: POS0 must be a 4-component position; later vectors carry the misc/clip
@@ -933,7 +943,9 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (auto reason = nonzero(cx, 0x204, ClipControlMask, "unsupported PA_CL_CLIP_CNTL flags"); !reason.empty()) return reason;
     std::uint32_t targetMask = 0, shaderMask = 0;
     if (value(cx, 0x8e, targetMask) && value(cx, 0x8f, shaderMask) && value(cx, 0x202, word) && !colorControlSupported(word, (targetMask & shaderMask) != 0)) return colorControlMessage(word);
-    if (auto reason = nonzero(cx, 0x1c4, ~0u, "depth or sample-mask export"); !reason.empty()) return reason;
+    if (value(cx, 0x203, word) && value(cx, 0x1c4, other)) {
+        if (auto reason = zExportFormatRejection(word, other); !reason.empty()) return reason;
+    }
     // The pixel stage decode (ShaderInputState.cpp) reads these after DecodeState and the program
     // prepare; a bank without them fails there with this message.
     for (const auto offset : {0x1b3u, 0x1b4u, 0x1c5u}) {

@@ -5,6 +5,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +27,9 @@ constexpr std::uint32_t spiPsInputAddr = 0x1B4;
 constexpr std::uint32_t spiPsInControl = 0x1B6;
 constexpr std::uint32_t dbShaderControl = 0x203;
 constexpr std::uint32_t spiShaderColFormat = 0x1C5;
+constexpr std::uint32_t dbRenderOverride = 0x003;
+constexpr std::uint32_t paScVportZmin0 = 0x0B4;
+constexpr std::uint32_t paScVportZmax0 = 0x0B5;
 
 std::uint32_t read(const Registers& registers, std::uint32_t offset, RegisterBank bank) {
     NoteRegisterRead(bank, offset);
@@ -123,6 +128,18 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     const bool depthExportEnable = (shaderControl & 0x1u) != 0;
     const bool sampleMaskExportEnable = ((shaderControl >> 8u) & 0x1u) != 0;
     const auto zOrder = (shaderControl >> 4u) & 0x3u;
+    float depthExportMin = 0.0f;
+    float depthExportMax = 1.0f;
+    if (depthExportEnable) {
+        if ((read(context, dbRenderOverride, RegisterBank::Context) & 0x10000u) != 0) {
+            throw std::runtime_error("AGC graphics: depth export with DB_RENDER_OVERRIDE.DISABLE_VIEWPORT_CLAMP is unsupported");
+        }
+        depthExportMin = std::bit_cast<float>(read(context, paScVportZmin0, RegisterBank::Context));
+        depthExportMax = std::bit_cast<float>(read(context, paScVportZmax0, RegisterBank::Context));
+        if (!std::isfinite(depthExportMin) || !std::isfinite(depthExportMax) || depthExportMin > depthExportMax) {
+            throw std::runtime_error("AGC graphics: invalid viewport depth clamp bounds for depth export");
+        }
+    }
     const auto loaded = [&](PixelInput input) { return (activeInputs & PixelInputBit(input)) != 0; };
     return ShaderRecompiler::ShaderPixelStageInfo{
         .interpolatorCount = inputNum,
@@ -142,6 +159,8 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
         .linearCentroid = loaded(PixelInput::LinearCentroid),
         .pixelKillEnable = pixelKillEnable,
         .depthExportEnable = depthExportEnable,
+        .depthExportMin = depthExportMin,
+        .depthExportMax = depthExportMax,
         .sampleMaskExportEnable = sampleMaskExportEnable,
         .earlyZ = zOrder == 1u && !pixelKillEnable && !depthExportEnable && !sampleMaskExportEnable,
         .executeOnNoop = ((shaderControl >> 10u) & 0x1u) != 0,

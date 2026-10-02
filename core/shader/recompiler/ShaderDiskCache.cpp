@@ -81,13 +81,13 @@ static_assert(sizeof(ResourceSpecialization) == 72, "ResourceSpecialization chan
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16, "ResourceSpecialization::Buffer changed: update BuildKey");
 static_assert(sizeof(ResourceSpecialization::Image) == 36, "ResourceSpecialization::Image changed: update BuildKey");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
-static_assert(sizeof(RecompileRequest) == 1712, "RecompileRequest changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(RecompileRequest) == 1720, "RecompileRequest changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(SpirvTarget) == 200, "SpirvTarget changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(LocalMemoryProbeDevice) == 28, "LocalMemoryProbeDevice changed: key the new field in BuildKey or RecompileCacheKey::Build");
-static_assert(sizeof(GuestContext) == 1304, "GuestContext changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(GuestContext) == 1312, "GuestContext changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(ShaderBinary) == 56, "ShaderBinary changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(ShaderComputeStageInfo) == 36, "ShaderComputeStageInfo changed: key the new field in BuildKey or RecompileCacheKey::Build");
-static_assert(sizeof(ShaderPixelStageInfo) == 172, "ShaderPixelStageInfo changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(ShaderPixelStageInfo) == 184, "ShaderPixelStageInfo changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(ShaderVertexStageInfo) == 1040, "ShaderVertexStageInfo changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(ShaderVertexResourceDestination) == 16, "ShaderVertexResourceDestination changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(GraphicsCompileContext) == 120, "GraphicsCompileContext changed: key the new field in BuildKey or RecompileCacheKey::Build");

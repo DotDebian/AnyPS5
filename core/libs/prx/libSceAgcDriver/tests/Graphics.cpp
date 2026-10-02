@@ -1559,6 +1559,8 @@ struct ModuleShape {
     std::uint32_t parameterLocation = 0;
     bool rectParameters = false;
     bool secondTarget = false;
+    bool fragDepth = false;
+    bool depthReplacing = false;
 };
 
 void emit(std::vector<std::uint32_t>& out, spv::Op op, std::initializer_list<std::uint32_t> operands) {
@@ -1637,6 +1639,14 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
         emit(annotations, spv::OpDecorate, {variable, spv::DecorationPerVertexKHR});
         extraInterface.push_back(variable);
     }
+    if (shape.fragDepth) {
+        const auto pointer = id();
+        const auto variable = id();
+        emit(declarations, spv::OpTypePointer, {pointer, spv::StorageClassOutput, floatType});
+        emit(declarations, spv::OpVariable, {pointer, variable, spv::StorageClassOutput});
+        emit(annotations, spv::OpDecorate, {variable, spv::DecorationBuiltIn, spv::BuiltInFragDepth});
+        extraInterface.push_back(variable);
+    }
     if (shape.vertexInput) {
         emit(declarations, spv::OpTypePointer, {inputPointer, spv::StorageClassInput, vectorType});
         emit(declarations, spv::OpVariable, {inputPointer, input, spv::StorageClassInput});
@@ -1707,6 +1717,7 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     words[entryPointOffset] += static_cast<std::uint32_t>(extraInterface.size()) << 16u;
     words.insert(words.end(), extraInterface.begin(), extraInterface.end());
     if (shape.fragment) emit(words, spv::OpExecutionMode, {main, spv::ExecutionModeOriginUpperLeft});
+    if (shape.depthReplacing) emit(words, spv::OpExecutionMode, {main, spv::ExecutionModeDepthReplacing});
     words.insert(words.end(), annotations.begin(), annotations.end());
     words.insert(words.end(), declarations.begin(), declarations.end());
     words.insert(words.end(), function.begin(), function.end());
@@ -2090,6 +2101,76 @@ void colorGapPipelineTests() {
     Require(mock.live == 0, "color gap pipelines leaked Vulkan objects");
 }
 
+void depthExportTests() {
+    using namespace AgcDriver::Graphics;
+    auto queue = makeDepthState();
+    queue.context[0x3] = 0;
+    queue.context[0x203] = 0x11;
+    queue.context[0x1c4] = 1;
+    std::vector<RegisterRead> log;
+    RegisterReadLog() = &log;
+    const auto state = DecodeState(queue);
+    Require(DrawRejection(queue, false).empty(), "the precheck rejected a depth-exporting draw");
+    auto pixel = DecodePixelStageInfo(queue.context, ExportMappings(state));
+    RegisterReadLog() = nullptr;
+    for (const auto read : log) Require(DrawKeyCovers(read), "DrawKeyRegisters lacks a register the depth export decode reads: " + std::string(RegisterBankName(read.bank)) + " " + std::to_string(read.offset));
+    Require(std::any_of(log.begin(), log.end(), [](RegisterRead read) { return read.bank == RegisterBank::Context && read.offset == 0x3; }), "the depth export decode did not read DB_RENDER_OVERRIDE");
+    Require(state.depth.attached && pixel.depthExportEnable && !pixel.earlyZ && pixel.depthExportMin == 0.0f && pixel.depthExportMax == 1.0f, "Z_EXPORT_ENABLE did not decode with the viewport depth clamp");
+    queue.context[0xb4] = std::bit_cast<std::uint32_t>(0.25f);
+    queue.context[0xb5] = std::bit_cast<std::uint32_t>(0.75f);
+    pixel = DecodePixelStageInfo(queue.context, ExportMappings(DecodeState(queue)));
+    Require(pixel.depthExportMin == 0.25f && pixel.depthExportMax == 0.75f, "PA_SC_VPORT_ZMIN_0/ZMAX_0 did not become the exported depth clamp");
+    queue.context[0x3] = 0x10000;
+    expectFailure([&] { static_cast<void>(DecodePixelStageInfo(queue.context, ExportMappings(state))); }, "DISABLE_VIEWPORT_CLAMP");
+    queue.context[0x203] = 0x10;
+    queue.context[0x1c4] = 0;
+    pixel = DecodePixelStageInfo(queue.context, ExportMappings(state));
+    Require(!pixel.depthExportEnable && pixel.depthExportMin == 0.0f && pixel.depthExportMax == 1.0f, "a draw without depth export took the viewport depth clamp");
+    for (const auto control : {0x3u, 0x5u, 0x101u, 0x2001u}) {
+        auto changed = makeDepthState();
+        changed.context[0x3] = 0;
+        changed.context[0x203] = control;
+        changed.context[0x1c4] = 1;
+        expectDepthRejection(changed, "depth export, shader coverage or ordered fragment execution");
+    }
+    for (const auto format : {2u, 3u, 9u}) {
+        auto changed = makeDepthState();
+        changed.context[0x203] = 0x11;
+        changed.context[0x1c4] = format;
+        expectDepthRejection(changed, "depth or sample-mask export");
+    }
+    for (const auto [control, format] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x10u, 1u}, {0x11u, 0u}}) {
+        auto changed = makeDepthState();
+        changed.context[0x203] = control;
+        changed.context[0x1c4] = format;
+        expectDepthRejection(changed, "depth export without its Z export format");
+    }
+    auto blit = makeDepthState();
+    for (const auto [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x0, 0x60}, {0x200, 0}, {0x202, 0xcc0000}, {0x203, 0x11}, {0x1c4, 1}, {0x1c5, 0}, {0x8e, 0}, {0x8f, 0}}) blit.context[offset] = value;
+    blit.context[0x2dc] = 0xaa00;
+    Require(!DepthMetadataBlit(blit), "a depth-exporting draw was taken for a DB metadata blit");
+    auto exporting = makeDepthState();
+    exporting.context[0x3] = 0;
+    exporting.context[0x203] = 0x11;
+    exporting.context[0x1c4] = 1;
+    const auto exportState = DecodeState(exporting);
+    const std::array<std::uint32_t, 3> code{0xf8001881u, 0x00000000u, 0xbf810000u};
+    ShaderRecompiler::RecompileRequest request{};
+    request.shader = {ShaderRecompiler::ShaderStage::Fragment, 0x30000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.context.pixel = DecodePixelStageInfo(exporting.context, ExportMappings(exportState));
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    const auto pixelResult = ShaderRecompiler::Recompile(request);
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.spirv = makeModule({});
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &pixelResult, 0}}};
+    ValidateShaders(shaders, exportState, VkPhysicalDeviceSubgroupProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES}, false);
+}
+
 void validationTests() {
     AgcDriver::Graphics::State state{};
     state.stages.path = AgcDriver::Graphics::ShaderPath::Vertex;
@@ -2115,6 +2196,16 @@ void validationTests() {
         vertex.spirv = makeModule({.barycentric = true});
         pixel.spirv = makeModule({.fragment = true});
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, true); }, "requires a fragment shader");
+        vertex.spirv = makeModule({});
+        pixel.spirv = makeModule({.fragment = true, .fragDepth = true, .depthReplacing = true});
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false);
+        pixel.spirv = makeModule({.fragment = true, .fragDepth = true});
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "fragment depth output and DepthReplacing disagree");
+        pixel.spirv = makeModule({.fragment = true, .depthReplacing = true});
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "fragment depth output and DepthReplacing disagree");
+        vertex.spirv = makeModule({.fragDepth = true});
+        pixel.spirv = makeModule({.fragment = true});
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported or duplicate vertex built-in output");
     }
     {
         ShaderRecompiler::RecompileResult vertex;
@@ -2436,6 +2527,7 @@ int main() {
         DisabledColorTests();
         metadataPassTests();
         depthMetadataBlitTests();
+        depthExportTests();
         mimgDecodeTests();
         ShaderStageTests();
         PixelInputLayoutTests();
