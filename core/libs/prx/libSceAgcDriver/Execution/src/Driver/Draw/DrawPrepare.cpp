@@ -63,8 +63,10 @@ std::shared_ptr<PreparedDraw> Driver::prepareDrawAhead(const QueueState& queue, 
     if (useDrawEntries && !registerKeyEnabled()) return nullptr;
     if (useDrawEntries) {
         prepared->drawKey = drawRegisterKey(queue, *submission.shaders, prepared->deviceSerial);
+        static const bool skipKnown = std::getenv("APS5_DRAW_AHEAD_SKIP_KNOWN") != nullptr;
         std::lock_guard cacheLock(drawCacheMutex);
-        if (drawCache.contains(prepared->drawKey)) return nullptr;
+        prepared->keyKnown = drawCache.contains(prepared->drawKey);
+        if (prepared->keyKnown && skipKnown) return nullptr;
     }
 
     auto decode = decodeDraw(queue, submission);
@@ -158,8 +160,8 @@ void Driver::reportDrawAhead() {
     aheadReported = now;
     const auto totals = drawAhead->Totals();
     const auto failures = [&](AheadRecheck reason) { return static_cast<unsigned long long>(aheadRecheckFailures[reason].load(std::memory_order_relaxed)); };
-    std::fprintf(stderr, "[ahead] %llu submissions, %llu draws: %llu prepared ahead, %llu handed over (%llu waited for), %llu the worker's own, %llu after a differing load; loads %llu read ahead, %llu behind, %llu differed; %llu stops; rechecks %llu, failed: device %llu, mappings %llu, pending GPU writes %llu, words differ %llu, unreadable %llu\n",
-                 static_cast<unsigned long long>(totals.submissions), static_cast<unsigned long long>(totals.draws), static_cast<unsigned long long>(totals.prepared), static_cast<unsigned long long>(totals.handed), static_cast<unsigned long long>(totals.waited), static_cast<unsigned long long>(totals.workerOwn), static_cast<unsigned long long>(totals.poisonedDraws), static_cast<unsigned long long>(totals.loadsAhead), static_cast<unsigned long long>(totals.loadsBehind), static_cast<unsigned long long>(totals.loadMismatches), static_cast<unsigned long long>(totals.stopped), static_cast<unsigned long long>(aheadRechecks.load(std::memory_order_relaxed)), failures(RecheckDevice), failures(RecheckMappings), failures(RecheckPending), failures(RecheckDiffers), failures(RecheckUnreadable));
+    std::fprintf(stderr, "[ahead] %llu submissions, %llu draws: %llu prepared ahead, %llu handed over (%llu waited for), %llu the worker's own, %llu after a differing load; loads %llu read ahead, %llu behind, %llu differed; %llu stops; rechecks %llu, failed: device %llu, mappings %llu, pending GPU writes %llu, words differ %llu, unreadable %llu; cached keys: entry hit %llu, missed and recheck failed %llu, adopted %llu\n",
+                 static_cast<unsigned long long>(totals.submissions), static_cast<unsigned long long>(totals.draws), static_cast<unsigned long long>(totals.prepared), static_cast<unsigned long long>(totals.handed), static_cast<unsigned long long>(totals.waited), static_cast<unsigned long long>(totals.workerOwn), static_cast<unsigned long long>(totals.poisonedDraws), static_cast<unsigned long long>(totals.loadsAhead), static_cast<unsigned long long>(totals.loadsBehind), static_cast<unsigned long long>(totals.loadMismatches), static_cast<unsigned long long>(totals.stopped), static_cast<unsigned long long>(aheadRechecks.load(std::memory_order_relaxed)), failures(RecheckDevice), failures(RecheckMappings), failures(RecheckPending), failures(RecheckDiffers), failures(RecheckUnreadable), static_cast<unsigned long long>(aheadKnownKeys[0].load(std::memory_order_relaxed)), static_cast<unsigned long long>(aheadKnownKeys[1].load(std::memory_order_relaxed)), static_cast<unsigned long long>(aheadKnownKeys[2].load(std::memory_order_relaxed)));
 }
 
 }

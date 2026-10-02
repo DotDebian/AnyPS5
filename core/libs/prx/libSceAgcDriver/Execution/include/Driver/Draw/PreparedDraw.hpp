@@ -19,6 +19,7 @@ struct PreparedDraw {
     std::uint64_t deviceSerial = 0;
     std::uint64_t forgetSerial = 0;
     std::uint64_t drawKey = 0;
+    bool keyKnown = false;
     std::shared_ptr<const DrawDecode> decode;
     std::vector<DrawProgram> programs;
     Pm4::DrawParameters drawParameters{};

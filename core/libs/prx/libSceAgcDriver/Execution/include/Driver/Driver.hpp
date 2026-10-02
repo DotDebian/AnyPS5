@@ -321,6 +321,7 @@ private:
     std::unique_ptr<DrawAhead> drawAhead;
     std::atomic<std::uint64_t> aheadRechecks{0};
     std::array<std::atomic<std::uint64_t>, 5> aheadRecheckFailures{};
+    std::array<std::atomic<std::uint64_t>, 3> aheadKnownKeys{};
     std::chrono::steady_clock::time_point aheadReported = std::chrono::steady_clock::now();
 
 };
