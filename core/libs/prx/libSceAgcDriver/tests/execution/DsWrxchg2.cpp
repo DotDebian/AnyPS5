@@ -35,7 +35,7 @@ alignas(256) constexpr auto Code = std::to_array<std::uint32_t>({
     0xd8b82000, 0x0a07061e,
     0xd8bc0103, 0x0c06071e,
     0xd8b8a060, 0x0e0f0e1e,
-    0xbefe03ff, 0x0000ffff,
+    0x7da80090,
     0xd8b880e0, 0x1007061e,
     0xbefe03c1,
     0xbf8cc07f,
