@@ -76,6 +76,7 @@ enum class IrOpcode : std::uint16_t {
     GetUserData,
     GetShaderBase,
     MeshDrawParameter,
+    MeshArgument,
     MeshAllocate,
     TessellationBase,
     GetTessellationAttribute,

@@ -184,6 +184,7 @@ bool UniformSource(const IrValue& value) {
     case IrOpcode::ReadConst:
     case IrOpcode::ReadConstBuffer:
     case IrOpcode::MeshDrawParameter:
+    case IrOpcode::MeshArgument:
     case IrOpcode::GetSrtResource:
     case IrOpcode::GetBufferResource:
     case IrOpcode::GetAddressResource:
