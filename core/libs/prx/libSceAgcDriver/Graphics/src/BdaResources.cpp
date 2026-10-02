@@ -276,7 +276,7 @@ namespace AgcDriver::Graphics {
 void BdaResources::markWrittenPages() const {
     namespace Abi = ShaderRecompiler::BdaAbi;
     auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
-    Require(words[Abi::WrittenOverflowWord] == 0, "more than " + std::to_string(Abi::WrittenPageSlots) + " pages stored to through GPU-selected buffer descriptors in one use are not implemented");
+    if (words[Abi::WrittenOverflowWord] != 0) Require(false, "more than " + std::to_string(Abi::WrittenPageSlots) + " pages stored to through GPU-selected buffer descriptors in one use are not implemented");
     bool any = false;
     for (std::uint32_t slot = 0; slot < Abi::WrittenPageSlots; ++slot) {
         const auto page = words[Abi::WrittenSlotsWord + slot];
