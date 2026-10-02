@@ -164,7 +164,7 @@ target_link_libraries(libSceAgcDriver PRIVATE
 set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(libSceAgcDriver)
 if(WIN32)
-    target_compile_definitions(libSceAgcDriver PRIVATE _WIN32_WINNT=0x0602)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp PROPERTIES COMPILE_DEFINITIONS _WIN32_WINNT=0x0602)
 endif()
 
 foreach(runtimeLinkFlag IN ITEMS -static-libgcc -static-libstdc++ -static)
