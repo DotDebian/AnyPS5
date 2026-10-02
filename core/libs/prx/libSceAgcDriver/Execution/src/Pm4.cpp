@@ -495,6 +495,28 @@ std::size_t WaitAwaitedBytes(std::span<const std::uint32_t> packet) {
     return wide && (packet.size() < 8 || packet[7] != 0) ? 8 : 4;
 }
 
+std::uint32_t ParseGpuTimestampScale(const char* value) {
+    if (value == nullptr) return 100;
+    char* end = nullptr;
+    const auto parsed = std::strtoul(value, &end, 10);
+    require(end != value && *end == '\0' && parsed >= 1 && parsed <= 1000, "APS5_GPU_TIMESTAMP_SCALE must be a percentage between 1 and 1000");
+    return static_cast<std::uint32_t>(parsed);
+}
+
+std::uint64_t ScaleGpuClockNs(std::uint64_t nowNs, std::uint64_t originNs, std::uint32_t percent) {
+    require(nowNs >= originNs, "GPU clock went backwards");
+    const auto elapsed = nowNs - originNs;
+    return originNs + elapsed / 100 * percent + elapsed % 100 * percent / 100;
+}
+
+std::uint64_t GpuTimestamp() {
+    static const std::uint32_t percent = ParseGpuTimestampScale(std::getenv("APS5_GPU_TIMESTAMP_SCALE"));
+    const auto nowNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (percent == 100) return nowNs / 10;
+    static const std::uint64_t originNs = nowNs;
+    return ScaleGpuClockNs(nowNs, originNs, percent) / 10;
+}
+
 std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet) {
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     if (opcode == 0x49 && packet.size() >= 7) {
@@ -503,7 +525,7 @@ std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet
         if (dataSelect == 0 || dataSelect > 3) return std::nullopt;
         if (destination == 0) return std::nullopt;
         std::uint64_t value = address(packet[5], packet[6]);
-        if (dataSelect == 3) value = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+        if (dataSelect == 3) value = GpuTimestamp();
         LabelWrite label{destination, {}};
         label.inlineSize = dataSelect == 1 ? 4 : 8;
         std::memcpy(label.inlineBytes.data(), &value, label.inlineSize);
@@ -789,7 +811,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             if (dataSelect == 0 || destination == 0) return;
             std::uint64_t value = address(packet[5], packet[6]);
             if (dataSelect == 3) {
-                value = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+                value = GpuTimestamp();
             }
             GuestMemory::Write(destination, std::as_bytes(std::span(&value, 1)).first(dataSelect == 1 ? 4 : 8), dataSelect == 1 ? 4 : 8);
             return;

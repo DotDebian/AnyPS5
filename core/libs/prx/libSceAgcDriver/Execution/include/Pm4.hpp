@@ -123,6 +123,9 @@ struct LabelWrite {
     std::span<const std::byte> Bytes() const { return inlineSize != 0 ? std::span<const std::byte>(inlineBytes).first(inlineSize) : packetBytes; }
 };
 std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet);
+std::uint32_t ParseGpuTimestampScale(const char* value);
+std::uint64_t ScaleGpuClockNs(std::uint64_t nowNs, std::uint64_t originNs, std::uint32_t percent);
+std::uint64_t GpuTimestamp();
 // A memory store the CPU can resolve before the GPU runs it (COPY_DATA and DMA_DATA to memory,
 // DUMP_CONST_RAM): the destination and the bytes it stores, so the driver can record the store on
 // the GPU like a label instead of draining the device and storing on the CPU. Immediate and constant

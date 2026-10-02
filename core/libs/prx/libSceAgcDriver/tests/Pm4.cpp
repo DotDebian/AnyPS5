@@ -470,6 +470,29 @@ void testEventWrite() {
     expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x46, {0x0d}), 0); }, "event type 13");
 }
 
+void testGpuTimestampScale() {
+    using AgcDriver::Pm4::ParseGpuTimestampScale;
+    using AgcDriver::Pm4::ScaleGpuClockNs;
+    check(ParseGpuTimestampScale(nullptr) == 100 && ParseGpuTimestampScale("115") == 115 && ParseGpuTimestampScale("1") == 1 && ParseGpuTimestampScale("1000") == 1000, "timestamp scale parsing");
+    for (const char* rejected : {"", "0", "1001", "115%", "-5", "abc"}) {
+        expectFailure([&] { ParseGpuTimestampScale(rejected); }, "APS5_GPU_TIMESTAMP_SCALE");
+    }
+    constexpr std::uint64_t origin = 5'000'000'000'000ull;
+    check(ScaleGpuClockNs(origin, origin, 115) == origin, "the scaled clock starts at its origin");
+    check(ScaleGpuClockNs(origin + 16'666'667, origin, 100) == origin + 16'666'667, "a 100 percent clock is the host clock");
+    check(ScaleGpuClockNs(origin + 10'000'000, origin, 115) == origin + 11'500'000 && ScaleGpuClockNs(origin + 10'000'000, origin, 50) == origin + 5'000'000, "deltas scale by the percentage");
+    check(ScaleGpuClockNs(origin + 101, origin, 115) == origin + 116, "sub-100 ns remainders scale too");
+    const std::uint64_t day = 86'400'000'000'000ull;
+    check(ScaleGpuClockNs(origin + day, origin, 1000) == origin + 10 * day, "a long run does not overflow");
+    std::uint64_t previous = 0;
+    for (std::uint64_t step = 0; step < 1000; ++step) {
+        const auto value = ScaleGpuClockNs(origin + step * 7, origin, 115);
+        check(value >= previous, "the scaled clock never goes backwards");
+        previous = value;
+    }
+    expectFailure([&] { ScaleGpuClockNs(origin - 1, origin, 115); }, "backwards");
+}
+
 void testAcquireMem() {
     const auto captured = makePacket(0x58, {0x02007fc0, 0, 0, 0, 0, 10, 0x200});
     AgcDriver::Pm4::Validate(captured, 0);
@@ -590,6 +613,7 @@ int main(int argc, char** argv) {
         testGdsBacking();
         testMemorySynchronization();
         testEventWrite();
+        testGpuTimestampScale();
         testAcquireMem();
         testDriverSubmission();
         LibcRunShutdown_nid_postfix();
