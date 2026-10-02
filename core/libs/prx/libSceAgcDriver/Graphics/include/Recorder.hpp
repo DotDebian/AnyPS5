@@ -146,6 +146,8 @@ public:
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
     // memory; its completion stores are the caller's business, see VulkanDevice::CopyBuffer).
     bool PendingWriteSettled(std::uint64_t address, std::size_t bytes) const;
+    std::uint64_t LastWriteNote(std::uint64_t address, std::size_t bytes) const;
+    std::uint64_t NewestWriteNote(std::uint64_t address, std::size_t bytes) const;
     // Batch read tracking: the guest ranges the recorded work reads IN PLACE through a host import
     // and the GPU has not executed yet (a V# element bound in place, a region the GPU copies out of
     // an import, an address-based build's leased heaps, indirect arguments, a GPU-direct storage
@@ -533,6 +535,7 @@ private:
         std::vector<std::shared_ptr<void>> kept;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+        std::vector<std::uint64_t> writeNotes;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {
             std::uint64_t begin;
@@ -742,6 +745,7 @@ private:
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
     std::uint64_t submissions = 0;
+    std::uint64_t writeNoteCount = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;

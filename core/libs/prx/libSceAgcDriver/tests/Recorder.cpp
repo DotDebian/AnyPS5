@@ -2022,6 +2022,61 @@ void importWindowTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
+void pendingKeyStoreTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: pending key stores not tested\n";
+        return;
+    }
+    constexpr std::size_t surfaceBytes = 65536;
+    constexpr std::size_t keyCount = surfaceBytes / 256;
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the pending key store block");
+    auto* keys = static_cast<std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the pending key store block refused: pending key stores not tested\n";
+        return;
+    }
+    recorder.Sync();
+    std::memset(keys, 0x00, keyCount);
+    MarkDccUncompressed(context, address, surfaceBytes);
+    Require(recorder.PendingWriteOverlaps(address, keyCount) && keys[0] == 0x00, "the uncompressed key store did not stay pending");
+    Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed, "the keys after a pending uncompressed store do not read as uncompressed");
+    Require(recorder.PendingWriteOverlaps(address, keyCount), "reading keys the driver's own pending store wrote waited for the GPU");
+    Require(CurrentDccKeys(address + 16, surfaceBytes / 2) == DccKeys::Uncompressed, "a key range inside the pending store does not read as uncompressed");
+    recorder.NotePendingWrite(address + 16, 16);
+    Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed && !recorder.PendingWriteOverlaps(address, keyCount), "a key read with a later writer over the pending store did not wait for it");
+    Require(std::all_of(keys, keys + keyCount, [](std::uint8_t key) { return key == 0xff; }), "the uncompressed key store did not land");
+    recorder.NotePendingWrite(address, keyCount);
+    NoteKeysFillOnGpu(address, keyCount, DccKeys::Clear0001);
+    Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Clear0001 && recorder.PendingWriteOverlaps(address, keyCount), "the keys of a pending fill did not read as its keys without a wait");
+    recorder.NotePendingWrite(address, 2 * keyCount);
+    Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed && !recorder.PendingWriteOverlaps(address, keyCount), "a later wider writer over a pending fill was not waited for");
+    recorder.Sync();
+}
+
 void metadataPassTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -2818,6 +2873,7 @@ int main() {
             firstLayerViewTests(device, recorder);
             depthSurfaceSamplingTests(device, recorder);
             metadataPassTests(device, recorder);
+            pendingKeyStoreTests(device, recorder);
             movedMetadataTests(device, recorder);
             keysFillTests(device, recorder);
             unimportableRangeTests(device);

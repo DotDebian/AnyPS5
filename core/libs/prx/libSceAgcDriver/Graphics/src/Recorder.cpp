@@ -2094,6 +2094,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
+    open->writeNotes.push_back(++writeNoteCount);
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
@@ -2118,6 +2119,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
+    batch.writeNotes.push_back(++writeNoteCount);
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
     if (!SnapshotCovers(address, address + bytes)) publishPendingWrites();
@@ -2204,6 +2206,26 @@ bool Recorder::PendingWriteSettled(std::uint64_t address, std::size_t bytes) con
         if (overlaps(*batch, address, end) && !signaled(*batch)) return false;
     }
     return true;
+}
+
+std::uint64_t Recorder::LastWriteNote(std::uint64_t address, std::size_t bytes) const {
+    if (open == nullptr || open->writes.empty() || open->writeNotes.size() != open->writes.size()) return 0;
+    if (open->writes.back() != std::pair<std::uint64_t, std::uint64_t>{address, address + bytes}) return 0;
+    return open->writeNotes.back() == writeNoteCount ? writeNoteCount : 0;
+}
+
+std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return 0;
+    const auto end = address + bytes;
+    std::uint64_t newest = 0;
+    const auto scan = [&](const Batch& batch) {
+        for (std::size_t i = 0; i < batch.writes.size(); ++i) {
+            if (address < batch.writes[i].second && batch.writes[i].first < end) newest = std::max(newest, batch.writeNotes[i]);
+        }
+    };
+    if (open != nullptr) scan(*open);
+    for (const auto& batch : inFlight) scan(*batch);
+    return newest;
 }
 
 bool Recorder::ReadTracking() {
