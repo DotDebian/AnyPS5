@@ -26,6 +26,7 @@
 #else
 #include <fcntl.h>
 #include <fstream>
+#include <link.h>
 #include <pthread.h>
 #include <sstream>
 #include <unistd.h>
@@ -490,8 +491,12 @@ struct PageRun {
 // mutations, and registered with the write watch for as long as it is mapped: for a range the watch
 // covers, the whole table is parsed once and reused while the registry generation it was parsed
 // under is the live one (every mutation bumps it after changing the mappings, so a table read
-// during a mutation is tagged older and parsed again). Any other range (host heap memory the
-// registry never sees) is looked up afresh each time, as before. APS5_NO_MAPS_CACHE=1 looks every
+// during a mutation is tagged older and parsed again). The main image's loaded segments are
+// changed only through registry mutations too (guest mprotect), so they share the table. Only
+// readable runs are answered from it: a range it lists as unmapped may have been mapped since
+// without a registry mutation (a write-watched block a test allocates), so that answer is looked
+// up afresh. Any other range (host heap memory the registry never sees) is looked up afresh each
+// time, as before. APS5_NO_MAPS_CACHE=1 looks every
 // range up afresh.
 struct Mapping {
     std::uintptr_t begin;
@@ -553,8 +558,39 @@ std::shared_ptr<const MappingTable> parseMappings(std::uint64_t generation) {
 
 // The run of [cursor, end) that starts at `cursor` as the cached table describes it, when the
 // range is direct memory (see MappingTable); false leaves the query to the caller.
+struct ImageExtent {
+    std::uintptr_t begin = 0;
+    std::uintptr_t end = 0;
+};
+
+const ImageExtent& mainImageExtent() {
+    static const ImageExtent extent = [] {
+        ImageExtent found;
+        dl_iterate_phdr([](dl_phdr_info* image, std::size_t, void* data) {
+            auto& into = *static_cast<ImageExtent*>(data);
+            const auto page = static_cast<std::uintptr_t>(::sysconf(_SC_PAGESIZE));
+            for (int index = 0; index < image->dlpi_phnum; ++index) {
+                const auto& header = image->dlpi_phdr[index];
+                if (header.p_type != PT_LOAD || header.p_memsz == 0) continue;
+                const auto begin = (image->dlpi_addr + header.p_vaddr) & ~(page - 1);
+                const auto end = (image->dlpi_addr + header.p_vaddr + header.p_memsz + page - 1) & ~(page - 1);
+                into.begin = into.begin == 0 ? begin : std::min(into.begin, begin);
+                into.end = std::max(into.end, end);
+            }
+            return 1;
+        }, &found);
+        return found;
+    }();
+    return extent;
+}
+
+bool mainImageCovers(std::uintptr_t cursor, std::uintptr_t end) {
+    const auto& extent = mainImageExtent();
+    return extent.begin != 0 && cursor >= extent.begin && end <= extent.end;
+}
+
 bool cachedMappingRun(std::uintptr_t cursor, std::uintptr_t end, PageRun& run) {
-    if (!mapsCacheEnabled() || !GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(cursor, static_cast<std::size_t>(end - cursor))) return false;
+    if (!mapsCacheEnabled() || !(GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(cursor, static_cast<std::size_t>(end - cursor)) || mainImageCovers(cursor, end))) return false;
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     auto table = mappingTable.load(std::memory_order_acquire);
     if (table == nullptr || table->generation != generation) {
@@ -564,12 +600,9 @@ bool cachedMappingRun(std::uintptr_t cursor, std::uintptr_t end, PageRun& run) {
     }
     const auto& mappings = table->mappings;
     const auto next = std::upper_bound(mappings.begin(), mappings.end(), cursor, [](std::uintptr_t value, const Mapping& mapping) { return value < mapping.begin; });
-    if (next != mappings.begin() && cursor < std::prev(next)->end) {
-        const auto& mapping = *std::prev(next);
-        run = {cursor, std::min(end, mapping.end), mapping.readable, mapping.writable};
-    } else {
-        run = {cursor, next != mappings.end() ? std::min(end, next->begin) : end, false, false};
-    }
+    if (next == mappings.begin() || cursor >= std::prev(next)->end || !std::prev(next)->readable) return false;
+    const auto& mapping = *std::prev(next);
+    run = {cursor, std::min(end, mapping.end), mapping.readable, mapping.writable};
     return true;
 }
 #endif
