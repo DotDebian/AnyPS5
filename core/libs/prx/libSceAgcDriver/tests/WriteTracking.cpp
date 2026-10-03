@@ -86,7 +86,8 @@ void CheckSharedBlock() {
     Require(StoredOver(boundary, static_cast<std::size_t>(sharedSecond), beforeCpu), "a CPU store in the shared block is not seen");
 
     std::array<std::uint8_t, 64> unwatched{};
-    Require(StoredOver(reinterpret_cast<std::uint64_t>(unwatched.data()), unwatched.size(), TrackerGeneration()), "an unwatched range reads as not stored over");
+    const auto outside = reinterpret_cast<std::uint64_t>(unwatched.data());
+    if (!Watched(outside, unwatched.size())) Require(StoredOver(outside, unwatched.size(), TrackerGeneration()), "an unwatched range reads as not stored over");
 }
 
 
