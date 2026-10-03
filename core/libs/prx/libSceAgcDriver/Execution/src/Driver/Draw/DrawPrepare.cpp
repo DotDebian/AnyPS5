@@ -100,10 +100,12 @@ std::shared_ptr<PreparedDraw> Driver::prepareDrawAhead(const QueueState& queue, 
     auto phaseLap = std::chrono::steady_clock::time_point{};
     DrawPhaseTiming phaseTiming{false, phaseMs, phaseLap};
     std::uint32_t pushCursorBytes = 0;
+    std::string rejected;
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         prepared->resultIndex[i] = results.size();
-        results.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, prepared->vertexInfos, memory, linked, drawParameters, localDevice, *prepared->shaderMemory, prepared->stageCaptures, recompiled, false, matched, matchedRegions, false, 0, 0, prepared->captures, phaseTiming, phaseMs));
+        results.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, prepared->vertexInfos, memory, linked, drawParameters, localDevice, *prepared->shaderMemory, prepared->stageCaptures, recompiled, false, matched, matchedRegions, false, 0, 0, prepared->captures, phaseTiming, phaseMs, rejected));
+        if (!rejected.empty()) return nullptr;
         const auto& result = results.back();
         if (i == 0) foldDrawOffsets(result, programs.front(), drawParameters);
         require(result.pushConstants.size() <= Graphics::PipelinePushConstantBytes - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
