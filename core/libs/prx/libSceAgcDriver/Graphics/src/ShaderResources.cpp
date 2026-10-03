@@ -1496,7 +1496,7 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto descriptors = context.descriptorCache != nullptr ? context.descriptorCache->Counters() : DescriptorCache::Stats{};
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
-    std::fprintf(stderr, "[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    std::fprintf(stderr, "[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools, %llu recycled, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.recycled), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
@@ -2436,6 +2436,14 @@ namespace {
 // What one chain pool holds; a set needing more of any type gets a dedicated pool.
 constexpr std::uint32_t ChainPoolSets = 1024;
 constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
+
+constexpr std::size_t SpareSetsBound = 4096;
+
+bool RecycleSets() {
+    static const bool enabled = std::getenv("APS5_NO_SET_RECYCLE") == nullptr;
+    return enabled;
+}
+
 }
 
 DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes) {
@@ -2444,6 +2452,13 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         if (capacity == ChainPoolSizes.end() || size.descriptorCount > capacity->descriptorCount) return {};
     }
     std::lock_guard lock(mutex);
+    if (const auto found = spare.find(layout); found != spare.end() && !found->second.empty()) {
+        const auto allocation = found->second.back();
+        found->second.pop_back();
+        --spareSets;
+        ++stats.recycled;
+        return allocation;
+    }
     const auto allocate = context.Resolved(&DeviceFunctions::allocateDescriptorSets, "vkAllocateDescriptorSets");
     VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocation.descriptorSetCount = 1;
@@ -2456,7 +2471,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         const auto result = allocate(context.device, &allocation, &set);
         if (result == VK_SUCCESS) {
             ++stats.sets;
-            return {set, *it};
+            return {set, *it, layout};
         }
         if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) Check(result, "vkAllocateDescriptorSets");
     }
@@ -2473,12 +2488,20 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
     VkDescriptorSet set = VK_NULL_HANDLE;
     Check(allocate(context.device, &allocation, &set), "vkAllocateDescriptorSets");
     ++stats.sets;
-    return {set, pool};
+    return {set, pool, layout};
 }
 
 void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
     if (allocation.set == VK_NULL_HANDLE || allocation.pool == VK_NULL_HANDLE) return;
     std::lock_guard lock(mutex);
+    if (RecycleSets() && allocation.layout != VK_NULL_HANDLE && spareSets < SpareSetsBound) {
+        try {
+            spare[allocation.layout].push_back(allocation);
+            ++spareSets;
+            return;
+        } catch (...) {
+        }
+    }
     static_cast<void>(freeSets(context.device, allocation.pool, 1, &allocation.set));
 }
 
@@ -2974,7 +2997,7 @@ ShaderResources::~ShaderResources() {
 
 void ShaderResources::release() noexcept {
     // A set from the cache's pool chain goes back to it; a dedicated pool dies with its set.
-    if (cachePool && context.descriptorCache != nullptr) context.descriptorCache->Free({_set, cachePool});
+    if (cachePool && context.descriptorCache != nullptr) context.descriptorCache->Free({_set, cachePool, _layout});
     if (pool) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
     if (_layout && ownsLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, _layout, nullptr);
     cachePool = VK_NULL_HANDLE;

@@ -60,6 +60,7 @@ public:
     struct SetAllocation {
         VkDescriptorSet set = VK_NULL_HANDLE;
         VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
     };
     // A set of `layout` needing `sizes` descriptors from the pool chain, opening a pool when no pool
     // has room; a null set when the needs exceed what one chain pool holds (the caller then makes a
@@ -72,6 +73,7 @@ public:
         std::uint64_t layoutMisses = 0;
         std::uint64_t sets = 0;
         std::uint64_t pools = 0;
+        std::uint64_t recycled = 0;
     };
     Stats Counters() const;
 
@@ -83,6 +85,8 @@ private:
     mutable std::mutex mutex;
     std::map<std::vector<std::uint32_t>, VkDescriptorSetLayout> layouts;
     std::vector<VkDescriptorPool> pools;
+    std::unordered_map<VkDescriptorSetLayout, std::vector<SetAllocation>> spare;
+    std::size_t spareSets = 0;
     Stats stats;
 };
 

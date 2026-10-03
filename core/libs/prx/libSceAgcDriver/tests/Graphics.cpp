@@ -1101,6 +1101,10 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateDescriptorSets(VkDevice, const VkDesc
     return VK_SUCCESS;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL mockFreeDescriptorSets(VkDevice, VkDescriptorPool, std::uint32_t, const VkDescriptorSet*) {
+    return VK_SUCCESS;
+}
+
 VKAPI_ATTR void VKAPI_CALL mockUpdateDescriptorSets(VkDevice, std::uint32_t count, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet*) {
     Require(copyCount == 0, "descriptor copies are not expected");
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -1242,6 +1246,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCreateDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockCreateDescriptorPool)},
         {"vkDestroyDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyDescriptorPool)},
         {"vkAllocateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateDescriptorSets)},
+        {"vkFreeDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockFreeDescriptorSets)},
         {"vkUpdateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockUpdateDescriptorSets)},
         {"vkCmdBindDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindDescriptorSets)},
         {"vkCreatePipelineLayout", reinterpret_cast<PFN_vkVoidFunction>(mockCreatePipelineLayout)},
@@ -1304,6 +1309,31 @@ void bufferPoolTests() {
         Buffer none(context, 300, storage);
         Require(none.Handle() != first && none.Handle() != second, "a buffer in use was taken");
     }
+}
+
+void descriptorRecycleTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    const auto context = mockContext();
+    DescriptorCache cache(context);
+    const std::array<VkDescriptorSetLayoutBinding, 1> first{{{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}}};
+    const std::array<VkDescriptorSetLayoutBinding, 1> second{{{1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}}};
+    const std::array<std::uint32_t, 4> firstKey{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+    const std::array<std::uint32_t, 4> secondKey{1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT};
+    const auto firstLayout = cache.Layout(firstKey, first);
+    const auto secondLayout = cache.Layout(secondKey, second);
+    const std::array<VkDescriptorPoolSize, 1> sizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}}};
+    const auto freed = cache.Allocate(firstLayout, sizes);
+    Require(freed.set != VK_NULL_HANDLE && freed.layout == firstLayout, "a chain set does not name its layout");
+    cache.Free(freed);
+    const auto other = cache.Allocate(secondLayout, sizes);
+    Require(other.set != freed.set, "a freed set of another layout was handed out");
+    const auto again = cache.Allocate(firstLayout, sizes);
+    Require(again.set == freed.set && again.pool == freed.pool && again.layout == firstLayout, "a freed set of the same layout was not reused");
+    const auto busy = cache.Allocate(firstLayout, sizes);
+    Require(busy.set != freed.set, "a set in use was handed out again");
+    cache.Free(other);
+    cache.Free(again);
+    cache.Free(busy);
 }
 
 using Role = ShaderRecompiler::DescriptorRole;
@@ -2635,6 +2665,9 @@ int main() {
         mock = MockVulkan{};
         bufferPoolTests();
         Require(mock.live == 0, "the buffer pool leaked Vulkan objects");
+        mock = MockVulkan{};
+        descriptorRecycleTests();
+        Require(mock.live == 0, "the descriptor cache leaked Vulkan objects");
         RunGuestAllocationTests();
         RunLiveStackAccessTests();
         RunUnwatchedGapTests();
