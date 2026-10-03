@@ -177,6 +177,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureResidency.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
@@ -303,6 +304,12 @@ target_include_directories(agc_texture_residency_tests PRIVATE ${LIBS_INCLUDE_DI
 target_link_libraries(agc_texture_residency_tests PRIVATE libc)
 set_target_properties(agc_texture_residency_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_texture_residency_tests)
+
+add_test_executable(agc_pass_hazards_tests EXCLUDE_FROM_ALL tests/PassHazards.cpp Graphics/src/PassHazards.cpp)
+target_include_directories(agc_pass_hazards_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_pass_hazards_tests PRIVATE libc)
+set_target_properties(agc_pass_hazards_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_pass_hazards_tests)
 
 add_test_executable(agc_dcc_key_sharing_tests EXCLUDE_FROM_ALL tests/DccKeySharing.cpp)
 target_include_directories(agc_dcc_key_sharing_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
@@ -447,6 +454,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/TextureDetiler.cpp
         Graphics/src/Texture.cpp
         Graphics/src/TextureResidency.cpp
+        Graphics/src/PassHazards.cpp
         Graphics/src/UnitShadow.cpp
         Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
@@ -555,7 +563,7 @@ set_target_properties(agc_driver_wave_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_wave_tests)
 
 if(BUILD_TESTING)
-    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_write_tracking_tests agc_structurizer_tests agc_dpp_write_tests agc_shader_disk_cache_tests agc_texture_residency_tests agc_dcc_key_sharing_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_resident_present_tests ${agcExecutionTests})
+    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_write_tracking_tests agc_structurizer_tests agc_dpp_write_tests agc_shader_disk_cache_tests agc_texture_residency_tests agc_pass_hazards_tests agc_dcc_key_sharing_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_resident_present_tests ${agcExecutionTests})
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})
@@ -630,6 +638,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/TextureDetiler.cpp
             Graphics/src/Texture.cpp
             Graphics/src/TextureResidency.cpp
+            Graphics/src/PassHazards.cpp
             Graphics/src/UnitShadow.cpp
             Graphics/src/Sampler.cpp
             ${agcTextureDetileShaderHeader}
