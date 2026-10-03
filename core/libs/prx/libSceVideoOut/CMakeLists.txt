@@ -43,12 +43,16 @@ if(BUILD_TESTING)
 
     add_test_executable(level_menu_model_tests tests/LevelMenuModel.cpp src/LevelMenuModel.cpp)
     target_include_directories(level_menu_model_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(level_menu_model_tests PRIVATE libc)
+    configure_windows_unwind(level_menu_model_tests)
     add_test(NAME level_menu_model COMMAND level_menu_model_tests)
 endif()
 
 if(BUILD_TESTING)
     add_test_executable(video_out_flip_pacing_tests tests/FlipPacing.cpp)
     target_include_directories(video_out_flip_pacing_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(video_out_flip_pacing_tests PRIVATE libc)
+    configure_windows_unwind(video_out_flip_pacing_tests)
     add_test(NAME video_out_flip_pacing COMMAND video_out_flip_pacing_tests)
 endif()
 
