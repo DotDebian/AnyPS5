@@ -1266,8 +1266,8 @@ void ShaderResources::buildComplete() {
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
-        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
-        else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
+        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, bdaWrites);
+        else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context, bdaWrites);
         phase(BuildPhase::Bda);
         if (_set != VK_NULL_HANDLE) {
             // One update call for the whole set: the info arrays are sized up front so every write's
