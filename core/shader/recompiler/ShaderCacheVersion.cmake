@@ -1,3 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+
 file(STRINGS "${LIST_FILE}" entries)
 set(sources)
 set(guard)

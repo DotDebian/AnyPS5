@@ -300,11 +300,13 @@ configure_windows_unwind(agc_dpp_write_tests)
 
 add_test_executable(agc_texture_residency_tests EXCLUDE_FROM_ALL tests/TextureResidency.cpp Graphics/src/TextureResidency.cpp)
 target_include_directories(agc_texture_residency_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_texture_residency_tests PRIVATE libc)
 set_target_properties(agc_texture_residency_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_texture_residency_tests)
 
 add_test_executable(agc_dcc_key_sharing_tests EXCLUDE_FROM_ALL tests/DccKeySharing.cpp)
 target_include_directories(agc_dcc_key_sharing_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_dcc_key_sharing_tests PRIVATE libc)
 set_target_properties(agc_dcc_key_sharing_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_dcc_key_sharing_tests)
 
