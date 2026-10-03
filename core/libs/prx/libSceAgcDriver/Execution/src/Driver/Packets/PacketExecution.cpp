@@ -204,7 +204,8 @@ void Driver::execute(const Submission& submission) {
 
                 if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
-                if (localDevice != nullptr) localDevice->SettleSampleDumps();
+                static const bool settleDumps = std::getenv("APS5_SETTLE_SAMPLE_DUMPS") != nullptr;
+                if (localDevice != nullptr && settleDumps) localDevice->SettleSampleDumps();
             }
             ++flipsCounted;
             Graphics::ResidencyClock::NoteFrame();

@@ -182,8 +182,6 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     static const bool drawDrain = std::getenv("APS5_DRAW_DRAIN") != nullptr;
     drawPacket = Pm4::DrawOpcode(opcode);
     sampleDump = opcode == 0x46 && (packet[1] & 0x3fu) == 0x39u;
-    // Technical debt: the flip after a dump still waits for the batch holding it
-    // (VulkanDevice::SettleSampleDumps); when a title may read counters is not modeled.
     static const bool drainFlipless = std::getenv("APS5_DRAIN_FLIPLESS_DUMPS") != nullptr;
     const bool flipFollows = submission.flips.upper_bound(static_cast<std::size_t>(packet.data() - submission.commands.data())) != submission.flips.end();
     if (sampleDump && !drainAll && (flipFollows || !drainFlipless)) {
