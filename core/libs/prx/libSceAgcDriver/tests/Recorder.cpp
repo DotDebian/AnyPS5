@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
@@ -2426,6 +2427,81 @@ void dataWordPositionsTests() {
 // A template's data buffers refreshed by words from a patched compiled result (a data-only hit)
 // and back: DataWordsHash() follows the buffers exactly, so a later recipe hit's hash compare
 // (RecordedDispatch::DataRefresh::Hash) decides correctly in both directions.
+std::array<std::uint32_t, 8> linearTextureWords(std::uint64_t address, std::uint32_t width, std::uint32_t height, std::uint32_t format) {
+    const auto base40 = address >> 8u;
+    std::array<std::uint32_t, 8> words{};
+    words[0] = static_cast<std::uint32_t>(base40);
+    words[1] = static_cast<std::uint32_t>((base40 >> 32u) & 0xffu) | (format << 20u) | (((width - 1u) & 3u) << 30u);
+    words[2] = (((width - 1u) >> 2u) & 0xfffu) | ((height - 1u) << 14u);
+    words[3] = 4u | (5u << 3u) | (6u << 6u) | (7u << 9u) | (9u << 28u);
+    return words;
+}
+
+void imageMemoTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    TextureCache textureCache(context);
+    context.textureCache = &textureCache;
+    constexpr std::uint32_t width = 64;
+    constexpr std::uint32_t height = 4;
+    constexpr std::size_t surfaceBytes = width * height * 4;
+    constexpr std::size_t bytes = 2 * 65536;
+    void* block = AllocateWatched(bytes, 65536);
+    const bool watched = block != nullptr;
+#ifdef _WIN32
+    if (!watched) block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    if (!watched) block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the image memo block");
+    auto* first = static_cast<std::uint8_t*>(block);
+    auto* second = first + 65536;
+    std::memset(first, 0x11, surfaceBytes);
+    std::memset(second, 0x22, surfaceBytes);
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    program.bindings.push_back(binding);
+    const CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    std::vector<std::shared_ptr<Texture>> kept;
+    const auto sample = [&](const std::uint8_t* surface) {
+        const auto words = linearTextureWords(reinterpret_cast<std::uint64_t>(surface), width, height, 56);
+        program.bindings[0].guestDescriptor.assign(words.begin(), words.end());
+        ShaderResources resources(context, compiled);
+        Require(resources.SampledTextures().size() == 1, "the build has no sampled texture");
+        kept.push_back(resources.SampledTextures().front());
+        return kept.back();
+    };
+    const auto made = sample(first);
+    Require(sample(first) == made, "an unchanged sampled texture was made again");
+    const auto other = sample(second);
+    Require(other != made && sample(first) == made, "a texture of another descriptor answered for the first");
+    ClearCachedTextures(context.device);
+    const auto remade = sample(first);
+    Require(remade != made && remade != other, "a texture the cache dropped was bound again");
+    Require(sample(first) == remade, "the remade texture is not the cache's");
+    const auto replaced = sample(second);
+    Require(replaced != other && sample(second) == replaced && sample(first) == remade, "the cache does not answer with the replacements");
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    kept.clear();
+    ClearCachedTextures(context.device);
+    if (watched) ReleaseWatched(block, bytes);
+#ifdef _WIN32
+    else VirtualFree(block, 0, MEM_RELEASE);
+#else
+    else std::free(block);
+#endif
+}
+
 void dataRefreshTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     ShaderRecompiler::RecompileResult program;
@@ -3080,6 +3156,7 @@ int main() {
             importWindowTests(device, recorder);
             dataWordPositionsTests();
             dataRefreshTests(device, recorder);
+            imageMemoTests(device, recorder);
             minLodTests(device, recorder);
             firstLayerViewTests(device, recorder);
             depthSurfaceSamplingTests(device, recorder);
