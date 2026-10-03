@@ -481,9 +481,9 @@ void verifyFormatDigest() {
     const auto payload = std::span(file).subspan(48 + key.size());
     const auto resultDigest = HashBytes(result);
     const auto payloadDigest = HashBytes(payload);
-    constexpr std::uint32_t DigestFormat = 7;
-    constexpr std::uint64_t ResultDigest = 0x9b50e5fd197ec1d9ull;
-    constexpr std::uint64_t PayloadDigest = 0xce05863499a2891aull;
+    constexpr std::uint32_t DigestFormat = 8;
+    constexpr std::uint64_t ResultDigest = 0xcbdb49376ef9eaa8ull;
+    constexpr std::uint64_t PayloadDigest = 0x8276fa736df225b8ull;
     char text[160];
     std::snprintf(text, sizeof(text), "format %u: result digest 0x%016llx, payload digest 0x%016llx", ShaderDiskCache::FormatVersion, static_cast<unsigned long long>(resultDigest), static_cast<unsigned long long>(payloadDigest));
     require(ShaderDiskCache::FormatVersion == DigestFormat && resultDigest == ResultDigest && payloadDigest == PayloadDigest, std::string("the entry encoding changed (") + text + "): bump ShaderDiskCache::FormatVersion and record the new digests here");
