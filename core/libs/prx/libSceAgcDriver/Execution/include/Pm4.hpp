@@ -155,6 +155,16 @@ struct GdsTransfer {
     std::size_t bytes;
 };
 std::optional<GdsTransfer> DecodeGdsTransfer(std::span<const std::uint32_t> packet);
+// A DMA_DATA that copies guest memory to guest memory (both addresses incrementing, no GDS, no
+// immediate, no register): its ranges, for the driver to record the copy on the GPU in queue
+// order (VulkanDevice::CopyBuffer) instead of draining the device and copying on the CPU. Nothing
+// for any other packet, an empty copy or overlapping ranges.
+struct MemoryCopy {
+    std::uint64_t source;
+    std::uint64_t destination;
+    std::size_t bytes;
+};
+std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet);
 // A DISPATCH_INDIRECT's arguments: the guest address of its three group-count dwords (no memory
 // access, so the GPU can read them in place: VulkanDevice::DispatchIndirect), the DISPATCH_DIRECT
 // packet made by reading them there (through the checked guest memory path, which waits for

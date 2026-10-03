@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include <cstdlib>
+#include <limits>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
@@ -138,6 +139,35 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                     recordDeferredLabels(localDevice.get(), submission.queue);
                     if (localDevice->TransferGdsOnGpu(*transfer, submission.queue == 0)) {
                         ++gdsTransfersOnGpu;
+                        wroteOnGpu = true;
+                        drained = false;
+                    }
+                }
+            }
+        }
+        // A memory-to-memory DMA_DATA too large to resolve as a store: the copy is recorded on the
+        // GPU in queue order (VulkanDevice::CopyBuffer, the copy-kernel path) instead of draining the
+        // device and copying on this worker's thread. The CPU copy of a large range takes
+        // milliseconds, during which another queue's worker records and runs work that reads the
+        // destination in place: PPSA21564 copies each 12 MiB intro video frame into its texture with
+        // one DMA_DATA on queue 0x3a and samples it on queue 0 without waiting for that queue, which
+        // the GPU's own DMA makes safe by finishing in microseconds; the CPU copy was still writing
+        // when queue 0's storage upload read the texture, so a frame showed the new luma over the
+        // previous frame's chroma. Recorded on the GPU, everything recorded after the packet reads
+        // the whole copy. Debug aid: APS5_CPU_MEMORY_COPIES=1 drains and copies on the CPU as before.
+        static const bool cpuMemoryCopies = std::getenv("APS5_CPU_MEMORY_COPIES") != nullptr;
+        if (drained && opcode == 0x50 && !cpuMemoryCopies) {
+            const auto copy = Pm4::DecodeMemoryCopy(packet);
+            if (copy.has_value() && copy->bytes > gpuStoreLimit && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (const auto localDevice = device.Load()) {
+                    recordDeferredLabels(localDevice.get(), submission.queue);
+                    // No CPU path (cpuMax 0): the drain below stays the fallback when either range is
+                    // not host-imported.
+                    const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                    if (outcome.path == 1 || outcome.path == 3) {
+                        ++memoryCopiesOnGpu;
                         wroteOnGpu = true;
                         drained = false;
                     }

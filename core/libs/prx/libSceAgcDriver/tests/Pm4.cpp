@@ -346,6 +346,28 @@ void testCopies() {
 #endif
 }
 
+// DecodeMemoryCopy: only a memory-to-memory DMA_DATA with incrementing addresses and disjoint,
+// non-empty ranges is a copy the driver may record on the GPU (VulkanDevice::CopyBuffer).
+void testMemoryCopyDecode() {
+    using AgcDriver::Pm4::DecodeMemoryCopy;
+    constexpr std::uint64_t source = 0x1120000000ull, destination = 0x403d7b400ull;
+    const auto packet = [&](std::uint32_t control, std::uint64_t from, std::uint64_t to, std::uint32_t command) {
+        return makePacket(0x50, {control, static_cast<std::uint32_t>(from), static_cast<std::uint32_t>(from >> 32u), static_cast<std::uint32_t>(to), static_cast<std::uint32_t>(to >> 32u), command});
+    };
+    const auto copy = DecodeMemoryCopy(packet(0x60000000, source, destination, 0xbdd800));
+    check(copy.has_value() && copy->source == source && copy->destination == destination && copy->bytes == 0xbdd800, "a memory-to-memory DMA_DATA did not decode as a copy");
+    check(DecodeMemoryCopy(packet(0x00000000, source, destination, 64)).has_value(), "a DMA_DATA with memory selectors 0 did not decode as a copy");
+    check(!DecodeMemoryCopy(packet(0x40000000, 0x44332211, destination, 64)).has_value(), "an immediate fill decoded as a copy");
+    check(!DecodeMemoryCopy(packet(0x60100000, source, 0x100, 64)).has_value(), "a DMA_DATA to the GDS decoded as a copy");
+    check(!DecodeMemoryCopy(packet(0x20000000, 0x100, destination, 64)).has_value(), "a DMA_DATA from the GDS decoded as a copy");
+    check(!DecodeMemoryCopy(packet(0x60000000, source, destination, 64 | (1u << 28u))).has_value(), "a non-incrementing source decoded as a copy");
+    check(!DecodeMemoryCopy(packet(0x60000000, source, destination, 64 | (1u << 29u))).has_value(), "a non-incrementing destination decoded as a copy");
+    check(!DecodeMemoryCopy(packet(0x60000000, source, destination, 0)).has_value(), "an empty DMA_DATA decoded as a copy");
+    check(!DecodeMemoryCopy(packet(0x60000000, source, source + 32, 64)).has_value(), "overlapping ranges decoded as a copy");
+    check(DecodeMemoryCopy(packet(0x60000000, source, source + 64, 64)).has_value(), "adjacent ranges did not decode as a copy");
+    check(!DecodeMemoryCopy(makePacket(0x40, {0x10101, 0, 0, 0, 0})).has_value(), "a COPY_DATA decoded as a DMA_DATA copy");
+}
+
 // The CP's GDS behind a device's backing (Pm4::InstallGdsBacking): the bytes move into the backing
 // and back, DMA_DATA reads and writes the backing, and after a shader use a store from the GDS is
 // not resolved ahead of the drain (its bytes may still be on the way), until the CP's next access.
@@ -854,6 +876,7 @@ int main(int argc, char** argv) {
         testIndirectDraw();
         testMemory();
         testCopies();
+        testMemoryCopyDecode();
         testGdsBacking();
         testMemorySynchronization();
         testEventWrite();
