@@ -1024,6 +1024,11 @@ struct ThreadCollectMemo {
 };
 thread_local ThreadCollectMemo threadCollectMemo;
 
+bool newestCollectFirst() {
+    static const bool enabled = std::getenv("APS5_SCAN_WHOLE_COLLECT_MEMO") == nullptr;
+    return enabled;
+}
+
 bool sharedCollectMemo() {
     static const bool shared = std::getenv("APS5_SHARED_COLLECT_MEMO") != nullptr;
     return shared;
@@ -1104,7 +1109,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
-        for (const auto& entry : threadCollectMemo.entries) {
+        const auto count = threadCollectMemo.entries.size();
+        for (std::size_t age = 1; age <= count; ++age) {
+            const auto& entry = threadCollectMemo.entries[(threadCollectMemo.next - age) % count];
+            if (entry.epoch != epoch && newestCollectFirst()) break;
             if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
