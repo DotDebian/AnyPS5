@@ -89,6 +89,34 @@ void CheckSharedBlock() {
     Require(StoredOver(reinterpret_cast<std::uint64_t>(unwatched.data()), unwatched.size(), TrackerGeneration()), "an unwatched range reads as not stored over");
 }
 
+
+void CheckOwnStore() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto second = base + Block;
+    std::memset(memory, 0x11, 2 * Block);
+    const auto synced = CollectWrites(base, 2 * Block);
+    Require(synced != 0, "the own-store block is not collected");
+
+    std::array<std::byte, 8192> bytes{};
+    bytes.fill(std::byte{0x44});
+    Write(second, bytes);
+    const auto stored = TrackerGeneration();
+    Require(!UnchangedSince(second, bytes.size(), synced), "the driver store is not stamped");
+    CollectWritesUncached(base, 2 * Block);
+    Require(UnchangedSince(second, Block, stored), "a walk after a driver store reports the store again as a newer write");
+    Require(UnchangedSinceCollected(second, bytes.size(), synced), "the driver store's own page faults are stamped as a CPU write");
+
+    static_cast<volatile std::uint8_t*>(memory)[Block + 3 * 4096 + 8] = 0x22;
+    const std::array<std::byte, 64> label{};
+    Write(second + 3 * 4096 + 64, label);
+    Require(!UnchangedSinceCollected(second + 3 * 4096, 4096, stored), "a CPU write before a driver store in its page is not stamped as one");
+
+    const auto beforeCpu = TrackerGeneration();
+    static_cast<volatile std::uint8_t*>(memory)[16] = 0x33;
+    CollectWritesUncached(base, 2 * Block);
+    Require(!UnchangedSince(base, 64, beforeCpu), "a CPU write after the driver store is not seen");
+}
 }
 
 int main() {
@@ -98,6 +126,7 @@ int main() {
             return 77;
         }
         CheckSharedBlock();
+        CheckOwnStore();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

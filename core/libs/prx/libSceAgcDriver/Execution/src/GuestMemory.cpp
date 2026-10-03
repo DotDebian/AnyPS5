@@ -1240,6 +1240,46 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     return true;
 }
 
+bool ConsumeOwnStores() {
+    static const bool enabled = std::getenv("APS5_NO_OWN_STORE_COLLECT") == nullptr;
+    return enabled;
+}
+
+std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
+    if (bytes == 0) return 0;
+    const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
+        if (stored.second <= stored.first || !tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) return 0;
+        ++tracker.generation;
+        for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
+            tracker.stamp(block, tracker.generation, StampKind::Driver);
+            tracker.noteDriverStore(block, stored.first, stored.second, tracker.generation);
+        }
+        return tracker.generation;
+    };
+    if (!ConsumeOwnStores()) {
+        const auto stored = store();
+        return stored.second > stored.first ? MarkWritten(stored.first, static_cast<std::size_t>(stored.second - stored.first)) : 0;
+    }
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return stampStored(tracker, store());
+    constexpr std::uint64_t page = 4096;
+    const auto first = address & ~(page - 1);
+    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return stampStored(tracker, store());
+    const auto stored = store();
+    walkWrites(tracker, first, stop, StampKind::Driver);
+    return stampStored(tracker, stored);
+}
+
+std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store) {
+    return storeOwn(address, bytes, [&] {
+        store();
+        return std::pair<std::uint64_t, std::uint64_t>{address, address + bytes};
+    });
+}
+
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
@@ -1800,23 +1840,25 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
         const auto length = std::min(block, size - at);
         return std::memcmp(current.data() + at, original.data() + at, length) != 0;
     };
-    std::size_t firstChanged = size;
-    std::size_t lastChanged = 0;
-    for (std::size_t at = 0; at < size; at += block) {
-        if (!differs(at)) continue;
-        const auto blockEnd = std::min(at + block, size);
-        for (std::size_t run = at; run < blockEnd;) {
-            if (current[run] == original[run]) { ++run; continue; }
-            auto runEnd = run + 1;
-            while (runEnd < blockEnd && current[runEnd] != original[runEnd]) ++runEnd;
-            std::memcpy(destination + run, current.data() + run, runEnd - run);
-            firstChanged = std::min(firstChanged, run);
-            lastChanged = std::max(lastChanged, runEnd);
-            run = runEnd;
-        }
-    }
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
-    if (firstChanged < lastChanged) MarkWritten(address + firstChanged, lastChanged - firstChanged);
+    storeOwn(address, size, [&] {
+        std::size_t firstChanged = size;
+        std::size_t lastChanged = 0;
+        for (std::size_t at = 0; at < size; at += block) {
+            if (!differs(at)) continue;
+            const auto blockEnd = std::min(at + block, size);
+            for (std::size_t run = at; run < blockEnd;) {
+                if (current[run] == original[run]) { ++run; continue; }
+                auto runEnd = run + 1;
+                while (runEnd < blockEnd && current[runEnd] != original[runEnd]) ++runEnd;
+                std::memcpy(destination + run, current.data() + run, runEnd - run);
+                firstChanged = std::min(firstChanged, run);
+                lastChanged = std::max(lastChanged, runEnd);
+                run = runEnd;
+            }
+        }
+        return firstChanged < lastChanged ? std::pair<std::uint64_t, std::uint64_t>{address + firstChanged, address + lastChanged} : std::pair<std::uint64_t, std::uint64_t>{0, 0};
+    });
 }
 
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {
@@ -1828,9 +1870,8 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     CountWriteCaller(__builtin_return_address(0));
     auto* destination = reinterpret_cast<void*>(address);
     CheckRange(destination, source.size(), alignment, true);
-    std::memcpy(destination, source.data(), source.size());
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
-    MarkWritten(address, source.size());
+    StoreOwnBytes(address, source.size(), [&] { std::memcpy(destination, source.data(), source.size()); });
 }
 
 }
