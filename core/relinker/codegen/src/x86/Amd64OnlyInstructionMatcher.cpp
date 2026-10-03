@@ -7,6 +7,8 @@
 #include <codegen/x86/ClzeroOperands.hpp>
 #include <codegen/x86/Sha256Lowering.hpp>
 #include <codegen/x86/Sha256Operands.hpp>
+#include <codegen/x86/ReciprocalLowering.hpp>
+#include <codegen/x86/ReciprocalOperands.hpp>
 #include <codegen/x86/StubBodyBuilder.hpp>
 #include <codegen/x86/X64OpcodeConstants.hpp>
 #include <codegen/CodegenException.hpp>
@@ -45,6 +47,10 @@ const Entry& _sha256Entry(const Sha256Operands& operands) {
     return kSha256rnds2;
 }
 
+const Entry& _reciprocalEntry(const ReciprocalOperands& operands) {
+    return operands.Operation == ReciprocalOperation::ReciprocalSquareRoot ? kVrsqrtps : kVrcpps;
+}
+
 Amd64OnlyMatch _inPlace(const Entry& entry, const std::size_t length, std::vector<std::uint8_t> replacement) {
     while (replacement.size() < length) {
         const auto& nop = kNops[std::min<std::size_t>(length - replacement.size(), std::size(kNops)) - 1];
@@ -80,6 +86,7 @@ private:
     Sse4aLowering _lowering;
     Sha256Lowering _sha256Lowering;
     ClzeroLowering _clzeroLowering;
+    ReciprocalLowering _reciprocalLowering;
 
     [[nodiscard]] Amd64OnlyMatch _matchMovnts(const DecodedInstruction& instr, const Entry& entry) const;
     [[nodiscard]] Amd64OnlyMatch _matchSse4a(const DecodedInstruction& instr, const Entry& entry, const Entry& registerFormEntry, std::span<const std::uint8_t> trailing) const;
@@ -142,6 +149,10 @@ std::optional<Amd64OnlyMatch> Amd64OnlyInstructionMatcher::MatchSequence(
             if (name == nullptr)
                 name = _sha256Entry(operands).Name;
             _sha256Lowering.EmitOutOfLine(body, operands);
+        } else if (const auto reciprocal = DecodeVexReciprocal(instr.Data, instr.Length)) {
+            if (name == nullptr)
+                name = _reciprocalEntry(*reciprocal).Name;
+            _reciprocalLowering.EmitOutOfLine(body, *reciprocal);
         } else if (instr.IsClzero()) {
             const auto operands = DecodeClzero(instr.Data, instr.Length);
             if (name == nullptr)
@@ -153,7 +164,8 @@ std::optional<Amd64OnlyMatch> Amd64OnlyInstructionMatcher::MatchSequence(
     }
     body.Raw(trailing);
     auto lowered = body.Finish();
-    return Amd64OnlyMatch{name, instructions.front().size(), Amd64OnlyLowering::Trampoline, {}, std::move(lowered.Bytes), lowered.ReturnBranchOffset};
+    const bool optional = DecodeVexReciprocal(instructions.front().data(), instructions.front().size()).has_value();
+    return Amd64OnlyMatch{name, instructions.front().size(), Amd64OnlyLowering::Trampoline, {}, std::move(lowered.Bytes), lowered.ReturnBranchOffset, optional};
 }
 
 std::optional<Amd64OnlyMatch> Amd64OnlyInstructionMatcher::Match(
@@ -177,6 +189,11 @@ std::optional<Amd64OnlyMatch> Amd64OnlyInstructionMatcher::Match(
 
     if (instr.IsSha256())
         return _matchSha256(instr, trailing);
+
+    if (const auto reciprocal = DecodeVexReciprocal(data, length)) {
+        auto body = _reciprocalLowering.LowerOutOfLine(*reciprocal, trailing);
+        return Amd64OnlyMatch{_reciprocalEntry(*reciprocal).Name, length, Amd64OnlyLowering::Trampoline, {}, std::move(body.Bytes), body.ReturnBranchOffset, true};
+    }
 
     if (instr.IsMonitorx())
         return _validWait(instr) ? _inPlace(kMonitorx, length, {}) : _unsupported(kMonitorx, length);

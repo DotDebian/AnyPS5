@@ -23,6 +23,7 @@ void EmitShiftImm(std::vector<std::uint8_t>& out, std::uint8_t extension, std::u
 class StubBodyBuilder {
 public:
     void Sse(std::uint8_t prefix, std::initializer_list<std::uint8_t> opcode, std::uint8_t dst, std::uint8_t src);
+    void SsePlain(std::initializer_list<std::uint8_t> opcode, std::uint8_t dst, std::uint8_t src);
     void SseImm(std::uint8_t prefix, std::initializer_list<std::uint8_t> opcode, std::uint8_t dst, std::uint8_t src, std::uint8_t imm);
     void ShiftImm(std::uint8_t extension, std::uint8_t reg, std::uint8_t imm);
     void ShiftDwordImm(std::uint8_t extension, std::uint8_t reg, std::uint8_t imm);

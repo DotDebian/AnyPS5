@@ -51,6 +51,14 @@ void StubBodyBuilder::Sse(const std::uint8_t prefix, const std::initializer_list
     EmitSse(_bytes, prefix, opcode, dst, src);
 }
 
+void StubBodyBuilder::SsePlain(const std::initializer_list<std::uint8_t> opcode, const std::uint8_t dst, const std::uint8_t src) {
+    const auto rex = _rex(dst, src);
+    if (rex != kRexBase)
+        _bytes.push_back(rex);
+    _bytes.insert(_bytes.end(), opcode.begin(), opcode.end());
+    _bytes.push_back(static_cast<std::uint8_t>(kModRmRegister | ((dst & 7) << 3) | (src & 7)));
+}
+
 void StubBodyBuilder::SseImm(const std::uint8_t prefix, const std::initializer_list<std::uint8_t> opcode, const std::uint8_t dst, const std::uint8_t src, const std::uint8_t imm) {
     EmitSse(_bytes, prefix, opcode, dst, src);
     _bytes.push_back(imm);

@@ -25,6 +25,28 @@ auto _atFileOffset(const Domain::FileByteOffset base, const TOperation& operatio
     }
 }
 
+bool _vexRipRelative(const std::span<const std::uint8_t> bytes) {
+    std::size_t pos = 0;
+    while (pos < bytes.size() && (bytes[pos] == 0x66 || bytes[pos] == 0x67 || bytes[pos] == 0xF2 || bytes[pos] == 0xF3 || bytes[pos] == 0x2E || bytes[pos] == 0x3E || bytes[pos] == 0x26 || bytes[pos] == 0x36 || bytes[pos] == 0x64 || bytes[pos] == 0x65))
+        ++pos;
+    if (pos >= bytes.size())
+        return false;
+    std::size_t payload = 0;
+    if (bytes[pos] == 0xC5)
+        payload = 1;
+    else if (bytes[pos] == 0xC4)
+        payload = 2;
+    else if (bytes[pos] == 0x62)
+        payload = 3;
+    else
+        return false;
+    const auto modrmOffset = pos + 1 + payload + 1;
+    if (modrmOffset >= bytes.size())
+        return false;
+    const auto modrm = bytes[modrmOffset];
+    return (modrm & 0xC7) == 0x05;
+}
+
 class Amd64OnlyConverter : public IAmd64OnlyConverter {
 public:
     [[nodiscard]] ConvertResult Convert(
@@ -126,50 +148,61 @@ void Amd64OnlyConverter::_convertSegment(
             break;
         }
         case Amd64OnlyLowering::Trampoline: {
-            std::size_t siteLength = match.Length;
-            auto stub = substitution;
-            if (siteLength < Amd64OnlySubstitutionTable::kJmpRel32.Size) {
-                const X64InstructionDecoder decoder;
-                std::vector<std::span<const std::uint8_t>> sequence{std::span<const std::uint8_t>(seg.data() + match.Offset, match.Length)};
-                std::size_t trailingBytes = 0;
-                for (auto next = item.Index + 1; siteLength < Amd64OnlySubstitutionTable::kJmpRel32.Size; ++next) {
-                    if (next >= matches.size() || matches[next].Offset != match.Offset + siteLength)
-                        throw CodegenException("AMD-only instruction too short for a jump and not followed by an instruction", fileOffset);
-                    const auto& following = matches[next];
-                    const std::span<const std::uint8_t> bytes(seg.data() + following.Offset, following.Length);
-                    const auto info = decoder.DecodeInstruction(bytes.data(), bytes.size());
-                    const bool amdOnly = _matcher->Match(bytes.data(), bytes.size()).has_value();
-                    if (amdOnly && trailingBytes == 0) {
-                        sequence.push_back(bytes);
-                        consumed.insert(next);
-                    } else if (amdOnly || info.FlowKind != ControlFlowKind::Sequential || info.HasRipRelativeDisp || info.HasBranchTarget) {
-                        throw CodegenException("AMD-only instruction too short for a jump is followed by an instruction that cannot move", ph.Offset + following.Offset);
-                    } else {
-                        trailingBytes += following.Length;
+            std::vector<std::size_t> taken;
+            try {
+                std::size_t siteLength = match.Length;
+                auto stub = substitution;
+                if (siteLength < Amd64OnlySubstitutionTable::kJmpRel32.Size) {
+                    const X64InstructionDecoder decoder;
+                    std::vector<std::span<const std::uint8_t>> sequence{std::span<const std::uint8_t>(seg.data() + match.Offset, match.Length)};
+                    std::size_t trailingBytes = 0;
+                    for (auto next = item.Index + 1; siteLength < Amd64OnlySubstitutionTable::kJmpRel32.Size; ++next) {
+                        if (next >= matches.size() || matches[next].Offset != match.Offset + siteLength)
+                            throw CodegenException("AMD-only instruction too short for a jump and not followed by an instruction", fileOffset);
+                        const auto& following = matches[next];
+                        const std::span<const std::uint8_t> bytes(seg.data() + following.Offset, following.Length);
+                        const auto info = decoder.DecodeInstruction(bytes.data(), bytes.size());
+                        const bool amdOnly = _matcher->Match(bytes.data(), bytes.size()).has_value();
+                        if (amdOnly && trailingBytes == 0) {
+                            sequence.push_back(bytes);
+                            taken.push_back(next);
+                        } else if (amdOnly || info.FlowKind != ControlFlowKind::Sequential || info.HasRipRelativeDisp || _vexRipRelative(bytes) || info.HasBranchTarget) {
+                            throw CodegenException("AMD-only instruction too short for a jump is followed by an instruction that cannot move", ph.Offset + following.Offset);
+                        } else {
+                            trailingBytes += following.Length;
+                        }
+                        siteLength += following.Length;
                     }
-                    siteLength += following.Length;
+                    const std::span<const std::uint8_t> trailing(seg.data() + match.Offset + siteLength - trailingBytes, trailingBytes);
+                    auto relocated = _atFileOffset(fileOffset, [&] { return _matcher->MatchSequence(sequence, trailing); });
+                    if (!relocated.has_value() || relocated->Lowering != Amd64OnlyLowering::Trampoline)
+                        throw CodegenException("AMD-only instruction sequence has no out-of-line lowering", fileOffset);
+                    stub = std::move(*relocated);
                 }
-                const std::span<const std::uint8_t> trailing(seg.data() + match.Offset + siteLength - trailingBytes, trailingBytes);
-                auto relocated = _atFileOffset(fileOffset, [&] { return _matcher->MatchSequence(sequence, trailing); });
-                if (!relocated.has_value() || relocated->Lowering != Amd64OnlyLowering::Trampoline)
-                    throw CodegenException("AMD-only instruction sequence has no out-of-line lowering", fileOffset);
-                stub = std::move(*relocated);
+                const auto hit = branchTargets.upper_bound(address);
+                if (hit != branchTargets.end() && *hit < address + siteLength)
+                    throw CodegenException("Branch enters an AMD-only instruction", ph.Offset + (*hit - ph.MappedAddress));
+                const auto begin = seg.begin() + static_cast<std::ptrdiff_t>(match.Offset);
+                result.Trampolines.push_back({
+                    fileOffset,
+                    address,
+                    siteLength,
+                    std::vector<std::uint8_t>(begin, begin + static_cast<std::ptrdiff_t>(siteLength)),
+                    stub.StubBody,
+                    stub.ReturnBranchOffset
+                });
+                replacementLength = stub.StubBody.size();
+                consumed.insert(taken.begin(), taken.end());
+            } catch (const CodegenException&) {
+                if (!substitution.Optional)
+                    throw;
+                ++result.KeptCount;
+                result.Reports.push_back({substitution.InstructionName, fileOffset, match.Length, 0, Amd64OnlyLowering::Kept});
+                continue;
             }
-            const auto hit = branchTargets.upper_bound(address);
-            if (hit != branchTargets.end() && *hit < address + siteLength)
-                throw CodegenException("Branch enters an AMD-only instruction", ph.Offset + (*hit - ph.MappedAddress));
-            const auto begin = seg.begin() + static_cast<std::ptrdiff_t>(match.Offset);
-            result.Trampolines.push_back({
-                fileOffset,
-                address,
-                siteLength,
-                std::vector<std::uint8_t>(begin, begin + static_cast<std::ptrdiff_t>(siteLength)),
-                stub.StubBody,
-                stub.ReturnBranchOffset
-            });
-            replacementLength = stub.StubBody.size();
             break;
         }
+        case Amd64OnlyLowering::Kept:
         case Amd64OnlyLowering::Unsupported:
             throw CodegenException("AMD-only instruction without Intel lowering: " + substitution.InstructionName, fileOffset);
         }
@@ -186,7 +219,7 @@ ConvertResult Amd64OnlyConverter::Convert(
     std::vector<std::uint8_t> fileBytes,
     const std::vector<Domain::ProgramHeader>& codeSegments
 ) const {
-    ConvertResult result{{}, 0, {}, {}};
+    ConvertResult result{};
     for (const auto& ph : codeSegments)
         _convertSegment(fileBytes, ph, result);
     result.Bytes = std::move(fileBytes);

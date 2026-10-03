@@ -4,6 +4,7 @@
 #include <codegen/x86/Sse4aLowering.hpp>
 #include <codegen/x86/Sse4aOperands.hpp>
 #include <codegen/x86/Sha256Operands.hpp>
+#include <codegen/x86/ReciprocalOperands.hpp>
 #include <codegen/x86/ClzeroOperands.hpp>
 #include <codegen/x86/ClzeroLowering.hpp>
 #include <codegen/x86/DecodedInstruction.hpp>
@@ -17,6 +18,7 @@
 #include <elfpatcher/linux/LinuxElfPatcher.hpp>
 #include <io/ByteWriter.hpp>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <cstdint>
 #ifdef __linux__
@@ -332,6 +334,51 @@ void converterSegment() {
     require(shortSite.Offset == 0x20F && shortSite.Length == 5 && shortSite.OriginalBytes == shortOriginal, "Short EXTRQ site did not absorb the following instruction");
     require(shortSite.Body[shortSite.ReturnBranchOffset - 1] == 0x90 && shortSite.Body[shortSite.ReturnBranchOffset] == 0xE9, "Absorbed instruction does not run before the return jump");
     requireFailure([&] { (void)converter->Convert(file, {segmentHeader(0x200)}); }, "Segment exceeding the file was accepted");
+}
+
+void reciprocalOperands() {
+    const auto vex2 = Codegen::DecodeVexReciprocal(Bytes{0xC5, 0xF8, 0x52, 0xD5}.data(), 4);
+    require(vex2 && vex2->Operation == Codegen::ReciprocalOperation::ReciprocalSquareRoot && vex2->Destination == 2 && vex2->Source == 5, "VEX2 VRSQRTPS was not decoded");
+    const auto vex2High = Codegen::DecodeVexReciprocal(Bytes{0xC5, 0x78, 0x53, 0xC1}.data(), 4);
+    require(vex2High && vex2High->Operation == Codegen::ReciprocalOperation::Reciprocal && vex2High->Destination == 8 && vex2High->Source == 1, "VEX2 VRCPPS with a high destination was not decoded");
+    const auto vex3 = Codegen::DecodeVexReciprocal(Bytes{0xC4, 0x41, 0x78, 0x52, 0xC9}.data(), 5);
+    require(vex3 && vex3->Destination == 9 && vex3->Source == 9, "VEX3 VRSQRTPS with high registers was not decoded");
+    require(!Codegen::DecodeVexReciprocal(Bytes{0xC5, 0xFC, 0x52, 0xD5}.data(), 4), "256-bit VRSQRTPS must stay native");
+    require(!Codegen::DecodeVexReciprocal(Bytes{0xC5, 0xFA, 0x52, 0xD5}.data(), 4), "VRSQRTSS must stay native");
+    require(!Codegen::DecodeVexReciprocal(Bytes{0xC5, 0xF8, 0x52, 0x10}.data(), 4), "Memory form must stay native");
+    require(!Codegen::DecodeVexReciprocal(Bytes{0xC5, 0xF8, 0x51, 0xD5}.data(), 4), "VSQRTPS is not a reciprocal");
+    require(!Codegen::DecodeVexReciprocal(Bytes{0x0F, 0x52, 0xD5}.data(), 3), "Legacy RSQRTPS must stay native");
+}
+
+void converterReciprocal() {
+    const auto converter = Codegen::MakeAmd64OnlyConverter();
+    Bytes file(0x300, 0xCC);
+    const Bytes text = {
+        0xC5, 0xF8, 0x52, 0xD5,
+        0xC5, 0xE8, 0x59, 0xD1,
+        0xC5, 0xF8, 0x53, 0xC1,
+        0xC3};
+    std::copy(text.begin(), text.end(), file.begin() + 0x200);
+    const auto result = converter->Convert(file, {segmentHeader(text.size())});
+    require(result.Trampolines.size() == 1 && result.KeptCount == 1 && result.Bytes == file, "VRSQRTPS was not lowered or the unmovable VRCPPS was not kept");
+    const auto& site = result.Trampolines[0];
+    require(site.Offset == 0x200 && site.Length == 8 && result.Reports[0].InstructionName == "VRSQRTPS", "VRSQRTPS did not absorb the following VMULPS");
+    require(site.Body[site.ReturnBranchOffset - 4] == 0xC5 && site.Body[site.ReturnBranchOffset - 1] == 0xD1, "Absorbed VMULPS does not run before the return jump");
+    require(result.Reports[1].InstructionName == "VRCPPS" && result.Reports[1].Lowering == Codegen::Amd64OnlyLowering::Kept && result.Reports[1].Offset == 0x208, "VRCPPS before a return was not reported as kept");
+    auto branchInto = file;
+    const Bytes jump = {0xEB, 0x00, 0xC5, 0xF8, 0x52, 0xD5, 0xC5, 0xE8, 0x59, 0xD1, 0xC3};
+    std::copy(jump.begin(), jump.end(), branchInto.begin() + 0x200);
+    const auto branched = converter->Convert(branchInto, {segmentHeader(jump.size())});
+    require(branched.Trampolines.size() == 1 && branched.KeptCount == 0, "A branch to the reciprocal itself must still allow a stub");
+    const Bytes jumpInside = {0xEB, 0x04, 0xC5, 0xF8, 0x52, 0xD5, 0xC5, 0xE8, 0x59, 0xD1, 0xC3};
+    std::copy(jumpInside.begin(), jumpInside.end(), branchInto.begin() + 0x200);
+    const auto inside = converter->Convert(branchInto, {segmentHeader(jumpInside.size())});
+    require(inside.Trampolines.empty() && inside.KeptCount == 1 && inside.Bytes == branchInto, "A branch into the absorbed instruction must keep the reciprocal native");
+    auto ripRelative = file;
+    const Bytes broadcast = {0xC5, 0xF8, 0x52, 0xD5, 0xC4, 0xE2, 0x79, 0x18, 0x15, 0x10, 0x00, 0x00, 0x00, 0xC3};
+    std::copy(broadcast.begin(), broadcast.end(), ripRelative.begin() + 0x200);
+    const auto kept = converter->Convert(ripRelative, {segmentHeader(broadcast.size())});
+    require(kept.Trampolines.empty() && kept.KeptCount == 1 && kept.Bytes == ripRelative, "A following RIP-relative VEX instruction was moved into a stub");
 }
 
 void converterSha256() {
@@ -763,10 +810,58 @@ void clzeroExecution() {
         munmap(buffer, 4096);
     }
 }
+
+std::uint64_t packLanes(const float (&lanes)[4], const std::size_t first) {
+    std::uint64_t packed = 0;
+    std::memcpy(&packed, lanes + first, sizeof(packed));
+    return packed;
+}
+
+bool sameLane(const float expected, const float actual) {
+    if (std::isnan(expected))
+        return std::isnan(actual);
+    std::uint32_t a = 0;
+    std::uint32_t b = 0;
+    std::memcpy(&a, &expected, sizeof(a));
+    std::memcpy(&b, &actual, sizeof(b));
+    return a == b;
+}
+
+void reciprocalExecution() {
+    const float inputs[][4] = {
+        {1.0f, 4.0f, 0.25f, 2.0f},
+        {0.0f, -0.0f, INFINITY, -1.0f},
+        {1.00000012f, 0.99999994f, 3.0e-38f, 1.0e30f}};
+    for (const auto& lanes : inputs) {
+        const std::uint64_t source[2] = {packLanes(lanes, 0), packLanes(lanes, 2)};
+        const std::uint64_t destination[2] = {0x1111111111111111ull, 0x2222222222222222ull};
+        for (const bool squareRoot : {true, false}) {
+            const std::uint8_t opcode = squareRoot ? 0x52 : 0x53;
+            const Bytes distinct = {0xC5, 0xF8, opcode, 0xD5};
+            const Bytes same = {0xC5, 0xF8, opcode, 0xD2};
+            const auto distinctOut = runRegisterFormStub(distinct, destination, source);
+            const auto sameOut = runRegisterFormStub(same, source, source);
+            float distinctLanes[4];
+            float sameLanes[4];
+            std::memcpy(distinctLanes, distinctOut.data(), sizeof(distinctLanes));
+            std::memcpy(sameLanes, sameOut.data(), sizeof(sameLanes));
+            for (std::size_t lane = 0; lane < 4; ++lane) {
+                const float expected = squareRoot ? 1.0f / std::sqrt(lanes[lane]) : 1.0f / lanes[lane];
+                require(sameLane(expected, distinctLanes[lane]), "VRSQRTPS/VRCPPS stub is not correctly rounded");
+                require(sameLane(expected, sameLanes[lane]), "VRSQRTPS/VRCPPS stub with equal operands is not correctly rounded");
+            }
+        }
+    }
+    const float one[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    const std::uint64_t ones[2] = {packLanes(one, 0), packLanes(one, 2)};
+    const auto unit = runRegisterFormStub({0xC5, 0xF8, 0x52, 0xD5}, ones, ones);
+    require(unit[0] == ones[0] && unit[1] == ones[1], "VRSQRTPS of 1.0 must be exactly 1.0 so a renormalised unit quaternion stays unit");
+}
 #else
 void registerFormExecution() {}
 void sha256Execution() {}
 void clzeroExecution() {}
+void reciprocalExecution() {}
 #endif
 
 void scannerZeroTail() {
@@ -782,14 +877,17 @@ int main() {
         decoderLengths();
         sse4aOperands();
         sha256Operands();
+        reciprocalOperands();
         clzeroOperands();
         matcherSubstitutions();
         goldenBodies();
         registerFormExecution();
         sha256Execution();
         clzeroExecution();
+        reciprocalExecution();
         converterSegment();
         converterSha256();
+        converterReciprocal();
         converterMonitorWait();
         converterClzero();
         converterStrayRex();
