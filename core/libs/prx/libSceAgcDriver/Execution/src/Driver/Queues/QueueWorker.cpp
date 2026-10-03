@@ -79,9 +79,9 @@ void Driver::run(std::uint32_t id) noexcept {
                 pending.pop_front();
                 if (id == 0) queue0Executing = submission.suspend ? 0 : submission.received;
                 static const bool crossQueueOrder = std::getenv("APS5_NO_CROSS_QUEUE_ORDER") == nullptr;
-                if (crossQueueOrder && submission.waitFree && queue0Before(submission.received)) {
+                if (crossQueueOrder && submission.waitFree) {
                     orderHolders.fetch_add(1, std::memory_order_acq_rel);
-                    changed.wait(lock, [&] { return failure || stopping || writesAwaited(submission, queue0Awaited.load(std::memory_order_acquire)) || !queue0Before(submission.received); });
+                    while (!failure && !stopping && !orderReleased(id, submission.received)) changed.wait_for(lock, std::chrono::milliseconds(1));
                     orderHolders.fetch_sub(1, std::memory_order_acq_rel);
                     rethrowFailure();
                 }
@@ -90,7 +90,14 @@ void Driver::run(std::uint32_t id) noexcept {
                 worker.started.fetch_add(1, std::memory_order_acq_rel);
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
-            execute(submission);
+            {
+                struct Running {
+                    std::atomic<std::uint32_t>& count;
+                    explicit Running(std::atomic<std::uint32_t>& count) : count(count) { count.fetch_add(1, std::memory_order_acq_rel); }
+                    ~Running() { count.fetch_sub(1, std::memory_order_acq_rel); }
+                } running{runningWorkers};
+                execute(submission);
+            }
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             bool notify = true;
