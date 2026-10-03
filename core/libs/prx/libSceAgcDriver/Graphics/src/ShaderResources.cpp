@@ -158,6 +158,11 @@ void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
 }
 
+bool DedupeImages() {
+    static const bool enabled = std::getenv("APS5_NO_IMAGE_DEDUPE") == nullptr;
+    return enabled;
+}
+
 bool ImageMemoEnabled() {
     static const bool enabled = std::getenv("APS5_NO_IMAGE_MEMO") == nullptr;
     return enabled;
@@ -1337,7 +1342,9 @@ void ShaderResources::buildComplete() {
     try {
         // The lookups run in plan order: Revalidate walks the bindings the same way, and consecutive
         // storage elements of one mip chain share the previous element's image.
+        previousSampled = {};
         for (const auto& deferred : deferredImages) resolveImageBinding(*deferred.binding, bindings[deferred.index]);
+        previousSampled = {};
         deferredImages.clear();
         // The records served their purpose: each holds the cache entry's objects as of stage A,
         // which would otherwise keep a replaced texture or an evicted storage image (and its device
@@ -2795,8 +2802,23 @@ bool ShaderResources::precollectImages() {
         const auto elementWords = binding.guestDescriptor.size() / binding.count;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+            const bool sampled = binding.kind == ShaderRecompiler::DescriptorKind::SampledImage;
+            if (sampled && DedupeImages() && !imageRecords.empty()) {
+                const auto& previous = imageRecords.back();
+                if (previous.sampled && previous.decoded && words.size() == 8 && std::equal(words.begin(), words.end(), previous.words.begin()) && (binding.imageDepthCompare.empty() || !binding.imageDepthCompare.at(element))) {
+                    ImageRecord repeated;
+                    repeated.sampled = true;
+                    repeated.decoded = previous.decoded;
+                    repeated.words = previous.words;
+                    repeated.resource = previous.resource;
+                    repeated.guestBytes = previous.guestBytes;
+                    repeated.components = previous.components;
+                    imageRecords.push_back(repeated);
+                    continue;
+                }
+            }
             ImageRecord record;
-            record.sampled = binding.kind == ShaderRecompiler::DescriptorKind::SampledImage;
+            record.sampled = sampled;
             try {
                 const auto* memo = ImageMemoEnabled() && words.size() == 8 ? decodedImage(context.device, words) : nullptr;
                 if (memo != nullptr) {
@@ -2901,11 +2923,18 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             const VkComponentMapping components{ComponentSwizzleFor(resource.dstSelX), ComponentSwizzleFor(resource.dstSelY), ComponentSwizzleFor(resource.dstSelZ), ComponentSwizzleFor(resource.dstSelW)};
             const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
             std::shared_ptr<Texture> texture;
-            if (record != nullptr && record->texture != nullptr) {
+            const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
+            if (DedupeImages() && previousSampled.texture != nullptr && previousSampled.depthCompare == depthCompare && words.size() == 8 && std::equal(words.begin(), words.end(), previousSampled.words.begin())) texture = previousSampled.texture;
+            if (texture == nullptr && record != nullptr && record->texture != nullptr) {
                 texture = fastTexture(*record);
                 if (TextureCountersReported()) (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
             }
-            if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element));
+            if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare);
+            if (words.size() == 8) {
+                std::copy(words.begin(), words.end(), previousSampled.words.begin());
+                previousSampled.depthCompare = depthCompare;
+                previousSampled.texture = texture;
+            }
             textures.push_back(std::move(texture));
             textureFirstLayer.push_back(firstLayer);
             describedRanges.push_back({"texture", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress});
@@ -2915,6 +2944,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         reportTextureCounters();
         return;
     }
+    previousSampled = {};
     // Consecutive identical storage descriptors address successive mips of one texture (dynamic-mip
     // storage writes).
     std::uint32_t mipOffset = 0;

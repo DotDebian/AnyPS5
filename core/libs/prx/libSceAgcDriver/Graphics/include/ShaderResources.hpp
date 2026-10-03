@@ -332,6 +332,12 @@ private:
         std::uint64_t entryGeneration = 0;
     };
     std::vector<ImageRecord> imageRecords;
+    struct PreviousSampled {
+        std::array<std::uint32_t, 8> words{};
+        bool depthCompare = false;
+        std::shared_ptr<Texture> texture;
+    };
+    PreviousSampled previousSampled;
     // The next record resolveImageBinding consumes (records follow the deferredImages order).
     std::size_t nextImageRecord = 0;
     // Stage B: the record's texture when the fastRevalidate predicate proves it current under the

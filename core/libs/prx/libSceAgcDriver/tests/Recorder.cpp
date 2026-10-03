@@ -2489,6 +2489,24 @@ void imageMemoTests(const Device& device, Recorder& recorder) {
     Require(sample(first) == remade, "the remade texture is not the cache's");
     const auto replaced = sample(second);
     Require(replaced != other && sample(second) == replaced && sample(first) == remade, "the cache does not answer with the replacements");
+    const auto firstWords = linearTextureWords(reinterpret_cast<std::uint64_t>(first), width, height, 56);
+    const auto secondWords = linearTextureWords(reinterpret_cast<std::uint64_t>(second), width, height, 56);
+    const auto bindElements = [&](std::initializer_list<std::array<std::uint32_t, 8>> elements, std::vector<bool> depthCompare) {
+        program.bindings[0].count = static_cast<std::uint32_t>(elements.size());
+        program.bindings[0].guestDescriptor.clear();
+        for (const auto& words : elements) program.bindings[0].guestDescriptor.insert(program.bindings[0].guestDescriptor.end(), words.begin(), words.end());
+        program.bindings[0].imageDepthCompare = std::move(depthCompare);
+        ShaderResources resources(context, compiled);
+        Require(resources.SampledTextures().size() == elements.size(), "the build has the wrong number of sampled textures");
+        kept.insert(kept.end(), resources.SampledTextures().begin(), resources.SampledTextures().end());
+        return resources.SampledTextures();
+    };
+    const auto repeated = bindElements({firstWords, firstWords, secondWords, firstWords}, {});
+    Require(repeated[0] == remade && repeated[1] == remade && repeated[2] == replaced && repeated[3] == remade, "repeated elements of one build do not bind the cache's textures");
+    const auto compared = bindElements({firstWords, firstWords}, {false, true});
+    Require(compared[0] == remade && compared[1] == remade, "a comparison element over a color surface does not bind its color texture");
+    program.bindings[0].count = 1;
+    program.bindings[0].imageDepthCompare.clear();
     recorder.Submit();
     device.WaitQueue();
     recorder.Sync();
