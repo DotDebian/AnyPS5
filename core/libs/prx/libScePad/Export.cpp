@@ -222,9 +222,8 @@ int APS5_VABI scePadSetMotionSensorState(int handle, bool enable) {
 }
 
 int APS5_VABI scePadSetTiltCorrectionState(int handle, bool enabled) {
- static std::atomic<bool> tiltCorrection{false};
  if (handle != PAD_HANDLE) return PAD_ERROR_INVALID_HANDLE;
- tiltCorrection.store(enabled, std::memory_order_relaxed);
+ Pad::SetTiltCorrection(enabled);
  return PAD_OK;
 }
 

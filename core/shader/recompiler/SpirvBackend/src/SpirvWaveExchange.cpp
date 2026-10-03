@@ -266,15 +266,6 @@ std::unordered_map<const IrValue*, bool> LaneVaryingValues(const IrProgram& prog
 
 }
 
-std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program) {
-    const auto varying = LaneVaryingValues(program, true);
-    std::unordered_set<const IrValue*> uniform;
-    for (const auto& [value, lanes] : varying) {
-        if (!lanes) uniform.insert(value);
-    }
-    return uniform;
-}
-
 std::vector<const BlockInfo*> LaneVaryingScalarBranches(const IrProgram& program) {
     const auto varying = LaneVaryingValues(program, false);
     const auto isVarying = [&](const IrValue* value) {

@@ -35,7 +35,6 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     spvtools::SpirvTools tools(environment);
     if (!tools.IsValid()) throw std::runtime_error("SPIRV-Tools: cannot create validator");
     tools.SetMessageConsumer(consumer);
-    // A sampling instruction's non-constant Offset is valid on a device with maintenance8.
     spvtools::ValidatorOptions validatorOptions;
     validatorOptions.SetAllowOffsetTextureOperand(allowOffsetTextureOperand);
     if (!tools.Validate(spirv.data(), spirv.size(), validatorOptions)) {

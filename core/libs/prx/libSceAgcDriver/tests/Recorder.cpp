@@ -344,9 +344,28 @@ void completionCountTests(const Device& device, Recorder& recorder) {
     Require(memory[0] == 1 && memory[2] == (storeAlways ? 1u : 7u) && memory[16] == 1, "completion stores ran for the wrong labels (overlapped and not-imported ones store, the untouched GPU-stored one skips)");
 }
 
-// Every finished batch leaves a completion record; its whole-batch GPU stamps are real exactly
-// when batch stamps are on (APS5_PROFILE_DRAW or APS5_PROFILE_GPU: run the binary with and
-// without), and a reused stamp pool gives the next batch its own stamps.
+void afterRecordedWorkTests(const Device& device, Recorder& recorder) {
+    alignas(64) static std::uint32_t memory[16];
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const std::array<std::byte, 4> value{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    recorder.Sync();
+    std::vector<int> ran;
+    std::uint32_t seen = 0;
+    Require(recorder.Idle() && !recorder.AfterRecordedWork([&] { ran.push_back(0); }) && ran.empty() && Recorder::PendingCompletionLabels() == 0, "an idle recorder kept an action for recorded work");
+    recorder.NotePendingWrite(0x52000, 0x100);
+    Require(!Recorder::PendingLabelSince().has_value(), "a write started the label flush deadline");
+    Require(recorder.AfterRecordedWork([&] { ran.push_back(1); }) && Recorder::PendingCompletionLabels() == 1 && Recorder::PendingLabelSince().has_value(), "an action behind the open batch is not pending under the label flush deadline");
+    recorder.AfterCompletions(base, value, 6, 0, false);
+    Require(recorder.AfterRecordedWork([&] { seen = memory[0]; ran.push_back(2); }) && Recorder::PendingCompletionLabels() == 3, "an action behind a completion label is not pending");
+    recorder.Submit();
+    Require(recorder.AfterRecordedWork([&] { ran.push_back(3); }) && Recorder::PendingCompletionLabels() == 4, "an action behind an in-flight batch is not pending");
+    device.WaitQueue();
+    Require(ran.empty(), "an action ran before its batch was reaped");
+    recorder.Sync();
+    Require(ran == std::vector<int>{1, 2, 3} && Recorder::PendingCompletionLabels() == 0 && recorder.Idle(), "actions behind recorded work did not run once each, in order");
+    Require(seen == 1, "an action ran before the completion label recorded ahead of it");
+}
+
 void batchStampTests(Recorder& recorder) {
     Require(recorder.Idle(), "batch stamps: the recorder is busy");
     double previousEnd = 0;
@@ -3038,6 +3057,7 @@ int main() {
             writeSettledTests(device, recorder);
             writeSnapshotTests(device, recorder);
             completionCountTests(device, recorder);
+            afterRecordedWorkTests(device, recorder);
             batchStampTests(recorder);
             labelTests(recorder);
             lateLabelTests(recorder);

@@ -186,13 +186,13 @@ struct VulkanDevice::State {
     bool tessellationShader = false;
     bool meshShader = false;
     bool fragmentShaderBarycentric = false;
+    bool shaderClock = false;
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
     bool primitiveListRestart = false;
     bool depthClipControl = false;
     bool imageViewMinLod = false;
-    // VK_KHR_maintenance8: sampling instructions take a non-constant texel Offset.
     bool maintenance8 = false;
     // The GDS shaders bind and the CP's DMA_DATA reaches (Pm4::InstallGdsBacking), when this device
     // installed the backing.
@@ -718,12 +718,23 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
         state->fragmentShaderBarycentric = barycentricFeatures.fragmentShaderBarycentric == VK_TRUE;
     }
+    VkPhysicalDeviceShaderClockFeaturesKHR clockFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+    if (hasExtension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &clockFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        state->shaderClock = clockFeatures.shaderSubgroupClock == VK_TRUE && clockFeatures.shaderDeviceClock == VK_TRUE;
+    }
     std::vector<const char*> deviceExtensions;
     if (window != nullptr) deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
     if (state->fragmentShaderBarycentric) {
         deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentBarycentricKHR);
         state->spirvExtensions.push_back("SPV_KHR_fragment_shader_barycentric");
+    }
+    if (state->shaderClock) {
+        deviceExtensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+        state->capabilities.push_back(spv::CapabilityShaderClockKHR);
+        state->spirvExtensions.push_back("SPV_KHR_shader_clock");
     }
     deviceExtensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
     state->capabilities.push_back(spv::CapabilitySignedZeroInfNanPreserve);
@@ -782,8 +793,6 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     minLodFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
     minLodFeatures.minLod = VK_TRUE;
-    // Texel offsets the guest computes (image_sample_*_o with an offset VGPR) are an Offset image
-    // operand, which Vulkan allows on sampling instructions only with maintenance8.
     VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     if (hasExtension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance8Features};
@@ -920,6 +929,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (state->fragmentShaderBarycentric) {
         barycentricFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &barycentricFeatures;
+    }
+    if (state->shaderClock) {
+        clockFeatures.pNext = byteFeatures.pNext;
+        byteFeatures.pNext = &clockFeatures;
     }
     VkPhysicalDeviceImageRobustnessFeaturesEXT imageRobustnessFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT, nullptr, VK_TRUE};
     if (imageRobustness) {
@@ -1233,8 +1246,6 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
 
 bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirst) {
     if (!state->recorder) return false;
-    // Finished batches are retired first (the graphics worker only, as in WriteLabelOnGpu), so an
-    // action behind work that already completed runs now rather than at a later reap.
     if (reapFirst && OpportunisticReap()) state->recorder->Reap();
     return state->recorder->AfterRecordedWork(std::move(action));
 }
@@ -1873,9 +1884,6 @@ void WriteFrameBmp(int index, std::uint32_t fullWidth, std::uint32_t fullHeight,
     }
 }
 
-// How a resident image of the display buffer presents (ResidentPresentPath: blitted as it is, or
-// converted from a raw copy of its texels as the guest-memory path converts them): one 2D level of
-// the display's extent and size. `filter` gets the best filter a blit of the format allows.
 ResidentPresent ResidentPresentable(const Graphics::Context& context, const Graphics::StorageTexture& image, const DisplayBuffer& buffer, VkFilter& filter) {
     const auto& descriptor = image.Descriptor();
     if (descriptor.width != buffer.width || descriptor.height != buffer.height || descriptor.mipCount != 1 || image.ImageLayers() != 1 || image.ImageDepth() != 1) return ResidentPresent::None;
@@ -1888,9 +1896,6 @@ ResidentPresent ResidentPresentable(const Graphics::Context& context, const Grap
     return ResidentPresentPath(format, buffer.pixelFormat, blitSource);
 }
 
-// The resident image a display buffer is presented from, or null; `pending` tells a buffer without
-// a pending image from one whose image is unsuitable, `convert` whether it presents through the
-// conversion (ResidentPresent::Convert).
 std::shared_ptr<Graphics::StorageTexture> PresentableResident(const Graphics::Context& context, const DisplayBuffer& buffer, VkFilter& filter, bool& pending, bool& convert) {
     auto resident = Graphics::StorageTexture::FindPending(buffer.address, DisplayBufferSize(buffer));
     pending = resident != nullptr;
@@ -2136,8 +2141,6 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
         } else {
             if (display != nullptr) {
-                // The texels in DisplayTexelFormat's order: red in the low bits (R8G8B8A8 base) is
-                // swapped for the B8G8R8A8 swapchain; the 10-bit variant drops each channel's low bits.
                 state->colorTransfer->Detile(commands, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat));
             }
             state->scaler->RecordUpload(commands, display != nullptr ? state->colorTransfer->LinearBuffer() : state->uploadBuffer);

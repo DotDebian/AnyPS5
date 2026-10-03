@@ -553,6 +553,7 @@ struct AvPlayerFrameInfo {
     std::uint64_t timestamp;
     AvPlayerStreamDetails details;
 };
+static_assert(sizeof(AvPlayerFrameInfo) == 40 && offsetof(AvPlayerFrameInfo, timestamp) == 16);
 
 struct AvPlayerStreamInfo {
     std::uint32_t type;
@@ -560,7 +561,7 @@ struct AvPlayerStreamInfo {
     AvPlayerStreamDetails details;
     std::uint64_t duration;
 };
-static_assert(sizeof(AvPlayerStreamInfo) == 0x20);
+static_assert(sizeof(AvPlayerStreamInfo) == 32);
 
 struct AvPlayerAudioEx {
     std::uint16_t channel_count;
@@ -587,6 +588,8 @@ struct AvPlayerVideoEx {
     bool video_full_range_flag;
     std::uint8_t reserved1[37];
 };
+static_assert(sizeof(AvPlayerVideoEx) == 80);
+static_assert(offsetof(AvPlayerVideoEx, crop_left_offset) == 20 && offsetof(AvPlayerVideoEx, pitch) == 36);
 
 struct AvPlayerTimedTextEx {
     std::uint8_t language_code[4];
@@ -607,6 +610,17 @@ struct AvPlayerFrameInfoEx {
     std::uint64_t timestamp;
     AvPlayerStreamDetailsEx details;
 };
+static_assert(sizeof(AvPlayerFrameInfoEx) == 104 && offsetof(AvPlayerFrameInfoEx, details) == 24);
+
+struct AvPlayerStreamInfoEx {
+    std::uint64_t this_size;
+    std::uint32_t type;
+    std::uint8_t reserved[4];
+    AvPlayerStreamDetailsEx details;
+    std::uint64_t duration;
+};
+static_assert(sizeof(AvPlayerStreamInfoEx) == 104);
+static_assert(offsetof(AvPlayerStreamInfoEx, details) == 16 && offsetof(AvPlayerStreamInfoEx, duration) == 96);
 
 using AvPlayerAllocate = void* (APS5_VABI*)(void*, std::uint32_t, std::uint32_t);
 using AvPlayerDeallocate = void (APS5_VABI*)(void*, void*);
@@ -1468,6 +1482,34 @@ struct ContentExportInitParam2 {
 
 struct ContentSearchInitParam { std::size_t memory_size; };
 
+struct PngEncCreateParam {
+    std::uint32_t this_size;
+    std::uint32_t attribute;
+    std::uint32_t max_image_width;
+    std::uint32_t max_filter_number;
+};
+
+struct PngEncEncodeParam {
+    const std::uint8_t* image_mem_addr;
+    std::uint8_t* png_mem_addr;
+    std::uint32_t image_mem_size;
+    std::uint32_t png_mem_size;
+    std::uint32_t image_width;
+    std::uint32_t image_height;
+    std::uint32_t image_pitch;
+    std::uint16_t pixel_format;
+    std::uint16_t color_space;
+    std::uint16_t bit_depth;
+    std::uint16_t clut_number;
+    std::uint16_t filter_type;
+    std::uint16_t compression_level;
+};
+
+struct PngEncOutputInfo {
+    std::uint32_t data_size;
+    std::uint32_t processed_height;
+};
+
 struct ContentDeleteInitParam {
     char reserved1[4];
     std::size_t heap_size;
@@ -1530,6 +1572,35 @@ struct JpegEncOutputInfo {
     std::uint32_t height;
 };
 
+struct JpegDecCreateParam {
+    std::uint32_t size;
+    std::uint32_t attribute;
+};
+
+struct JpegDecParseParam {
+    const void* jpeg_mem_addr;
+    std::uint32_t jpeg_mem_size;
+    std::uint32_t reserved0;
+};
+
+struct JpegDecDecodeParam {
+    const void* jpeg_mem_addr;
+    void* image_mem_addr;
+    std::uint32_t jpeg_mem_size;
+    std::uint32_t image_mem_size;
+    std::uint16_t pixel_format;
+    std::uint16_t reserved0;
+    std::uint32_t image_pitch;
+};
+
+struct JpegDecImageInfo {
+    std::uint32_t image_width;
+    std::uint32_t image_height;
+    std::uint16_t color_space;
+    std::uint16_t bit_depth;
+    std::uint32_t image_flag;
+};
+
 struct PlayGoInitParams {
     const void* buf_addr;
     std::uint32_t buf_size;
@@ -1551,6 +1622,11 @@ union PlayGoOptionalChunk {
     std::uint64_t bitmask;
     std::uint64_t languages;
     std::uint64_t scenarios;
+};
+
+struct PlayGoDialogResult {
+    std::int32_t result;
+    std::int32_t reserved[9];
 };
 
 using RudpEventHandler = void (*)(int ctx_id, int event_id, int error_code, void* arg);

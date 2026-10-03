@@ -3,6 +3,7 @@
 #include <limits>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
 #include "prx/libkernel/File/include/NativeStat.hpp"
@@ -153,6 +154,7 @@ int APS5_VABI chmod_nid_postfix(const char* path, int mode) {
 int APS5_VABI close_nid_postfix(int d) {
     if (d >= GuestSockets::FirstDescriptor) return GuestSockets::Close(d);
 #ifdef _WIN32
+    File::ForgetDirectoryDescriptor(d);
     return _close(d);
 #else
     return ::close(d);
@@ -260,7 +262,9 @@ int64_t APS5_VABI pread_nid_postfix(int d, void* buf, size_t nbytes, int64_t off
     if (offset < 0) {
         APS5_INVALID_ARG_EX;
     }
-    auto n = NativePread(d, buf, nbytes, offset);
+    const GuestArena::HostWrite destination(buf, nbytes);
+    if (!destination.Open()) errno = EFAULT;
+    auto n = destination.Open() ? NativePread(d, buf, nbytes, offset) : -1;
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": pread failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
     }
@@ -327,8 +331,7 @@ int APS5_VABI sceKernelGetdirentries(int fd, char* buf, int nbytes, int64_t* bas
     if (buf == nullptr) return SceErrorFromErrno(GUEST_EFAULT);
     if (nbytes <= 0) return SceErrorFromErrno(GUEST_EINVAL);
     if (basep != nullptr) *basep = 0;
-    const int written = File::ReadDirectoryDescriptor(fd, buf, nbytes);
-    return written < 0 ? SceErrorFromErrno(GUEST_ENOTDIR) : written;
+    return File::ReadDirectoryDescriptor(fd, buf, nbytes);
 }
 
 int APS5_VABI sceKernelGetdents(int fd, char* buf, int nbytes) {
@@ -409,6 +412,8 @@ int64_t APS5_VABI sceKernelPwrite(int d, const void* buf, size_t nbytes, int64_t
 int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset) {
     if (buf == nullptr && nbytes != 0) return SceErrorFromErrno(GUEST_EFAULT);
     if (offset < 0) return SceErrorFromErrno(GUEST_EINVAL);
+    const GuestArena::HostWrite destination(buf, nbytes);
+    if (!destination.Open()) return SceErrorFromErrno(GUEST_EFAULT);
     const auto result = NativePread(d, buf, nbytes, offset);
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }

@@ -309,6 +309,7 @@ void encodeResult(Writer& writer, const RecompileResult& result) {
         out.Value(parameter.sourceLocation);
         out.Value(parameter.flat);
         out.Value(parameter.perVertex);
+        out.Value(parameter.custom);
     });
     writer.Value(static_cast<std::uint8_t>(result.waveLayout));
     writer.Value(result.workgroupReserveBytes);
@@ -343,6 +344,7 @@ void decodeResult(Reader& reader, RecompileResult& result) {
         in.Value(parameter.sourceLocation);
         in.Value(parameter.flat);
         in.Value(parameter.perVertex);
+        in.Value(parameter.custom);
     });
     const auto waveLayout = reader.Get<std::uint8_t>();
     result.waveLayout = waveLayout <= static_cast<std::uint8_t>(WaveLayout::SingleLane) ? static_cast<WaveLayout>(waveLayout) : WaveLayout::Auto;

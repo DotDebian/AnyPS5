@@ -35,7 +35,6 @@ enum class StageInputKind {
     GlobalInvocationId,
     DispatchThreadLimit,
     Parameter,
-    // A fragment invocation the rasterizer added to complete a quad (gl_HelperInvocation).
     HelperInvocation,
 };
 

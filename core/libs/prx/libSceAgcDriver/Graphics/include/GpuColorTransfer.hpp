@@ -22,8 +22,6 @@ public:
 private:
     void prepare(std::uint32_t width, std::uint32_t height, ColorTileMode mode);
     void convert(VkCommandBuffer commands, bool toTiled, bool swapRedBlue, bool tenBit = false);
-    // The conversion dispatch over the device-local buffers, with its barriers; `tiledSource`: the
-    // source words are in the surface's tiling (else row order).
     void dispatch(VkCommandBuffer commands, bool toTiled, bool swapRedBlue, bool tenBit, bool tiledSource);
     void release() noexcept;
     Context context;

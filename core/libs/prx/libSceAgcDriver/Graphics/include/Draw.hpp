@@ -18,17 +18,6 @@ namespace AgcDriver::Graphics {
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 
-// A draw's index or vertex input: a copy of guest memory taken when the draw is recorded. The draws
-// of a frame read the same ranges again (static meshes, shared quads), so with a recorder the copy
-// is kept in its draw snapshot cache and bound again while the guest bytes are provably unchanged
-// since it was taken (Recorder::ReusableDrawSnapshot: the write tracker's UnchangedSince on the
-// collect made right before the copy, which a CPU store, a driver or GPU store stamped by
-// MarkWritten, or an import window's maybe-written stamp all fail, and an unchanged allocation
-// registry). As GuestMemory::Read does, the flush hook runs first, so pending GPU results over the
-// range are stored (and stamped) before the check; unwatched memory (a collect of 0) is copied every
-// time. `derived` is the value KeepDrawInput stored with a reused copy (an index buffer's highest
-// index). The caller checks the range's access first, as before. APS5_NO_DRAW_INPUT_REUSE=1 (or no
-// recorder) copies for every draw.
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;
     bool reused = false;
@@ -37,7 +26,6 @@ struct DrawInputCopy {
     std::uint64_t registryGeneration = 0;
 };
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
-// Offers a fresh copy (not a reused one) to the cache with `derived`, computed from its bytes.
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
 
 // The raw V# of a mesh-stage draw's index buffer, which the driver places in the program's hidden

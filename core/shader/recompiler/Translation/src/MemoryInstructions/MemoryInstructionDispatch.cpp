@@ -17,7 +17,12 @@ bool TranslationContext::emitMemory(const RdnaInstruction& inst) {
     case RdnaOpcode::BufferGl1Inv:
         emitControlNop();
         return true;
-
+    case RdnaOpcode::SMemtime:
+        writeU32Pair(inst.destination, extractU64(IrU64(ir.Emit(IrOpcode::ShaderClock, IrType::U64, {}))));
+        return true;
+    case RdnaOpcode::SMemrealtime:
+        writeU32Pair(inst.destination, extractU64(IrU64(ir.Emit(IrOpcode::RealtimeClock, IrType::U64, {}))));
+        return true;
     case RdnaOpcode::SLoadDword:
     case RdnaOpcode::SLoadDwordx2:
     case RdnaOpcode::SLoadDwordx4:
@@ -157,9 +162,42 @@ bool TranslationContext::emitMemory(const RdnaInstruction& inst) {
         return dsAtomic(inst, IrOpcode::SharedAtomicSwap32, true);
 
     case RdnaOpcode::DsMinF32:
-        return dsMinmaxF32(inst, IrOpcode::SharedAtomicFMin32);
+        return dsAtomic(inst, IrOpcode::SharedAtomicFMin32, false);
+    case RdnaOpcode::DsMinRtnF32:
+        return dsAtomic(inst, IrOpcode::SharedAtomicFMin32, true);
     case RdnaOpcode::DsMaxF32:
-        return dsMinmaxF32(inst, IrOpcode::SharedAtomicFMax32);
+        return dsAtomic(inst, IrOpcode::SharedAtomicFMax32, false);
+    case RdnaOpcode::DsMaxRtnF32:
+        return dsAtomic(inst, IrOpcode::SharedAtomicFMax32, true);
+    case RdnaOpcode::DsRsubU32:
+        return dsAtomic(inst, IrOpcode::SharedAtomicRsub32, false);
+    case RdnaOpcode::DsRsubRtnU32:
+        return dsAtomic(inst, IrOpcode::SharedAtomicRsub32, true);
+    case RdnaOpcode::DsIncU32:
+        return dsAtomic(inst, IrOpcode::SharedAtomicInc32, false);
+    case RdnaOpcode::DsDecU32:
+        return dsAtomic(inst, IrOpcode::SharedAtomicDec32, false);
+    case RdnaOpcode::DsAddF32:
+        return dsAtomic(inst, IrOpcode::SharedAtomicFAdd32, false);
+    case RdnaOpcode::DsAddRtnF32:
+        return dsAtomic(inst, IrOpcode::SharedAtomicFAdd32, true);
+    case RdnaOpcode::DsMskorB32:
+        return dsAtomic2(inst, IrOpcode::SharedAtomicMskor32, false);
+    case RdnaOpcode::DsMskorRtnB32:
+        return dsAtomic2(inst, IrOpcode::SharedAtomicMskor32, true);
+    case RdnaOpcode::DsCmpstB32:
+        return dsAtomic2(inst, IrOpcode::SharedAtomicCmpst32, false);
+    case RdnaOpcode::DsCmpstRtnB32:
+        return dsAtomic2(inst, IrOpcode::SharedAtomicCmpst32, true);
+    case RdnaOpcode::DsCmpstF32:
+        return dsAtomic2(inst, IrOpcode::SharedAtomicCmpstF32, false);
+    case RdnaOpcode::DsCmpstRtnF32:
+        return dsAtomic2(inst, IrOpcode::SharedAtomicCmpstF32, true);
+    case RdnaOpcode::DsWrapRtnB32:
+        return dsAtomic2(inst, IrOpcode::SharedAtomicWrap32, true);
+    case RdnaOpcode::DsNop:
+        emitControlNop();
+        return true;
     case RdnaOpcode::DsSwizzleB32:
         return dsSwizzleB32(inst);
     case RdnaOpcode::DsBpermuteB32:
@@ -205,6 +243,31 @@ bool TranslationContext::emitMemory(const RdnaInstruction& inst) {
 
     case RdnaOpcode::ImageSample:
     case RdnaOpcode::ImageSampleLz:
+    case RdnaOpcode::ImageSampleBCl:
+    case RdnaOpcode::ImageSampleBClO:
+    case RdnaOpcode::ImageSampleBO:
+    case RdnaOpcode::ImageSampleC:
+    case RdnaOpcode::ImageSampleCB:
+    case RdnaOpcode::ImageSampleCBCl:
+    case RdnaOpcode::ImageSampleCBClO:
+    case RdnaOpcode::ImageSampleCBO:
+    case RdnaOpcode::ImageSampleCCl:
+    case RdnaOpcode::ImageSampleCClO:
+    case RdnaOpcode::ImageSampleCD:
+    case RdnaOpcode::ImageSampleCDCl:
+    case RdnaOpcode::ImageSampleCDClO:
+    case RdnaOpcode::ImageSampleCDO:
+    case RdnaOpcode::ImageSampleCL:
+    case RdnaOpcode::ImageSampleCLzO:
+    case RdnaOpcode::ImageSampleCLO:
+    case RdnaOpcode::ImageSampleCO:
+    case RdnaOpcode::ImageSampleCl:
+    case RdnaOpcode::ImageSampleClO:
+    case RdnaOpcode::ImageSampleD:
+    case RdnaOpcode::ImageSampleDCl:
+    case RdnaOpcode::ImageSampleDO:
+    case RdnaOpcode::ImageSampleLzO:
+    case RdnaOpcode::ImageSampleO:
         return imageSample(inst);
     case RdnaOpcode::ImageGather4Lz:
     case RdnaOpcode::ImageGather4C:
@@ -213,6 +276,24 @@ bool TranslationContext::emitMemory(const RdnaInstruction& inst) {
     case RdnaOpcode::ImageGather4CO:
     case RdnaOpcode::ImageGather4CLzO:
     case RdnaOpcode::ImageGather4h:
+    case RdnaOpcode::ImageGather4:
+    case RdnaOpcode::ImageGather4B:
+    case RdnaOpcode::ImageGather4BCl:
+    case RdnaOpcode::ImageGather4BClO:
+    case RdnaOpcode::ImageGather4BO:
+    case RdnaOpcode::ImageGather4Cl:
+    case RdnaOpcode::ImageGather4ClO:
+    case RdnaOpcode::ImageGather4CB:
+    case RdnaOpcode::ImageGather4CBCl:
+    case RdnaOpcode::ImageGather4CBClO:
+    case RdnaOpcode::ImageGather4CBO:
+    case RdnaOpcode::ImageGather4CCl:
+    case RdnaOpcode::ImageGather4CClO:
+    case RdnaOpcode::ImageGather4CL:
+    case RdnaOpcode::ImageGather4CLO:
+    case RdnaOpcode::ImageGather4L:
+    case RdnaOpcode::ImageGather4LO:
+    case RdnaOpcode::ImageGather4O:
         return imageGather(inst);
     case RdnaOpcode::ImageAtomicSwap:
         return imageAtomic(inst, IrOpcode::ImageAtomicSwap32);

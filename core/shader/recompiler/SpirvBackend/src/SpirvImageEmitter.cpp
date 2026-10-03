@@ -288,8 +288,7 @@ std::uint32_t ResultVector(SpirvValueEmitContext& ctx, const ImageEmitAccess& ac
             } else {
                 const auto pair = state.module.AllocateId();
                 state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, low, high);
-                packed[word] = state.module.AllocateId();
-                state.module.AddFunction(spv::OpExtInst, TypeU32(state), packed[word], GlslStd450(state), GLSLstd450PackHalf2x16, pair);
+                packed[word] = EmitPackHalf2x16(state, pair);
             }
         }
         const auto result = state.module.AllocateId();
@@ -801,8 +800,6 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
             minLod = clamp;
         }
     }
-    // A texel offset the address holds as a constant is a ConstOffset; one the guest computed is an
-    // Offset, which Vulkan takes on a sampling instruction only with maintenance8.
     const auto constantOffset = [&]() -> const IrValue* {
         const auto component = GetRdnaImageAddressComponentLayout(mem.imageSampleFlags, setup.layout.offset);
         const auto argument = component.bitOffset / 32u;
@@ -817,7 +814,7 @@ void EmitSampleOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, con
         }
         state.module.EmitCapability(spv::CapabilityImageGatherExtended);
         operandMask |= spv::ImageOperandsOffsetMask;
-        operands.push_back(PackedOffset(ctx, access, setup.layout));
+        operands.insert(operands.end() - ((operandMask & spv::ImageOperandsMinLodMask) != 0u ? 1 : 0), PackedOffset(ctx, access, setup.layout));
     } else if (setup.layout.offset != NoImageComponent) {
         const auto bits = constantOffset()->ImmediateU32();
         std::array<std::uint32_t, 3> values{};

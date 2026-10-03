@@ -4,8 +4,6 @@
 #include "prx/libSceAvPlayer/include/AvPlayer.hpp"
 #include "prx/libc/include/General.hpp"
 
-#if APS5_HAVE_FFMPEG
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -139,7 +137,7 @@ public:
     double Now() const {
         if (!running || paused) return base;
         const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - wall;
-        return base + elapsed.count() * speed / NormalSpeed;
+        return std::max(0.0, base + elapsed.count() * speed / NormalSpeed);
     }
 
     void Rebase(double milliseconds) {
@@ -177,13 +175,14 @@ private:
     bool paused = false;
 };
 
-enum class PacketKind { Data, Flush, Drain, End };
+enum class PacketKind { Data, Flush, Drain, End, Reopen };
 
 struct PacketItem {
     PacketKind kind = PacketKind::Data;
     AVPacket* packet = nullptr;
     std::uint64_t epoch = 0;
     std::uint64_t skipBefore = 0;
+    int stream = -1;
 };
 
 struct Frame {
@@ -194,7 +193,8 @@ struct Frame {
 };
 
 struct Decoder {
-    int stream = -1;
+    std::atomic<int> stream = -1;
+    int switchTo = -1;
     bool video = false;
     AVCodecContext* context = nullptr;
     std::deque<PacketItem> packets;
@@ -242,7 +242,8 @@ public:
             format->pb = replacement->Context();
             format->flags |= AVFMT_FLAG_CUSTOM_IO;
         } else {
-            url = ResolvePath_nid_no_patch(path.c_str()).string();
+            const auto resolved = ResolvePath_nid_no_patch(path.c_str()).u8string();
+            url = "file:" + std::string(resolved.begin(), resolved.end());
         }
         if (const int error = avformat_open_input(&format, replacement ? nullptr : url.c_str(), nullptr, nullptr); error < 0) {
             char reason[AV_ERROR_MAX_STRING_SIZE]{};
@@ -254,7 +255,7 @@ public:
         for (unsigned index = 0; index < format->nb_streams; ++index) {
             const auto* stream = format->streams[index];
             if (!IsStreamSupported(*stream)) continue;
-            streams.push_back({static_cast<int>(index), createStreamInfo(*stream)});
+            streams.push_back({static_cast<int>(index), createStreamInfo(*stream), createStreamInfoEx(*stream)});
         }
         for (const auto& stream : streams) duration = std::max(duration, stream.info.duration);
         return true;
@@ -265,6 +266,12 @@ public:
     bool GetStreamInfo(std::uint32_t index, AvPlayerStreamInfo& info) const override {
         if (index >= streams.size()) return false;
         info = streams[index].info;
+        return true;
+    }
+
+    bool GetStreamInfoEx(std::uint32_t index, AvPlayerStreamInfoEx& info) const override {
+        if (index >= streams.size()) return false;
+        info = streams[index].infoEx;
         return true;
     }
 
@@ -284,6 +291,31 @@ public:
         return true;
     }
 
+    bool ChangeStream(std::uint32_t from, std::uint32_t to) override {
+        if (from >= streams.size() || to >= streams.size()) return false;
+        const auto& current = streams[from];
+        const auto& next = streams[to];
+        if (current.info.type != next.info.type) return false;
+        auto& decoder = current.info.type == StreamTypeVideo ? video : audio;
+        const auto* parameters = format->streams[next.stream]->codecpar;
+        {
+            std::lock_guard lock(mutex);
+            const int active = decoder.switchTo >= 0 ? decoder.switchTo : decoder.stream.load();
+            if (active != current.stream) return false;
+            if (current.stream == next.stream) return true;
+            if (!started) {
+                decoder.stream = next.stream;
+                return true;
+            }
+            if (decoder.video && (AlignUp(static_cast<std::uint32_t>(parameters->width), VideoPitchAlignment) > pitch || AlignUp(static_cast<std::uint32_t>(parameters->height), VideoHeightAlignment) > bufferHeight)) return false;
+            if (!decoder.video && (parameters->ch_layout.nb_channels <= 0 || parameters->ch_layout.nb_channels > static_cast<int>(AudioMaxChannels))) return false;
+            decoder.switchTo = next.stream;
+            if (!reposition) reposition = Reposition{clockMillis(), false};
+        }
+        condition.notify_all();
+        return true;
+    }
+
     int Start() override {
         if (video.stream < 0 && audio.stream < 0) return SCE_AVPLAYER_ERROR_OPERATION_FAILED;
         for (auto* decoder : {&video, &audio}) {
@@ -300,7 +332,7 @@ public:
         {
             std::lock_guard lock(mutex);
             stopping = false;
-            jumpTarget.reset();
+            reposition.reset();
             demuxEnded = false;
             demuxEpoch = 1;
             minEpoch = 1;
@@ -310,6 +342,7 @@ public:
             lastPresented = 0;
             presentationClock.Reset(static_cast<double>(start));
             for (auto* decoder : {&video, &audio}) {
+                decoder->switchTo = -1;
                 decoder->epoch = 1;
                 decoder->skipBefore = start;
                 decoder->seamless = false;
@@ -336,6 +369,10 @@ public:
             if (decoder->thread.joinable()) decoder->thread.join();
         }
         releaseDecoders();
+        for (auto* decoder : {&video, &audio}) {
+            if (decoder->switchTo >= 0) decoder->stream = decoder->switchTo;
+            decoder->switchTo = -1;
+        }
         started = false;
         paused = false;
     }
@@ -359,7 +396,7 @@ public:
                 startOffset = milliseconds;
                 return;
             }
-            jumpTarget = milliseconds;
+            reposition = Reposition{milliseconds, true};
         }
         condition.notify_all();
     }
@@ -367,10 +404,15 @@ public:
     void SetLooping(bool enabled) override { looping = enabled; }
 
     void SetSpeed(std::int32_t percent) override {
-        std::lock_guard lock(mutex);
-        speed = percent;
-        presentationClock.SetSpeed(percent);
-        if (percent != NormalSpeed) audioDriving = false;
+        {
+            std::lock_guard lock(mutex);
+            const bool forwardAgain = speed < 0 && percent > 0;
+            speed = percent;
+            presentationClock.SetSpeed(percent);
+            if (percent != NormalSpeed) audioDriving = false;
+            if (forwardAgain && started && !reposition) reposition = Reposition{clockMillis(), false};
+        }
+        condition.notify_all();
     }
 
     void SetSyncMode(std::uint32_t mode) override { syncMode = mode; }
@@ -414,15 +456,12 @@ public:
 
     std::uint64_t CurrentTime() override {
         std::lock_guard lock(mutex);
-        if (!started) return 0;
-        const auto now = std::max(0.0, presentationClock.Now());
-        const auto milliseconds = static_cast<std::uint64_t>(now);
-        return duration != 0 ? std::min(milliseconds, duration) : milliseconds;
+        return clockMillis();
     }
 
     bool Finished() override {
         std::lock_guard lock(mutex);
-        if (!started || !demuxEnded || jumpTarget) return false;
+        if (!started || !demuxEnded || reposition) return false;
         for (const auto* decoder : {&video, &audio}) {
             if (decoder->stream < 0) continue;
             if (!decoder->ended || !decoder->packets.empty()) return false;
@@ -437,10 +476,23 @@ private:
     struct StreamEntry {
         int stream;
         AvPlayerStreamInfo info;
+        AvPlayerStreamInfoEx infoEx;
     };
 
+    struct Reposition {
+        std::uint64_t target;
+        bool announce;
+        bool operator==(const Reposition&) const = default;
+    };
+
+    std::uint64_t clockMillis() const {
+        if (!started) return 0;
+        const auto milliseconds = static_cast<std::uint64_t>(presentationClock.Now());
+        return duration != 0 ? std::min(milliseconds, duration) : milliseconds;
+    }
+
     bool takeVideo(AvPlayerFrameInfoEx& info) {
-        if (!started || paused || video.stream < 0) return false;
+        if (!started || paused || video.stream < 0 || speed < 0) return false;
         if (speed != NormalSpeed) dropLateAudio();
         auto& frames = video.frames;
         const bool synced = syncMode == SyncModeDefault;
@@ -499,8 +551,38 @@ private:
         return info;
     }
 
-    int openDecoder(Decoder& decoder) {
-        const auto* stream = format->streams[decoder.stream];
+    AvPlayerStreamInfoEx createStreamInfoEx(const AVStream& stream) const {
+        const auto basic = createStreamInfo(stream);
+        AvPlayerStreamInfoEx info{};
+        info.type = basic.type;
+        info.duration = basic.duration;
+        const auto* parameters = stream.codecpar;
+        if (info.type == StreamTypeVideo) {
+            auto& picture = info.details.video;
+            const auto width = static_cast<std::uint32_t>(parameters->width);
+            const auto height = static_cast<std::uint32_t>(parameters->height);
+            const auto streamPitch = AlignUp(width, VideoPitchAlignment);
+            picture.width = basic.details.video.width;
+            picture.height = basic.details.video.height;
+            picture.aspect_ratio = basic.details.video.aspect_ratio;
+            std::memcpy(picture.language_code, basic.details.video.language_code, sizeof(picture.language_code));
+            picture.crop_right_offset = streamPitch - width;
+            picture.crop_bottom_offset = picture.height - height;
+            picture.pitch = streamPitch;
+            picture.luma_bit_depth = 8;
+            picture.chroma_bit_depth = 8;
+            picture.video_full_range_flag = parameters->color_range == AVCOL_RANGE_JPEG;
+        } else {
+            auto& sound = info.details.audio;
+            sound.channel_count = basic.details.audio.channel_count;
+            sound.sample_rate = basic.details.audio.sample_rate;
+            std::memcpy(sound.language_code, basic.details.audio.language_code, sizeof(sound.language_code));
+        }
+        return info;
+    }
+
+    int openContext(Decoder& decoder, int index) {
+        const auto* stream = format->streams[index];
         const auto* codec = avcodec_find_decoder(stream->codecpar->codec_id);
         if (!codec) return SCE_AVPLAYER_ERROR_NOT_SUPPORTED;
         decoder.context = avcodec_alloc_context3(codec);
@@ -509,6 +591,11 @@ private:
         decoder.context->pkt_timebase = stream->time_base;
         if (decoder.video) decoder.context->thread_count = static_cast<int>(std::clamp(std::thread::hardware_concurrency(), 1u, 4u));
         if (avcodec_open2(decoder.context, codec, nullptr) < 0) return SCE_AVPLAYER_ERROR_OPERATION_FAILED;
+        return SCE_OK;
+    }
+
+    int openDecoder(Decoder& decoder) {
+        if (const int result = openContext(decoder, decoder.stream); result != SCE_OK) return result;
         std::uint32_t count = 0;
         bool texture = false;
         std::uint32_t alignment = 0;
@@ -626,19 +713,19 @@ private:
         AVPacket* packet = av_packet_alloc();
         bool ended = false;
         for (;;) {
-            std::optional<std::uint64_t> requested;
+            std::optional<Reposition> requested;
             {
                 std::unique_lock lock(mutex);
-                condition.wait(lock, [&] { return stopping || jumpTarget.has_value() || (!ended && !demuxerSaturated()); });
+                condition.wait(lock, [&] { return stopping || reposition.has_value() || (!ended && !demuxerSaturated()); });
                 if (stopping) break;
-                requested = jumpTarget;
+                requested = reposition;
             }
             if (requested) {
-                seek(*requested);
+                seek(requested->target);
                 {
                     std::lock_guard lock(mutex);
-                    if (jumpTarget == requested) jumpTarget.reset();
-                    presentationClock.Rebase(static_cast<double>(*requested));
+                    if (reposition == requested) reposition.reset();
+                    presentationClock.Rebase(static_cast<double>(requested->target));
                     ++demuxEpoch;
                     minEpoch = demuxEpoch;
                     for (auto* decoder : {&video, &audio}) {
@@ -648,12 +735,18 @@ private:
                         decoder->queuedBytes = 0;
                         while (!decoder->frames.empty()) recycleFront(*decoder);
                     }
-                    pushAll(PacketKind::Flush, demuxEpoch, *requested);
+                    for (auto* decoder : {&video, &audio}) {
+                        if (decoder->switchTo < 0) continue;
+                        decoder->stream = decoder->switchTo;
+                        decoder->packets.push_back({PacketKind::Reopen, nullptr, demuxEpoch, 0, decoder->switchTo});
+                        decoder->switchTo = -1;
+                    }
+                    pushAll(PacketKind::Flush, demuxEpoch, requested->target);
                     demuxEnded = false;
                     audioDriving = false;
                 }
                 condition.notify_all();
-                events.OnWarning(SCE_AVPLAYER_ERROR_WAR_JUMP_COMPLETE);
+                if (requested->announce) events.OnWarning(SCE_AVPLAYER_ERROR_WAR_JUMP_COMPLETE);
                 ended = false;
                 continue;
             }
@@ -713,6 +806,7 @@ private:
             }
             switch (item.kind) {
             case PacketKind::Data:
+                if (!decoder.context) break;
                 for (;;) {
                     const int result = avcodec_send_packet(decoder.context, item.packet);
                     if (result == AVERROR(EAGAIN) && receiveFrames(decoder, frame)) continue;
@@ -721,8 +815,15 @@ private:
                     break;
                 }
                 break;
+            case PacketKind::Reopen:
+                avcodec_free_context(&decoder.context);
+                if (openContext(decoder, item.stream) != SCE_OK) {
+                    avcodec_free_context(&decoder.context);
+                    events.OnError();
+                }
+                break;
             case PacketKind::Flush: {
-                avcodec_flush_buffers(decoder.context);
+                if (decoder.context) avcodec_flush_buffers(decoder.context);
                 std::lock_guard lock(mutex);
                 decoder.epoch = item.epoch;
                 decoder.skipBefore = item.skipBefore;
@@ -732,9 +833,11 @@ private:
             }
             case PacketKind::Drain:
             case PacketKind::End: {
-                avcodec_send_packet(decoder.context, nullptr);
-                receiveFrames(decoder, frame);
-                avcodec_flush_buffers(decoder.context);
+                if (decoder.context) {
+                    avcodec_send_packet(decoder.context, nullptr);
+                    receiveFrames(decoder, frame);
+                    avcodec_flush_buffers(decoder.context);
+                }
                 std::lock_guard lock(mutex);
                 if (item.kind == PacketKind::End) {
                     decoder.ended = true;
@@ -792,8 +895,8 @@ private:
     }
 
     bool deliverVideo(Decoder& decoder, const AVFrame& frame) {
-        const auto* stream = format->streams[decoder.stream];
-        const auto timestamp = FrameMillis(frame, stream->time_base);
+        const int index = decoder.stream;
+        const auto timestamp = FrameMillis(frame, format->streams[index]->time_base);
         std::uint64_t epoch = 0;
         std::uint64_t skipBefore = 0;
         bool seamless = false;
@@ -840,7 +943,7 @@ private:
         info.details.video.width = alignedWidth;
         info.details.video.height = alignedHeight;
         info.details.video.aspect_ratio = DisplayAspect(frame.width, frame.height, frame.sample_aspect_ratio);
-        std::memcpy(info.details.video.language_code, streamLanguage(decoder), sizeof(info.details.video.language_code));
+        std::memcpy(info.details.video.language_code, streamLanguage(index), sizeof(info.details.video.language_code));
         info.details.video.crop_left_offset = static_cast<std::uint32_t>(frame.crop_left);
         info.details.video.crop_right_offset = static_cast<std::uint32_t>(frame.crop_right) + pitch - width;
         info.details.video.crop_top_offset = static_cast<std::uint32_t>(frame.crop_top);
@@ -854,8 +957,8 @@ private:
     }
 
     bool deliverAudio(Decoder& decoder, const AVFrame& frame) {
-        const auto* stream = format->streams[decoder.stream];
-        const auto timestamp = FrameMillis(frame, stream->time_base);
+        const int index = decoder.stream;
+        const auto timestamp = FrameMillis(frame, format->streams[index]->time_base);
         const auto channels = frame.ch_layout.nb_channels;
         if (channels <= 0 || channels > static_cast<int>(AudioMaxChannels) || frame.sample_rate <= 0) {
             events.OnError();
@@ -900,15 +1003,15 @@ private:
             chunk.info.details.audio.channel_count = static_cast<std::uint16_t>(channels);
             chunk.info.details.audio.sample_rate = static_cast<std::uint32_t>(frame.sample_rate);
             chunk.info.details.audio.size = size;
-            std::memcpy(chunk.info.details.audio.language_code, streamLanguage(decoder), sizeof(chunk.info.details.audio.language_code));
+            std::memcpy(chunk.info.details.audio.language_code, streamLanguage(index), sizeof(chunk.info.details.audio.language_code));
             publish(decoder, chunk);
         }
         return true;
     }
 
-    const std::uint8_t* streamLanguage(const Decoder& decoder) const {
+    const std::uint8_t* streamLanguage(int index) const {
         for (const auto& stream : streams) {
-            if (stream.stream != decoder.stream) continue;
+            if (stream.stream != index) continue;
             return reinterpret_cast<const std::uint8_t*>(stream.info.type == StreamTypeVideo ? stream.info.details.video.language_code : stream.info.details.audio.language_code);
         }
         static constexpr std::uint8_t none[4]{};
@@ -934,7 +1037,7 @@ private:
     std::atomic_bool looping = false;
     std::atomic<std::uint32_t> syncMode = SyncModeDefault;
     std::int32_t speed = NormalSpeed;
-    std::optional<std::uint64_t> jumpTarget;
+    std::optional<Reposition> reposition;
     std::uint32_t demuxVideoBytes = 0;
     std::uint64_t startOffset = 0;
     std::uint64_t demuxEpoch = 0;
@@ -964,16 +1067,3 @@ std::unique_ptr<ISource> OpenSource(const SourceSettings& settings, const std::s
 }
 
 }
-
-#else
-
-namespace AvPlayer {
-
-std::unique_ptr<ISource> OpenSource(const SourceSettings&, const std::string&, ISourceEvents&) {
-    NotImplemented_nid_no_patch("sceAvPlayerAddSource (built without FFmpeg)");
-    return nullptr;
-}
-
-}
-
-#endif

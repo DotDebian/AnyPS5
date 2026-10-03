@@ -4,7 +4,6 @@
 namespace AgcDriver {
 namespace {
 
-// Bit 56 selects the 10-bit variant of the format; the R8G8B8A8 base keeps red in the low bits.
 constexpr std::uint64_t PixelFormatUnormBit = 0x0100000000000000ull;
 constexpr std::uint64_t PixelFormatR8G8B8A8 = 0x8000000022000000ull;
 

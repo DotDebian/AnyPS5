@@ -111,7 +111,6 @@ struct SpirvEmitterState {
     std::uint32_t spirvVersion = 0x00010300u;
     std::span<const std::uint32_t> supportedCapabilities;
     std::span<const std::string_view> supportedExtensions;
-    // SpirvTarget::nonConstantImageOffsets.
     bool nonConstantImageOffsets = false;
     // A bindless table's runtime slot is wave-uniform; it is uniform over the invocation group
     // only for a single-wave compute workgroup, elsewhere it needs the NonUniform decoration.

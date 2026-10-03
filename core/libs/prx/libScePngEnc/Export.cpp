@@ -1,131 +1,135 @@
-// libScePngEnc: PNG encoding of 8-bit RGBA / BGRA images with stb_image_write (public domain / MIT, 3rdparty/stb).
-// The encode parameter block is laid out by analogy with the decoder's (image address, png address, sizes, geometry,
-// pixel format); it is validated strictly and refused when it does not fit that layout.
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <cstddef>
-#include <cstdlib>
-#include <cstring>
+#include <exception>
 #include <vector>
-
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_STATIC
-#define STBI_WRITE_NO_STDIO
-#include "stb_image_write.h"
-
 #include "SceTypes.hpp"
-#include "HitLog.hpp"
 #include "prx/libc/include/General.hpp"
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
+#include "Decoder/Png.hpp"
 
 namespace {
-constexpr std::int32_t kErrInvalidAddr = static_cast<std::int32_t>(0x80690101u);
-constexpr std::int32_t kErrInvalidSize = static_cast<std::int32_t>(0x80690102u);
-constexpr std::int32_t kErrInvalidParam = static_cast<std::int32_t>(0x80690103u);
-constexpr std::int32_t kErrInvalidHandle = static_cast<std::int32_t>(0x80690104u);
-constexpr std::int32_t kErrInvalidWorkMemory = static_cast<std::int32_t>(0x80690105u);
-constexpr std::int32_t kErrEncodeError = static_cast<std::int32_t>(0x80690112u);
-constexpr std::uint64_t kContextMagic = 0x504e47454e434f44ull;  // "PNGENCOD"
-constexpr std::uint32_t kContextSize = 16;
 
-// Guessed ScePngEncEncodeParam.
-struct EncodeParam {
-    const void* imageMemAddr;
-    void* pngMemAddr;
-    std::uint32_t imageMemSize;
-    std::uint32_t pngMemSize;
-    std::uint32_t imageWidth;
-    std::uint32_t imageHeight;
-    std::uint32_t imagePitch;
-    std::uint16_t pixelFormat;
-    std::uint16_t compressionLevel;
+constexpr int PNG_ENC_ERROR_INVALID_ADDR = static_cast<int>(0x80690101);
+constexpr int PNG_ENC_ERROR_INVALID_SIZE = static_cast<int>(0x80690102);
+constexpr int PNG_ENC_ERROR_INVALID_PARAM = static_cast<int>(0x80690103);
+constexpr int PNG_ENC_ERROR_INVALID_HANDLE = static_cast<int>(0x80690104);
+constexpr int PNG_ENC_ERROR_DATA_OVERFLOW = static_cast<int>(0x80690110);
+constexpr int PNG_ENC_ERROR_FATAL = static_cast<int>(0x80690120);
+
+constexpr std::uint32_t MAX_IMAGE_WIDTH = 1000000;
+constexpr std::uint32_t MAX_IMAGE_HEIGHT = 1000000;
+constexpr std::uint32_t MAX_FILTER_NUMBER = 5;
+constexpr std::uint16_t COLOR_SPACE_RGB = 3;
+constexpr std::uint16_t COLOR_SPACE_RGBA = 19;
+constexpr std::uint16_t PIXEL_FORMAT_R8G8B8A8 = 0;
+constexpr std::uint16_t PIXEL_FORMAT_B8G8R8A8 = 1;
+constexpr std::uint16_t FILTER_SUB = 1;
+constexpr std::uint16_t FILTER_UP = 2;
+constexpr std::uint16_t FILTER_AVERAGE = 4;
+constexpr std::uint16_t FILTER_PAETH = 8;
+constexpr std::uint16_t FILTER_ALL = FILTER_SUB | FILTER_UP | FILTER_AVERAGE | FILTER_PAETH;
+constexpr std::uint64_t CONTEXT_MAGIC = 0x434E45474E505341ull;
+
+struct PngEncContext {
+    std::uint64_t magic;
+    std::uint32_t maxImageWidth;
+    std::uint32_t reserved;
 };
 
-bool Readable(const void* p, std::size_t n) {
-#ifdef _WIN32
-    if (p == nullptr) return false;
-    MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT) return false;
-    if ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
-    return reinterpret_cast<std::uintptr_t>(p) + n <= reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-#else
-    return p != nullptr;
-#endif
+static_assert(sizeof(PngEncCreateParam) == 16);
+static_assert(sizeof(PngEncEncodeParam) == 48);
+static_assert(sizeof(PngEncOutputInfo) == 8);
+
+int validateCreateParam(const PngEncCreateParam* param) {
+    if (!param) return PNG_ENC_ERROR_INVALID_ADDR;
+    if (param->attribute != 0 || param->max_filter_number > MAX_FILTER_NUMBER) return PNG_ENC_ERROR_INVALID_PARAM;
+    if (param->max_image_width == 0 || param->max_image_width > MAX_IMAGE_WIDTH) return PNG_ENC_ERROR_INVALID_SIZE;
+    return 0;
 }
-}  // namespace
+
+PngEncContext* context(void* handle) {
+    auto* ctx = static_cast<PngEncContext*>(handle);
+    return ctx && ctx->magic == CONTEXT_MAGIC ? ctx : nullptr;
+}
+
+int filterMode(std::uint16_t filterType) {
+    if (filterType == FILTER_ALL) return -1;
+    if (filterType & FILTER_SUB) return 1;
+    if (filterType & FILTER_UP) return 2;
+    if (filterType & FILTER_AVERAGE) return 3;
+    if (filterType & FILTER_PAETH) return 4;
+    return 0;
+}
+
+}
 
 extern "C" {
 
-int32_t APS5_VABI scePngEncQueryMemorySize(const void* param) {
- if (param == nullptr) return kErrInvalidParam;
- return static_cast<int32_t>(kContextSize);
+int APS5_VABI scePngEncQueryMemorySize(const PngEncCreateParam* param) {
+    if (const int result = validateCreateParam(param); result != 0) return result;
+    return sizeof(PngEncContext);
 }
-int32_t APS5_VABI scePngEncCreate(const void* param, void* memory_address, uint32_t memory_size, void** handle) {
- if (param == nullptr || handle == nullptr) return kErrInvalidParam;
- if (memory_address == nullptr) return kErrInvalidAddr;
- if (memory_size < kContextSize) return kErrInvalidWorkMemory;
- const std::uint64_t magic = kContextMagic;
- std::memset(memory_address, 0, kContextSize);
- std::memcpy(memory_address, &magic, sizeof(magic));
- *handle = memory_address;
- return 0;
+
+int APS5_VABI scePngEncCreate(const PngEncCreateParam* param, void* memoryAddress, uint32_t memorySize, void** handle) {
+    if (const int result = validateCreateParam(param); result != 0) return result;
+    if (!memoryAddress || !handle) return PNG_ENC_ERROR_INVALID_ADDR;
+    if (memorySize < sizeof(PngEncContext)) return PNG_ENC_ERROR_INVALID_SIZE;
+    *static_cast<PngEncContext*>(memoryAddress) = {CONTEXT_MAGIC, param->max_image_width, 0};
+    *handle = memoryAddress;
+    return 0;
 }
-int32_t APS5_VABI scePngEncDelete(void* handle) {
- if (handle == nullptr) return kErrInvalidHandle;
- std::uint64_t magic = 0;
- std::memcpy(&magic, handle, sizeof(magic));
- if (magic != kContextMagic) return kErrInvalidHandle;
- std::memset(handle, 0, sizeof(magic));
- return 0;
+
+int APS5_VABI scePngEncDelete(void* handle) {
+    PngEncContext* ctx = context(handle);
+    if (!ctx) return PNG_ENC_ERROR_INVALID_HANDLE;
+    ctx->magic = 0;
+    return 0;
 }
-int32_t APS5_VABI scePngEncEncode(void* handle, const void* param, void* output_info) {
- if (handle == nullptr) return kErrInvalidHandle;
- std::uint64_t magic = 0;
- std::memcpy(&magic, handle, sizeof(magic));
- if (magic != kContextMagic) return kErrInvalidHandle;
- if (param == nullptr) return kErrInvalidParam;
- if (!Readable(param, sizeof(EncodeParam))) return kErrInvalidAddr;
- const EncodeParam* p = static_cast<const EncodeParam*>(param);
- const std::uint64_t rowBytes = static_cast<std::uint64_t>(p->imageWidth) * 4;
- const std::uint64_t pitch = p->imagePitch != 0 ? p->imagePitch : rowBytes;
- const bool plausible = p->imageWidth > 0 && p->imageHeight > 0 && p->imageWidth <= 16384 && p->imageHeight <= 16384 && pitch >= rowBytes &&
-                        p->pixelFormat <= 1 && p->imageMemSize >= pitch * (p->imageHeight - 1) + rowBytes && p->pngMemSize > 64 &&
-                        Readable(p->imageMemAddr, pitch * (p->imageHeight - 1) + rowBytes) && Readable(p->pngMemAddr, p->pngMemSize);
- if (!plausible) {
-  const std::uint8_t* raw = static_cast<const std::uint8_t*>(param);
-  APS5_HIT("PNGENC", "scePngEncEncode: parameter block does not match the expected layout (%02x%02x%02x%02x%02x%02x%02x%02x ...), refusing",
-           raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
-  return kErrInvalidParam;
- }
- const std::uint8_t* src = static_cast<const std::uint8_t*>(p->imageMemAddr);
- std::vector<std::uint8_t> rgba(static_cast<std::size_t>(rowBytes) * p->imageHeight);
- for (std::uint32_t y = 0; y < p->imageHeight; ++y) {
-  const std::uint8_t* s = src + static_cast<std::size_t>(y) * pitch;
-  std::uint8_t* d = rgba.data() + static_cast<std::size_t>(y) * rowBytes;
-  for (std::uint32_t x = 0; x < p->imageWidth; ++x, s += 4, d += 4) {
-   if (p->pixelFormat == 1) { d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; }
-   else { d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; }
-   d[3] = s[3];
-  }
- }
- int len = 0;
- unsigned char* png = stbi_write_png_to_mem(rgba.data(), static_cast<int>(rowBytes), static_cast<int>(p->imageWidth), static_cast<int>(p->imageHeight), 4, &len);
- if (png == nullptr) return kErrEncodeError;
- if (static_cast<std::uint32_t>(len) > p->pngMemSize) {
-  std::free(png);
-  return kErrInvalidSize;
- }
- std::memcpy(p->pngMemAddr, png, static_cast<std::size_t>(len));
- std::free(png);
- if (output_info != nullptr && Readable(output_info, 4)) {
-  const std::uint32_t size = static_cast<std::uint32_t>(len);
-  std::memcpy(output_info, &size, 4);
- }
- APS5_HIT("PNGENC", "scePngEncEncode %ux%u -> %d bytes", p->imageWidth, p->imageHeight, len);
- return 0;
+
+int APS5_VABI scePngEncEncode(void* handle, const PngEncEncodeParam* param, PngEncOutputInfo* outputInfo) {
+    const PngEncContext* ctx = context(handle);
+    if (!ctx) return PNG_ENC_ERROR_INVALID_HANDLE;
+    if (!param) return PNG_ENC_ERROR_INVALID_PARAM;
+    if (!param->image_mem_addr || !param->png_mem_addr) return PNG_ENC_ERROR_INVALID_ADDR;
+    if ((param->pixel_format != PIXEL_FORMAT_R8G8B8A8 && param->pixel_format != PIXEL_FORMAT_B8G8R8A8)
+        || (param->color_space != COLOR_SPACE_RGB && param->color_space != COLOR_SPACE_RGBA) || param->bit_depth != 8
+        || param->clut_number != 0 || (param->filter_type & ~FILTER_ALL) != 0 || param->compression_level > 9) {
+        return PNG_ENC_ERROR_INVALID_PARAM;
+    }
+
+    const std::uint32_t width = param->image_width;
+    const std::uint32_t height = param->image_height;
+    if (width == 0 || height == 0 || width > ctx->maxImageWidth || height > MAX_IMAGE_HEIGHT || param->png_mem_size == 0
+        || param->image_pitch < width * 4 || static_cast<std::uint64_t>(param->image_pitch) * (height - 1) + width * 4 > param->image_mem_size) {
+        return PNG_ENC_ERROR_INVALID_SIZE;
+    }
+
+    const std::uint32_t channels = param->color_space == COLOR_SPACE_RGBA ? 4 : 3;
+    const bool bgr = param->pixel_format == PIXEL_FORMAT_B8G8R8A8;
+    std::vector<std::uint8_t> pixels;
+    std::vector<std::uint8_t> png;
+    try {
+        pixels.resize(static_cast<std::size_t>(width) * height * channels);
+        std::uint8_t* destination = pixels.data();
+        for (std::uint32_t y = 0; y < height; ++y) {
+            const std::uint8_t* source = param->image_mem_addr + static_cast<std::size_t>(y) * param->image_pitch;
+            for (std::uint32_t x = 0; x < width; ++x, source += 4) {
+                *destination++ = source[bgr ? 2 : 0];
+                *destination++ = source[1];
+                *destination++ = source[bgr ? 0 : 2];
+                if (channels == 4) *destination++ = source[3];
+            }
+        }
+        png = Decoder::Png::Encode(pixels, width, height, channels, {param->compression_level, filterMode(param->filter_type)});
+    } catch (const std::exception&) {
+        return PNG_ENC_ERROR_FATAL;
+    }
+
+    const bool overflow = png.size() > param->png_mem_size;
+    if (outputInfo) *outputInfo = {overflow ? 0 : static_cast<std::uint32_t>(png.size()), overflow ? 0 : height};
+    if (overflow) return PNG_ENC_ERROR_DATA_OVERFLOW;
+    std::copy(png.begin(), png.end(), param->png_mem_addr);
+    return static_cast<int>(png.size());
 }
+
 }

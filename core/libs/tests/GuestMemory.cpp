@@ -3,10 +3,16 @@
 #include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libkernel/File/include/FileFlags.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 #include <array>
 #include "SceTypes.hpp"
+#include <chrono>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +33,8 @@ void* APS5_VABI mmap_nid_postfix(void*, std::size_t, int, int, int, std::int64_t
 int APS5_VABI munmap_nid_postfix(void*, std::size_t) noexcept;
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceKernelMapNamedFlexibleMemory(void**, std::size_t, int, int, const char*);
+int APS5_VABI sceKernelMapNamedFlexibleMemoryInternal(void**, std::size_t, int, int, const char*);
+int APS5_VABI sceKernelAvailableFlexibleMemorySize(std::size_t*);
 int APS5_VABI sceKernelMapFlexibleMemory(void**, std::size_t, int, int);
 int APS5_VABI sceKernelMunmap(void*, std::size_t);
 int APS5_VABI sceKernelMprotect(const void*, std::size_t, int);
@@ -38,6 +46,14 @@ int APS5_VABI sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64
 int APS5_VABI sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
 int APS5_VABI sceKernelReserveVirtualRange(void**, std::size_t, int, std::size_t);
 int APS5_VABI sceKernelMemoryPoolReserve(void*, std::size_t, std::size_t, int, void**);
+int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
+int APS5_VABI sceKernelClose(int);
+std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
+std::int64_t APS5_VABI sceKernelPread(int, void*, std::size_t, std::int64_t);
+int APS5_VABI sceKernelAioInitializeImpl(void*, std::int32_t);
+int APS5_VABI sceKernelAioSubmitReadCommands(KernelAioRwRequest*, std::int32_t, std::int32_t, std::int32_t*);
+int APS5_VABI sceKernelAioWaitRequest(std::int32_t, std::int32_t*, std::uint32_t*);
+int APS5_VABI sceKernelAioDeleteRequest(std::int32_t, std::int32_t*);
 }
 
 static void Require(bool condition, std::source_location location = std::source_location::current()) {
@@ -65,17 +81,39 @@ static void CheckNamedAndHintedMappings() {
     Require(sceKernelClearVirtualRangeName(first, length) == 0);
     Require(NameAt(middle)[0] == '\0');
     Require(sceKernelSetVirtualRangeName(nullptr, length, "x") != 0);
-#if defined(__linux__)
     void* hinted = first;
     Require(sceKernelMapFlexibleMemory(&hinted, length, 3, 0) == 0);
     Require(hinted > first && (reinterpret_cast<std::uintptr_t>(hinted) & 0x3fff) == 0);
+    static_cast<volatile unsigned char*>(hinted)[length - 1] = 1;
     bool rejected = false;
     void* overwrite = first;
     try { sceKernelMapFlexibleMemory(&overwrite, 0x4000, 3, 0x90); } catch (const std::exception&) { rejected = true; }
     Require(rejected && overwrite == first);
     Require(sceKernelMunmap(hinted, length) == 0);
-#endif
+    void* exclusive = hinted;
+    Require(sceKernelMapFlexibleMemory(&exclusive, length, 3, 0x90) == 0);
+    Require(exclusive == hinted);
+    static_cast<volatile unsigned char*>(exclusive)[0] = 1;
+    Require(sceKernelMunmap(exclusive, length) == 0);
     Require(sceKernelMunmap(first, length) == 0);
+}
+
+static void CheckInternalNamedFlexibleMapping() {
+    constexpr std::size_t length = 0x10000;
+    std::size_t before = 0;
+    std::size_t available = 0;
+    Require(sceKernelAvailableFlexibleMemorySize(&before) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapNamedFlexibleMemoryInternal(&mapped, length, 3, 0, "internal mapping") == 0 && mapped != nullptr);
+    Require(std::strcmp(NameAt(mapped), "internal mapping") == 0);
+    Require(sceKernelAvailableFlexibleMemorySize(&available) == 0 && available == before - length);
+    Require(sceKernelMunmap(mapped, length) == 0);
+    Require(sceKernelAvailableFlexibleMemorySize(&available) == 0 && available == before);
+    bool rejected = false;
+    void* unknown = nullptr;
+    try { sceKernelMapNamedFlexibleMemoryInternal(&unknown, length, 3, 0x8000, "internal mapping"); } catch (const std::exception&) { rejected = true; }
+    Require(rejected && unknown == nullptr);
+    Require(sceKernelAvailableFlexibleMemorySize(&available) == 0 && available == before);
 }
 
 static void CheckDirectMemoryFollowsPhysicalPages() {
@@ -274,6 +312,73 @@ static void CheckSharedWriteTracking() {
 #endif
 }
 
+static void CheckReadsIntoSharedWriteTracking() {
+#ifdef _WIN32
+    constexpr std::size_t page = 0x4000;
+    const auto path = std::filesystem::path("anyps5-tracked-read-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
+    std::vector<char> seed(page * 2);
+    for (std::size_t i = 0; i < seed.size(); ++i) seed[i] = static_cast<char>(i * 7 + 1);
+    {
+        std::ofstream stream(path, std::ios::binary);
+        stream.write(seed.data(), static_cast<std::streamsize>(seed.size()));
+    }
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2, 0, 0, &phys) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, page * 2, 3, 0, phys, 0) == 0);
+    auto* bytes = static_cast<unsigned char*>(mapped);
+    const auto collect = [&] {
+        std::array<void*, 32> pages{};
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(mapped), page * 2, pages.data(), &count, true));
+        return count;
+    };
+    const int fd = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Require(fd >= 0);
+    collect();
+    Require(collect() == 0);
+    Require(sceKernelPread(fd, mapped, page * 2, 0) == static_cast<std::int64_t>(page * 2));
+    Require(std::memcmp(bytes, seed.data(), page * 2) == 0);
+    Require(collect() == 8);
+    const int sequential = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Require(sequential >= 0);
+    Require(sceKernelRead(sequential, bytes + page, page) == static_cast<std::int64_t>(page));
+    Require(sceKernelClose(sequential) == 0);
+    Require(std::memcmp(bytes + page, seed.data(), page) == 0);
+    Require(collect() == 4);
+    Require(sceKernelAioInitializeImpl(nullptr, 0) == 0);
+    KernelAioResult result{-1, 0};
+    KernelAioRwRequest request{static_cast<std::int64_t>(page), page, bytes, &result, fd};
+    std::int32_t id = 0;
+    std::int32_t state = 0;
+    Require(sceKernelAioSubmitReadCommands(&request, 1, 0, &id) == 0);
+    Require(sceKernelAioWaitRequest(id, &state, nullptr) == 0);
+    Require(result.state == 3 && result.return_value == static_cast<std::int64_t>(page));
+    Require(std::memcmp(bytes, seed.data() + page, page) == 0);
+    Require(collect() == 4);
+    std::int32_t deleted = -1;
+    Require(sceKernelAioDeleteRequest(id, &deleted) == 0);
+    Require(sceKernelMprotect(mapped, page * 2, 1) == 0);
+    bool refused = false;
+    try {
+        sceKernelPread(fd, mapped, page, 0);
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    Require(refused);
+    KernelAioResult refusedResult{-1, 0};
+    KernelAioRwRequest refusedRequest{0, page, bytes, &refusedResult, fd};
+    Require(sceKernelAioSubmitReadCommands(&refusedRequest, 1, 0, &id) == 0);
+    Require(sceKernelAioWaitRequest(id, &state, nullptr) == 0);
+    Require(refusedResult.return_value == static_cast<std::int64_t>(SCE_KERNEL_ERROR_EFAULT));
+    Require(sceKernelAioDeleteRequest(id, &deleted) == 0);
+    Require(sceKernelClose(fd) == 0);
+    Require(sceKernelMunmap(mapped, page * 2) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page * 2) == 0);
+    std::filesystem::remove(path);
+#endif
+}
+
 #if defined(__linux__)
 using PageRuns = std::vector<std::pair<std::uintptr_t, std::uintptr_t>>;
 
@@ -452,11 +557,13 @@ static void CheckDirectMemoryWriteWatch() {
 
 int main() {
     CheckNamedAndHintedMappings();
+    CheckInternalNamedFlexibleMapping();
     CheckDirectMemoryFollowsPhysicalPages();
     CheckFixedVirtualReservation();
     CheckSharedDirectMemoryLifecycle();
     CheckHeapAfterMappingReuse();
     CheckSharedWriteTracking();
+    CheckReadsIntoSharedWriteTracking();
 #if defined(__linux__)
     CheckWriteWatch();
     CheckDirectMemoryWriteWatch();

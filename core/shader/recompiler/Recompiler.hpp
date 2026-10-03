@@ -211,8 +211,6 @@ struct SpirvTarget {
     LocalMemoryProbe localMemoryProbe = nullptr;
     void* localMemoryProbeContext = nullptr;
     LocalMemoryProbeDevice localMemoryProbeDevice{};
-    // VK_KHR_maintenance8's maintenance8 feature: OpImageSample* take a non-constant Offset image
-    // operand (texel offsets the guest computes into a VGPR).
     bool nonConstantImageOffsets = false;
 };
 
@@ -368,6 +366,7 @@ struct FragmentParameter {
     std::uint32_t sourceLocation;
     bool flat;
     bool perVertex;
+    bool custom = false;
 };
 
 // Compiled SPIR-V shared between a cached variant and every result materialized from it: results

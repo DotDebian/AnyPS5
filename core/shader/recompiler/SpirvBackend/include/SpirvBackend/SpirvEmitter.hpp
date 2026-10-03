@@ -19,7 +19,6 @@ struct SpirvTargetOptions {
     std::uint32_t bdaAbiVersion;
     std::span<const std::uint32_t> supportedCapabilities;
     std::span<const std::string_view> supportedExtensions;
-    // SpirvTarget::nonConstantImageOffsets.
     bool nonConstantImageOffsets = false;
     // The guest program's address, for the loop guard's report (APS5_LOOP_GUARD).
     std::uint64_t codeAddress = 0;

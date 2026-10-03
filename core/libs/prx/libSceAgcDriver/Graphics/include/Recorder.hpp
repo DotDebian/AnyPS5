@@ -365,13 +365,6 @@ public:
     // completion store would land on memory the game may have reused by then (a stale label value
     // over a fresh command buffer). Debug aid: APS5_LABEL_STORE_ALWAYS=1 stores unconditionally.
     void AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu);
-    // An action that must run once the work recorded so far completed, without the CPU waiting
-    // for that work (an end-of-pipe interrupt, see Driver.cpp): appended, like a completion label,
-    // to the open batch or to the newest in-flight batch when none is open, after its earlier
-    // completions (a completion label stored just before it lands first). It is counted with the
-    // completion labels so the idle workers and the pollers reap its batch, and the open batch
-    // takes the label flush deadline. Returns false, registering nothing, when the recorder is idle
-    // (nothing recorded is unfinished: the caller runs the action itself).
     bool AfterRecordedWork(std::function<void()> action);
     // A CPU store of GPU results into guest memory (GuestBufferMemory::WriteBack): recorded so a
     // completion label store can tell whether its bytes were overwritten. Under GuestMemory::
@@ -458,10 +451,6 @@ public:
     // range index to pass to End, or NoTiming when timing is off or the batch's queries are used up.
     static constexpr std::uint32_t NoTiming = 0xffffffffu;
     static bool GpuTimingEnabled();
-    // Whether every batch carries its whole-batch stamps (the Completed record's gpuStartNs and
-    // gpuEndNs, the [present] line's GPU busy and idle gaps): under APS5_PROFILE_GPU with the
-    // other ranges, and under APS5_PROFILE_DRAW alone, where the two stamps are all that is
-    // written (a two-query pool per batch, reused like the command buffers).
     static bool BatchStampsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
@@ -785,7 +774,6 @@ private:
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per
     // frame would otherwise allocate and free their objects each time).
     std::vector<std::pair<VkCommandBuffer, VkFence>> spare;
-    // Two-query pools of finished batches that carried only their batch stamps, reused likewise.
     std::vector<VkQueryPool> sparePools;
     mutable std::mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;

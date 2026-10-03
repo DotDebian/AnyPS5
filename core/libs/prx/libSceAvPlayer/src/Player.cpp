@@ -7,6 +7,7 @@
 #include <cstring>
 #include "prx/libSceAvPlayer/include/AvPlayer.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestHeap.hpp"
 
 namespace AvPlayer {
 
@@ -18,6 +19,26 @@ bool EqualsIgnoreCase(std::string_view left, std::string_view right) {
 
 bool SameLanguage(const char* preferred, const char* code) {
     return preferred[0] != '\0' && std::strncmp(preferred, code, 4) == 0;
+}
+
+void* APS5_VABI GuestAllocate_nid_no_patch(void*, std::uint32_t alignment, std::uint32_t size) {
+    return GuestHeap::GuestHeapAlign_nid_postfix(std::max<std::uint32_t>(alignment, 16), size);
+}
+
+void APS5_VABI GuestDeallocate_nid_no_patch(void*, void* memory) {
+    GuestHeap::GuestHeapFree_nid_postfix(memory);
+}
+
+AvPlayerMemAllocator WithGuestHeapFallback(AvPlayerMemAllocator memory) {
+    if (!memory.allocate || !memory.deallocate) {
+        memory.allocate = GuestAllocate_nid_no_patch;
+        memory.deallocate = GuestDeallocate_nid_no_patch;
+    }
+    if (!memory.allocate_texture || !memory.deallocate_texture) {
+        memory.allocate_texture = GuestAllocate_nid_no_patch;
+        memory.deallocate_texture = GuestDeallocate_nid_no_patch;
+    }
+    return memory;
 }
 
 }
@@ -37,7 +58,7 @@ std::uint32_t DetectSourceType(std::string_view path) {
 }
 
 Player::Player(const AvPlayerInitData& init, std::uint32_t bufferCount)
-    : memory(init.memory_replacement), callback(init.event_replacement), videoBuffers(bufferCount) {
+    : memory(WithGuestHeapFallback(init.memory_replacement)), callback(init.event_replacement), videoBuffers(bufferCount) {
     if (init.file_replacement.open && init.file_replacement.close && init.file_replacement.read_offset && init.file_replacement.size) {
         file = init.file_replacement;
     }
@@ -157,7 +178,7 @@ int Player::PostInit(const AvPlayerPostInitData& data) {
 int Player::AddSource(std::string_view path, std::uint32_t sourceType) {
     if (path.empty()) return SCE_AVPLAYER_ERROR_OPERATION_FAILED;
     if (sourceType == SourceTypeUnknown) sourceType = DetectSourceType(path);
-    if (sourceType == SourceTypeHls) return SCE_AVPLAYER_ERROR_NOT_SUPPORTED;
+    if (sourceType == SourceTypeHls) NotImplemented_nid_no_patch("sceAvPlayerAddSource (HLS)");
     std::lock_guard lock(mutex);
     if (source) return SCE_AVPLAYER_ERROR_OPERATION_FAILED;
     auto opened = OpenSource({memory, file, videoBuffers}, std::string(path), *this);
@@ -196,6 +217,15 @@ int Player::GetStreamInfo(std::uint32_t index, AvPlayerStreamInfo& info) {
     return SCE_OK;
 }
 
+int Player::GetStreamInfoEx(std::uint32_t index, AvPlayerStreamInfoEx& info) {
+    std::lock_guard lock(mutex);
+    AvPlayerStreamInfoEx described{};
+    if (!source || !source->GetStreamInfoEx(index, described)) return SCE_AVPLAYER_ERROR_OPERATION_FAILED;
+    described.this_size = info.this_size;
+    info = described;
+    return SCE_OK;
+}
+
 int Player::EnableStream(std::uint32_t index) {
     std::lock_guard lock(mutex);
     if (!source || !source->EnableStream(index)) return SCE_AVPLAYER_ERROR_OPERATION_FAILED;
@@ -205,6 +235,12 @@ int Player::EnableStream(std::uint32_t index) {
 int Player::DisableStream(std::uint32_t index) {
     std::lock_guard lock(mutex);
     if (!source || !source->DisableStream(index)) return SCE_AVPLAYER_ERROR_OPERATION_FAILED;
+    return SCE_OK;
+}
+
+int Player::ChangeStream(std::uint32_t from, std::uint32_t to) {
+    std::lock_guard lock(mutex);
+    if (!source || state == State::Error || !source->ChangeStream(from, to)) return SCE_AVPLAYER_ERROR_OPERATION_FAILED;
     return SCE_OK;
 }
 
@@ -273,7 +309,6 @@ int Player::SetLooping(bool enabled) {
 }
 
 int Player::SetTrickSpeed(std::int32_t trickSpeed) {
-    if (trickSpeed < 0) NotImplemented_nid_no_patch("sceAvPlayerSetTrickSpeed (reverse playback)");
     if (trickSpeed == 0) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
     std::lock_guard lock(mutex);
     if (state == State::Stop || state == State::EndOfFile || state == State::Error) return SCE_AVPLAYER_ERROR_OPERATION_FAILED;

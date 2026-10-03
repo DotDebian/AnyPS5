@@ -43,7 +43,6 @@ bool g_memory = false;
 bool g_spirv = false;
 bool g_graph = false;
 bool g_code = false;
-// --maintenance8: recompile for a device with VK_KHR_maintenance8 (non-constant texel offsets).
 bool g_maintenance8 = false;
 
 bool Replay(const char* path) {

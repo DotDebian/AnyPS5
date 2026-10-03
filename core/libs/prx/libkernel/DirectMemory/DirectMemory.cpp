@@ -61,9 +61,9 @@ static void CommitArenaRange(void* addr, size_t len, DWORD winProt) {
     GuestArena::GuestArenaCommit_nid_postfix(addr, len, winProt, PS5_PAGE_SIZE);
 }
 
-static void* mmap_aligned(size_t len, int prot, size_t alignment) {
+static void* mmap_aligned(size_t len, int prot, size_t alignment, std::uintptr_t hint = 0) {
     auto& arena = KernelArena::Get();
-    void* result = arena.Allocate(len, alignment);
+    void* result = GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(hint, len, alignment);
     if (prot != PROT_NONE) {
         try {
             CommitArenaRange(result, len, WinProtFromPosix(prot));
@@ -389,11 +389,7 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
     constexpr int GuestMapFixed = 0x10;
     constexpr int GuestMapNoOverwrite = 0x80;
     constexpr int GuestMapNoCoalesce = 0x400000;
-#if defined(__linux__)
     constexpr int SupportedFlags = GuestMapFixed | GuestMapNoOverwrite | GuestMapNoCoalesce;
-#else
-    constexpr int SupportedFlags = GuestMapFixed | GuestMapNoCoalesce;
-#endif
     if ((flags & ~SupportedFlags) != 0) {
         char message[64];
         std::snprintf(message, sizeof(message), "Unsupported memory mapping flags 0x%x", flags);
@@ -417,7 +413,7 @@ void* MapPlaced(void* addr, size_t len, int prot, int flags, size_t alignment) {
 #if defined(__linux__)
         return MapAtOrAbove(reinterpret_cast<std::uintptr_t>(addr), len, prot, alignment);
 #else
-        throw std::invalid_argument("Non-fixed mapping address hints are not implemented");
+        return mmap_aligned(len, prot, alignment, reinterpret_cast<std::uintptr_t>(addr));
 #endif
     }
 #ifdef _WIN32

@@ -61,8 +61,10 @@ public:
     virtual ~ISource() = default;
     virtual std::uint32_t StreamCount() const = 0;
     virtual bool GetStreamInfo(std::uint32_t index, AvPlayerStreamInfo& info) const = 0;
+    virtual bool GetStreamInfoEx(std::uint32_t index, AvPlayerStreamInfoEx& info) const = 0;
     virtual bool EnableStream(std::uint32_t index) = 0;
     virtual bool DisableStream(std::uint32_t index) = 0;
+    virtual bool ChangeStream(std::uint32_t from, std::uint32_t to) = 0;
     virtual int Start() = 0;
     virtual void Stop() = 0;
     virtual void Pause() = 0;
@@ -93,8 +95,10 @@ public:
     int AddSource(std::string_view path, std::uint32_t sourceType);
     int StreamCount();
     int GetStreamInfo(std::uint32_t index, AvPlayerStreamInfo& info);
+    int GetStreamInfoEx(std::uint32_t index, AvPlayerStreamInfoEx& info);
     int EnableStream(std::uint32_t index);
     int DisableStream(std::uint32_t index);
+    int ChangeStream(std::uint32_t from, std::uint32_t to);
     int Start();
     int Stop();
     int Pause();

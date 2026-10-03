@@ -116,6 +116,8 @@ constexpr std::array<OpcodeMeta, static_cast<std::size_t>(IrOpcode::Count)> Meta
     makeMeta("ReferenceU32", Void, U32),
     makeMeta("GetUserData", U32, ScalarReg),
     makeMeta("GetShaderBase", U64),
+    makeMeta("ShaderClock", U64),
+    makeMeta("RealtimeClock", U64),
     makeMeta("MeshDrawParameter", U32, U32),
     makeMeta("MeshArgument", U32, U32),
     makeMeta("MeshAllocate", Void, U32),
@@ -263,6 +265,7 @@ constexpr std::array<OpcodeMeta, static_cast<std::size_t>(IrOpcode::Count)> Meta
     makeMeta("FPAdd32", F32, F32, F32),
     makeMeta("FPSub32", F32, F32, F32),
     makeMeta("FPFma32", F32, F32, F32, F32),
+    makeMeta("FPMad32", F32, F32, F32, F32),
     makeMeta("FPMul32", F32, F32, F32),
     makeMeta("FPMin32", F32, F32, F32),
     makeMeta("FPMax32", F32, F32, F32),
@@ -344,8 +347,8 @@ constexpr std::array<OpcodeMeta, static_cast<std::size_t>(IrOpcode::Count)> Meta
     makeMeta("WriteSharedU32x2", Void, U32, U32, U32, U1),
     makeMeta("WriteSharedU32x3", Void, U32, U32, U32, U32, U1),
     makeMeta("WriteSharedU32x4", Void, U32, U32, U32, U32, U32, U1),
-    makeMeta("SharedAtomicFMin32", Void, U32, U32, U32, U1),
-    makeMeta("SharedAtomicFMax32", Void, U32, U32, U32, U1),
+    makeMeta("SharedAtomicFMin32", U32, U32, U32, U1),
+    makeMeta("SharedAtomicFMax32", U32, U32, U32, U1),
     makeMeta("SharedAtomicSwap32", U32, U32, U32, U1),
     makeMeta("SharedAtomicIAdd32", U32, U32, U32, U1),
     makeMeta("SharedAtomicISub32", U32, U32, U32, U1),
@@ -358,6 +361,12 @@ constexpr std::array<OpcodeMeta, static_cast<std::size_t>(IrOpcode::Count)> Meta
     makeMeta("SharedAtomicAnd32", U32, U32, U32, U1),
     makeMeta("SharedAtomicOr32", U32, U32, U32, U1),
     makeMeta("SharedAtomicXor32", U32, U32, U32, U1),
+    makeMeta("SharedAtomicRsub32", U32, U32, U32, U1),
+    makeMeta("SharedAtomicFAdd32", U32, U32, U32, U1),
+    makeMeta("SharedAtomicCmpst32", U32, U32, U32, U32, U1),
+    makeMeta("SharedAtomicCmpstF32", U32, U32, U32, U32, U1),
+    makeMeta("SharedAtomicMskor32", U32, U32, U32, U32, U1),
+    makeMeta("SharedAtomicWrap32", U32, U32, U32, U32, U1),
     makeMeta("DataAppend", U32, U32, U1, U32, U32),
     makeMeta("DataConsume", U32, U32, U1, U32, U32),
     makeMeta("SwizzleU32", U32, U32, U32, U1),
@@ -502,6 +511,12 @@ SharedAccess SharedAccessOf(IrOpcode opcode) {
         case IrOpcode::SharedAtomicAnd32:
         case IrOpcode::SharedAtomicOr32:
         case IrOpcode::SharedAtomicXor32:
+        case IrOpcode::SharedAtomicRsub32:
+        case IrOpcode::SharedAtomicFAdd32:
+        case IrOpcode::SharedAtomicCmpst32:
+        case IrOpcode::SharedAtomicCmpstF32:
+        case IrOpcode::SharedAtomicMskor32:
+        case IrOpcode::SharedAtomicWrap32:
             return SharedAccess::Atomic;
         case IrOpcode::DataAppend:
             return SharedAccess::Append;

@@ -70,8 +70,6 @@ std::uint32_t EmitSplitBallotWord(SpirvEmitterState& state, std::uint32_t predic
 // wave's halves could take them apart, so such a program cannot take that layout.
 std::vector<const BlockInfo*> LaneVaryingScalarBranches(const IrProgram& program);
 
-std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program);
-
 }
 
 #endif
