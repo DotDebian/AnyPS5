@@ -1364,35 +1364,72 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     if (open != nullptr) open->coveredAccess = access;
 }
 
-bool Recorder::ContinuesRenderPass(std::uint64_t key) const {
-    return open != nullptr && open->renderPass.open && open->renderPass.continuable && open->renderPass.key == key;
+bool Recorder::PassHazardsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_PASS_HAZARDS") == nullptr;
+    return enabled;
 }
 
-VkCommandBuffer Recorder::CommandsInRenderPass() {
-    Require(open != nullptr && open->renderPass.open, "no render pass is open in the recorder");
+Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, PassBreak forced, const PassAccess& access) {
+    ensureOpen();
+    auto& pass = open->renderPass;
+    const bool hazards = PassHazardsEnabled();
+    auto reason = forced;
+    auto hazard = PassHazard::None;
+    if (reason == PassBreak::None) {
+        if (!pass.open) {
+            reason = open->passEnded ? PassBreak::OtherWork : PassBreak::FirstInBatch;
+        } else if (hazards) {
+            hazard = open->passHazards.Check(access, pass.key == key);
+            reason = hazard != PassHazard::None ? PassBreak::Hazard : pass.key != key ? PassBreak::Key : PassBreak::None;
+        } else {
+            reason = pass.key != key ? PassBreak::Key : pass.block != PassBlock::None ? PassBreak::PreviousWrote : PassBreak::None;
+        }
+    }
+    CountPassStart(reason, hazard, pass.open ? pass.block : PassBlock::None);
+    if (reason == PassBreak::None) {
+        traceProgram();
+        return {open->commands, true, false};
+    }
+    if (!pass.open) {
+        const auto commands = Commands();
+        open->passHazards.Clear();
+        open->passHazards.BeginPass();
+        return {commands, false, true};
+    }
+    const bool elide = hazards && reason == PassBreak::Key && MergeBarriers();
+    const bool merged = hazards && reason == PassBreak::Hazard && MergeBarriers();
+    endOpenRenderPass(!elide && !merged);
     traceProgram();
-    return open->commands;
+    open->coveredAccess = 0;
+    if (!elide) open->passHazards.Clear();
+    open->passHazards.BeginPass();
+    CountPassBarrier(elide, merged);
+    return {open->commands, false, !elide};
 }
 
-void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool continuable) {
+void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, PassBlock block, const PassAccess& access) {
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;
     if (!pass.open) pass.timing = timing;
     pass.open = true;
     pass.key = key;
-    pass.continuable = continuable;
+    pass.block = block;
+    if (PassHazardsEnabled()) open->passHazards.Add(access);
 }
 
-void Recorder::endOpenRenderPass() {
+void Recorder::endOpenRenderPass(bool barrier) {
     auto& pass = open->renderPass;
     context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
-    recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-    CountBarriers(CommandClass::Draw);
+    if (barrier) {
+        recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        CountBarriers(CommandClass::Draw);
+    }
     EndGpuTiming(pass.timing);
-    open->coveredAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0;
     open->hostReadOwed = true;
+    open->passEnded = true;
     pass = {};
 }
 
@@ -1685,6 +1722,8 @@ constexpr std::size_t HazardKinds = 5;
 constexpr const char* HazardNames[HazardKinds] = {"raw", "waw", "war", "image", "conservative"};
 std::atomic<std::uint64_t> validateEmitted[CommandClasses]{}, validateSkipped[CommandClasses]{}, validateKinds[HazardKinds]{};
 std::atomic<std::uint64_t> validateBatchEnds{0};
+std::atomic<std::uint64_t> passContinued{0}, passBreaks[static_cast<std::size_t>(PassBreak::Count)]{}, passHazardKinds[static_cast<std::size_t>(PassHazard::Count)]{}, passBlocks[static_cast<std::size_t>(PassBlock::Count)]{};
+std::atomic<std::uint64_t> passBarriersElided{0}, passBarriersMerged{0};
 std::atomic<std::int64_t> traceBarriersLeft{[] {
     const char* text = std::getenv("APS5_TRACE_BARRIERS");
     return text != nullptr ? static_cast<std::int64_t>(std::strtoll(text, nullptr, 10)) : std::int64_t{0};
@@ -1745,6 +1784,31 @@ void reportBarriers() {
         std::fprintf(stderr, "; validate: would emit %llu (%s) + %llu batch ends, would skip %llu; emitted/skipped by class:%s", static_cast<unsigned long long>(emitted), kinds.c_str() + 1, static_cast<unsigned long long>(validateBatchEnds.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(skipped), classes.c_str());
     }
     std::fputc('\n', stderr);
+    std::uint64_t breaks = 0;
+    std::string breakLine, hazardLine, blockLine;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(PassBreak::Count); ++i) {
+        const auto count = passBreaks[i].exchange(0, std::memory_order_relaxed);
+        breaks += count;
+        if (count == 0) continue;
+        char text[64];
+        std::snprintf(text, sizeof(text), " %s %llu", PassBreakNames[i], static_cast<unsigned long long>(count));
+        breakLine += text;
+    }
+    for (std::size_t i = 1; i < static_cast<std::size_t>(PassHazard::Count); ++i) {
+        const auto count = passHazardKinds[i].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        char text[64];
+        std::snprintf(text, sizeof(text), " %s %llu", PassHazardNames[i], static_cast<unsigned long long>(count));
+        hazardLine += text;
+    }
+    for (std::size_t i = 1; i < static_cast<std::size_t>(PassBlock::Count); ++i) {
+        const auto count = passBlocks[i].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        char text[64];
+        std::snprintf(text, sizeof(text), " %s %llu", PassBlockNames[i], static_cast<unsigned long long>(count));
+        blockLine += text;
+    }
+    std::fprintf(stderr, "[passes] %s: %llu draws continued a pass, %llu began one (10 s); breaks by reason:%s; hazards:%s; previous draw wrote:%s; begin barriers elided %llu, merged with the pass end %llu\n", Recorder::PassHazardsEnabled() ? "hazard-tracked" : "legacy", static_cast<unsigned long long>(passContinued.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(breaks), breakLine.c_str(), hazardLine.c_str(), blockLine.c_str(), static_cast<unsigned long long>(passBarriersElided.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(passBarriersMerged.exchange(0, std::memory_order_relaxed)));
 }
 
 }
@@ -1766,6 +1830,23 @@ void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
 bool Recorder::MergeBarriers() {
     static const bool merge = std::getenv("APS5_FULL_BARRIERS") == nullptr && std::getenv("APS5_NO_BARRIER_ELISION") == nullptr;
     return merge;
+}
+
+void Recorder::CountPassStart(PassBreak reason, PassHazard hazard, PassBlock block) {
+    if (!DrawOrGpuProfiled()) return;
+    if (reason == PassBreak::None) {
+        passContinued.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    passBreaks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    if (reason == PassBreak::Hazard) passHazardKinds[static_cast<std::size_t>(hazard)].fetch_add(1, std::memory_order_relaxed);
+    if (reason == PassBreak::PreviousWrote) passBlocks[static_cast<std::size_t>(block)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void Recorder::CountPassBarrier(bool elided, bool merged) {
+    if (!DrawOrGpuProfiled()) return;
+    if (elided) passBarriersElided.fetch_add(1, std::memory_order_relaxed);
+    if (merged) passBarriersMerged.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Recorder::CountMerged(CommandClass which) {

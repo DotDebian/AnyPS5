@@ -1124,6 +1124,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         std::set<std::uint32_t> occupied;
         for (const auto& shader : shaders) {
             Require(shader.program != nullptr, "missing compiled shader");
+            bdaWrites = bdaWrites || shader.program->bdaWrites;
             const VkShaderStageFlags flags = VulkanStage(shader.stage);
             std::uint64_t stageDescriptors = 0;
             std::vector<std::size_t> offsetsInData;
@@ -3111,6 +3112,15 @@ void ShaderResources::WriteBackBuffers() {
 
 bool ShaderResources::WritesMemory() const {
     return usesGds || HoldsLease() || NeedsCompletion() || !guestMemory.Writes().empty() || std::any_of(storageWritten.begin(), storageWritten.end(), [](bool written) { return written; });
+}
+
+PassBlock ShaderResources::LegacyPassBlock() const {
+    if (HoldsLease()) return PassBlock::Lease;
+    if (bda != nullptr && !guestMemory.HasCopiedWrites()) return PassBlock::Completion;
+    if (!guestMemory.Writes().empty() || guestMemory.HasCopiedWrites()) return PassBlock::Buffers;
+    if (std::any_of(storageWritten.begin(), storageWritten.end(), [](bool written) { return written; })) return PassBlock::Images;
+    if (usesGds) return PassBlock::Gds;
+    return PassBlock::None;
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {

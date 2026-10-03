@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "Recompiler.hpp"
@@ -149,6 +150,10 @@ public:
     // sampled, or the image itself bound): a recorded draw's render pass may only be continued by
     // a draw for which neither holds (Draw.cpp).
     bool WritesMemory() const;
+    PassBlock LegacyPassBlock() const;
+    bool UsesGds() const { return usesGds; }
+    bool BdaWrites() const { return bdaWrites; }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     bool ReadsImage(const StorageTexture* image) const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
     // Debug aid: each bound guest resource with the fraction of sampled bytes that are nonzero.
@@ -396,6 +401,7 @@ private:
     // A GDS binding (the device's GDS buffer, Context::gdsBuffer): every use is noted for the CP
     // (Pm4::NoteGdsShaderUse) and counts as a memory write.
     bool usesGds = false;
+    bool bdaWrites = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     // Whether the layout is this object's own (no cache) and destroyed with it.
     bool ownsLayout = false;

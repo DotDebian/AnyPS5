@@ -1366,10 +1366,28 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
-    const bool continued = !capture && !readsTarget && !gpuIndirect && !meshIndirect && !depthClear && recorder->ContinuesRenderPass(passKey);
+    const auto forced = capture ? PassBreak::Capture : readsTarget ? PassBreak::ReadsTarget : gpuIndirect ? PassBreak::GpuIndirect : meshIndirect ? PassBreak::MeshIndirect : depthClear ? PassBreak::DepthClear : PassBreak::None;
+    const bool addressBased = resources.HoldsLease();
+    const auto passReads = addressBased ? std::vector<std::pair<std::uint64_t, std::uint64_t>>{} : resources.DeviceReads();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> indirectReads;
+    if (gpuIndirect) {
+        indirectReads = passReads;
+        indirectReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
+        if (args->countIndirect) indirectReads.emplace_back(args->countAddress, args->countAddress + 4);
+    }
+    const auto passImages = resources.StorageImages();
+    std::vector<std::pair<VkImage, bool>> passAttachments;
+    passAttachments.reserve(record.targets.size() + 1);
+    for (const auto& target : record.targets) {
+        if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
+    }
+    if (record.depth != nullptr) passAttachments.emplace_back(record.depth->Image(), true);
+    const PassAccess passAccess{gpuIndirect ? GuestRangeList(indirectReads) : GuestRangeList(passReads), resources.GpuWrites(), passImages, passAttachments, addressBased, resources.BdaWrites(), resources.UsesGds()};
+    const auto start = recorder->StartDrawPass(passKey, forced, passAccess);
+    const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
-    const auto commands = continued ? recorder->CommandsInRenderPass() : recorder->Commands();
+    const auto commands = start.commands;
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
@@ -1395,9 +1413,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // With a depth attachment the depth tests also wait for earlier depth writes (a previous
         // pass over the same image) and the pending clear below.
         const bool depth = record.depth != nullptr;
-        const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | (depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : 0u), VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : 0u)};
-        context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages | (depth ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT : 0u), 0, 1, &before, 0, nullptr, 0, nullptr);
-        countBarrier(1);
+        const bool chained = Recorder::PassHazardsEnabled();
+        const bool depthAccess = depth || chained;
+        const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | (depthAccess ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : 0u), VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (depthAccess ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : 0u)};
+        const VkPipelineStageFlags beforeStages = chained ? VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages | (depth ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT : 0u);
+        if (start.barrier) {
+            context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, beforeStages, 0, 1, &before, 0, nullptr, 0, nullptr);
+            countBarrier(1);
+        }
         APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");
         if (meshIndirect) {
             meshArguments = recordMeshArguments(context, commands, recorder, true, state, draw, *record.indirect, countBarrier);
@@ -1431,7 +1454,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // The pass stays open for the next draw of these attachments; the recorder ends it (and the
     // draw class range) before anything else is recorded. A draw that wrote memory owes the next
     // one a barrier, so its pass cannot be continued.
-    recorder->LeaveRenderPassOpen(passKey, drawTiming, !resources.WritesMemory());
+    recorder->LeaveRenderPassOpen(passKey, drawTiming, resources.LegacyPassBlock(), passAccess);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.depth), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);
