@@ -107,7 +107,17 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
     if (CurrentDccKeys(color.dccAddress, color.bytes) != DccKeys::ClearRegister) return;
     const auto texel = clearTexel(color, DccKeys::ClearRegister);
     const char* refusal = nullptr;
-    if (clearToTexel(resident, texel, color.elementBytes, refusal)) {
+    bool cleared = clearToTexel(resident, texel, color.elementBytes, refusal);
+    static const bool syncKeys = std::getenv("APS5_NO_REGISTER_CLEAR_SYNC") == nullptr;
+    const auto keyBytes = static_cast<std::size_t>(color.bytes / 256);
+    if (!cleared && syncKeys && keyBytes != 0) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(color.dccAddress, keyBytes)) {
+            Recorder::CountSync(2);
+            recorder->SyncThrough(color.dccAddress, keyBytes);
+            cleared = CurrentDccKeys(color.dccAddress, color.bytes) == DccKeys::ClearRegister && clearToTexel(resident, texel, color.elementBytes, refusal);
+        }
+    }
+    if (cleared) {
         MarkDccUncompressed(context, color.dccAddress, color.bytes);
         return;
     }
