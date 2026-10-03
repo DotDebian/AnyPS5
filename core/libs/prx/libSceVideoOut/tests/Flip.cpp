@@ -369,7 +369,7 @@ void testFlipAfterGpuWork() {
         0xc0037600, 0x207, 32, 1, 1,
         0xc0057600, 0x240, static_cast<std::uint32_t>(output), static_cast<std::uint32_t>(output >> 32u) & 0xffffu, 4, 0x31016fac, iterations,
         0xc0031500, 1, 1, 1, 0x8041,
-        0xc0064900, 0x514, (1u << 29u) | (2u << 24u), static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(target >> 32u), 1, 0, 0};
+        0xc0064900, 0x514, 1u << 29u, static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(target >> 32u), 1, 0, 0};
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     check(sceVideoOutSubmitFlip(handle, 0, 1, 4) == 0, "the first flip was not accepted");
     {
