@@ -239,7 +239,6 @@ bool TranslationContext::emitMemory(const RdnaInstruction& inst) {
     case RdnaOpcode::ImageGetLod:
         return imageGetLod(inst);
     case RdnaOpcode::ImageBvhIntersectRay:
-    case RdnaOpcode::ImageBvh64IntersectRay:
         return imageBvhIntersectRay(inst);
 
     default:

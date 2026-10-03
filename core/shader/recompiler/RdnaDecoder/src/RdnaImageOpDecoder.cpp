@@ -68,7 +68,6 @@ constexpr ImageOpcodeInfo imageOpcodes[] = {
     {0x0eu, RdnaOpcode::ImageGetResinfo, nullptr, 0, false, false, false},
     {0x60u, RdnaOpcode::ImageGetLod, nullptr, 0, false, false, false},
     {0xe6u, RdnaOpcode::ImageBvhIntersectRay, "image_bvh_intersect_ray", 0, false, false, false},
-    {0xe7u, RdnaOpcode::ImageBvh64IntersectRay, "image_bvh64_intersect_ray", 0, false, false, false},
 };
 
 const ImageOpcodeInfo& lookupOpcode(std::uint32_t opcode) {
@@ -259,9 +258,8 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
     if (d16 && !(info.sample || info.gather || opcode == 0u || opcode == 1u || opcode == 8u || opcode == 9u)) {
         throw std::runtime_error("MIMG opcode does not support D16");
     }
-    const bool rayQuery = info.opcode == RdnaOpcode::ImageBvhIntersectRay || info.opcode == RdnaOpcode::ImageBvh64IntersectRay;
-    const std::uint32_t nodeDwords = info.opcode == RdnaOpcode::ImageBvh64IntersectRay ? 2u : 1u;
-    std::uint32_t components = rayQuery ? nodeDwords + (a16 ? 7u : 10u) : opcode == 0x0Eu ? 1u : coordinateCount(dimension);
+    const bool rayQuery = info.opcode == RdnaOpcode::ImageBvhIntersectRay;
+    std::uint32_t components = rayQuery ? (a16 ? 8u : 11u) : opcode == 0x0Eu ? 1u : coordinateCount(dimension);
     if (opcode == 1u || opcode == 9u) {
         ++components;
     }

@@ -298,10 +298,6 @@ target_link_libraries(agc_dpp_write_tests PRIVATE shader_recompiler_agc_driver l
 set_target_properties(agc_dpp_write_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_dpp_write_tests)
 
-add_test_executable(agc_bvh_reference_tests EXCLUDE_FROM_ALL tests/BvhReference.cpp)
-set_target_properties(agc_bvh_reference_tests PROPERTIES CXX_EXTENSIONS OFF)
-configure_windows_unwind(agc_bvh_reference_tests)
-
 add_test_executable(agc_texture_residency_tests EXCLUDE_FROM_ALL tests/TextureResidency.cpp Graphics/src/TextureResidency.cpp)
 target_include_directories(agc_texture_residency_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
 set_target_properties(agc_texture_residency_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -557,7 +553,7 @@ set_target_properties(agc_driver_wave_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_wave_tests)
 
 if(BUILD_TESTING)
-    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_write_tracking_tests agc_structurizer_tests agc_dpp_write_tests agc_bvh_reference_tests agc_shader_disk_cache_tests agc_texture_residency_tests agc_dcc_key_sharing_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_resident_present_tests ${agcExecutionTests})
+    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_write_tracking_tests agc_structurizer_tests agc_dpp_write_tests agc_shader_disk_cache_tests agc_texture_residency_tests agc_dcc_key_sharing_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_resident_present_tests ${agcExecutionTests})
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})

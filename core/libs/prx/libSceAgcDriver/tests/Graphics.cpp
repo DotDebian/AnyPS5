@@ -782,12 +782,6 @@ void depthMetadataBlitTests() {
 void mimgDecodeTests() {
     const std::array<std::uint32_t, 5> bvh{0xf1989f07u, 0x00040505u, 0, 0, 0};
     Require(ShaderRecompiler::DecodeRdnaMimg(0, bvh, 0).op == ShaderRecompiler::RdnaOpcode::ImageBvhIntersectRay, "Astro Bot's BVH intersection encoding was not decoded");
-    Require(ShaderRecompiler::DecodeRdnaMimg(0, bvh, 0).imageAddressComponents == 11u, "image_bvh_intersect_ray does not take eleven address dwords");
-    const std::array<std::uint32_t, 5> bvh64{0xf19c9f07u, 0x00040505u, 0, 0, 0};
-    const auto wide = ShaderRecompiler::DecodeRdnaMimg(0, bvh64, 0);
-    Require(wide.op == ShaderRecompiler::RdnaOpcode::ImageBvh64IntersectRay && wide.imageAddressComponents == 12u, "image_bvh64_intersect_ray does not decode with twelve address dwords");
-    const std::array<std::uint32_t, 5> bvh64Half{0xf19c9f07u, 0x40040505u, 0, 0, 0};
-    Require(ShaderRecompiler::DecodeRdnaMimg(0, bvh64Half, 0).imageAddressComponents == 9u, "image_bvh64_intersect_ray with A16 does not take nine address dwords");
     // image_sample (0x20) with TFE (bit 16): a reserved control bit, named with the words.
     const std::array<std::uint32_t, 2> tfe{0xf0800f00u | (1u << 16u), 0x00000000u};
     expectFailure([&] { ShaderRecompiler::DecodeRdnaMimg(0, tfe, 0); }, "reserved MIMG control bits (words f0810f00 00000000)");

@@ -54,7 +54,6 @@ std::uint32_t estimatedSpirvWords(const RdnaInstruction& instruction) {
     case RdnaOpcode::DsBpermuteB32:
         return 120u;
     case RdnaOpcode::ImageBvhIntersectRay:
-    case RdnaOpcode::ImageBvh64IntersectRay:
         return 2000u;
     default:
         break;
