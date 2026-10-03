@@ -338,9 +338,13 @@ std::atomic<std::uint64_t>& StorageDepartures() {
     return departures;
 }
 
+bool TextureCountersReported() {
+    static const bool reported = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_TEXTURE_STATS") != nullptr;
+    return reported;
+}
+
 void reportTextureCounters() {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_TEXTURE_STATS") != nullptr;
-    if (!profile) return;
+    if (!TextureCountersReported()) return;
     auto& counters = TextureCounts();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = counters.lastReport.load();
@@ -866,7 +870,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         it->texture->Refresh();
         it->lastUse = ResidencyClock::Now();
         cache.entries.splice(cache.entries.begin(), cache.entries, it);
-        counters.storageHits.fetch_add(1, std::memory_order_relaxed);
+        if (TextureCountersReported()) counters.storageHits.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
         return it->texture;
     }
@@ -2815,7 +2819,7 @@ bool ShaderResources::precollectImages() {
                         record.source = it->source;
                         record.entryKeys = it->keys;
                         record.entryGeneration = it->generation;
-                        counters.records.fetch_add(1, std::memory_order_relaxed);
+                        if (TextureCountersReported()) counters.records.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
             } catch (const std::exception&) {
@@ -2827,7 +2831,7 @@ bool ShaderResources::precollectImages() {
     return true;
 }
 
-std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record) {
+std::shared_ptr<Texture> ShaderResources::fastTexture(ImageRecord& record) {
     if (record.texture == nullptr) return nullptr;
     struct Outcome {
         bool profile;
@@ -2879,18 +2883,18 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     touchTexture(cache, it);
     logLookup({record.texture.get(), record.resource, record.guestBytes, keys, record.source != nullptr ? 0 : record.generation, record.source.get()});
     outcome.hit = true;
-    return record.texture;
+    return std::move(record.texture);
 }
 
 void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBinding& binding, Binding& item) {
     auto& counters = TextureCounts();
     // The element's stage-A record, when the pass ran (records follow the plan order exactly).
-    const auto nextRecord = [&]() -> const ImageRecord* { return nextImageRecord < imageRecords.size() ? &imageRecords[nextImageRecord++] : nullptr; };
+    const auto nextRecord = [&]() -> ImageRecord* { return nextImageRecord < imageRecords.size() ? &imageRecords[nextImageRecord++] : nullptr; };
     if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
         const auto elementWords = binding.guestDescriptor.size() / binding.count;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
-            const auto* record = nextRecord();
+            auto* record = nextRecord();
             const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
             const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
             if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
@@ -2899,7 +2903,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             std::shared_ptr<Texture> texture;
             if (record != nullptr && record->texture != nullptr) {
                 texture = fastTexture(*record);
-                (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
+                if (TextureCountersReported()) (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
             }
             if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element));
             textures.push_back(std::move(texture));

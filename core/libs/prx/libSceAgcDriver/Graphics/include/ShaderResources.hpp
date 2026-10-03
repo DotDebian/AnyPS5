@@ -336,7 +336,7 @@ private:
     std::size_t nextImageRecord = 0;
     // Stage B: the record's texture when the fastRevalidate predicate proves it current under the
     // lock and the cache still holds it; null sends the element to cachedTexture.
-    std::shared_ptr<Texture> fastTexture(const ImageRecord& record);
+    std::shared_ptr<Texture> fastTexture(ImageRecord& record);
     void resolveImageBinding(const ShaderRecompiler::DescriptorBinding& binding, Binding& item);
     void forgetDeferredInputs();
     void release() noexcept;
