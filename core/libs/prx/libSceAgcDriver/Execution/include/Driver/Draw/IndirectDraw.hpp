@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_INDIRECTDRAW_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PreparedDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -22,6 +23,14 @@ void ResolveIndirectSgprs(const std::vector<DrawProgram>& programs, const std::v
 Pm4::DrawParameters MeshIndexParameters(const Pm4::DrawParameters& draw);
 
 std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& main, const Graphics::State& graphics, const DrawProgram& front, const VulkanDevice::IndirectDrawSupport& support, Pm4::DrawParameters& drawParameters);
+
+enum class IndirectAhead : std::uint8_t { Prepare, CpuRecords, Disabled };
+
+IndirectAhead IndirectAheadRule(const std::optional<Graphics::IndirectDrawPath>& path, bool enabled);
+
+bool AdoptableIndirect(const PreparedDraw& prepared, const VulkanDevice::IndirectDrawSupport& support, bool enabled);
+
+bool IndirectDrawAheadEnabled();
 
 }
 

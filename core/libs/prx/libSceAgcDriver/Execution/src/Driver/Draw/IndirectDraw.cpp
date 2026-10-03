@@ -81,6 +81,23 @@ std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecom
     return indirectCpu;
 }
 
+IndirectAhead IndirectAheadRule(const std::optional<Graphics::IndirectDrawPath>& path, bool enabled) {
+    if (!enabled) return IndirectAhead::Disabled;
+    return path ? IndirectAhead::CpuRecords : IndirectAhead::Prepare;
+}
+
+bool AdoptableIndirect(const PreparedDraw& prepared, const VulkanDevice::IndirectDrawSupport& support, bool enabled) {
+    if (!prepared.drawParameters.indirect || prepared.decode == nullptr || prepared.programs.empty() || prepared.resultIndex.empty() || prepared.resultIndex.front() >= prepared.results.size()) return false;
+    auto parameters = prepared.drawParameters;
+    const auto path = ClassifyIndirectDraw(prepared.results[prepared.resultIndex.front()], prepared.decode->state, prepared.programs.front(), support, parameters);
+    return IndirectAheadRule(path, enabled) == IndirectAhead::Prepare;
+}
+
+bool IndirectDrawAheadEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_INDIRECT_DRAW_AHEAD") == nullptr;
+    return enabled;
+}
+
 std::optional<Graphics::IndirectDrawPath> Driver::classifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect) {
     const auto indirectCpu = ClassifyIndirectDraw(result, graphics, frontProgram, localDevice->DrawIndirectSupport(), drawParameters);
     if (traceIndirect) {

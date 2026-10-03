@@ -103,7 +103,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
-    if (prepared != nullptr && (lockedPrepare || drawParameters.indirect)) prepared = nullptr;
+    if (prepared != nullptr && (lockedPrepare || (drawParameters.indirect && !AdoptableIndirect(*prepared, localDevice->DrawIndirectSupport(), IndirectDrawAheadEnabled())))) prepared = nullptr;
     const bool lookupFirst = prepared != nullptr && prepared->keyKnown && registerKey;
     if (prepared != nullptr && !lookupFirst && !recheckPreparedDraw(*prepared, localDevice->Serial())) prepared = nullptr;
     bool adopted = prepared != nullptr && !lookupFirst;

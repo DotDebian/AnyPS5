@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/IndirectDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -47,8 +48,8 @@ std::shared_ptr<PreparedDraw> Driver::prepareDrawAhead(const QueueState& queue, 
     prepared->deviceSerial = localDevice->Serial();
 
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
-    if (drawParameters.indirect) return nullptr;
-    if (!drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return nullptr;
+    if (drawParameters.indirect && !IndirectDrawAheadEnabled()) return nullptr;
+    if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return nullptr;
     static const bool metadataPasses = std::getenv("APS5_NO_METADATA_PASSES") == nullptr;
     if (metadataPasses && (Graphics::DecodeColorMetadataPass(queue) || Graphics::DepthMetadataBlit(queue))) return nullptr;
     {
@@ -75,7 +76,8 @@ std::shared_ptr<PreparedDraw> Driver::prepareDrawAhead(const QueueState& queue, 
     const auto& roles = decode->roles;
     auto& programs = prepared->programs;
     programs = decode->programs;
-    setMeshIndexWords(programs.front(), graphics, drawParameters);
+    setMeshIndexWords(programs.front(), graphics, MeshIndexParameters(drawParameters));
+    if (drawParameters.indirect) ResolveIndirectSgprs(programs, roles, *drawParameters.indirect);
 
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<ShaderRecompiler::LinkedProgram> linked;
@@ -107,7 +109,11 @@ std::shared_ptr<PreparedDraw> Driver::prepareDrawAhead(const QueueState& queue, 
         results.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, prepared->vertexInfos, memory, linked, drawParameters, localDevice, *prepared->shaderMemory, prepared->stageCaptures, recompiled, false, matched, matchedRegions, false, 0, 0, prepared->captures, phaseTiming, phaseMs, rejected));
         if (!rejected.empty()) return nullptr;
         const auto& result = results.back();
-        if (i == 0) foldDrawOffsets(result, programs.front(), drawParameters);
+        if (i == 0 && drawParameters.indirect) {
+            if (IndirectAheadRule(ClassifyIndirectDraw(result, graphics, programs.front(), localDevice->DrawIndirectSupport(), drawParameters), true) != IndirectAhead::Prepare) return nullptr;
+        } else if (i == 0) {
+            foldDrawOffsets(result, programs.front(), drawParameters);
+        }
         require(result.pushConstants.size() <= Graphics::PipelinePushConstantBytes - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }

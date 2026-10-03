@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/IndirectDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PreparedDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -22,6 +23,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <sys/mman.h>
 #endif
 
 namespace {
@@ -770,6 +773,207 @@ void testDrawAhead() {
     }
 }
 
+void testIndirectArgumentsUnread() {
+    constexpr std::size_t PageBytes = 4096;
+#ifdef _WIN32
+    auto* page = static_cast<std::byte*>(VirtualAlloc(nullptr, PageBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    check(page != nullptr, "cannot map a record page");
+#else
+    auto* page = static_cast<std::byte*>(mmap(nullptr, PageBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    check(page != MAP_FAILED, "cannot map a record page");
+#endif
+    const std::array<std::uint32_t, 4> record{3, 1, 0, 0};
+    std::memcpy(page + 64, record.data(), sizeof(record));
+    AgcDriver::QueueState state;
+    state.userConfig[0x24a] = 0;
+    state.drawIndirectBase = reinterpret_cast<std::uintptr_t>(page);
+    const auto packet = makePacket(0x24, {64, 0x280, 0x280, 2});
+#ifdef _WIN32
+    DWORD previous = 0;
+    check(VirtualProtect(page, PageBytes, PAGE_NOACCESS, &previous) != 0, "cannot protect the record page");
+#else
+    check(mprotect(page, PageBytes, PROT_NONE) == 0, "cannot protect the record page");
+#endif
+    {
+        const AgcDriver::GuestMemory::UnhookedReadScope unhooked;
+        const auto draw = AgcDriver::Pm4::ResolveDraw(packet, state);
+        check(draw.indirect && draw.indirect->arguments == reinterpret_cast<std::uintptr_t>(page + 64) && draw.indirect->count == 1, "an indirect draw resolved ahead names other records");
+    }
+    bool unreadable = false;
+    try {
+        static_cast<void>(AgcDriver::Pm4::ReadDrawArguments(*AgcDriver::Pm4::ResolveDraw(packet, state).indirect, 0));
+    } catch (const std::exception&) {
+        unreadable = true;
+    }
+    check(unreadable, "the protected record page was readable, so the test proves nothing");
+#ifdef _WIN32
+    check(VirtualProtect(page, PageBytes, PAGE_READWRITE, &previous) != 0, "cannot unprotect the record page");
+#else
+    check(mprotect(page, PageBytes, PROT_READ | PROT_WRITE) == 0, "cannot unprotect the record page");
+#endif
+    const auto read = AgcDriver::Pm4::ReadDrawArguments(*AgcDriver::Pm4::ResolveDraw(packet, state).indirect, 0);
+    check(read.count == 3 && read.instances == 1, "the record page was not restored");
+#ifdef _WIN32
+    VirtualFree(page, 0, MEM_RELEASE);
+#else
+    munmap(page, PageBytes);
+#endif
+}
+
+void testIndirectDrawAheadRules() {
+    using namespace AgcDriver::DriverDetail;
+    using Path = AgcDriver::Graphics::IndirectDrawPath;
+    using Rule = AgcDriver::Pm4::DrawParameters::IndirectDraw::Rule;
+    using Role = ShaderRecompiler::ProgramRole;
+    std::vector<DrawProgram> programs(2);
+    programs[0].userDataBase = 0x8c;
+    programs[0].firstUserSgpr = 8;
+    programs[0].userData = {0, 0, 0, 0, 37, 0};
+    programs[1].userDataBase = 0x0c;
+    programs[1].firstUserSgpr = 0;
+    programs[1].userData = {0, 0};
+    const std::vector<Role> roles{Role::Main, Role::Fragment};
+    AgcDriver::Graphics::State graphics{};
+    graphics.stages.path = AgcDriver::Graphics::ShaderPath::Vertex;
+    const AgcDriver::VulkanDevice::IndirectDrawSupport all{true, true, true};
+    AgcDriver::QueueState state;
+    state.userConfig[0x24a] = 5;
+    state.drawIndirectBase = 0x100000;
+    const auto resolve = [&](std::initializer_list<std::uint32_t> payload) {
+        auto draw = AgcDriver::Pm4::ResolveDraw(makePacket(payload.size() == 4 ? 0x24 : 0x2c, payload), state);
+        ResolveIndirectSgprs(programs, roles, *draw.indirect);
+        return draw;
+    };
+    const auto classify = [&](const ShaderRecompiler::RecompileResult& main, AgcDriver::Pm4::DrawParameters& draw, const AgcDriver::VulkanDevice::IndirectDrawSupport& support = {true, true, true}) {
+        return ClassifyIndirectDraw(main, graphics, programs.front(), support, draw);
+    };
+
+    ShaderRecompiler::RecompileResult folded{};
+    folded.vertexOffsetSgpr = 12;
+    auto constant = resolve({0, 0x280, 0x280, 2});
+    check(constant.indirect->baseVertexSgpr == -1 && constant.indirect->startInstanceSgpr == -1, "records with no register locations got SGPRs");
+    const auto constantPath = classify(folded, constant);
+    check(IndirectAheadRule(constantPath, true) == IndirectAhead::Prepare, "a GPU-side indirect draw was not prepared ahead");
+    check(constant.indirect->vertexRule == Rule::Constant && constant.indirect->vertexConstant == 42 && constant.indirect->instanceRule == Rule::Constant && constant.indirect->instanceConstant == 0, "constant dimensions classified wrong");
+    auto again = constant;
+    check(classify(folded, again) == constantPath && again.indirect->vertexRule == constant.indirect->vertexRule && again.indirect->vertexConstant == constant.indirect->vertexConstant && again.indirect->instanceRule == constant.indirect->instanceRule && again.indirect->instanceConstant == constant.indirect->instanceConstant, "classifying an adopted draw again changed its rules");
+    check(IndirectAheadRule(constantPath, false) == IndirectAhead::Disabled, "the opt-out did not refuse the draw");
+
+    state.userConfig[0x24a] = 0;
+    auto inPlace = resolve({0, 0x90, 0x280, 2});
+    check(inPlace.indirect->baseVertexSgpr == 12, "the base vertex location did not resolve to its SGPR");
+    check(IndirectAheadRule(classify(folded, inPlace), true) == IndirectAhead::Prepare && inPlace.indirect->vertexRule == Rule::InPlace, "an in-place dimension was not prepared");
+    state.userConfig[0x24a] = 5;
+    auto offset = resolve({0, 0x90, 0x280, 2});
+    check(classify(folded, offset) == Path::IndxOffset && IndirectAheadRule(Path::IndxOffset, true) == IndirectAhead::CpuRecords, "an in-place dimension over GE_INDX_OFFSET was not left to the CPU records");
+
+    ShaderRecompiler::RecompileResult other{};
+    other.vertexOffsetSgpr = 13;
+    auto unfolded = resolve({0, 0x90, 0x280, 2});
+    check(IndirectAheadRule(classify(other, unfolded), true) == IndirectAhead::CpuRecords, "a record dimension the shader does not fold was prepared ahead");
+    auto indexed = resolve({0, 0x280, 0x280, 0x8d | (1u << 31u), 2, 0, 0, 16, 2});
+    check(indexed.indirect->drawIndexSgpr == 9 && classify(folded, indexed) == Path::DrawIndex, "a draw index register write was not left to the CPU records");
+    auto counted = resolve({0, 0x280, 0x280, 0x280 | (1u << 30u), 2, 0x200000, 0, 16, 2});
+    check(classify(folded, counted, {true, true, false}) == Path::FeatureGap && IndirectAheadRule(classify(folded, counted), true) == IndirectAhead::Prepare, "a GPU-side draw count was not judged by the device's support");
+    graphics.stages.path = AgcDriver::Graphics::ShaderPath::Geometry;
+    auto geometry = resolve({0, 0x280, 0x280, 2});
+    check(classify(folded, geometry) == Path::NonVertexPath, "a non-vertex path indirect draw was prepared ahead");
+    graphics.stages.path = AgcDriver::Graphics::ShaderPath::Vertex;
+
+    PreparedDraw prepared;
+    auto decode = std::make_shared<DrawDecode>();
+    decode->state = graphics;
+    decode->programs = programs;
+    decode->roles = roles;
+    prepared.decode = decode;
+    prepared.programs = programs;
+    prepared.results = {folded, ShaderRecompiler::RecompileResult{}};
+    prepared.resultIndex = {0, 1};
+    prepared.drawParameters = resolve({0, 0x280, 0x280, 2});
+    static_cast<void>(classify(folded, prepared.drawParameters));
+    check(AdoptableIndirect(prepared, all, true), "a GPU-side prepared indirect draw was not adoptable");
+    check(!AdoptableIndirect(prepared, all, false), "the opt-out did not refuse adoption");
+    check(AdoptableIndirect(prepared, {false, true, true}, true), "a zero first instance was refused on a device without the feature");
+    ShaderRecompiler::RecompileResult instanced{};
+    instanced.instanceOffsetSgpr = 12;
+    prepared.programs[0].userData[4] = 3;
+    prepared.results[0] = instanced;
+    check(!AdoptableIndirect(prepared, {false, true, true}, true) && AdoptableIndirect(prepared, all, true), "a nonzero constant first instance was adopted on a device without the feature");
+    prepared.results[0] = other;
+    prepared.drawParameters = resolve({0, 0x90, 0x280, 2});
+    check(!AdoptableIndirect(prepared, all, true), "a prepared draw needing CPU records was adoptable");
+    prepared.drawParameters = AgcDriver::Pm4::DrawParameters{};
+    check(!AdoptableIndirect(prepared, all, true), "a direct draw was taken for an indirect one");
+    prepared.drawParameters = resolve({0, 0x280, 0x280, 2});
+    prepared.resultIndex.clear();
+    check(!AdoptableIndirect(prepared, all, true), "a prepared draw without its front result was adoptable");
+
+    check(MeshIndexParameters(constant).indexCount == 1 && MeshIndexParameters(constant).instanceCount == 1 && !MeshIndexParameters(constant).indirect, "an indirect mesh draw's index words were not taken from the declared range");
+}
+
+void testIndirectDrawAhead() {
+    using AgcDriver::DriverDetail::DrawAhead;
+    alignas(16) std::array<std::uint32_t, 16> first{};
+    alignas(16) std::array<std::uint32_t, 16> second{};
+    std::array<std::uint32_t, 2> loadPairs{0x40, 3};
+    Submission submission{};
+    submission.queue = 0;
+    for (const auto& packet : {
+        makePacket(0x79, {0x24a, 0}),
+        makePacket(0x11, {1, low(first.data()), high(first.data())}),
+        makePacket(0x24, {0, 0x280, 0x280, 2}),
+        makePacket(0x2d, {3, 2}),
+        makePacket(0x11, {1, low(second.data()), high(second.data())}),
+        makePacket(0x2c, {16, 0x280, 0x280, 0x280, 2, 0, 0, 16, 2}),
+        makePacket(0x63, {low(loadPairs.data()), high(loadPairs.data()), 0x80000000, 1}),
+        makePacket(0x79, {0x24a, 7}),
+        makePacket(0x24, {32, 0x280, 0x280, 2})
+    }) submission.commands.insert(submission.commands.end(), packet.begin(), packet.end());
+    std::atomic<std::size_t> prepares{0};
+    DrawAhead ahead([&](const AgcDriver::QueueState& state, std::span<const std::uint32_t> packet, const Submission&) {
+        auto prepared = std::make_shared<PreparedDraw>();
+        {
+            const AgcDriver::GuestMemory::UnhookedReadScope unhooked;
+            prepared->drawParameters = AgcDriver::Pm4::ResolveDraw(packet, state);
+        }
+        prepared->drawKey = stateHash(state);
+        ++prepares;
+        return prepared;
+    }, [](std::span<const std::uint32_t> packet) { return AgcDriver::Pm4::ReadRegisterPairs(packet); });
+    AgcDriver::QueueState state;
+    ahead.Begin(submission, state);
+    std::size_t handed = 0, draws = 0;
+    for (std::size_t cursor = 0; cursor < submission.commands.size();) {
+        const auto header = submission.commands[cursor];
+        const auto count = AgcDriver::Pm4::PacketWords(header);
+        const auto packet = std::span(submission.commands).subspan(cursor, count);
+        const auto opcode = (header >> 8u) & 0xffu;
+        cursor += count;
+        if (AgcDriver::Pm4::DrawOpcode(opcode)) {
+            if (draws++ == 0) waitFor([&] { return prepares.load() == 4; }, "the front end did not prepare the indirect draws");
+            const auto prepared = ahead.TakeDraw();
+            check(prepared != nullptr, "an indirect draw prepared ahead was not handed over");
+            ++handed;
+            const auto worker = AgcDriver::Pm4::ResolveDraw(packet, state);
+            check(prepared->drawKey == stateHash(state) && worker.indirect.has_value() == prepared->drawParameters.indirect.has_value() && worker.firstVertex == prepared->drawParameters.firstVertex, "a prepared draw was resolved from another state");
+            if (worker.indirect) {
+                const auto& a = *worker.indirect;
+                const auto& b = *prepared->drawParameters.indirect;
+                check(a.arguments == b.arguments && a.count == b.count && a.stride == b.stride && a.recordBytes == b.recordBytes && a.indxOffset == b.indxOffset && a.countIndirect == b.countIndirect, "a prepared indirect draw names other records than the worker's");
+            }
+        } else if (AgcDriver::Pm4::RegisterLoadOpcode(opcode)) {
+            const auto pairs = AgcDriver::Pm4::ReadRegisterPairs(packet);
+            AgcDriver::Pm4::ApplyRegisterPairs(packet, state, pairs);
+            ahead.ConfirmLoad(pairs);
+        } else if (AgcDriver::Pm4::PacketStateEffect(header) == AgcDriver::Pm4::StateEffect::Registers) {
+            execute(state, std::vector<std::uint32_t>(packet.begin(), packet.end()));
+        }
+    }
+    ahead.End();
+    check(handed == 4 && draws == 4, "indirect and direct draws were not handed over in order");
+    check(state.drawIndirectBase == reinterpret_cast<std::uintptr_t>(second.data()) && state.userConfig.at(0x24a) == 7 && state.shader.at(0x40) == 3, "the worker state went wrong");
+}
+
 void testStageFailureMemo() {
     using namespace ShaderRecompiler;
     static const std::array<std::uint32_t, 8> code{0xf4040004u, 0xfa000000u, 0xf4000080u, 0xfa000000u, 0x7e000202u, 0xf80008cfu, 0u, 0xbf810000u};
@@ -884,6 +1088,9 @@ int main(int argc, char** argv) {
         testAcquireMem();
         testStateEffects();
         testDrawAhead();
+        testIndirectArgumentsUnread();
+        testIndirectDrawAheadRules();
+        testIndirectDrawAhead();
         testStageFailureMemo();
         testDriverSubmission();
         LibcRunShutdown_nid_postfix();
