@@ -229,8 +229,54 @@ void Driver::throttleSubmit(std::uint32_t queue) {
     }
 }
 
+bool Driver::queue0Before(std::uint64_t received) const {
+    if (queue0Executing != 0 && queue0Executing < received) return true;
+    const auto worker = workers.find(0);
+    if (worker == workers.end()) return false;
+    for (const auto& pending : worker->second.pending) {
+        if (pending.suspend) continue;
+        return pending.received < received;
+    }
+    return false;
+}
+
+void Driver::noteQueue0Stall(std::uint64_t awaited) {
+    queue0Awaited.store(awaited, std::memory_order_release);
+    if (awaited != 0 && orderHolders.load(std::memory_order_acquire) != 0) {
+        std::lock_guard lock(mutex);
+        changed.notify_all();
+    }
+}
+
+bool Driver::writesAwaited(const Submission& submission, std::uint64_t awaited) {
+    if (awaited == 0) return false;
+    if (std::find(submission.labelWrites.begin(), submission.labelWrites.end(), awaited & ~std::uint64_t{3}) != submission.labelWrites.end()) return true;
+    for (std::size_t at = 0; at < submission.commands.size();) {
+        const auto header = submission.commands[at];
+        const auto words = std::max<std::size_t>(1, Pm4::PacketWords(header));
+        if ((header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x50u && at + words <= submission.commands.size()) {
+            const auto copy = Pm4::DecodeMemoryCopy(std::span<const std::uint32_t>(submission.commands).subspan(at, words));
+            if (copy.has_value() && awaited >= copy->destination && awaited < copy->destination + copy->bytes) return true;
+        }
+        at += words;
+    }
+    return false;
+}
+
 void Driver::enqueue(Submission submission) {
     const auto queue = submission.queue;
+    if (queue != 0 && !submission.suspend && submission.flips.empty() && submission.renderingWaits.empty()) {
+        submission.waitFree = true;
+        for (std::size_t at = 0; at < submission.commands.size();) {
+            const auto header = submission.commands[at];
+            const auto opcode = (header >> 8u) & 0xffu;
+            if ((header >> 30u) == 3u && (opcode == 0x3c || opcode == 0x93)) {
+                submission.waitFree = false;
+                break;
+            }
+            at += std::max<std::size_t>(1, Pm4::PacketWords(header));
+        }
+    }
     auto& worker = workers[queue];
     for (const auto dword : submission.labelWrites) ++worker.unfinishedWrites[dword];
     if (!submission.flips.empty()) worker.queuedFlips.fetch_add(1, std::memory_order_acq_rel);

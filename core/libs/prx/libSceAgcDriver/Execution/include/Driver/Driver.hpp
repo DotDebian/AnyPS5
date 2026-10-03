@@ -304,6 +304,12 @@ private:
     bool resetGraphics = false;
 
     std::uint32_t idleWaiters = 0;
+    std::uint64_t queue0Executing = 0;
+    std::atomic<std::uint32_t> orderHolders{0};
+    std::atomic<std::uint64_t> queue0Awaited{0};
+    bool queue0Before(std::uint64_t received) const;
+    void noteQueue0Stall(std::uint64_t awaited);
+    static bool writesAwaited(const Submission& submission, std::uint64_t awaited);
 
     std::atomic<std::uint64_t> evidenceReads{0};
     std::atomic<std::uint64_t> evidenceValidations{0};

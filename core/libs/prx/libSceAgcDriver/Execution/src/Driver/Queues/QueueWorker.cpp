@@ -77,6 +77,14 @@ void Driver::run(std::uint32_t id) noexcept {
                 }
                 submission = std::move(pending.front());
                 pending.pop_front();
+                if (id == 0) queue0Executing = submission.suspend ? 0 : submission.received;
+                static const bool crossQueueOrder = std::getenv("APS5_NO_CROSS_QUEUE_ORDER") == nullptr;
+                if (crossQueueOrder && submission.waitFree && queue0Before(submission.received)) {
+                    orderHolders.fetch_add(1, std::memory_order_acq_rel);
+                    changed.wait(lock, [&] { return failure || stopping || writesAwaited(submission, queue0Awaited.load(std::memory_order_acquire)) || !queue0Before(submission.received); });
+                    orderHolders.fetch_sub(1, std::memory_order_acq_rel);
+                    rethrowFailure();
+                }
                 worker.queued.fetch_sub(1, std::memory_order_acq_rel);
                 if (!submission.flips.empty()) worker.queuedFlips.fetch_sub(1, std::memory_order_acq_rel);
                 worker.started.fetch_add(1, std::memory_order_acq_rel);
@@ -91,8 +99,9 @@ void Driver::run(std::uint32_t id) noexcept {
                 rethrowFailure();
                 markCompleted(submission.serial);
                 forgetUnfinishedWrites(workers.at(id), submission);
+                if (id == 0) queue0Executing = 0;
 
-                notify = idleWaiters != 0;
+                notify = idleWaiters != 0 || orderHolders.load(std::memory_order_acquire) != 0;
             }
             if (notify) changed.notify_all();
             else ++costs.notifiesSkipped;

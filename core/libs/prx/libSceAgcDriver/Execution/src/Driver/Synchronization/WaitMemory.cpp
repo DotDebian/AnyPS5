@@ -261,6 +261,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
     if (entryTryFailed && pollService(false)) return;
 
+    struct Queue0Stall {
+        Driver& driver;
+        bool on;
+        ~Queue0Stall() { if (on) driver.noteQueue0Stall(0); }
+    } queue0Stall{*this, queue == 0};
+    if (queue == 0) noteQueue0Stall(awaited);
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
     const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : std::chrono::microseconds(100);
     const auto spinStart = std::chrono::steady_clock::now();

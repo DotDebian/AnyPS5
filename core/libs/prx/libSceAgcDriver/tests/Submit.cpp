@@ -295,6 +295,26 @@ void testLabelHeldAtSubmission() {
     AgcDriverWaitIdle_nid_postfix();
 }
 
+void testWaitFreeSubmissionAfterEarlierQueue0Work() {
+    alignas(64) static volatile std::uint32_t gate = 0, first = 0, second = 0;
+    submit(0, commands(waitEqual(&gate, 1), writeData(&first, 1)));
+    submit(0x20, commands(writeData(&second, 1)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    check(first == 0 && second == 0, "a wait-free submission ran before queue 0's earlier submission");
+    gate = 1;
+    waitFor(&second, 1, "the wait-free submission never ran after queue 0's earlier submission");
+    check(first == 1, "the wait-free submission ran before queue 0's earlier submission finished");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void testWaitFreeSubmissionQueue0WaitsOn() {
+    alignas(64) static volatile std::uint32_t label = 0, done = 0;
+    submit(0, commands(waitEqual(&label, 1), writeData(&done, 1)));
+    submit(0x20, commands(writeData(&label, 1)));
+    check(waitFor(&done, 1, "queue 0 never passed the wait the held submission satisfies") < std::chrono::milliseconds(500), "queue 0's wait on a held wait-free submission's label was not released at once");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
 void testWorkerFailure() {
     std::array<std::uint32_t, 5> words{0xc0031500, 1, 1, 1, 0x41};
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
@@ -324,6 +344,8 @@ int main() {
         testEndOfPipeLabelsWithoutWork();
         testLabelHeldAtSubmission();
         testWideLabelStoredSinceSubmission();
+        testWaitFreeSubmissionAfterEarlierQueue0Work();
+        testWaitFreeSubmissionQueue0WaitsOn();
         testWorkerFailure();
         check(expectFailure([] { LibcRunShutdown_nid_postfix(); }).find("required shader register") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC driver submit tests passed");
