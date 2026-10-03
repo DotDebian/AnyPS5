@@ -1279,6 +1279,33 @@ AgcDriver::Graphics::Context mockContext() {
     return context;
 }
 
+void bufferPoolTests() {
+    using AgcDriver::Graphics::Buffer;
+    const auto context = mockContext();
+    constexpr VkBufferUsageFlags storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    constexpr VkBufferUsageFlags refreshable = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkBuffer first = VK_NULL_HANDLE;
+    VkBuffer second = VK_NULL_HANDLE;
+    {
+        Buffer a(context, 300, storage);
+        Buffer b(context, 300, storage);
+        first = a.Handle();
+        second = b.Handle();
+    }
+    {
+        Buffer other(context, 300, refreshable);
+        Require(other.Handle() != first && other.Handle() != second, "a free buffer of another usage was taken");
+        Buffer larger(context, 600, storage);
+        Require(larger.Handle() != first && larger.Handle() != second, "a free buffer of another size class was taken");
+        Buffer classed(context, 400, storage);
+        Require(classed.Handle() == first, "the most recently freed buffer of the size class was not taken");
+        Buffer next(context, 260, storage);
+        Require(next.Handle() == second, "the other free buffer of the size class was not taken");
+        Buffer none(context, 300, storage);
+        Require(none.Handle() != first && none.Handle() != second, "a buffer in use was taken");
+    }
+}
+
 using Role = ShaderRecompiler::DescriptorRole;
 using Kind = ShaderRecompiler::DescriptorKind;
 
@@ -2605,6 +2632,9 @@ int main() {
             }
         });
         Require(mock.live == 0, "BDA resources leaked Vulkan objects");
+        mock = MockVulkan{};
+        bufferPoolTests();
+        Require(mock.live == 0, "the buffer pool leaked Vulkan objects");
         RunGuestAllocationTests();
         RunLiveStackAccessTests();
         RunUnwatchedGapTests();

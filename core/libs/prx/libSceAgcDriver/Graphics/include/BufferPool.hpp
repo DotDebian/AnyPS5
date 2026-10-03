@@ -3,9 +3,11 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -60,10 +62,22 @@ private:
         BufferAllocation allocation;
         std::uint64_t lastUse;
     };
+    struct SlotKey {
+        std::size_t bytes;
+        VkBufferUsageFlags usage;
+        VkMemoryPropertyFlags properties;
+        bool operator==(const SlotKey&) const = default;
+    };
+    struct SlotKeyHash {
+        std::size_t operator()(const SlotKey& key) const noexcept {
+            return std::hash<std::size_t>{}(key.bytes) ^ (static_cast<std::size_t>(key.usage) << 32u) ^ (static_cast<std::size_t>(key.properties) << 48u);
+        }
+    };
     // One retention tier: its slots, their bytes, the byte budget they are evicted under and its
     // counters (APS5_PROFILE_DRAW, reported every 10 s from Take).
     struct Tier {
-        std::vector<Slot> free;
+        std::unordered_map<SlotKey, std::deque<Slot>, SlotKeyHash> free;
+        std::size_t slots = 0;
         VkDeviceSize retainedBytes = 0;
         VkDeviceSize budget = 0;
         std::uint64_t hits = 0;
