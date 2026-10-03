@@ -1176,17 +1176,30 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
     }
     try {
         Require(!shaders.empty() && context.limits.maxBoundDescriptorSets >= 1, "shader descriptor set exceeds device limits");
-        std::set<std::uint32_t> occupied;
+        std::size_t plannedBindings = 0;
+        std::size_t plannedAllocations = 0;
         for (const auto& shader : shaders) {
             Require(shader.program != nullptr, "missing compiled shader");
+            plannedBindings += shader.program->bindings.size();
+            for (const auto& binding : shader.program->bindings) {
+                if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages && binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers) plannedAllocations += binding.count;
+            }
+        }
+        bindings.reserve(plannedBindings);
+        allocations.reserve(plannedAllocations);
+        std::vector<std::uint32_t> occupied;
+        occupied.reserve(plannedBindings);
+        std::vector<std::size_t> offsetsInData;
+        for (const auto& shader : shaders) {
             bdaWrites = bdaWrites || shader.program->bdaWrites;
             const VkShaderStageFlags flags = VulkanStage(shader.stage);
             std::uint64_t stageDescriptors = 0;
-            std::vector<std::size_t> offsetsInData;
+            offsetsInData.clear();
             std::int64_t shaderData = -1;
             for (const auto& binding : shader.program->bindings) {
                 Require(binding.descriptorSet == 0, "unexpected descriptor set: every shader resource must use descriptor set zero");
-                Require(occupied.insert(binding.binding).second, "duplicate shader binding");
+                Require(std::find(occupied.begin(), occupied.end(), binding.binding) == occupied.end(), "duplicate shader binding");
+                occupied.push_back(binding.binding);
                 const bool addressRole = binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer;
                 const bool gdsRole = binding.role == ShaderRecompiler::DescriptorRole::Gds;
                 const bool bufferRole = addressRole || gdsRole || binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers || binding.role == ShaderRecompiler::DescriptorRole::ShaderData || binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt;
@@ -1203,6 +1216,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 storageBuffers += binding.count;
                 Require(stageDescriptors <= context.limits.maxPerStageDescriptorStorageBuffers && stageDescriptors <= context.limits.maxPerStageResources, "shader descriptors exceed per-stage limits");
                 Binding item{{binding.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, binding.count, flags, nullptr}, {}};
+                item.allocations.reserve(binding.count);
                 if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
                     Require(binding.guestDescriptor.size() == static_cast<std::uint64_t>(binding.count) * 4, "guest buffer descriptor must contain four DWORDs per array element");
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
@@ -1244,6 +1258,14 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             for (const auto index : offsetsInData) allocations[index].dataAllocation = shaderData;
         }
         Require(storageBuffers <= context.limits.maxDescriptorSetStorageBuffers, "pipeline descriptors exceed device limits");
+        textures.reserve(plannedSampledImages);
+        textureFirstLayer.reserve(plannedSampledImages);
+        storageTextures.reserve(plannedStorageImages);
+        storageMips.reserve(plannedStorageImages);
+        storageKeys.reserve(plannedStorageImages);
+        storageFirstLayer.reserve(plannedStorageImages);
+        storageWritten.reserve(plannedStorageImages);
+        describedRanges.reserve(plannedSampledImages + plannedStorageImages);
         timing.bindingsMs = phase(BuildPhase::Bindings);
         // For every build, locked ones included: their stage B then takes the fast path too, and the
         // collects cost the same wherever they run.
@@ -1251,6 +1273,8 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         guestMemory.UploadPrepare(usesBda);
         timing.uploadMs = phase(BuildPhase::Upload);
         std::vector<VkDescriptorSetLayoutBinding> description;
+        description.reserve(bindings.size());
+        layoutKey.reserve(bindings.size() * 4);
         for (const auto& binding : bindings) {
             description.push_back(binding.layout);
             layoutKey.insert(layoutKey.end(), {binding.layout.binding, static_cast<std::uint32_t>(binding.layout.descriptorType), binding.layout.descriptorCount, binding.layout.stageFlags});
@@ -1448,6 +1472,11 @@ void ShaderResources::noteReusable() {
         directRegions.push_back({begin, end, serial});
     }
     reusable = true;
+}
+
+bool ShaderResources::keepsTemplateRecords() const {
+    static const bool always = std::getenv("APS5_KEEP_TEMPLATE_RECORDS") != nullptr;
+    return always || (!usesBda && !usesFaultBuffer);
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
@@ -1664,6 +1693,11 @@ bool EpochRevalidate() {
 // Turns the lookups' records into this object's per-texture validation records (see
 // ValidatedSurface); the last record of an object is the freshest.
 void ShaderResources::captureValidation() {
+    if (!keepsTemplateRecords()) {
+        validatedTextures.clear();
+        lookupLog.clear();
+        return;
+    }
     const auto record = [](const void* object) -> const LookupRecord* {
         for (auto it = lookupLog.rbegin(); it != lookupLog.rend(); ++it) {
             if (it->object == object) return &*it;
@@ -2553,7 +2587,7 @@ std::size_t ShaderResources::addDataBuffer(std::span<const std::uint32_t> words)
     auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u));
     std::memcpy(buffer->Bytes().data(), words.data(), size);
     Allocation allocation{0, size, false, std::move(buffer)};
-    if (refreshable) allocation.dataWords.assign(words.begin(), words.end());
+    if (refreshable && keepsTemplateRecords()) allocation.dataWords.assign(words.begin(), words.end());
     allocations.push_back(std::move(allocation));
     mixDataWords(dataWordsHash, allocations.back().dataWords);
     return allocations.size() - 1;
@@ -2726,6 +2760,7 @@ bool ShaderResources::precollectImages() {
     static const bool noRecords = std::getenv("APS5_NO_STAGE_A_IMAGES") != nullptr;
     if (disabled || deferredImages.empty()) return false;
     imageRecords.clear();
+    imageRecords.reserve(plannedSampledImages + plannedStorageImages);
     nextImageRecord = 0;
     auto& counters = TextureCounts();
     for (const auto& deferred : deferredImages) {
