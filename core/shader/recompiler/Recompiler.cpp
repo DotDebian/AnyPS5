@@ -488,6 +488,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     DescriptorBindingBuilder{}.Populate(bindings, variant.info.info, variant.info.stage, variant.info.userDataBase, snapshot, partialThreads(request));
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
+    result.bdaWrites = variant.info.info.bdaWrites;
     for (auto& attribute : result.vertexAttributes) {
         if (!request.context.vertex || attribute.location >= request.context.vertex->resourcesNum) throw std::runtime_error("Shader cache: invalid vertex attribute metadata");
         attribute.resource = request.context.vertex->resources[attribute.location];
