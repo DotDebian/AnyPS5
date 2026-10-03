@@ -15,6 +15,7 @@ if(BUILD_TESTING)
     add_test_executable(guest_system_font_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemFont.cpp)
     target_include_directories(guest_system_font_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_system_font_tests PRIVATE libSceFont libSceFontFt libc)
+    configure_windows_unwind(guest_system_font_tests)
     add_test(NAME guest_system_font COMMAND guest_system_font_tests)
     if(WIN32)
         set_tests_properties(guest_font guest_system_font PROPERTIES ENVIRONMENT_MODIFICATION
