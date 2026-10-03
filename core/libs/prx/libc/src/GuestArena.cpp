@@ -115,6 +115,7 @@ private:
             if (last < regionEnd) _holes.emplace_back(last, regionEnd);
             cursor = regionEnd;
         }
+        _hostRegions = _holes;
         _holes.emplace_back(SystemReservedStart, SystemReservedEnd);
         for (const auto& [holeStart, holeEnd] : _holes) _used.emplace(holeStart, holeEnd);
         _base = ArenaStart;
@@ -125,6 +126,7 @@ private:
     std::mutex _lock;
     std::map<std::uintptr_t, std::uintptr_t> _used;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _holes;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _hostRegions;
     std::uintptr_t _base = 0;
     std::uintptr_t _end = 0;
     bool _writeWatched = false;
@@ -133,6 +135,12 @@ public:
     std::uintptr_t Base() const { return _base; }
     std::size_t Size() const { return _end - _base; }
     bool WriteWatched() const { return _writeWatched; }
+    bool OverlapsHostRegion(std::uintptr_t start, std::size_t bytes) const {
+        for (const auto& [regionStart, regionEnd] : _hostRegions) {
+            if (regionStart < start + bytes && start < regionEnd) return true;
+        }
+        return false;
+    }
 };
 
 const bool g_reserved = (Arena::Get(), true);
@@ -183,6 +191,10 @@ bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* pro
 
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear);
+}
+
+bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    return Arena::Get().OverlapsHostRegion(address, bytes);
 }
 
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule) {

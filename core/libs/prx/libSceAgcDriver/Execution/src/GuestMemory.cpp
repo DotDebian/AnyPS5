@@ -1267,6 +1267,9 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     constexpr std::uint64_t page = 4096;
     const auto first = address & ~(page - 1);
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
+#ifdef _WIN32
+    if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(first, static_cast<std::size_t>(stop - first))) return stampStored(tracker, store());
+#endif
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return stampStored(tracker, store());
     const auto stored = store();
     walkWrites(tracker, first, stop, StampKind::Driver);
