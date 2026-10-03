@@ -53,7 +53,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     try {
         handle = ShaderRecompiler::ResolveSource(request);
     } catch (const std::exception& error) {
-        if (FailureMemo()) {
+        if (FailureMemo() && request.shader.stage == ShaderRecompiler::ShaderStage::Compute) {
             std::lock_guard lock(memos.mutex);
             memos.entries[memos.next] = {key, nullptr, std::make_shared<const std::string>(error.what())};
             memos.next = (memos.next + 1) % memos.entries.size();

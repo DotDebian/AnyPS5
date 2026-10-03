@@ -103,9 +103,7 @@ std::shared_ptr<PreparedDraw> Driver::prepareDrawAhead(const QueueState& queue, 
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         prepared->resultIndex[i] = results.size();
-        const std::string* failed = nullptr;
-        results.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, prepared->vertexInfos, memory, linked, drawParameters, localDevice, *prepared->shaderMemory, prepared->stageCaptures, recompiled, false, matched, matchedRegions, false, 0, 0, prepared->captures, phaseTiming, phaseMs, &failed));
-        if (failed != nullptr) return nullptr;
+        results.push_back(compileDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, prepared->vertexInfos, memory, linked, drawParameters, localDevice, *prepared->shaderMemory, prepared->stageCaptures, recompiled, false, matched, matchedRegions, false, 0, 0, prepared->captures, phaseTiming, phaseMs));
         const auto& result = results.back();
         if (i == 0) foldDrawOffsets(result, programs.front(), drawParameters);
         require(result.pushConstants.size() <= Graphics::PipelinePushConstantBytes - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
