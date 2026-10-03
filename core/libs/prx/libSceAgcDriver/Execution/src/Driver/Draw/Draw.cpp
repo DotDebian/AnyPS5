@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/IndirectDraw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -21,11 +22,11 @@ void Driver::foldDrawOffsets(const ShaderRecompiler::RecompileResult& main, cons
     static const bool indexedOffsetFold = std::getenv("APS5_NO_INDEXED_OFFSET_FOLD") == nullptr;
     if (parameters.indexed && !indexedOffsetFold) return;
     if (main.vertexOffsetSgpr >= 0 && (parameters.firstVertex == 0 || !indxOffsetSkipFold)) {
-        const auto offset = drawUserWord(front, main.vertexOffsetSgpr);
+        const auto offset = DrawUserWord(front, main.vertexOffsetSgpr);
         require(offset <= std::numeric_limits<std::uint32_t>::max() - parameters.firstVertex, "draw vertex offset overflow");
         parameters.firstVertex += offset;
     }
-    if (main.instanceOffsetSgpr >= 0) parameters.firstInstance = drawUserWord(front, main.instanceOffsetSgpr);
+    if (main.instanceOffsetSgpr >= 0) parameters.firstInstance = DrawUserWord(front, main.instanceOffsetSgpr);
 }
 
 void Driver::decodeProgramVertexInfo(const DrawProgram& program, ShaderRecompiler::ProgramRole role, std::optional<ShaderRecompiler::ShaderVertexStageInfo>& info, std::vector<Graphics::DecodeRead>& reads) {
@@ -132,32 +133,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto& pixel = decode->pixel;
     std::vector<DrawProgram> programs = adopted ? std::move(prepared->programs) : decode->programs;
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) { setMeshIndexWords(programs.front(), graphics, parameters); };
-    if (adopted) {
-    } else if (!drawParameters.indirect) setMeshIndexBuffer(drawParameters);
-    else if (graphics.stages.mesh) setMeshIndexBuffer(Pm4::DrawParameters{drawParameters.indexAddress, std::max(drawParameters.indexCount, 1u), drawParameters.indexSize, 1, 0, drawParameters.indexed});
+    if (!adopted) setMeshIndexBuffer(MeshIndexParameters(drawParameters));
     const std::vector<Role>& roles = decode->roles;
     phaseTiming.Phase(DrawRowDecode);
 
-    const auto locate = [&](std::uint32_t location) -> std::optional<std::pair<std::size_t, std::size_t>> {
-        if (location == 0x280u) return std::nullopt;
-        for (std::size_t i = 0; i < programs.size(); ++i) {
-            if (roles[i] == Role::Fragment || roles[i] == Role::GeometryBack || location < programs[i].userDataBase) continue;
-            const auto word = location - programs[i].userDataBase + (8u - programs[i].firstUserSgpr);
-            if (word < programs[i].userData.size()) return std::make_pair(i, static_cast<std::size_t>(word));
-        }
-        return std::nullopt;
-    };
-    if (drawParameters.indirect) {
-        auto& indirect = *drawParameters.indirect;
-        const auto sgprOf = [&](std::uint32_t location) -> std::int32_t {
-            const auto word = locate(location);
-            if (!word || word->first != 0) return -1;
-            return static_cast<std::int32_t>(programs.front().firstUserSgpr + word->second);
-        };
-        indirect.baseVertexSgpr = sgprOf(indirect.baseVertexLocation);
-        indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
-        indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
-    }
+    const auto locate = [&](std::uint32_t location) { return LocateDrawUserWord(programs, roles, location); };
+    if (drawParameters.indirect) ResolveIndirectSgprs(programs, roles, *drawParameters.indirect);
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<ShaderRecompiler::LinkedProgram> linked;
     if (adopted) memory = std::move(prepared->memory);
