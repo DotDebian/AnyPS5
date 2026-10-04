@@ -1034,7 +1034,7 @@ struct IndirectRecord {
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
 void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset) {
-    if (context.recorder != nullptr) context.recorder->NoteSampledDraw();
+    if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
     if (state.stages.mesh && args != nullptr) {
         context.Function<PFN_vkCmdDrawMeshTasksIndirectEXT>("vkCmdDrawMeshTasksIndirectEXT")(commands, argumentBuffer, argumentOffset, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));
@@ -1842,6 +1842,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         SyncDepthSurfaceTextures(context, writesDepth ? depthImage.get() : nullptr, resources->SampledTextures());
     }
     const auto commands = recorded ? recorder->Commands() : batch->Handle();
+    if (recorded) recorder->PrepareSampleSlot();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.
     const auto drawTiming = recorded ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
@@ -1916,6 +1917,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (args != nullptr) CountIndirectDraw(indirect.path, indirect.readMs, rewritten);
     auto checkRecords = indirectRecordCheck(args != nullptr ? &indirect : nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
+    if (recorded) recorder->EndPassSamples();
     context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
     APS5_LOG_CHARS_OUT_DEBUG("Render pass ended");
     for (auto& binding : targets) {

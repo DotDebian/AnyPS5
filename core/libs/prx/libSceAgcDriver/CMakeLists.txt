@@ -59,6 +59,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcSampleDumpsShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/SampleDumps.comp)
+set(agcSampleDumpsShaderSpv ${agcTextureDetileGeneratedDir}/SampleDumps.spv)
+set(agcSampleDumpsShaderHeader ${agcTextureDetileGeneratedDir}/SampleDumps_spv.h)
+add_custom_command(
+        OUTPUT "${agcSampleDumpsShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcSampleDumpsShaderSpv}" "${agcSampleDumpsShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcSampleDumpsShaderSpv} -DOUTPUT=${agcSampleDumpsShaderHeader}
+        -DSYMBOL=SAMPLE_DUMPS_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcSampleDumpsShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcMeshArgumentsShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/MeshArguments.comp)
 set(agcMeshArgumentsShaderSpv ${agcTextureDetileGeneratedDir}/MeshArguments.spv)
 set(agcMeshArgumentsShaderHeader ${agcTextureDetileGeneratedDir}/MeshArguments_spv.h)
@@ -182,6 +195,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
         ${agcSampleCounterShaderHeader}
+        ${agcSampleDumpsShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcPresentationShaderHeaders}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
@@ -361,9 +375,26 @@ add_custom_command(
         VERBATIM
 )
 
+foreach(agcCoverStage IN ITEMS vert frag)
+    string(TOUPPER "${agcCoverStage}" agcCoverSymbol)
+    set(agcCoverShaderSpv ${agcTestShaderGeneratedRoot}/Cover_${agcCoverStage}.spv)
+    set(agcCoverShaderHeader ${agcTestShaderGeneratedRoot}/Cover_${agcCoverStage}_spv.h)
+    add_custom_command(
+            OUTPUT "${agcCoverShaderHeader}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+            COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcCoverShaderSpv}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/Cover.${agcCoverStage}"
+            COMMAND ${CMAKE_COMMAND} -DINPUT=${agcCoverShaderSpv} -DOUTPUT=${agcCoverShaderHeader}
+            -DSYMBOL=COVER_${agcCoverSymbol}_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/Cover.${agcCoverStage}" glslang-standalone
+            VERBATIM
+    )
+    list(APPEND agcCoverShaderHeaders ${agcCoverShaderHeader})
+endforeach()
+
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
         ${agcSampleLodShaderHeader}
+        ${agcCoverShaderHeaders}
 )
 
 target_include_directories(agc_driver_recorder_tests PRIVATE
@@ -459,6 +490,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
         ${agcSampleCounterShaderHeader}
+        ${agcSampleDumpsShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         Execution/src/GuestMemory.cpp
         Execution/src/Pm4.cpp

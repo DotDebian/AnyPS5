@@ -90,4 +90,19 @@ bool PassHazards::Empty() const {
     return reads.Empty() && writes.Empty() && images.empty() && attachments.empty() && !anyReads && !anyWrites && !gds;
 }
 
+std::vector<std::size_t> QueuedWriteGroups(std::span<const QueuedWrite> writes) {
+    std::vector<std::size_t> ends;
+    GuestRangeSet computed;
+    for (std::size_t i = 0; i < writes.size(); ++i) {
+        const auto& write = writes[i];
+        if (!write.computed && computed.Overlaps(write.begin, write.end)) {
+            ends.push_back(i);
+            computed.Clear();
+        }
+        if (write.computed) computed.Insert(write.begin, write.end);
+    }
+    if (!writes.empty()) ends.push_back(writes.size());
+    return ends;
+}
+
 }

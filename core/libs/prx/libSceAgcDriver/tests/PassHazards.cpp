@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -196,6 +197,65 @@ void testGds() {
     Expect(hazards.Check(plain.View(), true) == PassHazard::None, "a draw without GDS after one with it");
 }
 
+using Groups = std::vector<std::size_t>;
+
+std::vector<std::uint8_t> ProgramOrder(const std::vector<QueuedWrite>& writes, std::size_t bytes) {
+    std::vector<std::uint8_t> memory(bytes, 0);
+    for (std::size_t i = 0; i < writes.size(); ++i) {
+        for (auto at = writes[i].begin; at < writes[i].end; ++at) memory[at] = static_cast<std::uint8_t>(i + 1);
+    }
+    return memory;
+}
+
+std::vector<std::uint8_t> RecordedOrder(const std::vector<QueuedWrite>& writes, const Groups& groups, std::size_t bytes) {
+    std::vector<std::uint8_t> memory(bytes, 0);
+    std::size_t first = 0;
+    for (const auto end : groups) {
+        for (const bool computed : {false, true}) {
+            for (auto i = first; i < end; ++i) {
+                if (writes[i].computed != computed) continue;
+                for (auto at = writes[i].begin; at < writes[i].end; ++at) memory[at] = static_cast<std::uint8_t>(i + 1);
+            }
+        }
+        first = end;
+    }
+    return memory;
+}
+
+void testQueuedWriteGroups() {
+    Expect(QueuedWriteGroups({}).empty(), "no queued writes, no groups");
+    const std::vector<QueuedWrite> query{{0x100, 0x200, false}, {0x100, 0x1f8, true}, {0x108, 0x200, true}, {0x200, 0x300, false}, {0x200, 0x2f8, true}, {0x208, 0x300, true}};
+    Expect(QueuedWriteGroups(query) == Groups{6}, "a clear, a begin dump and an end dump per query slot are one group");
+    const std::vector<QueuedWrite> reused{{0x100, 0x1f8, true}, {0x100, 0x200, false}, {0x100, 0x1f8, true}};
+    Expect(QueuedWriteGroups(reused) == Groups{1, 3}, "a store over a computed write of the group starts a new group");
+    const std::vector<QueuedWrite> apart{{0x100, 0x1f8, true}, {0x1f8, 0x200, false}, {0x300, 0x310, false}};
+    Expect(QueuedWriteGroups(apart) == Groups{3}, "stores beside the computed writes stay in their group");
+    const std::vector<QueuedWrite> stores{{0x100, 0x110, false}, {0x100, 0x110, false}};
+    Expect(QueuedWriteGroups(stores) == Groups{2}, "stores alone are one group (their own WAW barriers order them)");
+    std::uint64_t seed = 0x9e3779b97f4a7c15ull;
+    const auto next = [&](std::uint64_t bound) {
+        seed ^= seed << 13u;
+        seed ^= seed >> 7u;
+        seed ^= seed << 17u;
+        return seed % bound;
+    };
+    constexpr std::size_t bytes = 64;
+    int mismatches = 0;
+    for (int round = 0; round < 20000; ++round) {
+        std::vector<QueuedWrite> writes;
+        const auto count = 1 + next(12);
+        for (std::uint64_t i = 0; i < count; ++i) {
+            const auto begin = next(bytes - 1);
+            const auto end = begin + 1 + next(std::min<std::uint64_t>(16, bytes - begin));
+            writes.push_back({begin, std::min<std::uint64_t>(end, bytes), next(2) == 0});
+        }
+        const auto groups = QueuedWriteGroups(writes);
+        bool valid = !groups.empty() && groups.back() == writes.size() && std::is_sorted(groups.begin(), groups.end());
+        if (!valid || RecordedOrder(writes, groups, bytes) != ProgramOrder(writes, bytes)) ++mismatches;
+    }
+    Expect(mismatches == 0, "recording each group's stores before its computed writes keeps the program order's final bytes");
+}
+
 }
 
 int main() {
@@ -205,6 +265,7 @@ int main() {
     testImages();
     testAttachments();
     testGds();
+    testQueuedWriteGroups();
     if (failures != 0) {
         std::fprintf(stderr, "%d pass hazard checks failed\n", failures);
         return 1;

@@ -29,8 +29,8 @@ struct PassAccess {
 enum class PassHazard : std::uint8_t { None, ReadAfterWrite, WriteAfterWrite, WriteAfterRead, Image, UnknownRead, UnknownWrite, Gds, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(PassHazard::Count)> PassHazardNames{"none", "raw", "waw", "war", "image", "unknown-read", "unknown-write", "gds"};
 
-enum class PassBreak : std::uint8_t { Capture, ReadsTarget, GpuIndirect, MeshIndirect, DepthClear, FirstInBatch, OtherWork, Key, PreviousWrote, Hazard, None, Count = None };
-inline constexpr std::array<const char*, static_cast<std::size_t>(PassBreak::Count)> PassBreakNames{"capture", "reads-target", "gpu-indirect", "mesh-indirect", "depth-clear", "first-in-batch", "other-work", "key", "previous-wrote", "hazard"};
+enum class PassBreak : std::uint8_t { Capture, ReadsTarget, GpuIndirect, MeshIndirect, DepthClear, FirstInBatch, OtherWork, Key, PreviousWrote, Hazard, SampleSlots, None, Count = None };
+inline constexpr std::array<const char*, static_cast<std::size_t>(PassBreak::Count)> PassBreakNames{"capture", "reads-target", "gpu-indirect", "mesh-indirect", "depth-clear", "first-in-batch", "other-work", "key", "previous-wrote", "hazard", "sample-slots"};
 
 enum class PassBlock : std::uint8_t { None, Lease, Completion, Buffers, Images, Gds, Count };
 inline constexpr std::array<const char*, static_cast<std::size_t>(PassBlock::Count)> PassBlockNames{"none", "lease", "completion", "buffers", "images", "gds"};
@@ -46,6 +46,14 @@ public:
 private:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
 };
+
+struct QueuedWrite {
+    std::uint64_t begin;
+    std::uint64_t end;
+    bool computed;
+};
+
+std::vector<std::size_t> QueuedWriteGroups(std::span<const QueuedWrite> writes);
 
 class PassHazards {
 public:
