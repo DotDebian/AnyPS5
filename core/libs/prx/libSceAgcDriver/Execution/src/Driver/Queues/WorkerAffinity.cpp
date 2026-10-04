@@ -5,17 +5,14 @@
 
 namespace AgcDriver::DriverDetail {
 
-// The queue workers, the draw front end and the presenter run unpinned by default on every
-// platform. APS5_WORKER_AFFINITY=1 pins them to the performance cores of a hybrid CPU,
-// APS5_WORKER_AFFINITY_MASK=<hex> to the given cores, and APS5_NO_WORKER_AFFINITY=1 overrides both.
-// Pinning was the Linux default for a while (2-6% fps on an i9-14900KF) but made the Xid 109 GPU
-// hang of PPSA21564's tile light-culling dispatch far more frequent.
 std::uint64_t WorkerAffinityMask() {
     static const std::uint64_t mask = [] {
         if (std::getenv("APS5_NO_WORKER_AFFINITY") != nullptr) return std::uint64_t{0};
         const auto requested = CpuTopology::MaskFromEnvironment("APS5_WORKER_AFFINITY_MASK");
         if (requested != 0) return requested;
+#ifndef __linux__
         if (std::getenv("APS5_WORKER_AFFINITY") == nullptr) return std::uint64_t{0};
+#endif
         const auto& layout = CpuTopology::Get();
         return layout.hybrid ? layout.performant : std::uint64_t{0};
     }();
