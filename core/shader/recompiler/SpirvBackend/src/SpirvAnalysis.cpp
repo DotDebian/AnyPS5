@@ -1,6 +1,9 @@
 #include "SpirvBackend/SpirvAnalysis.hpp"
+#include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ShaderRecompiler {
 
@@ -61,6 +64,162 @@ bool LaneSource(const IrProgram& program, const IrValue& value) {
     return address != AddressAccess::None || BufferAccessOf(value.Opcode()) != BufferAccess::None || SharedAccessOf(value.Opcode()) != SharedAccess::None || ImageOpcodeInfoOf(value.Opcode()).access != ImageAccess::None;
 }
 
+}
+
+namespace {
+
+// The largest value a 32-bit LDS address can take, or nullopt when no bound is proven. Unsigned
+// throughout: an operation that could wrap past 2^32 has no bound.
+class AddressBound {
+public:
+    std::optional<std::uint64_t> Of(const IrValue* value) {
+        if (value == nullptr) return std::nullopt;
+        value = value->Resolve();
+        if (value == nullptr) return std::nullopt;
+        if (value->HasImmediate()) return static_cast<std::uint64_t>(value->ImmediateU32());
+        if (const auto known = bounds.find(value); known != bounds.end()) return known->second;
+        // A value on its own operand chain (a loop phi) has no bound here.
+        if (!visiting.insert(value).second || visiting.size() > MaxDepth) return std::nullopt;
+        const auto result = compute(*value);
+        visiting.erase(value);
+        bounds.emplace(value, result);
+        return result;
+    }
+
+private:
+    static constexpr std::size_t MaxDepth = 256;
+    static constexpr std::uint64_t Max32 = 0xffffffffull;
+
+    static std::optional<std::uint64_t> fits(std::uint64_t value) {
+        return value <= Max32 ? std::optional<std::uint64_t>(value) : std::nullopt;
+    }
+    static std::uint64_t ones(std::uint64_t value) {
+        std::uint64_t mask = 0;
+        while (mask < value) mask = (mask << 1u) | 1u;
+        return mask;
+    }
+
+    std::optional<std::uint64_t> compute(const IrValue& value) {
+        const auto argument = [&](std::size_t index) { return index < value.ArgumentCount() ? Of(value.Argument(index)) : std::nullopt; };
+        switch (value.Opcode()) {
+        case IrOpcode::LaneId:
+            // Guest lane ids, at most wave64 (EmitLaneId: the subgroup invocation of either half).
+            return 63u;
+        case IrOpcode::IAdd32: {
+            const auto a = argument(0), b = argument(1);
+            if (!a || !b) return std::nullopt;
+            return fits(*a + *b);
+        }
+        case IrOpcode::IMul32: {
+            const auto a = argument(0), b = argument(1);
+            if (!a || !b || (*b != 0 && *a > Max32 / *b)) return std::nullopt;
+            return *a * *b;
+        }
+        case IrOpcode::ShiftLeftLogical32:
+        case IrOpcode::IShiftLeft32: {
+            const auto a = argument(0), b = argument(1);
+            if (!a || !b || *b >= 32u) return std::nullopt;
+            return fits(*a << *b);
+        }
+        case IrOpcode::ShiftRightLogical32:
+        case IrOpcode::IShiftRightLogical32:
+            return argument(0);
+        case IrOpcode::BitwiseAnd32:
+        case IrOpcode::IAnd32: {
+            const auto a = argument(0), b = argument(1);
+            if (a && b) return std::min(*a, *b);
+            return a ? a : b;
+        }
+        case IrOpcode::BitwiseOr32:
+        case IrOpcode::IOr32:
+        case IrOpcode::BitwiseXor32:
+        case IrOpcode::IXor32: {
+            const auto a = argument(0), b = argument(1);
+            if (!a || !b) return std::nullopt;
+            return ones(std::max(*a, *b));
+        }
+        case IrOpcode::UMin32: {
+            const auto a = argument(0), b = argument(1);
+            if (a && b) return std::min(*a, *b);
+            return a ? a : b;
+        }
+        case IrOpcode::UMax32: {
+            const auto a = argument(0), b = argument(1);
+            if (!a || !b) return std::nullopt;
+            return std::max(*a, *b);
+        }
+        case IrOpcode::SelectU32: {
+            const auto a = argument(1), b = argument(2);
+            if (!a || !b) return std::nullopt;
+            return std::max(*a, *b);
+        }
+        case IrOpcode::BitFieldUExtract: {
+            const auto width = argument(2);
+            if (width && *width < 32u) return (1ull << *width) - 1u;
+            return argument(0);
+        }
+        case IrOpcode::Phi: {
+            std::uint64_t result = 0;
+            for (std::size_t index = 0; index < value.ArgumentCount(); ++index) {
+                const auto incoming = Of(value.Argument(index));
+                if (!incoming) return std::nullopt;
+                result = std::max(result, *incoming);
+            }
+            return result;
+        }
+        default:
+            return std::nullopt;
+        }
+    }
+
+    std::unordered_map<const IrValue*, std::optional<std::uint64_t>> bounds;
+    std::unordered_set<const IrValue*> visiting;
+};
+
+// The dwords an LDS access touches from its address on (0: not an addressed LDS access).
+std::uint32_t SharedAccessDwords(IrOpcode opcode) {
+    switch (opcode) {
+    case IrOpcode::LoadSharedU32x2:
+    case IrOpcode::WriteSharedU32x2:
+        return 2u;
+    case IrOpcode::LoadSharedU32x3:
+    case IrOpcode::WriteSharedU32x3:
+        return 3u;
+    case IrOpcode::LoadSharedU32x4:
+    case IrOpcode::WriteSharedU32x4:
+        return 4u;
+    case IrOpcode::LoadShared:
+    case IrOpcode::StoreShared:
+    case IrOpcode::DataAppend:
+    case IrOpcode::DataConsume:
+        return 0u;
+    default:
+        return SharedAccessOf(opcode) != SharedAccess::None ? 1u : 0u;
+    }
+}
+
+}
+
+std::uint32_t FunctionLdsDwords(const IrProgram& program) {
+    AddressBound bound;
+    std::uint64_t needed = 0;
+    for (const IrBlock* block : program.BlockOrder()) {
+        for (const IrValue* inst : block->Instructions()) {
+            if (SharedAccessOf(inst->Opcode()) == SharedAccess::None) continue;
+            const auto index = inst->Flags<MemoryFlags>().index;
+            if (index >= program.Resources().memoryInfo.size()) return FunctionLdsDwordLimit;
+            const auto& memory = program.Resources().memoryInfo[index];
+            if (memory.kind != ResourceKind::Lds) continue;
+            const auto dwords = SharedAccessDwords(inst->Opcode());
+            if (dwords == 0u || inst->ArgumentCount() == 0) return FunctionLdsDwordLimit;
+            const auto address = bound.Of(inst->Argument(0));
+            // The emitter adds the offset in 32 bits (ByteAddress): a sum that could wrap is unbounded.
+            if (!address || *address + memory.offset > 0xffffffffull) return FunctionLdsDwordLimit;
+            needed = std::max(needed, ((*address + memory.offset) >> 2u) + dwords);
+            if (needed >= FunctionLdsDwordLimit) return FunctionLdsDwordLimit;
+        }
+    }
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(std::max<std::uint64_t>((needed + 63u) & ~63ull, 64u), FunctionLdsDwordLimit));
 }
 
 SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
@@ -189,6 +348,7 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
             }
         }
     }
+    if (requirements.functionLds) requirements.functionLdsDwords = FunctionLdsDwords(program);
     return requirements;
 }
 
