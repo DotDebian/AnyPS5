@@ -127,8 +127,12 @@ int32_t APS5_VABI sceAudioPropagationSystemRegisterMaterial(AudioPropagationHand
     return Create(system, ObjectKind::Material, out_material, __func__);
 }
 
-int32_t APS5_VABI sceAudioPropagationSystemUnregisterMaterial(AudioPropagationHandle system, AudioPropagationHandle material) {
-    return Destroy(system, material, ObjectKind::Material, __func__);
+int32_t APS5_VABI sceAudioPropagationSystemUnregisterMaterial(AudioPropagationHandle material) {
+    auto& state = Objects();
+    std::lock_guard lock(state.mutex);
+    Find(state, material, ObjectKind::Material, __func__);
+    state.objects.erase(material);
+    return 0;
 }
 
 int32_t APS5_VABI sceAudioPropagationRoomCreate(AudioPropagationHandle system, AudioPropagationHandle* out_room) {
