@@ -4,21 +4,30 @@ This fork's `main` mirrors `astrobot`, my integration branch for running Astro B
 
 ## Astro Bot status
 
-| Part | State |
-| --- | --- |
-| Boot, PlayStation Studios video, logos | Renders |
-| Title screen | Renders; copyright line missing (needs the PS5 system fonts) |
-| NEW GAME menu | Renders |
-| Intro cinematic | Renders; some minor fixes still to make (it takes about 20 minutes at the current frame rate) |
-| Tutorial (Crash Site) | Playable with a DualSense; tutorial videos render |
-| World map, controller ship flight | Reached |
-| Performance | Low: about 15 to 30 fps in the menus, 4 to 11 fps in the cinematic and gameplay |
+Linux, measured on my machine (October 2026). Frame rates are the game's own, with no frame generation.
 
-Known issues: the copyright line, some artifacts and minor glitches in the cinematic and gameplay, and the frame rate.
+| Part | State | Frame rate |
+| --- | --- | --- |
+| Boot, PlayStation Studios video, logos | Renders | video at about 57 fps |
+| Title screen | Renders, including the copyright line (console fonts or the Noto substitutes) | about 50 fps |
+| NEW GAME menu | Renders | about 49 fps |
+| Intro cinematic and space scene | Renders | 40 to 45 fps |
+| Tutorial (Crash Site hub) | Playable with a DualSense | 6 to 13 fps |
+| World map, controller ship flight | Renders | about 28 fps |
+| Sky Garden | Reached and flown | about 4 fps |
+| Snowy Canyon | Reached | about 3.5 fps |
+| Windows | In game up to the first Gorilla Nebula level ([report](https://github.com/boykopovar/AnyPS5/discussions/357)) | |
+
+Known issues: the frame rate in levels (the queue worker's CPU time per draw is the main limit there), a short white flash on the world map, and occasional minor glitches.
+
+<img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/video.jpg" width="400" alt="PlayStation Studios video"> <img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/title.jpg" width="400" alt="Title screen">
+<img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/menu.jpg" width="400" alt="NEW GAME menu"> <img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/intro-ships.jpg" width="400" alt="Intro space scene">
+<img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/hub.jpg" width="400" alt="Crash Site hub"> <img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/map.jpg" width="400" alt="World map">
+<img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/garden.jpg" width="400" alt="Sky Garden"> <img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/snowy.jpg" width="400" alt="Snowy Canyon">
 
 ## Upstream contributions
 
-62 pull requests from this work are merged into [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), among them Linux write tracking (#120, #121), the shader disk and pipeline cache (#129), NGG geometry as mesh shaders (#133), structurizer cloning (#134), pixel input layout (#136, #137), geometry shader fusion (#124), recompiler fixes for v_fma_mix (#205) and SDWA results (#214), rendering fixes (#131, #132, #176, #177, #178, #181, #202, #204), DualSense output and audio (#179, #180) and Linux direct memory through memfd (#203). Open: #278, #297, #303, #304, #305, #306, #307, #322.
+98 pull requests from this work are merged into [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), among them Linux write tracking (#120, #121), the shader disk and pipeline cache (#129), NGG geometry as mesh shaders (#133), resident 10-bit scanout (#278), flips that complete after the frame's GPU work (#417), large DMA copies on the GPU in queue order (#439), triangle fan geometry input (#440), occlusion counter dumps on the GPU (#463), cross-queue submission order (#465), exact reciprocals for `--to-intel` (#464) and DualSense output and audio (#179, #180). Open: #461, #489, #490.
 
 ---
 
