@@ -209,6 +209,9 @@ struct VulkanDevice::State {
     bool textureCompressionBC = false;
     // VK_KHR_timeline_semaphore enabled: the recorder's unlocked waits are available.
     bool timelineSemaphores = false;
+    const char* calibratedTimestamps = nullptr;
+    bool hostQueryReset = false;
+    std::uint32_t timestampBits = 0;
     // Indirect draw features enabled (see Graphics::Context).
     bool drawIndirectFirstInstance = false;
     bool multiDrawIndirect = false;
@@ -676,6 +679,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
                 selected = physical;
                 family = i;
                 selectedRank = rank;
+                state->timestampBits = queues[i].timestampValidBits;
                 break;
             }
         }
@@ -974,6 +978,27 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     } else {
         std::fprintf(stderr, "[gpu] timeline semaphores unavailable or disabled; drains wait under the GPU mutex\n");
     }
+    state->calibratedTimestamps = hasExtension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : hasExtension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : nullptr;
+    if (state->calibratedTimestamps != nullptr) {
+        deviceExtensions.push_back(state->calibratedTimestamps);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+    }
+    VkPhysicalDeviceHostQueryResetFeaturesEXT hostQueryResetFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT};
+    if (hasExtension(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &hostQueryResetFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        state->hostQueryReset = hostQueryResetFeatures.hostQueryReset == VK_TRUE;
+    }
+    hostQueryResetFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT};
+    hostQueryResetFeatures.hostQueryReset = VK_TRUE;
+    if (state->hostQueryReset) {
+        deviceExtensions.push_back(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+        hostQueryResetFeatures.pNext = byteFeatures.pNext;
+        byteFeatures.pNext = &hostQueryResetFeatures;
+    }
     bdaFeatures.pNext = &byteFeatures;
     deviceInfo.pNext = &bdaFeatures;
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
@@ -995,6 +1020,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->samplerCache = std::make_unique<Graphics::SamplerCache>();
     state->recorder = std::make_unique<Graphics::Recorder>(graphicsContext(), state->timelineSemaphores);
     state->recorder->Activate();
+    state->recorder->SetClockMapping(calibrateClock());
     // The entry points every record site uses, resolved once (APS5_NO_PROC_TABLE=1: per call, as
     // before), and the context copy graphicsContext() hands out from here on: built after the
     // recorder and the descriptor cache exist, so it carries them.
@@ -1253,6 +1279,64 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     static const bool submitNow = std::getenv("APS5_LABEL_SUBMIT_NOW") != nullptr;
     if (submitNow) recorder.Submit();
     return 0;
+}
+
+Graphics::GpuClock::Mapping VulkanDevice::calibrateClock() const {
+    const double period = state->properties.limits.timestampPeriod;
+    if (state->calibratedTimestamps == nullptr) return Graphics::GpuClock::MakeMapping(period, 0, 0);
+    const bool khr = std::strcmp(state->calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
+#ifdef _WIN32
+    constexpr VkTimeDomainKHR hostDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+    constexpr VkTimeDomainKHR hostDomain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+    const auto getDomains = state->InstanceFunction<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
+    std::uint32_t count = 0;
+    check(getDomains(state->physical, &count, nullptr), "vkGetPhysicalDeviceCalibrateableTimeDomains");
+    std::vector<VkTimeDomainKHR> domains(count);
+    check(getDomains(state->physical, &count, domains.data()), "vkGetPhysicalDeviceCalibrateableTimeDomains");
+    const auto has = [&](VkTimeDomainKHR domain) { return std::find(domains.begin(), domains.end(), domain) != domains.end(); };
+    if (!has(VK_TIME_DOMAIN_DEVICE_KHR) || !has(hostDomain)) return Graphics::GpuClock::MakeMapping(period, 0, 0);
+    const std::array<VkCalibratedTimestampInfoKHR, 2> infos{{{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_DEVICE_KHR}, {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, hostDomain}}};
+    std::array<std::uint64_t, 2> stamps{};
+    std::uint64_t deviation = 0;
+    check(state->DeviceFunction<PFN_vkGetCalibratedTimestampsKHR>(khr ? "vkGetCalibratedTimestampsKHR" : "vkGetCalibratedTimestampsEXT")(state->device, 2, infos.data(), stamps.data(), &deviation), "vkGetCalibratedTimestamps");
+    std::uint64_t hostNanoseconds = stamps[1];
+#ifdef _WIN32
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    const auto ticks = stamps[1], perSecond = static_cast<std::uint64_t>(frequency.QuadPart);
+    hostNanoseconds = ticks / perSecond * 1'000'000'000ull + ticks % perSecond * 1'000'000'000ull / perSecond;
+#endif
+    return Graphics::GpuClock::MakeMapping(period, stamps[0], hostNanoseconds);
+}
+
+int VulkanDevice::WriteTimestampOnGpu(std::uint64_t address, std::size_t bytes, Pm4::TimestampStage stage, std::uint32_t queue, bool reapFirst) {
+    require(state->recorder != nullptr, "exact GPU timestamps need the command recorder (APS5_DECODE_TIME_GPU_TIMESTAMPS=1 takes them when the packet is decoded)");
+    require(state->timestampBits == 64, "exact GPU timestamps need a 64-bit Vulkan timestamp counter on the graphics queue (APS5_DECODE_TIME_GPU_TIMESTAMPS=1 takes them when the packet is decoded)");
+    require(bytes == 4 || bytes == 8, "a GPU timestamp of 4 or 8 bytes");
+    auto& recorder = *state->recorder;
+    static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
+    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
+    const auto context = graphicsContext();
+    Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "GPU timestamp", Graphics::PublishScope::PartialUnits);
+    const auto* import = Graphics::HostImportFor(context, address, bytes);
+    const bool onGpu = import != nullptr && import->address != 0 && !state->CopiedWriterOverlaps(address, bytes) && !(Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes));
+    if (onGpu && Graphics::AnyShadowedOverlaps(address, bytes)) Graphics::PublishShadow(address, bytes, Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+    const VkPipelineStageFlagBits pipelineStage = stage == Pm4::TimestampStage::ComputeShaders ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : stage == Pm4::TimestampStage::PixelShaders ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    const auto query = recorder.WriteTimestamp(pipelineStage);
+    if (onGpu) {
+        recorder.FlushKeyStoresOverlapping(address, bytes);
+        if (recorder.StoreTimestamp(query, import->address + (address - import->base), address, static_cast<std::uint32_t>(bytes))) {
+            recorder.NotePendingWrite(address, bytes);
+            GuestMemory::MarkWritten(address, bytes);
+            return 0;
+        }
+    }
+    recorder.Sync();
+    const auto value = recorder.ReadTimestamp(query);
+    GuestMemory::Write(address, std::as_bytes(std::span(&value, 1)).first(bytes), 4);
+    return 1;
 }
 
 bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirst) {
@@ -2418,6 +2502,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.copiedWriters = state->copiedWriters.get();
     context.functions = state->functionsReady ? &state->deviceFunctions : nullptr;
     context.descriptorIndexing = state->descriptorIndexing;
+    context.hostQueryReset = state->hostQueryReset;
     context.primitiveListRestart = state->primitiveListRestart;
     context.depthBiasClamp = state->depthBiasClamp;
     context.depthBounds = state->depthBounds;

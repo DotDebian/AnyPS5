@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuClock.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include <atomic>
 #include <chrono>
@@ -223,6 +224,20 @@ public:
     void CountSamples();
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
+    struct TimestampQuery {
+        std::shared_ptr<void> pool;
+        VkQueryPool handle = VK_NULL_HANDLE;
+        std::uint32_t slot = 0;
+    };
+    void SetClockMapping(const GpuClock::Mapping& mapping) { clockMapping = mapping; }
+    const GpuClock::Mapping& ClockMapping() const { return clockMapping; }
+    TimestampQuery WriteTimestamp(VkPipelineStageFlagBits stage);
+    bool StoreTimestamp(const TimestampQuery& query, VkDeviceAddress target, std::uint64_t address, std::uint32_t bytes);
+    std::uint64_t ReadTimestamp(const TimestampQuery& query);
+    struct TimestampStatistics {
+        std::uint64_t written, storedOnGpu, passBreaks;
+    };
+    static TimestampStatistics TimestampCounts();
     void NoteSampledDraw(VkCommandBuffer commands);
     static bool SampleDumpsInPass();
     bool QueuesSampleDumps() const;
@@ -351,6 +366,7 @@ public:
     // queues' waits and the driver's pending-label checks until the queued one is recorded.
     // Debug aid: APS5_NO_SEPARATE_QUEUED_LABELS=1 lets a queued entry replace the recorded one.
     static void NoteQueuedLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
+    static void NoteQueuedRange(std::uint64_t address, std::size_t bytes);
     // After the calling worker recorded (or dropped) its queued labels: its ranges are cleared and
     // the entries of its dwords still without a batch (stored by the CPU, or dropped) leave the table.
     static void ForgetQueuedLabels();
@@ -575,6 +591,10 @@ private:
         std::uint32_t segmentSlot = 0;
         bool segmentActive = false;
         std::uint32_t queuedDumps = 0;
+        VkQueryPool stamps = VK_NULL_HANDLE;
+        std::shared_ptr<void> stampPool;
+        std::uint32_t stampNext = 0;
+        std::uint32_t queuedStamps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
@@ -617,6 +637,10 @@ private:
                 std::uint64_t address;
                 VkDeviceAddress dumpTarget = 0;
                 std::uint32_t dumpSegments = 0;
+                VkQueryPool stampQueries = VK_NULL_HANDLE;
+                std::uint32_t stampSlot = 0;
+                std::uint32_t stampBytes = 0;
+                VkDeviceAddress stampTarget = 0;
                 std::uint64_t End() const;
             };
             std::vector<Queued> queued;
@@ -692,6 +716,16 @@ private:
     void dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, std::uint32_t dumps, std::uint32_t firstSegment, std::uint32_t lastSegment);
     void foldSegments();
     void foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end, std::uint32_t& dumpIndex, std::uint32_t& consumed);
+    bool gpuTimestamps();
+    void takeStampPool(Batch& batch);
+    bool convertStamps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end);
+    GpuClock::Mapping clockMapping;
+    bool stampsUsed = false;
+    int stampState = 0;
+    std::unique_ptr<Buffer> stampBuffer;
+    VkPipelineLayout stampLayout = VK_NULL_HANDLE;
+    VkPipeline stampPipeline = VK_NULL_HANDLE;
+    std::shared_ptr<void> stampPools;
     struct SampleSegment {
         std::shared_ptr<void> pool;
         VkQueryPool handle;

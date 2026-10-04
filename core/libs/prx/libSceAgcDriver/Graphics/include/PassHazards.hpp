@@ -51,6 +51,7 @@ struct QueuedWrite {
     std::uint64_t begin;
     std::uint64_t end;
     bool computed;
+    std::uint8_t kind = 0;
 };
 
 std::vector<std::size_t> QueuedWriteGroups(std::span<const QueuedWrite> writes);

@@ -2469,6 +2469,94 @@ void sampleDumpTests(const Device& device, Recorder& recorder) {
     inPassSampleDumpTests(recorder, context, cover, words, address, target);
 }
 
+void gpuTimestampTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress || context.limits.timestampComputeAndGraphics != VK_TRUE) {
+        std::cout << "host imports, buffer device addresses or timestamps unavailable: GPU timestamps not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the timestamp block");
+    auto* words = static_cast<volatile std::uint64_t*>(block);
+    constexpr std::uint64_t untouched = 0xaaaaaaaaaaaaaaaaull;
+    for (std::size_t i = 0; i < bytes / 8; ++i) words[i] = untouched;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || import->address == 0) {
+        std::cout << "host import of the timestamp block refused: GPU timestamps not tested\n";
+        return;
+    }
+    const auto target = import->address + (address - import->base);
+    recorder.SetClockMapping(GpuClock::MakeMapping(context.limits.timestampPeriod, 0, 0));
+    recorder.Sync();
+    const auto stamp = [&](std::size_t index, std::uint32_t size = 8) {
+        const auto query = recorder.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        Require(recorder.StoreTimestamp(query, target + index * 8, address + index * 8, size), "a GPU timestamp was not stored on the GPU");
+        return query;
+    };
+    Buffer scratch(context, 16u << 20u, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto work = [&](std::uint32_t value) {
+        const auto commands = recorder.Commands();
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, scratch.Handle(), 0, VK_WHOLE_SIZE, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    };
+    using Clock = std::chrono::steady_clock;
+    const auto started = Clock::now();
+    stamp(0);
+    recorder.Submit();
+    recorder.Sync();
+    Require(words[0] != untouched, "the first GPU timestamp did not land");
+    stamp(1);
+    Require(words[1] == untouched && !recorder.Idle(), "a GPU timestamp landed before its batch ran");
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    recorder.Submit();
+    recorder.Sync();
+    const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started).count());
+    Require(words[1] != untouched && words[1] >= words[0], "a later GPU timestamp is earlier");
+    Require(words[1] - words[0] >= 3'000'000ull, "a GPU timestamp was taken when it was recorded, not when the GPU ran it (30 ms of guest ticks missing)");
+    Require(words[1] - words[0] <= elapsed / GpuClock::NanosecondsPerGuestTick + 100'000ull, "GPU timestamps run faster than 100 MHz guest ticks");
+    for (std::size_t i = 0; i < 600; ++i) {
+        if (i % 50 == 0) work(static_cast<std::uint32_t>(i));
+        stamp(2 + i);
+    }
+    recorder.Submit();
+    recorder.Sync();
+    bool ordered = true;
+    for (std::size_t i = 2; i < 602; ++i) ordered = ordered && words[i] != untouched && words[i] >= words[i - 1];
+    Require(ordered, "GPU timestamps of one queue are not in queue order (or one did not land)");
+    const auto read = stamp(700);
+    work(1);
+    const auto after = stamp(701, 4);
+    recorder.Submit();
+    recorder.Sync();
+    Require(recorder.ReadTimestamp(read) == words[700], "the GPU and the CPU convert a timestamp differently");
+    Require(static_cast<std::uint32_t>(words[701]) == static_cast<std::uint32_t>(recorder.ReadTimestamp(after)) && (words[701] >> 32u) == (untouched >> 32u), "a 32-bit GPU timestamp store wrote the wrong bytes");
+    Require(recorder.ReadTimestamp(after) >= words[700], "a timestamp after work is earlier than the one before it");
+    const auto counts = Recorder::TimestampCounts();
+    Require(counts.written >= 604 && counts.storedOnGpu >= 604, "GPU timestamp counters are off");
+}
+
 void pendingKeyStoreTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -3428,6 +3516,7 @@ int main() {
             keysFillTests(device, recorder);
             unimportableRangeTests(device);
             sampleDumpTests(device, recorder);
+            gpuTimestampTests(device, recorder);
         }
         drawSnapshotPatchTests(device);
         std::cout << "Recorder read tracking and label tests passed\n";

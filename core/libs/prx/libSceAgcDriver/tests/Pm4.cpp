@@ -526,6 +526,27 @@ void testGpuTimestampScale() {
     expectFailure([&] { ScaleGpuClockNs(origin - 1, origin, 115); }, "backwards");
 }
 
+void testGpuTimestampDecode() {
+    using AgcDriver::Pm4::DecodeTimestampWrite;
+    using AgcDriver::Pm4::TimestampStage;
+    check(AgcDriver::Pm4::ExactGpuTimestamps(), "GPU timestamps are exact unless APS5_DECODE_TIME_GPU_TIMESTAMPS is set");
+    const auto endOfPipe = DecodeTimestampWrite(makePacket(0x49, {0x528, 3u << 29u, 0x1000, 0x5, 0, 0}));
+    check(endOfPipe.has_value() && endOfPipe->address == 0x500001000ull && endOfPipe->bytes == 8 && endOfPipe->stage == TimestampStage::EndOfPipe, "a bottom-of-pipe RELEASE_MEM timestamp decoded wrong");
+    check(!AgcDriver::Pm4::DecodeLabelWrite(makePacket(0x49, {0x528, 3u << 29u, 0x1000, 0x5, 0, 0})).has_value(), "a GPU timestamp decoded as a label with a value known at decode");
+    const auto flush = DecodeTimestampWrite(makePacket(0x49, {0x514, 3u << 29u, 0x1000, 0x5, 0, 0}));
+    check(flush.has_value() && flush->stage == TimestampStage::EndOfPipe, "a cache flush end-of-pipe timestamp decoded wrong");
+    const auto compute = DecodeTimestampWrite(makePacket(0x49, {0x62f, 3u << 29u, 0x1000, 0x5, 0, 0}));
+    check(compute.has_value() && compute->stage == TimestampStage::ComputeShaders, "a CS_DONE timestamp decoded wrong");
+    const auto pixel = DecodeTimestampWrite(makePacket(0x49, {0x630, 3u << 29u, 0x1000, 0x5, 0, 0}));
+    check(pixel.has_value() && pixel->stage == TimestampStage::PixelShaders, "a PS_DONE timestamp decoded wrong");
+    expectFailure([] { DecodeTimestampWrite(makePacket(0x49, {0x628, 3u << 29u, 0x1000, 0x5, 0, 0})); }, "is not implemented");
+    expectFailure([] { DecodeTimestampWrite(makePacket(0x49, {0x028, 3u << 29u, 0x1000, 0x5, 0, 0})); }, "is not implemented");
+    check(!DecodeTimestampWrite(makePacket(0x49, {0x528, 2u << 29u, 0x1000, 0x5, 0, 0})).has_value(), "a data store decoded as a timestamp");
+    check(!DecodeTimestampWrite(makePacket(0x49, {0x528, 3u << 29u, 0, 0, 0, 0})).has_value(), "a timestamp without a destination decoded");
+    const auto label = AgcDriver::Pm4::DecodeLabelWrite(makePacket(0x49, {0x528, 2u << 29u, 0x1000, 0x5, 0x11223344, 0x55667788}));
+    check(label.has_value() && label->Bytes().size() == 8, "a 64-bit data RELEASE_MEM stopped decoding as a label");
+}
+
 void testAcquireMem() {
     const auto captured = makePacket(0x58, {0x02007fc0, 0, 0, 0, 0, 10, 0x200});
     AgcDriver::Pm4::Validate(captured, 0);
@@ -1085,6 +1106,7 @@ int main(int argc, char** argv) {
         testMemorySynchronization();
         testEventWrite();
         testGpuTimestampScale();
+        testGpuTimestampDecode();
         testAcquireMem();
         testStateEffects();
         testDrawAhead();

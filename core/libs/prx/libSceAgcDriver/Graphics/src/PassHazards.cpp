@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include <algorithm>
+#include <map>
 
 namespace AgcDriver::Graphics {
 
@@ -92,14 +93,15 @@ bool PassHazards::Empty() const {
 
 std::vector<std::size_t> QueuedWriteGroups(std::span<const QueuedWrite> writes) {
     std::vector<std::size_t> ends;
-    GuestRangeSet computed;
+    std::map<std::uint8_t, GuestRangeSet> computed;
     for (std::size_t i = 0; i < writes.size(); ++i) {
         const auto& write = writes[i];
-        if (!write.computed && computed.Overlaps(write.begin, write.end)) {
+        const bool conflict = std::any_of(computed.begin(), computed.end(), [&](const auto& kind) { return (!write.computed || kind.first != write.kind) && kind.second.Overlaps(write.begin, write.end); });
+        if (conflict) {
             ends.push_back(i);
-            computed.Clear();
+            computed.clear();
         }
-        if (write.computed) computed.Insert(write.begin, write.end);
+        if (write.computed) computed[write.kind].Insert(write.begin, write.end);
     }
     if (!writes.empty()) ends.push_back(writes.size());
     return ends;

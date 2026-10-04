@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/GpuTimestamps_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -182,6 +183,11 @@ constexpr std::uint32_t DumpFoldCapacity = 1024;
 constexpr std::uint32_t SampleDumpBytes = 15 * 16 + 8;
 constexpr VkDeviceSize DumpListOffset = 16 + 8 * SegmentFoldCapacity;
 constexpr std::uint32_t SampleDumpPushBytes = 32;
+constexpr std::uint32_t StampSlots = 512;
+constexpr std::uint32_t StampFoldCapacity = 512;
+constexpr VkDeviceSize StampTargetsOffset = 8 * StampFoldCapacity;
+constexpr std::uint32_t StampPushBytes = 48;
+std::atomic<std::uint64_t> stampsWritten{0}, stampsOnGpu{0}, stampPassBreaks{0};
 std::atomic<std::uint64_t> dumpsQueued{0}, dumpsQueuedInPass{0}, dumpsAtOnce{0}, segmentsClosed{0}, dumpFolds{0};
 
 struct SamplePoolCache {
@@ -1160,6 +1166,10 @@ Recorder::~Recorder() {
     }
     if (meshArgumentPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, meshArgumentPipeline, nullptr);
     if (meshArgumentLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, meshArgumentLayout, nullptr);
+    if (stampPools != nullptr) std::static_pointer_cast<SamplePoolCache>(stampPools)->close();
+    if (stampPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, stampPipeline, nullptr);
+    if (stampLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, stampLayout, nullptr);
+    stampBuffer.reset();
     for (auto& [commands, fence] : spare) {
         context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
         context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
@@ -1272,6 +1282,12 @@ void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte>
         table.insert_or_assign(address + offset, LabelEntry{value, queue, stamp, nullptr});
     }
     labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
+}
+
+void Recorder::NoteQueuedRange(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return;
+    QueuedLabelRanges().emplace_back(address, address + bytes);
+    queuedLabelsNoted.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Recorder::ForgetQueuedLabels() {
@@ -1548,6 +1564,7 @@ void Recorder::ensureOpen() {
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
+        if (stampsUsed && !context.hostQueryReset) takeStampPool(*open);
     }
 }
 
@@ -1649,6 +1666,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         auto stores = std::move(run.queued);
         run.queued.clear();
         open->queuedDumps = 0;
+        open->queuedStamps = 0;
         if (stores.empty()) return false;
         // A label says the work before it is done: the queued key stores (results of that work)
         // land ahead of every store of the run, and the pass a draw left open ends.
@@ -1670,8 +1688,9 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         const auto update = function(cmdUpdateBuffer, "vkCmdUpdateBuffer");
         std::vector<QueuedWrite> writes;
         writes.reserve(stores.size());
-        for (const auto& store : stores) writes.push_back({store.address, store.End(), store.dumpTarget != 0});
-        const bool dumps = std::any_of(writes.begin(), writes.end(), [](const QueuedWrite& write) { return write.computed; });
+        for (const auto& store : stores) writes.push_back({store.address, store.End(), store.dumpTarget != 0 || store.stampQueries != VK_NULL_HANDLE, static_cast<std::uint8_t>(store.stampQueries != VK_NULL_HANDLE ? 1 : 0)});
+        const bool dumps = std::any_of(stores.begin(), stores.end(), [](const Batch::StoreRun::Queued& store) { return store.dumpTarget != 0; });
+        const bool stamps = std::any_of(stores.begin(), stores.end(), [](const Batch::StoreRun::Queued& store) { return store.stampQueries != VK_NULL_HANDLE; });
         if (dumps) recordQueuedDumps(commands, stores);
         std::size_t first = 0;
         std::uint32_t dumpIndex = 0, consumed = 0;
@@ -1683,7 +1702,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
             }
             for (std::size_t i = first; i < end; ++i) {
                 const auto& store = stores[i];
-                if (store.dumpTarget != 0) continue;
+                if (store.dumpTarget != 0 || store.stampQueries != VK_NULL_HANDLE) continue;
                 const VkDeviceSize storeEnd = store.offset + store.bytes.size();
                 // Two transfers to the same bytes have no order of their own within the run.
                 if (std::any_of(run.recorded.begin(), run.recorded.end(), [&](const auto& earlier) { return std::get<0>(earlier) == store.buffer && store.offset < std::get<2>(earlier) && std::get<1>(earlier) < storeEnd; })) {
@@ -1698,14 +1717,15 @@ bool Recorder::closeStoreRun(bool atSubmit) {
             const auto before = dumpIndex;
             foldQueuedDumps(commands, stores, first, end, dumpIndex, consumed);
             if (dumpIndex != before) ++barriers;
+            if (convertStamps(commands, stores, first, end)) ++barriers;
             first = end;
         }
         if (dumps) {
             retireSegments(consumed);
             dumpFolds.fetch_add(1, std::memory_order_relaxed);
         }
-        const VkPipelineStageFlags written = VK_PIPELINE_STAGE_TRANSFER_BIT | (dumps ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u);
-        const VkAccessFlags writtenAccess = VK_ACCESS_TRANSFER_WRITE_BIT | (dumps ? VK_ACCESS_SHADER_WRITE_BIT : 0u);
+        const VkPipelineStageFlags written = VK_PIPELINE_STAGE_TRANSFER_BIT | (dumps || stamps ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u);
+        const VkAccessFlags writtenAccess = VK_ACCESS_TRANSFER_WRITE_BIT | (dumps || stamps ? VK_ACCESS_SHADER_WRITE_BIT : 0u);
         if (atSubmit) {
             recordBarrier(commands, written, VK_PIPELINE_STAGE_HOST_BIT, writtenAccess, VK_ACCESS_HOST_READ_BIT);
             open->coveredAccess = 0;
@@ -2147,7 +2167,7 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
 }
 
 std::uint64_t Recorder::Batch::StoreRun::Queued::End() const {
-    return address + (dumpTarget != 0 ? SampleDumpBytes : bytes.size());
+    return address + (dumpTarget != 0 ? SampleDumpBytes : stampQueries != VK_NULL_HANDLE ? stampBytes : bytes.size());
 }
 
 bool Recorder::SampleDumpsInPass() {
@@ -2181,6 +2201,174 @@ void Recorder::PrepareSampleSlot() {
 
 void Recorder::EndPassSamples() {
     if (open != nullptr && open->segmentActive) endSegment(*open);
+}
+
+Recorder::TimestampStatistics Recorder::TimestampCounts() {
+    return TimestampStatistics{stampsWritten.load(std::memory_order_relaxed), stampsOnGpu.load(std::memory_order_relaxed), stampPassBreaks.load(std::memory_order_relaxed)};
+}
+
+void Recorder::takeStampPool(Batch& batch) {
+    auto cache = std::static_pointer_cast<SamplePoolCache>(stampPools);
+    if (cache == nullptr) {
+        cache = std::make_shared<SamplePoolCache>();
+        cache->device = context.device;
+        cache->destroy = context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool");
+        stampPools = cache;
+    }
+    if (batch.stampPool != nullptr) batch.kept.push_back(std::move(batch.stampPool));
+    batch.stampPool.reset();
+    batch.stamps = cache->take();
+    if (batch.stamps == VK_NULL_HANDLE) {
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = StampSlots;
+        Check(context.Function<PFN_vkCreateQueryPool>("vkCreateQueryPool")(context.device, &info, nullptr, &batch.stamps), "vkCreateQueryPool GPU timestamps");
+    }
+    try {
+        batch.stampPool = std::make_shared<SamplePool>(cache, batch.stamps);
+    } catch (...) {
+        cache->put(batch.stamps);
+        batch.stamps = VK_NULL_HANDLE;
+        throw;
+    }
+    batch.stampNext = 0;
+    if (context.hostQueryReset) context.Function<PFN_vkResetQueryPoolEXT>("vkResetQueryPoolEXT")(context.device, batch.stamps, 0, StampSlots);
+    else context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(batch.commands, batch.stamps, 0, StampSlots);
+}
+
+Recorder::TimestampQuery Recorder::WriteTimestamp(VkPipelineStageFlagBits stage) {
+    GuestMemory::AssertGpuLockHeld("Recorder::WriteTimestamp");
+    ensureOpen();
+    stampsUsed = true;
+    if (open->stamps == VK_NULL_HANDLE || open->stampNext >= StampSlots) {
+        if (open->renderPass.open && !context.hostQueryReset) {
+            endOpenRenderPass();
+            stampPassBreaks.fetch_add(1, std::memory_order_relaxed);
+        }
+        takeStampPool(*open);
+    }
+    const auto slot = open->stampNext++;
+    context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, stage, open->stamps, slot);
+    stampsWritten.fetch_add(1, std::memory_order_relaxed);
+    if (activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+        pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
+    }
+    return TimestampQuery{open->stampPool, open->stamps, slot};
+}
+
+bool Recorder::gpuTimestamps() {
+    if (stampState != 0) return stampState > 0;
+    stampState = -1;
+    if (!context.bufferDeviceAddress) return false;
+    VkShaderModule module = VK_NULL_HANDLE;
+    try {
+        stampBuffer = std::make_unique<Buffer>(context, StampTargetsOffset + 16 * StampFoldCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, StampPushBytes};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &stampLayout), "vkCreatePipelineLayout GPU timestamps");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = sizeof(GPU_TIMESTAMPS_SPV);
+        moduleInfo.pCode = GPU_TIMESTAMPS_SPV;
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule GPU timestamps");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = stampLayout;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &stampPipeline), "vkCreateComputePipelines GPU timestamps");
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+    } catch (const std::exception& error) {
+        if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        if (stampLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, stampLayout, nullptr);
+        stampLayout = VK_NULL_HANDLE;
+        stampBuffer.reset();
+        std::fprintf(stderr, "[gpu] GPU timestamps are stored after a device drain: %s\n", error.what());
+        return false;
+    }
+    stampState = 1;
+    return true;
+}
+
+bool Recorder::convertStamps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end) {
+    std::vector<std::uint32_t> targets;
+    std::vector<const Batch::StoreRun::Queued*> stamps;
+    for (std::size_t i = first; i < end; ++i) {
+        const auto& write = writes[i];
+        if (write.stampQueries == VK_NULL_HANDLE) continue;
+        stamps.push_back(&write);
+        targets.insert(targets.end(), {static_cast<std::uint32_t>(write.stampTarget), static_cast<std::uint32_t>(write.stampTarget >> 32u), write.stampBytes, 0u});
+    }
+    if (stamps.empty()) return false;
+    Require(stamps.size() <= StampFoldCapacity, "queued GPU timestamps exceed the fold capacity");
+    const auto copy = context.Function<PFN_vkCmdCopyQueryPoolResults>("vkCmdCopyQueryPoolResults");
+    for (std::size_t i = 0; i < stamps.size();) {
+        std::size_t run = 1;
+        while (i + run < stamps.size() && stamps[i + run]->stampQueries == stamps[i]->stampQueries && stamps[i + run]->stampSlot == stamps[i]->stampSlot + run) ++run;
+        copy(commands, stamps[i]->stampQueries, stamps[i]->stampSlot, static_cast<std::uint32_t>(run), stampBuffer->Handle(), 8 * static_cast<VkDeviceSize>(i), 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        i += run;
+    }
+    function(cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, stampBuffer->Handle(), StampTargetsOffset, targets.size() * sizeof(std::uint32_t), targets.data());
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, stampPipeline);
+    struct {
+        VkDeviceAddress stamps;
+        VkDeviceAddress targets;
+        std::uint64_t hostOrigin;
+        std::uint64_t guestOrigin;
+        std::uint64_t factor;
+        std::uint32_t count;
+        std::uint32_t reserved;
+    } parameters{stampBuffer->DeviceAddress(), stampBuffer->DeviceAddress() + StampTargetsOffset, clockMapping.hostOrigin, clockMapping.guestOrigin, clockMapping.factor, static_cast<std::uint32_t>(stamps.size()), 0u};
+    static_assert(sizeof(parameters) == StampPushBytes);
+    context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, stampLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, StampPushBytes, &parameters);
+    context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+    stampsOnGpu.fetch_add(stamps.size(), std::memory_order_relaxed);
+    return true;
+}
+
+bool Recorder::StoreTimestamp(const TimestampQuery& query, VkDeviceAddress target, std::uint64_t address, std::uint32_t bytes) {
+    GuestMemory::AssertGpuLockHeld("Recorder::StoreTimestamp");
+    Require(open != nullptr && query.handle != VK_NULL_HANDLE && (bytes == 4 || bytes == 8), "a GPU timestamp store without its query");
+    if (target == 0 || !gpuTimestamps()) return false;
+    if (LabelRunsPerBatch()) {
+        if (open->queuedStamps >= StampFoldCapacity) FlushStores();
+        if (open->run.queued.empty()) storeRuns.fetch_add(1, std::memory_order_relaxed);
+        auto& queued = open->run.queued.emplace_back();
+        queued.address = address;
+        queued.stampQueries = query.handle;
+        queued.stampSlot = query.slot;
+        queued.stampBytes = bytes;
+        queued.stampTarget = target;
+        ++open->queuedStamps;
+        return true;
+    }
+    FlushStores();
+    if (open->run.open) closeStoreRun();
+    if (!open->keyStores.empty()) recordKeyStores(true);
+    if (open->renderPass.open) endOpenRenderPass();
+    Batch::StoreRun::Queued queued;
+    queued.address = address;
+    queued.stampQueries = query.handle;
+    queued.stampSlot = query.slot;
+    queued.stampBytes = bytes;
+    queued.stampTarget = target;
+    const auto commands = open->commands;
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    convertStamps(commands, std::span(&queued, 1), 0, 1);
+    recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+    CountBarriers(CommandClass::LabelRun, 3);
+    open->coveredAccess = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    return true;
+}
+
+std::uint64_t Recorder::ReadTimestamp(const TimestampQuery& query) {
+    Require(query.handle != VK_NULL_HANDLE, "a GPU timestamp read without its query");
+    std::uint64_t value = 0;
+    Check(context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, query.handle, query.slot, 1, sizeof(value), &value, sizeof(value), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT), "vkGetQueryPoolResults GPU timestamp");
+    return GpuClock::ToGuest(clockMapping, value);
 }
 
 void Recorder::takeSegmentPool(Batch& batch) {
@@ -3768,6 +3956,8 @@ void Recorder::release(Batch& batch) noexcept {
     batch.samplePool.reset();
     batch.segments = VK_NULL_HANDLE;
     batch.segmentPool.reset();
+    batch.stamps = VK_NULL_HANDLE;
+    batch.stampPool.reset();
     // A completed (or never submitted) batch's objects are kept for reuse: the fence is signaled or
     // untouched, so resetting it cannot block, and the command buffer is no longer pending.
     if (batch.commands != VK_NULL_HANDLE && batch.fence != VK_NULL_HANDLE && spare.size() < 64 && function(resetFences, "vkResetFences")(context.device, 1, &batch.fence) == VK_SUCCESS) {

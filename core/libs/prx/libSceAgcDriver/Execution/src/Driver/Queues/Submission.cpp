@@ -297,6 +297,8 @@ void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
             if (label->address % 4 == 0 && bytes.size() <= 64) {
                 for (std::size_t offset = 0; offset < bytes.size(); offset += 4) submission.labelWrites.push_back(label->address + offset);
             }
+        } else if (const auto stamp = Pm4::DecodeTimestampWrite(packet); stamp.has_value() && stamp->address % 4 == 0) {
+            for (std::size_t offset = 0; offset < stamp->bytes; offset += 4) submission.labelWrites.push_back(stamp->address + offset);
         }
         return;
     }

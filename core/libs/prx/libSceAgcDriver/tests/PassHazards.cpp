@@ -211,9 +211,9 @@ std::vector<std::uint8_t> RecordedOrder(const std::vector<QueuedWrite>& writes, 
     std::vector<std::uint8_t> memory(bytes, 0);
     std::size_t first = 0;
     for (const auto end : groups) {
-        for (const bool computed : {false, true}) {
+        for (const int order : {0, 1, 2}) {
             for (auto i = first; i < end; ++i) {
-                if (writes[i].computed != computed) continue;
+                if ((writes[i].computed ? 1 + writes[i].kind : 0) != order) continue;
                 for (auto at = writes[i].begin; at < writes[i].end; ++at) memory[at] = static_cast<std::uint8_t>(i + 1);
             }
         }
@@ -232,6 +232,10 @@ void testQueuedWriteGroups() {
     Expect(QueuedWriteGroups(apart) == Groups{3}, "stores beside the computed writes stay in their group");
     const std::vector<QueuedWrite> stores{{0x100, 0x110, false}, {0x100, 0x110, false}};
     Expect(QueuedWriteGroups(stores) == Groups{2}, "stores alone are one group (their own WAW barriers order them)");
+    const std::vector<QueuedWrite> kinds{{0x100, 0x1f8, true, 0}, {0x100, 0x108, true, 1}, {0x300, 0x308, true, 1}};
+    Expect(QueuedWriteGroups(kinds) == Groups{1, 3}, "a computed write over a computed write of another kind starts a new group");
+    const std::vector<QueuedWrite> sameKind{{0x100, 0x108, true, 1}, {0x100, 0x108, true, 1}, {0x200, 0x2f8, true, 0}};
+    Expect(QueuedWriteGroups(sameKind) == Groups{3}, "computed writes of one kind stay in their group (their dispatch orders them)");
     std::uint64_t seed = 0x9e3779b97f4a7c15ull;
     const auto next = [&](std::uint64_t bound) {
         seed ^= seed << 13u;
@@ -247,7 +251,8 @@ void testQueuedWriteGroups() {
         for (std::uint64_t i = 0; i < count; ++i) {
             const auto begin = next(bytes - 1);
             const auto end = begin + 1 + next(std::min<std::uint64_t>(16, bytes - begin));
-            writes.push_back({begin, std::min<std::uint64_t>(end, bytes), next(2) == 0});
+            const auto kind = next(3);
+            writes.push_back({begin, std::min<std::uint64_t>(end, bytes), kind != 0, static_cast<std::uint8_t>(kind == 2 ? 1 : 0)});
         }
         const auto groups = QueuedWriteGroups(writes);
         bool valid = !groups.empty() && groups.back() == writes.size() && std::is_sorted(groups.begin(), groups.end());

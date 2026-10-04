@@ -1,0 +1,42 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint words[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Stamp { uint64_t value; };
+layout(push_constant) uniform Parameters {
+    Words stamps;
+    Words targets;
+    uvec2 hostOrigin;
+    uvec2 guestOrigin;
+    uvec2 factor;
+    uint count;
+    uint reserved;
+} parameters;
+
+uint64_t join(uvec2 value) {
+    return uint64_t(value.x) | (uint64_t(value.y) << 32);
+}
+
+uint64_t mulShift32(uint64_t value, uint64_t factor) {
+    uint64_t v0 = value & 0xffffffffUL;
+    uint64_t v1 = value >> 32;
+    uint64_t f0 = factor & 0xffffffffUL;
+    uint64_t f1 = factor >> 32;
+    return ((v0 * f0) >> 32) + v0 * f1 + v1 * f0 + ((v1 * f1) << 32);
+}
+
+void main() {
+    uint64_t hostOrigin = join(parameters.hostOrigin);
+    uint64_t guestOrigin = join(parameters.guestOrigin);
+    uint64_t factor = join(parameters.factor);
+    for (uint stamp = 0u; stamp < parameters.count; ++stamp) {
+        uint64_t host = uint64_t(parameters.stamps.words[stamp * 2u]) | (uint64_t(parameters.stamps.words[stamp * 2u + 1u]) << 32);
+        uint64_t guest = host >= hostOrigin ? guestOrigin + mulShift32(host - hostOrigin, factor) : guestOrigin - mulShift32(hostOrigin - host, factor);
+        uvec2 target = uvec2(parameters.targets.words[stamp * 4u], parameters.targets.words[stamp * 4u + 1u]);
+        if (parameters.targets.words[stamp * 4u + 2u] == 8u) Stamp(target).value = guest;
+        else Words(target).words[0] = uint(guest);
+    }
+}

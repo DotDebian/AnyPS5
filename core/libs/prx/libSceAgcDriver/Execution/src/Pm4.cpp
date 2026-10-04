@@ -517,13 +517,40 @@ std::uint64_t GpuTimestamp() {
     return ScaleGpuClockNs(nowNs, originNs, percent) / 10;
 }
 
+bool ExactGpuTimestamps() {
+    static const bool exact = std::getenv("APS5_DECODE_TIME_GPU_TIMESTAMPS") == nullptr;
+    return exact;
+}
+
+TimestampStage DecodeTimestampStage(std::uint32_t eventWord) {
+    const auto type = eventWord & 0x3fu;
+    switch ((eventWord >> 8u) & 0xfu) {
+        case 5: return TimestampStage::EndOfPipe;
+        case 6:
+            if (type == 0x2f) return TimestampStage::ComputeShaders;
+            if (type == 0x30) return TimestampStage::PixelShaders;
+            break;
+        default: break;
+    }
+    char message[96];
+    std::snprintf(message, sizeof(message), "RELEASE_MEM GPU timestamp for event 0x%x index %u is not implemented", type, (eventWord >> 8u) & 0xfu);
+    throw std::runtime_error(message);
+}
+
+std::optional<TimestampWrite> DecodeTimestampWrite(std::span<const std::uint32_t> packet) {
+    if (!ExactGpuTimestamps() || packet.size() < 7 || ((packet[0] >> 8u) & 0xffu) != 0x49 || (packet[2] >> 29u) != 3) return std::nullopt;
+    const auto destination = address(packet[3], packet[4]);
+    if (destination == 0) return std::nullopt;
+    return TimestampWrite{destination, 8, DecodeTimestampStage(packet[1])};
+}
+
 std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet) {
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     if (opcode == 0x49 && packet.size() >= 7) {
         const auto dataSelect = packet[2] >> 29u;
         const auto destination = address(packet[3], packet[4]);
         if (dataSelect == 0 || dataSelect > 3) return std::nullopt;
-        if (destination == 0) return std::nullopt;
+        if (destination == 0 || (dataSelect == 3 && ExactGpuTimestamps())) return std::nullopt;
         std::uint64_t value = address(packet[5], packet[6]);
         if (dataSelect == 3) value = GpuTimestamp();
         LabelWrite label{destination, {}};
@@ -850,6 +877,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             if (dataSelect == 0 || destination == 0) return;
             std::uint64_t value = address(packet[5], packet[6]);
             if (dataSelect == 3) {
+                require(!ExactGpuTimestamps(), "a RELEASE_MEM GPU timestamp is stored by the driver on the GPU");
                 value = GpuTimestamp();
             }
             GuestMemory::Write(destination, std::as_bytes(std::span(&value, 1)).first(dataSelect == 1 ? 4 : 8), dataSelect == 1 ? 4 : 8);

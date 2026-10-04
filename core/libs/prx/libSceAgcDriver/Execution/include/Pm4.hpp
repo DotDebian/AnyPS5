@@ -131,6 +131,15 @@ std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet
 std::uint32_t ParseGpuTimestampScale(const char* value);
 std::uint64_t ScaleGpuClockNs(std::uint64_t nowNs, std::uint64_t originNs, std::uint32_t percent);
 std::uint64_t GpuTimestamp();
+bool ExactGpuTimestamps();
+enum class TimestampStage : std::uint8_t { EndOfPipe, ComputeShaders, PixelShaders };
+struct TimestampWrite {
+    std::uint64_t address;
+    std::size_t bytes;
+    TimestampStage stage;
+};
+TimestampStage DecodeTimestampStage(std::uint32_t eventWord);
+std::optional<TimestampWrite> DecodeTimestampWrite(std::span<const std::uint32_t> packet);
 // A memory store the CPU can resolve before the GPU runs it (COPY_DATA and DMA_DATA to memory,
 // DUMP_CONST_RAM): the destination and the bytes it stores, so the driver can record the store on
 // the GPU like a label instead of draining the device and storing on the CPU. Immediate and constant

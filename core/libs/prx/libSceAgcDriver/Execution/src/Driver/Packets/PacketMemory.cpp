@@ -20,6 +20,37 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
     endOfPipeInterrupt = opcode == 0x49 && ((packet[2] >> 24u) & 7u) != 0;
     interruptDeferred = false;
+    if (opcode == 0x49) {
+        if (const auto stamp = Pm4::DecodeTimestampWrite(packet)) {
+            drawPacket = false;
+            sampleDump = false;
+            wroteOnGpu = true;
+            if (!drainAll && !endOfPipeInterrupt && DeferLabels()) {
+                auto& deferred = deferredLabels();
+                if (deferred.labels.empty()) deferred.since = std::chrono::steady_clock::now();
+                auto& entry = deferred.labels.emplace_back();
+                entry.address = stamp->address;
+                entry.size = stamp->bytes;
+                entry.timestamp = stamp->stage;
+                ++queuedLabels;
+                return false;
+            }
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (device == nullptr) device = std::make_shared<VulkanDevice>();
+            const auto localDevice = device.Load();
+            recordDeferredLabels(localDevice.get(), submission.queue);
+            const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
+            localDevice->WriteTimestampOnGpu(stamp->address, stamp->bytes, stamp->stage, submission.queue);
+            ++immediateLabels;
+            if (endOfPipeInterrupt) {
+                const auto queueId = submission.queue;
+                interruptDeferred = localDevice->AfterRecordedWork([queueId] { AgcDriverDeliverEopInterrupt(queueId); }, submission.queue == 0);
+                if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
+            }
+            return false;
+        }
+    }
     static const bool deferInterrupts = std::getenv("APS5_DRAIN_EOP_INTERRUPTS") == nullptr;
     if (!drainAll && deferInterrupts && endOfPipeInterrupt) {
         const auto label = Pm4::DecodeLabelWrite(packet);

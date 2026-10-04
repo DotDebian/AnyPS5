@@ -72,6 +72,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcGpuTimestampsShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/GpuTimestamps.comp)
+set(agcGpuTimestampsShaderSpv ${agcTextureDetileGeneratedDir}/GpuTimestamps.spv)
+set(agcGpuTimestampsShaderHeader ${agcTextureDetileGeneratedDir}/GpuTimestamps_spv.h)
+add_custom_command(
+        OUTPUT "${agcGpuTimestampsShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcGpuTimestampsShaderSpv}" "${agcGpuTimestampsShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcGpuTimestampsShaderSpv} -DOUTPUT=${agcGpuTimestampsShaderHeader}
+        -DSYMBOL=GPU_TIMESTAMPS_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcGpuTimestampsShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcMeshArgumentsShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/MeshArguments.comp)
 set(agcMeshArgumentsShaderSpv ${agcTextureDetileGeneratedDir}/MeshArguments.spv)
 set(agcMeshArgumentsShaderHeader ${agcTextureDetileGeneratedDir}/MeshArguments_spv.h)
@@ -191,12 +204,14 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureResidency.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GpuClock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}
         ${agcMeshArgumentsShaderHeader}
+        ${agcGpuTimestampsShaderHeader}
         ${agcPresentationShaderHeaders}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
@@ -324,6 +339,12 @@ target_include_directories(agc_pass_hazards_tests PRIVATE ${LIBS_INCLUDE_DIR} ${
 target_link_libraries(agc_pass_hazards_tests PRIVATE libc)
 set_target_properties(agc_pass_hazards_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_pass_hazards_tests)
+
+add_test_executable(agc_gpu_clock_tests EXCLUDE_FROM_ALL tests/GpuClock.cpp Graphics/src/GpuClock.cpp)
+target_include_directories(agc_gpu_clock_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_gpu_clock_tests PRIVATE libc)
+set_target_properties(agc_gpu_clock_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_gpu_clock_tests)
 
 add_test_executable(agc_dcc_key_sharing_tests EXCLUDE_FROM_ALL tests/DccKeySharing.cpp)
 target_include_directories(agc_dcc_key_sharing_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
@@ -486,12 +507,14 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/Texture.cpp
         Graphics/src/TextureResidency.cpp
         Graphics/src/PassHazards.cpp
+        Graphics/src/GpuClock.cpp
         Graphics/src/UnitShadow.cpp
         Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}
         ${agcMeshArgumentsShaderHeader}
+        ${agcGpuTimestampsShaderHeader}
         Execution/src/GuestMemory.cpp
         Execution/src/Pm4.cpp
 )
@@ -595,7 +618,7 @@ set_target_properties(agc_driver_wave_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_wave_tests)
 
 if(BUILD_TESTING)
-    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_write_tracking_tests agc_structurizer_tests agc_dpp_write_tests agc_shader_disk_cache_tests agc_texture_residency_tests agc_pass_hazards_tests agc_dcc_key_sharing_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_resident_present_tests ${agcExecutionTests})
+    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_write_tracking_tests agc_structurizer_tests agc_dpp_write_tests agc_shader_disk_cache_tests agc_texture_residency_tests agc_pass_hazards_tests agc_gpu_clock_tests agc_dcc_key_sharing_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_resident_present_tests ${agcExecutionTests})
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})

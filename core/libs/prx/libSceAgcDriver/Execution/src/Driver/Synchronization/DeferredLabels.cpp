@@ -109,7 +109,18 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         }
     } clear{labels, queue};
     bool first = true;
+    std::shared_ptr<VulkanDevice> created;
     for (const auto& label : labels) {
+        if (label.timestamp.has_value()) {
+            if (localDevice == nullptr) {
+                if (device == nullptr) device = std::make_shared<VulkanDevice>();
+                created = device.Load();
+                localDevice = created.get();
+            }
+            localDevice->WriteTimestampOnGpu(label.address, label.size, *label.timestamp, queue, first);
+            first = false;
+            continue;
+        }
         const auto bytes = std::span<const std::byte>(label.bytes).first(label.size);
         const auto stamp = ++eventSerial;
         const int reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label.address, bytes, stamp, queue, first) : 4;
@@ -187,6 +198,10 @@ void Driver::noteQueuedLabels(std::uint32_t queue) {
     const auto& labels = deferredLabels().labels;
     for (auto& noted = queuedLabelsNoted(); noted < labels.size(); ++noted) {
         const auto& label = labels[noted];
+        if (label.timestamp.has_value()) {
+            Graphics::Recorder::NoteQueuedRange(label.address, label.size);
+            continue;
+        }
         Graphics::Recorder::NoteQueuedLabel(label.address, std::span<const std::byte>(label.bytes).first(label.size), ++eventSerial, queue);
     }
 }

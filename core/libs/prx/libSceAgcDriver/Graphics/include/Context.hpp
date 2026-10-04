@@ -138,6 +138,7 @@ struct Context {
     // VK_EXT_descriptor_indexing with non-uniform sampled/storage image array indexing enabled
     // (bindless image tables in graphics stages).
     bool descriptorIndexing = false;
+    bool hostQueryReset = false;
     // VK_EXT_primitive_topology_list_restart: primitive restart on list topologies.
     bool primitiveListRestart = false;
     // The depthBiasClamp feature (PA_SU_POLY_OFFSET_CLAMP).

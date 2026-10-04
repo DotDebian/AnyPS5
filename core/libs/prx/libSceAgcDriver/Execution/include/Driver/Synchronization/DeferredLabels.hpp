@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <vector>
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -16,6 +18,7 @@ struct DeferredLabel {
     std::uint64_t address;
     std::size_t size;
     std::array<std::byte, Capacity> bytes;
+    std::optional<Pm4::TimestampStage> timestamp;
 };
 
 struct DeferredLabels {
