@@ -1133,8 +1133,13 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
                 value = mapped;
             }
         }
-        if (exp.kind == ExportTargetKind::Position && state.inputInfo.vertex->clipSpace.enabled) {
-            value = ConvertPositionToClipSpace(state, value);
+        if (exp.kind == ExportTargetKind::Position) {
+            if (state.inputInfo.vertex == nullptr) {
+                throw std::runtime_error("vertex input info is missing for a position export");
+            }
+            if (state.inputInfo.vertex->clipSpace.enabled) {
+                value = ConvertPositionToClipSpace(state, value);
+            }
         }
         if (state.program.Resources().stage == IrShaderStage::Mesh) {
             const auto kind = exp.kind == ExportTargetKind::Position ? StageOutputKind::Position : StageOutputKind::Parameter;

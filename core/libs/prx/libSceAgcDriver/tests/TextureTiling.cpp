@@ -1,10 +1,10 @@
 #include "GraphicsTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
-#include <bit>
-#include <span>
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,7 +25,6 @@ void reject(TAction action, std::string_view reason) {
     throw std::runtime_error(std::string("expected texture tiling rejection: ") + std::string(reason));
 }
 
-
 struct ElementAddress {
     std::uint32_t mip;
     std::uint32_t x;
@@ -44,50 +43,36 @@ std::uint64_t equationOffset(const TextureSwizzleEquation& equation, std::uint32
     return offset;
 }
 
-std::uint64_t detiledAddress(const SurfaceGeometry& geometry, const TextureSwizzleEquation& equation, std::array<std::uint32_t, 2> blockExtent, std::uint32_t blockBytes, const ElementAddress& element) {
-    const auto& mip = geometry.mips.at(element.mip);
-    const auto base = geometry.GuestLayerOffset(element.z) + mip.tiledOffset;
-    if (mip.tail) return base + equationOffset(equation, element.x + mip.tailX, element.y + mip.tailY, element.z);
-    const auto blockIndex = static_cast<std::uint64_t>(element.y / blockExtent[1]) * mip.blocksPerRow + element.x / blockExtent[0];
-    return base + blockIndex * blockBytes + equationOffset(equation, element.x, element.y, element.z);
-}
-
-GuestTextureResource volume(TextureTileMode tileMode, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t depth, std::uint32_t mipCount) {
+GuestTextureResource thickVolume(TextureTileMode tileMode, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t depth, std::uint32_t mipCount) {
     GuestTextureResource resource{};
-    resource.baseAddress = 0x100000000ull;
     resource.width = width;
     resource.height = height;
     resource.depthOrLastArray = depth - 1u;
     resource.mipCount = mipCount;
-    resource.lastLevel = mipCount - 1u;
     resource.tileMode = tileMode;
     resource.dimension = TextureDimension::k3D;
     resource.format = format;
     return resource;
 }
 
-void requireAddresses(const GuestTextureResource& resource, std::uint32_t swizzle, std::span<const ElementAddress> expected, std::uint64_t guestBytes, const char* what) {
+void requireThickAddresses(const GuestTextureResource& resource, std::uint32_t bytesPerElement, std::uint32_t firstTailLevel, std::uint64_t guestBytes, std::span<const ElementAddress> expected, const std::string& what) {
     const auto geometry = DescribeSurface(resource);
-    Require(geometry.guestBytes == guestBytes, std::string(what) + ": guest size differs from addrlib");
-    Require(geometry.mips.size() == resource.mipCount, std::string(what) + ": mip count changed");
-    const auto bytesPerElement = resource.format == 71 ? 8u : 4u;
-    const auto* equation = FindTextureSwizzleEquation(swizzle, bytesPerElement);
-    Require(equation != nullptr, std::string(what) + ": missing swizzle equation");
-    std::array<std::uint32_t, 2> extent{};
-    std::uint32_t blockBytes = 0;
-    if (geometry.thick) {
-        const auto thick = ThickBlockExtent(resource.tileMode, bytesPerElement);
-        extent = {thick[0], thick[1]};
-        blockBytes = resource.tileMode == TextureTileMode::kStandard4KB ? 4096u : 65536u;
-    } else {
-        const auto thin = ThinBlockLayout(resource.tileMode, bytesPerElement);
-        extent = {thin[1], thin[2]};
-        blockBytes = thin[0];
-    }
+    Require(geometry.thick && geometry.mips.size() == resource.mipCount && geometry.guestBytes == guestBytes, what + ": guest size differs from addrlib");
+    for (std::uint32_t level = 0; level < resource.mipCount; ++level) Require(geometry.mips[level].tail == (level >= firstTailLevel), what + ": mip " + std::to_string(level) + " is on the wrong side of the mip tail");
+    const auto blockBytes = resource.tileMode == TextureTileMode::kStandard4KB ? 4096u : 65536u;
+    const auto* equation = FindTextureSwizzleEquation(resource.tileMode == TextureTileMode::kStandard4KB ? 0x105u : 0x109u, bytesPerElement);
+    Require(equation != nullptr, what + ": missing thick swizzle equation");
+    const auto block = ThickBlockExtent(resource.tileMode, bytesPerElement);
     for (const auto& element : expected) {
-        Require(element.z < geometry.LevelLayers(element.mip), std::string(what) + ": sample slice lies outside its level");
-        const auto address = detiledAddress(geometry, *equation, extent, blockBytes, element);
-        Require(address == element.address, std::string(what) + ": mip " + std::to_string(element.mip) + " element (" + std::to_string(element.x) + ", " + std::to_string(element.y) + ", " + std::to_string(element.z) + ") detiles from " + std::to_string(address) + " instead of addrlib's " + std::to_string(element.address));
+        Require(geometry.HasLayer(element.mip, element.z), what + ": sample slice lies outside its level");
+        const auto& mip = geometry.mips.at(element.mip);
+        auto address = geometry.GuestLayerOffset(element.z) + mip.tiledOffset;
+        if (mip.tail) {
+            address += equationOffset(*equation, element.x + mip.tailX, element.y + mip.tailY, element.z);
+        } else {
+            address += (static_cast<std::uint64_t>(element.y / block[1]) * mip.blocksPerRow + element.x / block[0]) * blockBytes + equationOffset(*equation, element.x, element.y, element.z);
+        }
+        Require(address == element.address, what + ": mip " + std::to_string(element.mip) + " element (" + std::to_string(element.x) + ", " + std::to_string(element.y) + ", " + std::to_string(element.z) + ") detiles from " + std::to_string(address) + " instead of addrlib's " + std::to_string(element.address));
     }
 }
 
@@ -183,24 +168,48 @@ void RunTextureTilingTests() {
     Require(ComputeMipLayout(TextureTileMode::RenderTarget64KB, 132, 64, 64, 1).size() == 1, "format 132 render target layout is missing");
     reject([] { ComputeMipLayout(TextureTileMode::RenderTarget64KB, 74, 64, 64, 1); }, "unsupported bytes per element");
 
-    {
-        constexpr ElementAddress thick64KB32[] = {{0, 0, 0, 0, 0x20000}, {0, 63, 63, 31, 0xbfffc}, {0, 32, 21, 16, 0x94108}, {0, 21, 63, 0, 0x4cb2c}, {0, 63, 0, 31, 0x9b6d4}, {1, 0, 0, 0, 0x10000}, {1, 31, 31, 15, 0x1fffc}, {1, 16, 10, 8, 0x1a820}, {1, 10, 31, 0, 0x15968}, {1, 31, 0, 15, 0x1b6d4}, {2, 0, 0, 0, 0x8000}, {2, 15, 15, 7, 0x9ffc}, {2, 8, 5, 4, 0x9508}, {2, 5, 15, 0, 0x8b2c}, {2, 15, 0, 7, 0x96d4}, {3, 0, 0, 0, 0x4000}, {3, 7, 7, 3, 0x43fc}, {3, 4, 2, 2, 0x42a0}, {3, 2, 7, 0, 0x4168}, {3, 7, 0, 3, 0x42d4}, {4, 0, 0, 0, 0x1000}, {4, 3, 3, 1, 0x107c}, {4, 2, 1, 1, 0x1058}, {4, 1, 3, 0, 0x102c}, {4, 3, 0, 1, 0x1054}, {5, 0, 0, 0, 0xa00}, {5, 1, 1, 0, 0xa0c}, {5, 1, 0, 0, 0xa04}, {5, 0, 1, 0, 0xa08}, {5, 1, 0, 0, 0xa04}, {6, 0, 0, 0, 0x900}, {6, 0, 0, 0, 0x900}, {6, 0, 0, 0, 0x900}, {6, 0, 0, 0, 0x900}, {6, 0, 0, 0, 0x900}};
-        requireAddresses(volume(TextureTileMode::kStandard64KB, 22, 64, 64, 32, 7), 0x109u, thick64KB32, 786432, "SW_64KB_S 32-bit volume");
-        constexpr ElementAddress thick64KB64[] = {{0, 0, 0, 0, 0x20000}, {0, 39, 23, 19, 0xb0bf8}, {0, 20, 8, 10, 0x2e280}, {0, 13, 23, 0, 0x41b28}, {0, 39, 0, 19, 0x902d8}, {1, 0, 0, 0, 0x10000}, {1, 19, 11, 9, 0x1e178}, {1, 10, 4, 5, 0x11c50}, {1, 6, 11, 0, 0x14360}, {1, 19, 0, 9, 0x1a058}, {2, 0, 0, 0, 0x8000}, {2, 9, 5, 4, 0x9c28}, {2, 5, 2, 2, 0x8388}, {2, 3, 5, 0, 0x8868}, {2, 9, 0, 4, 0x9408}, {3, 0, 0, 0, 0x4000}, {3, 4, 2, 1, 0x4310}, {3, 2, 1, 1, 0x4070}, {3, 1, 2, 0, 0x4108}, {3, 4, 0, 1, 0x4210}, {4, 0, 0, 0, 0x1000}, {4, 1, 0, 0, 0x1008}, {4, 1, 0, 0, 0x1008}, {4, 0, 0, 0, 0x1000}, {4, 1, 0, 0, 0x1008}, {5, 0, 0, 0, 0xa00}, {5, 0, 0, 0, 0xa00}, {5, 0, 0, 0, 0xa00}, {5, 0, 0, 0, 0xa00}, {5, 0, 0, 0, 0xa00}};
-        requireAddresses(volume(TextureTileMode::kStandard64KB, 71, 40, 24, 20, 6), 0x109u, thick64KB64, 786432, "SW_64KB_S 64-bit volume");
-        constexpr ElementAddress thick4KB32[] = {{0, 0, 0, 0, 0x3000}, {0, 31, 31, 7, 0xaffc}, {0, 16, 10, 4, 0x5c20}, {0, 10, 31, 0, 0x8968}, {0, 31, 0, 7, 0x66d4}, {1, 0, 0, 0, 0x1000}, {1, 15, 15, 3, 0x2bfc}, {1, 8, 5, 2, 0x2188}, {1, 5, 15, 0, 0x1b2c}, {1, 15, 0, 3, 0x22d4}, {2, 0, 0, 0, 0x800}, {2, 7, 7, 1, 0xb7c}, {2, 4, 2, 1, 0xa30}, {2, 2, 7, 0, 0x968}, {2, 7, 0, 1, 0xa54}, {3, 0, 0, 0, 0x300}, {3, 3, 3, 0, 0x36c}, {3, 2, 1, 0, 0x348}, {3, 1, 3, 0, 0x32c}, {3, 3, 0, 0, 0x344}, {4, 0, 0, 0, 0x200}, {4, 1, 1, 0, 0x20c}, {4, 1, 0, 0, 0x204}, {4, 0, 1, 0, 0x208}, {4, 1, 0, 0, 0x204}, {5, 0, 0, 0, 0x100}, {5, 0, 0, 0, 0x100}, {5, 0, 0, 0, 0x100}, {5, 0, 0, 0, 0x100}, {5, 0, 0, 0, 0x100}};
-        requireAddresses(volume(TextureTileMode::kStandard4KB, 22, 32, 32, 8, 6), 0x105u, thick4KB32, 45056, "SW_4KB_S 32-bit volume");
-        constexpr ElementAddress thinRX64[] = {{0, 0, 0, 0, 0x10000}, {0, 127, 63, 7, 0xff6f8}, {0, 64, 21, 4, 0x9d410}, {0, 42, 63, 0, 0x17eb0}, {0, 127, 0, 7, 0xfa168}, {1, 0, 0, 0, 0x8400}, {1, 63, 31, 3, 0x6f0f8}, {1, 32, 10, 2, 0x48980}, {1, 21, 31, 0, 0xd5d8}, {1, 63, 0, 3, 0x6a368}, {2, 0, 0, 0, 0x400}, {2, 31, 15, 1, 0x23ef8}, {2, 16, 5, 1, 0x21e10}, {2, 10, 15, 0, 0x34b0}, {2, 31, 0, 1, 0x22f68}, {3, 0, 0, 0, 0x800}, {3, 15, 7, 0, 0x39f8}, {3, 8, 2, 0, 0x2980}, {3, 5, 7, 0, 0x18d8}, {3, 15, 0, 0, 0x2968}};
-        requireAddresses(volume(TextureTileMode::kR64KBX, 71, 128, 64, 8, 4), 27u, thinRX64, 1048576, "SW_64KB_R_X 64-bit volume");
-        const auto geometry = DescribeSurface(volume(TextureTileMode::kStandard64KB, 22, 64, 64, 32, 7));
-        Require(geometry.LevelLayers(0) == 32 && geometry.LevelLayers(3) == 4 && geometry.LevelLayers(6) == 1, "volume levels must hold their own depth in slices");
-        Require(geometry.mips[1].tiledOffset == 65536 && geometry.mips[0].tiledOffset == 131072 && geometry.layerBytes == 393216, "thick mip chains must stack from the tail block out to level 0 inside each slab");
-    }
-
     reject([] { ComputeMipLayout(TextureTileMode::kLinear, 1, 0, 4, 1); }, "zero-sized texture");
     reject([] { ComputeMipLayout(TextureTileMode::kLinear, 1, 4, 0, 1); }, "zero-sized texture");
     reject([] { ComputeMipLayout(TextureTileMode::kLinear, 1, 4, 4, 0); }, "mip count is out of range");
     reject([] { ComputeMipLayout(TextureTileMode::kLinear, 1, 4, 4, 17); }, "mip count is out of range");
+
+    {
+        GuestTextureResource volume{};
+        volume.width = 64;
+        volume.height = 64;
+        volume.depthOrLastArray = 31;
+        volume.mipCount = 3;
+        volume.tileMode = TextureTileMode::kStandard4KB;
+        volume.dimension = TextureDimension::k3D;
+        volume.format = 56;
+        const auto geometry = DescribeSurface(volume);
+        Require(geometry.thick && geometry.blockDepth == 8 && geometry.mips.size() == 3, "mipmapped 3D texture geometry changed");
+        Require(geometry.mips[2].tiledOffset == 0 && geometry.mips[2].tiledSize == 8192, "3D mip 2 must lead each slab");
+        Require(geometry.mips[1].tiledOffset == 8192 && geometry.mips[1].tiledSize == 32768, "3D mip 1 offset or size changed");
+        Require(geometry.mips[0].tiledOffset == 40960 && geometry.mips[0].tiledSize == 131072, "3D mip 0 must end each slab");
+        Require(geometry.layerBytes == 172032 && geometry.guestBytes == 172032ull * 4, "3D slabs must hold the whole mip chain");
+        Require(geometry.HasLayer(1, 15) && !geometry.HasLayer(1, 16) && !geometry.HasLayer(2, 8), "3D mips must halve their depth");
+        volume.width = 33;
+        volume.height = 20;
+        volume.depthOrLastArray = 11;
+        volume.mipCount = 2;
+        const auto odd = DescribeSurface(volume);
+        Require(odd.mips[1].width == 16 && odd.mips[1].blocksPerRow == 3 && odd.mips[1].tiledSize == 12288, "a 3D level must be padded from its size rounded up, as addrlib does");
+        Require(odd.mips[0].blocksPerRow == 5 && odd.mips[0].tiledOffset == 12288 && odd.mips[0].tiledSize == 40960, "3D mip 0 of a non-power-of-two volume changed");
+    }
+
+    {
+        constexpr ElementAddress chainInTail[] = {{0, 0, 0, 0, 0x800}, {0, 7, 7, 7, 0xffc}, {0, 4, 2, 4, 0xe20}, {0, 2, 7, 0, 0x968}, {0, 7, 0, 7, 0xed4}, {1, 0, 0, 0, 0x300}, {1, 3, 3, 3, 0x3fc}, {1, 2, 1, 2, 0x3c8}, {1, 1, 3, 0, 0x32c}, {1, 3, 0, 3, 0x3d4}};
+        requireThickAddresses(thickVolume(TextureTileMode::kStandard4KB, 56, 8, 8, 8, 2), 4, 0, 4096, chainInTail, "SW_4KB_S 32 bpp 8x8x8, 2 levels");
+        constexpr ElementAddress unevenTail[] = {{0, 0, 0, 0, 0x6000}, {0, 32, 19, 11, 0x1f0b8}, {0, 16, 6, 6, 0x85a0}, {0, 11, 19, 0, 0xc06c}, {0, 32, 0, 11, 0x1a090}, {1, 0, 0, 0, 0x3000}, {1, 15, 9, 5, 0x4e5c}, {1, 8, 3, 3, 0x40b8}, {1, 5, 9, 0, 0x3a0c}, {1, 15, 0, 5, 0x4654}, {2, 0, 0, 0, 0x1000}, {2, 7, 4, 2, 0x13c4}, {2, 4, 1, 1, 0x1218}, {2, 2, 4, 0, 0x1140}, {2, 7, 0, 2, 0x12c4}, {3, 0, 0, 0, 0x800}, {3, 3, 1, 0, 0x84c}, {3, 2, 0, 0, 0x840}, {3, 1, 1, 0, 0x80c}, {3, 3, 0, 0, 0x844}, {4, 0, 0, 0, 0x300}, {4, 1, 0, 0, 0x304}, {4, 0, 0, 0, 0x300}, {5, 0, 0, 0, 0x200}};
+        requireThickAddresses(thickVolume(TextureTileMode::kStandard4KB, 56, 33, 20, 12, 6), 4, 3, 131072, unevenTail, "SW_4KB_S 32 bpp 33x20x12, 6 levels");
+        constexpr ElementAddress wideTail[] = {{0, 0, 0, 0, 0x20000}, {0, 39, 23, 19, 0xb0bf8}, {0, 20, 8, 10, 0x2e280}, {0, 13, 23, 0, 0x41b28}, {0, 39, 0, 19, 0x902d8}, {1, 0, 0, 0, 0x10000}, {1, 19, 11, 9, 0x1e178}, {1, 10, 4, 5, 0x11c50}, {1, 6, 11, 0, 0x14360}, {1, 19, 0, 9, 0x1a058}, {2, 0, 0, 0, 0x8000}, {2, 9, 5, 4, 0x9c28}, {2, 5, 2, 2, 0x8388}, {2, 3, 5, 0, 0x8868}, {2, 9, 0, 4, 0x9408}, {3, 0, 0, 0, 0x4000}, {3, 4, 2, 1, 0x4310}, {3, 2, 1, 1, 0x4070}, {3, 1, 2, 0, 0x4108}, {3, 4, 0, 1, 0x4210}, {4, 0, 0, 0, 0x1000}, {4, 1, 0, 0, 0x1008}, {5, 0, 0, 0, 0xa00}};
+        requireThickAddresses(thickVolume(TextureTileMode::kStandard64KB, 71, 40, 24, 20, 6), 8, 2, 786432, wideTail, "SW_64KB_S 64 bpp 40x24x20, 6 levels");
+        constexpr ElementAddress byteTail[] = {{0, 0, 0, 0, 0x20000}, {0, 99, 59, 69, 0x11c8af}, {0, 50, 20, 35, 0x8d116}, {0, 33, 59, 0, 0x4c829}, {0, 99, 0, 69, 0xf8087}, {1, 0, 0, 0, 0x10000}, {1, 49, 29, 34, 0x7d919}, {1, 25, 10, 17, 0x13a25}, {1, 16, 29, 0, 0x15908}, {1, 49, 0, 34, 0x79011}, {2, 0, 0, 0, 0x8000}, {2, 24, 14, 16, 0xbb20}, {2, 12, 5, 8, 0x8748}, {2, 8, 14, 0, 0x8b20}, {2, 24, 0, 16, 0xb200}, {3, 0, 0, 0, 0x4000}, {3, 11, 6, 7, 0x43b7}, {3, 6, 2, 4, 0x40e2}, {3, 4, 6, 0, 0x4160}, {3, 11, 0, 7, 0x4297}, {4, 0, 0, 0, 0x1000}, {4, 5, 2, 3, 0x1075}, {4, 3, 1, 2, 0x101b}, {4, 2, 2, 0, 0x1022}, {4, 5, 0, 3, 0x1055}, {5, 0, 0, 0, 0xa00}, {5, 2, 0, 1, 0xa06}, {5, 1, 0, 0, 0xa01}, {6, 0, 0, 0, 0x900}};
+        requireThickAddresses(thickVolume(TextureTileMode::kStandard64KB, 1, 100, 60, 70, 7), 1, 2, 1179648, byteTail, "SW_64KB_S 8 bpp 100x60x70, 7 levels");
+        constexpr ElementAddress wideElementTail[] = {{0, 0, 0, 0, 0x3000}, {0, 8, 4, 2, 0x5880}, {0, 4, 1, 1, 0x4030}, {0, 3, 4, 0, 0x3a40}, {0, 8, 0, 2, 0x5080}, {1, 0, 0, 0, 0x1000}, {1, 3, 1, 0, 0x1260}, {1, 2, 0, 0, 0x1200}, {1, 1, 1, 0, 0x1060}, {1, 3, 0, 0, 0x1240}, {2, 0, 0, 0, 0x800}, {2, 1, 0, 0, 0x840}, {3, 0, 0, 0, 0x300}};
+        requireThickAddresses(thickVolume(TextureTileMode::kStandard4KB, 77, 9, 5, 3, 4), 16, 2, 24576, wideElementTail, "SW_4KB_S 128 bpp 9x5x3, 4 levels");
+    }
 
     reject([] { ComputeSurfaceSize({}, 1); }, "empty mip chain");
     reject([] { ComputeSurfaceSize(ComputeMipLayout(TextureTileMode::kLinear, 1, 4, 4, 1), 0); }, "zero array layers");

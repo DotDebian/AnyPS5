@@ -331,8 +331,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 const auto guestLayerOffset = geometry.GuestLayerOffset(layer);
                 const auto linearLayerOffset = geometry.LinearLayerOffset(layer);
-                for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
-                    if (layer >= geometry.LevelLayers(level)) continue;
+                for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                    if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
                     detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled->Handle(), guestLayerOffset + mip.tiledOffset, linear->Handle(), linearLayerOffset + mip.linearOffset, mip, false, layer, geometry.thick);
                 }
@@ -363,7 +363,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
                 const auto linearLayerOffset = static_cast<std::uint64_t>(layer) * sliceLinearBytes;
                 for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
-                    if (layer >= geometry.LevelLayers(level)) continue;
+                    if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
                     VkBufferImageCopy region{};
                     region.bufferOffset = linearLayerOffset + mip.linearOffset;
@@ -643,7 +643,6 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
         Require(mipLevel < descriptor.mipCount, "storage texture mip level is outside the texture");
-        Require(descriptor.dimension != TextureDimension::k3D || descriptor.mipCount == 1, "mipmapped 3D storage images are not implemented");
         const auto vkFormat = StorageFormatFor(context, ResolveTextureFormat(descriptor.format));
         storageFormat = vkFormat;
         APS5_LOG_OUT("StorageTexture address=0x%llx %ux%u mips=%u mip=%u layers=%u base=%u dim=%d tile=%d format=%u vk=%d", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, mipLevel,
@@ -1510,7 +1509,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             if (layers != nullptr && !(*layers)[layer]) continue;
-            for (const auto& mip : mips) {
+            for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                if (!geometry.HasLayer(level, layer)) continue;
+                const auto& mip = mips[level];
                 detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick);
             }
         }
@@ -1559,7 +1560,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             CopyBuffer(context, commands, staging.Handle(), 0, tiled.Handle(), 0, original.size());
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
-                for (const auto& mip : mips) {
+                for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                    if (!geometry.HasLayer(level, layer)) continue;
+                    const auto& mip = mips[level];
                     detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled.Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear.Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick);
                 }
             }
@@ -1609,6 +1612,7 @@ std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<
     for (const auto& [runBegin, runEnd] : runs) {
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+                if (!geometry.HasLayer(level, layer)) continue;
                 const auto& mip = mips[level];
                 const auto sliceBegin = geometry.GuestLayerOffset(layer) + mip.tiledOffset;
                 const auto sliceEnd = sliceBegin + mip.tiledSize;
@@ -1689,6 +1693,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
     std::vector<std::pair<std::uint64_t, std::uint64_t>> tailBlocks;
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
         for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+            if (!geometry.HasLayer(level, layer)) continue;
             const auto& mip = mips[level];
             if (!mip.tail) continue;
             const auto sliceBegin = geometry.GuestLayerOffset(layer) + mip.tiledOffset;
@@ -1987,6 +1992,7 @@ std::vector<VkBufferImageCopy> StorageTexture::CopyRegions(const std::vector<boo
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
         if (layers != nullptr && !(*layers)[layer]) continue;
         for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+            if (!geometry.HasLayer(level, layer)) continue;
             const auto& mip = mips[level];
             VkBufferImageCopy region{};
             region.bufferOffset = layer * sliceLinearBytes + mip.linearOffset;
@@ -2912,6 +2918,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     std::vector<VkImageCopy> regions;
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
         for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+            if (!geometry.HasLayer(level, layer)) continue;
             VkImageCopy region{};
             region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1};
             region.srcOffset = {0, 0, geometry.CopyDepth(layer)};
@@ -3334,7 +3341,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             if (storedLayers != nullptr && !(*storedLayers)[layer]) continue;
-            for (const auto& mip : mips) {
+            for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                if (!geometry.HasLayer(level, layer)) continue;
+                const auto& mip = mips[level];
                 detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiledScratch->Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, layer, geometry.thick);
             }
         }
@@ -3425,7 +3434,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     const VkBufferMemoryBarrier toShader[] = {WholeBufferBarrier(linear.Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT), WholeBufferBarrier(tiled.Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 2, toShader, 0, nullptr);
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
-        for (const auto& mip : mips) {
+        for (std::uint32_t level = 0; level < mips.size(); ++level) {
+            if (!geometry.HasLayer(level, layer)) continue;
+            const auto& mip = mips[level];
             detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear.Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiled.Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, layer, geometry.thick);
         }
     }

@@ -77,15 +77,16 @@ bool Replay(const char* path) {
         }
     }
     if (g_code) {
-        // --code: the shader's code words, as <request name>.code in the working directory (raw
-        // little-endian bytes for other disassemblers, e.g. llvm-mc -triple amdgcn -mcpu=gfx1030).
-        std::string name = path;
-        if (const auto slash = name.find_last_of('/'); slash != std::string::npos) name = name.substr(slash + 1);
-        name += ".code";
-        if (std::FILE* file = std::fopen(name.c_str(), "wb")) {
-            std::fwrite(request.request.shader.code.data(), sizeof(std::uint32_t), request.request.shader.code.size(), file);
-            std::fclose(file);
+        std::string name(path);
+        name = name.substr(name.find_last_of("/\\") + 1) + ".code";
+        const auto& code = request.request.shader.code;
+        std::ofstream file(name, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(code.data()), static_cast<std::streamsize>(code.size() * sizeof(code[0])));
+        if (!file) {
+            std::printf("  could not write %s\n", name.c_str());
+            return false;
         }
+        std::printf("  code -> %s\n", name.c_str());
     }
     if (g_assembly) {
         const auto program = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(request.request.shader.code);

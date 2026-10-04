@@ -122,6 +122,12 @@ void stateTests() {
     queue.context[0x91] = 0x30020;
     state = AgcDriver::Graphics::DecodeState(queue);
     Require(state.scissor.offset.x == 3 && state.scissor.offset.y == 1 && state.scissor.extent.width == 29 && state.scissor.extent.height == 2, "scissor intersection changed");
+    queue.context[0x90] = 0x10003;
+    state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.scissor.offset.x == 3 && state.scissor.offset.y == 1 && state.scissor.extent.width == 29 && state.scissor.extent.height == 2, "a scissor that applies the zero window offset changed");
+    queue.context[0x90] = 0x80008000;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "scissor reserved bits");
+    queue.context[0x90] = 0x80010003;
     // DCC_ENABLE: the target is rendered uncompressed and only its fast-clear keys are read.
     queue.context[0x31c] |= 0x10000000;
     queue.context[0x325] = 0x1234;
@@ -157,12 +163,12 @@ void stateTests() {
     for (std::uint32_t i = 0; i < 4; ++i) queue.context[0x105 + i] = 0;
     queue.context[0x1c5] = 0x909u;
     state = AgcDriver::Graphics::DecodeState(queue);
-    Require(state.colors.size() == 2 && state.blends.size() == 3 && state.colors[0].attachment == 0 && state.colors[1].attachment == 2 && state.colors[1].address == slotTwo, "the slots around an unwritten MRT slot did not keep their attachments");
+    Require(state.colors.size() == 2 && state.blends.size() == 3 && state.colors[0].exportIndex == 0 && state.colors[1].exportIndex == 2 && state.colors[1].address == slotTwo, "the slots around an unwritten MRT slot did not keep their attachments");
     Require(state.blends[1].colorWriteMask == 0 && !state.blends[1].blendEnable && state.blends[2].blendEnable && state.blends[2].colorWriteMask == 0xfu && !state.blends[0].blendEnable, "the unwritten MRT slot was not an unused attachment");
     Require(AgcDriver::Graphics::ExportMappings(state)[2] == state.colors[1].componentMapping && AgcDriver::Graphics::ExportMappings(state)[1] == 0xe4u, "export 2 did not take MRT slot 2's component mapping");
     queue.context[0x8e] = 0xf00u;
     state = AgcDriver::Graphics::DecodeState(queue);
-    Require(state.hasColorTarget && state.colors.size() == 1 && state.blends.size() == 3 && state.colors[0].attachment == 2 && state.color.address == slotTwo && state.blend.blendEnable && state.renderExtent.width == 64, "a draw writing MRT slot 2 alone did not leave slots 0 and 1 unused");
+    Require(state.hasColorTarget && state.colors.size() == 1 && state.blends.size() == 3 && state.colors[0].exportIndex == 2 && state.color.address == slotTwo && state.blend.blendEnable && state.renderExtent.width == 64, "a draw writing MRT slot 2 alone did not leave slots 0 and 1 unused");
     Require(state.blends[0].colorWriteMask == 0 && state.blends[1].colorWriteMask == 0, "unwritten MRT slots below the written one have color writes");
     queue = makeState();
     alignas(256) static std::array<std::byte, 1024> slotFourMemory{};
@@ -182,7 +188,7 @@ void stateTests() {
     Require(AgcDriver::Graphics::ExportMappings(state)[1] == state.colors[1].componentMapping, "export 1 did not take MRT slot 4's component mapping");
     queue.context[0x8e] = 0x30000u;
     state = AgcDriver::Graphics::DecodeState(queue);
-    Require(state.colors.size() == 1 && state.blends.size() == 2 && state.colors[0].attachment == 1 && state.colors[0].address == slotFour && state.blends[0].colorWriteMask == 0 && state.blends[1].blendEnable, "export 1 alone did not reach MRT slot 4 through attachment 1");
+    Require(state.colors.size() == 1 && state.blends.size() == 2 && state.colors[0].exportIndex == 1 && state.colors[0].address == slotFour && state.blends[0].colorWriteMask == 0 && state.blends[1].blendEnable, "export 1 alone did not reach MRT slot 4 through attachment 1");
     // Without a depth surface (DB_Z_INFO / DB_STENCIL_INFO absent: FORMAT INVALID) the DB passes
     // every test: no attachment (see depthTests for surfaces).
     queue = makeState();
@@ -444,7 +450,8 @@ void depthTests() {
     Require(state.depth.attached && state.depth.clearDepth && state.depth.clearStencil && state.depth.depthTest && state.depth.depthWrite && state.depth.depthCompare == VK_COMPARE_OP_ALWAYS, "a depth clear did not write every covered pixel");
     Require(state.viewport.minDepth == 0.25f && state.viewport.maxDepth == 0.25f, "a depth clear did not pin the depth range to the clear value");
     Require(state.depth.stencilTest && state.depth.front.passOp == VK_STENCIL_OP_REPLACE && state.depth.front.compareOp == VK_COMPARE_OP_ALWAYS && state.depth.front.reference == 0x5a && state.depth.front.writeMask == 0xff && state.depth.back.reference == 0x5a, "a stencil clear did not replace with the clear value");
-    // Depth bias: radeonsi's scale * 16 and units (* 4 for Z_16) back to Vulkan's factors.
+    // Depth bias: the inverse of radv, slope * 16 and the constant factor unscaled, in the depth format's
+    // units (PA_SU_POLY_OFFSET_DB_FMT_CNTL).
     queue = makeDepthState();
     queue.context[0x205] = 0x240u | 0x1800u;
     queue.context[0x2de] = 0x1e9;
@@ -454,12 +461,17 @@ void depthTests() {
     state = DecodeState(queue);
     Require(DrawRejection(queue, false).empty() && state.depth.depthBias && state.depth.depthBiasSlope == 2.0f && state.depth.depthBiasConstant == 3.0f, "depth bias was not decoded");
     queue.context[0x10] = 0x80000181u;
-    Require(DecodeState(queue).depth.depthBiasConstant == 0.75f, "Z_16 depth bias units were not scaled");
+    expectDepthRejection(queue, "depth bias in units other than the depth format");
+    queue.context[0x2de] = 0xf0;
+    Require(DecodeState(queue).depth.depthBiasConstant == 3.0f, "Z_16 depth bias units were scaled");
+    queue.context.erase(0x2de);
+    Require(DecodeState(queue).depth.depthBias, "depth bias without PA_SU_POLY_OFFSET_DB_FMT_CNTL was refused");
     queue.context[0x10] = 0xa0000183u;
+    queue.context[0x2de] = 0x1e9;
     queue.context[0x2e3] = std::bit_cast<std::uint32_t>(4.0f);
-    expectDepthRejection(queue, "different front and back depth bias");
+    expectDepthRejection(queue, "depth bias differing between front and back faces");
     queue.context[0x205] = 0x240u | 0x800u;
-    expectDepthRejection(queue, "one face only");
+    expectDepthRejection(queue, "depth bias differing between front and back faces");
     queue.context[0x205] = 0x240u | 0x800u | 2u;
     Require(DecodeState(queue).depth.depthBias, "depth bias of the only rasterized face was lost");
     queue = makeDepthState();
@@ -1015,6 +1027,7 @@ struct MockVulkan {
     std::uint32_t blendAttachments = 0;
     std::vector<VkDynamicState> dynamicStates;
     std::optional<std::pair<float, float>> depthBounds;
+    std::optional<std::array<float, 3>> depthBias;
     std::optional<VkPipelineDepthStencilStateCreateInfo> depthStencil;
     VkPipelineRasterizationStateCreateInfo raster{};
     std::vector<std::vector<std::uint32_t>> shaderModules;
@@ -1228,6 +1241,10 @@ VKAPI_ATTR void VKAPI_CALL mockCmdSetDepthBounds(VkCommandBuffer, float minimum,
     mock.depthBounds = std::make_pair(minimum, maximum);
 }
 
+VKAPI_ATTR void VKAPI_CALL mockCmdSetDepthBias(VkCommandBuffer, float constant, float clamp, float slope) {
+    mock.depthBias = std::array<float, 3>{constant, clamp, slope};
+}
+
 VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t size, const void* values) {
     const auto* bytes = static_cast<const std::byte*>(values);
     mock.lastPushConstants.assign(bytes, bytes + size);
@@ -1275,6 +1292,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCmdSetViewport", reinterpret_cast<PFN_vkVoidFunction>(mockCmdSetViewport)},
         {"vkCmdSetScissor", reinterpret_cast<PFN_vkVoidFunction>(mockCmdSetScissor)},
         {"vkCmdSetDepthBounds", reinterpret_cast<PFN_vkVoidFunction>(mockCmdSetDepthBounds)},
+        {"vkCmdSetDepthBias", reinterpret_cast<PFN_vkVoidFunction>(mockCmdSetDepthBias)},
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
         {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)}
@@ -1294,6 +1312,7 @@ AgcDriver::Graphics::Context mockContext() {
     context.limits.maxPerStageDescriptorStorageBuffers = 16;
     context.limits.maxPerStageResources = 128;
     context.limits.maxDescriptorSetStorageBuffers = 32;
+    context.limits.maxMemoryAllocationCount = 4096;
     return context;
 }
 
@@ -1921,11 +1940,13 @@ void depthPipelineTests() {
         const auto& depth = mock.renderPassAttachments[1];
         Require(depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT && depth.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && depth.storeOp == VK_ATTACHMENT_STORE_OP_STORE && depth.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_LOAD && depth.stencilStoreOp == VK_ATTACHMENT_STORE_OP_STORE && depth.initialLayout == VK_IMAGE_LAYOUT_GENERAL && depth.finalLayout == VK_IMAGE_LAYOUT_GENERAL, "the depth attachment does not keep its contents in GENERAL");
         Require(mock.depthStencil && mock.depthStencil->depthTestEnable && mock.depthStencil->depthWriteEnable && mock.depthStencil->depthCompareOp == VK_COMPARE_OP_LESS_OR_EQUAL && !mock.depthStencil->stencilTestEnable && !mock.depthStencil->depthBoundsTestEnable, "the pipeline's depth-stencil state was not built");
-        Require(mock.raster.depthBiasEnable && mock.raster.depthBiasSlopeFactor == 2.0f && mock.raster.depthBiasConstantFactor == 3.0f, "the pipeline lacks the depth bias");
+        Require(mock.raster.depthBiasEnable && std::find(mock.dynamicStates.begin(), mock.dynamicStates.end(), VK_DYNAMIC_STATE_DEPTH_BIAS) != mock.dynamicStates.end(), "the pipeline lacks the dynamic depth bias");
         Require(std::find(mock.dynamicStates.begin(), mock.dynamicStates.end(), VK_DYNAMIC_STATE_DEPTH_BOUNDS) == mock.dynamicStates.end(), "a pipeline without depth bounds made them dynamic");
         mock.depthBounds.reset();
+        mock.depthBias.reset();
         pipeline.Continue(VK_NULL_HANDLE, state);
         Require(!mock.depthBounds, "a pipeline without depth bounds set them");
+        Require(mock.depthBias && (*mock.depthBias)[0] == 3.0f && (*mock.depthBias)[1] == 0.0f && (*mock.depthBias)[2] == 2.0f, "the draw's depth bias was not set");
     }
     {
         auto bounded = queue;
@@ -2242,7 +2263,7 @@ void colorGapPipelineTests() {
     const auto plain = DecodeState(makeState());
     auto gap = plain;
     gap.blends.insert(gap.blends.begin(), VkPipelineColorBlendAttachmentState{});
-    gap.colors[0].attachment = 1;
+    gap.colors[0].exportIndex = 1;
     const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     Require(ValidateShaders(shaders, plain, subgroup, false) == std::set<std::uint32_t>{0u}, "an export past the attachments was not dropped");
     Require(ValidateShaders(shaders, gap, subgroup, false) == std::set<std::uint32_t>{0u, 1u}, "the export to the attachment after an unused one was dropped");
@@ -2252,7 +2273,7 @@ void colorGapPipelineTests() {
         Require(mock.renderPassAttachments.size() == 1 && mock.renderPassColors.size() == 2 && mock.renderPassColors[0].attachment == VK_ATTACHMENT_UNUSED && mock.renderPassColors[1].attachment == 0 && mock.renderPassColors[1].layout == VK_IMAGE_LAYOUT_GENERAL, "the unwritten MRT slot was not an unused attachment of the subpass");
         Require(mock.blendAttachments == 2, "the blend state does not cover every subpass color attachment");
         auto inverted = gap;
-        inverted.colors[0].attachment = 2;
+        inverted.colors[0].exportIndex = 2;
         expectFailure([&] { Pipeline broken(context, inverted, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL); }, "blend states do not match");
     }
     {
@@ -2263,7 +2284,7 @@ void colorGapPipelineTests() {
         auto second = gap;
         second.blends[0] = second.blends[1];
         auto shifted = second;
-        shifted.colors[0].attachment = 0;
+        shifted.colors[0].exportIndex = 0;
         const auto gapped = CachedPipeline(context, second, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
         const auto moved = CachedPipeline(context, shifted, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
         Require(gapped != first && moved != gapped && mock.pipelineCreateCount == before + 3, "targets bound to different attachments shared a pipeline");
@@ -2749,9 +2770,9 @@ int main() {
         descriptorRecycleTests();
         Require(mock.live == 0, "the descriptor cache leaked Vulkan objects");
         RunGuestAllocationTests();
-        RunLiveStackAccessTests();
-        RunUnwatchedGapTests();
+        RunUnmappedGapTests();
         RunColorTargetLayoutTests();
+        RunLiveStackAccessTests();
         RunTextureFormatTests();
         RunTextureTilingTests();
         RunGuestTextureResourceTests();

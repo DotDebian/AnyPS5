@@ -255,24 +255,6 @@ std::array<std::uint32_t, 3> ThinBlockLayout(TextureTileMode tileMode, std::uint
     return {block.blockSize, block.blockWidth, block.blockHeight};
 }
 
-namespace {
-
-std::uint32_t ThickMaxMipsInTail(std::uint32_t blockSizeLog2) {
-    const auto effectiveLog2 = blockSizeLog2 - (blockSizeLog2 - 8u) / 3u;
-    return effectiveLog2 <= 11u ? 1u + (1u << (effectiveLog2 - 9u)) : effectiveLog2 - 4u;
-}
-
-std::array<std::uint32_t, 2> ThickTailLocation(std::uint32_t blockSizeLog2, std::uint32_t maxMipsInTail, std::uint32_t index, std::uint32_t microWidth, std::uint32_t microHeight) {
-    Require((blockSizeLog2 & 1u) == 0u, "thick mip tails are only modeled for 4 KiB and 64 KiB blocks");
-    const auto m = maxMipsInTail - 1u - index;
-    const auto offset = m > 6u ? 16u << m : m << 8u;
-    const auto x = ((offset >> 9u) & 1u) | ((offset >> 10u) & 2u) | ((offset >> 11u) & 4u) | ((offset >> 12u) & 8u) | ((offset >> 13u) & 16u) | ((offset >> 14u) & 32u);
-    const auto y = ((offset >> 8u) & 1u) | ((offset >> 9u) & 2u) | ((offset >> 10u) & 4u) | ((offset >> 11u) & 8u) | ((offset >> 12u) & 16u) | ((offset >> 13u) & 32u);
-    return {x * microWidth, y * microHeight};
-}
-
-}
-
 ThickLayout ComputeThickLayout(TextureTileMode tileMode, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t depth, std::uint32_t mipCount) {
     Require(width != 0 && height != 0 && depth != 0, "cannot compute layout for a zero-sized 3D texture");
     Require(mipCount != 0 && mipCount <= 16u, "3D texture mip count is out of range");
@@ -280,93 +262,79 @@ ThickLayout ComputeThickLayout(TextureTileMode tileMode, std::uint32_t format, s
     Require(BlockWidth(format) == 1u && BlockHeight(format) == 1u, "block-compressed 3D textures are not implemented");
     ThickLayout result{};
     result.depth = depth;
-    if (tileMode == TextureTileMode::kLinear) {
-        Require(mipCount == 1, "mipmapped linear 3D textures are laid out per slice, not as a thick layout");
-        TileMipLayout mip{};
-        mip.width = width;
-        mip.height = height;
-        const auto paddedWidth = AlignUp(width, CalcLinearBlockWidth(bytesPerElement));
-        mip.blocksPerRow = paddedWidth;
-        mip.pitchBytes = paddedWidth * bytesPerElement;
-        mip.tiledSize = static_cast<std::uint64_t>(mip.pitchBytes) * height;
-        mip.linearSize = mip.tiledSize;
-        result.blockDepth = 1;
-        result.slabBytes = mip.tiledSize;
-        result.sliceLinearBytes = mip.linearSize;
-        result.guestBytes = result.slabBytes * depth;
-        result.mips = {mip};
-        return result;
-    }
-
-    const auto block = ThickBlockExtent(tileMode, bytesPerElement);
-    const auto blockBytes = tileMode == TextureTileMode::kStandard4KB ? 4096u : 65536u;
-    const auto blockSizeLog2 = static_cast<std::uint32_t>(std::countr_zero(blockBytes));
-    auto tailWidth = block[0];
-    auto tailHeight = block[1];
-    switch (blockSizeLog2 % 3u) {
-        case 0u: tailHeight >>= 1u; break;
-        case 1u: tailWidth >>= 1u; break;
-        default: break;
-    }
-    const auto maxMipsInTail = ThickMaxMipsInTail(blockSizeLog2);
-    constexpr std::uint32_t micro[5][2] = {{8, 4}, {4, 4}, {4, 4}, {4, 2}, {2, 2}};
-    const auto elementIndex = static_cast<std::size_t>(std::countr_zero(bytesPerElement));
-
+    result.mips.resize(mipCount);
+    std::array<std::uint32_t, 3> block{CalcLinearBlockWidth(bytesPerElement), 1u, 1u};
+    std::uint32_t blockBytes = 0;
+    std::uint32_t maxTailLevels = 0;
     auto firstTailLevel = mipCount;
-    if (mipCount > 1) {
-        for (std::uint32_t level = 0; level < mipCount; ++level) {
-            if (ShiftCeil(width, level) <= tailWidth && ShiftCeil(height, level) <= tailHeight && mipCount - level <= maxMipsInTail) {
+    if (tileMode != TextureTileMode::kLinear) {
+        block = ThickBlockExtent(tileMode, bytesPerElement);
+        blockBytes = tileMode == TextureTileMode::kStandard4KB ? 4096u : 65536u;
+        const auto log2BlockBytes = static_cast<std::uint32_t>(std::countr_zero(blockBytes));
+        const auto tailWidth = log2BlockBytes % 3u == 1u ? block[0] >> 1u : block[0];
+        const auto tailHeight = log2BlockBytes % 3u == 0u ? block[1] >> 1u : block[1];
+        const auto effectiveLog2 = log2BlockBytes - (log2BlockBytes - 8u) / 3u;
+        maxTailLevels = effectiveLog2 <= 11u ? 1u + (1u << (effectiveLog2 - 9u)) : effectiveLog2 - 4u;
+        for (std::uint32_t level = 0; mipCount > 1 && level < mipCount; ++level) {
+            if (ShiftCeil(width, level) <= tailWidth && ShiftCeil(height, level) <= tailHeight && mipCount - level <= maxTailLevels) {
                 firstTailLevel = level;
                 break;
             }
         }
     }
-
     result.blockDepth = block[2];
-    result.mips.resize(mipCount);
-    std::uint64_t offset = firstTailLevel < mipCount ? blockBytes : 0u;
-    for (auto level = firstTailLevel; level-- > 0;) {
+    std::uint64_t tiledOffset = firstTailLevel < mipCount ? blockBytes : 0u;
+    std::uint64_t linearOffset = 0;
+    for (auto level = mipCount; level-- > 0;) {
         auto& mip = result.mips[level];
-        const auto paddedWidth = AlignUp(ShiftCeil(width, level), block[0]);
-        const auto paddedHeight = AlignUp(ShiftCeil(height, level), block[1]);
         mip.width = std::max(width >> level, 1u);
         mip.height = std::max(height >> level, 1u);
-        mip.blocksPerRow = paddedWidth / block[0];
-        mip.pitchBytes = paddedWidth * bytesPerElement;
-        mip.tiledOffset = offset;
-        mip.tiledSize = static_cast<std::uint64_t>(mip.blocksPerRow) * (paddedHeight / block[1]) * blockBytes;
-        mip.tail = false;
-        offset += mip.tiledSize;
-    }
-    for (auto level = firstTailLevel; level < mipCount; ++level) {
-        auto& mip = result.mips[level];
-        const auto location = ThickTailLocation(blockSizeLog2, maxMipsInTail, level - firstTailLevel, micro[elementIndex][0], micro[elementIndex][1]);
-        mip.width = std::max(width >> level, 1u);
-        mip.height = std::max(height >> level, 1u);
-        mip.blocksPerRow = 1u;
-        mip.pitchBytes = block[0] * bytesPerElement;
-        mip.tiledOffset = 0;
-        mip.tiledSize = blockBytes;
-        mip.tail = true;
-        mip.tailX = location[0];
-        mip.tailY = location[1];
-    }
-    result.slabBytes = offset;
-    std::uint64_t linearCursor = 0;
-    for (auto& mip : result.mips) {
-        mip.linearOffset = linearCursor;
+        mip.tail = level >= firstTailLevel;
+        mip.tailX = 0;
+        mip.tailY = 0;
+        if (mip.tail) {
+            constexpr std::uint32_t microBlock[5][2] = {{8, 4}, {4, 4}, {4, 4}, {4, 2}, {2, 2}};
+            const auto element = static_cast<std::size_t>(std::countr_zero(bytesPerElement));
+            const auto slot = maxTailLevels - 1u - (level - firstTailLevel);
+            const auto slotOffset = slot > 6u ? 16u << slot : slot << 8u;
+            for (std::uint32_t bit = 0; bit < 6u; ++bit) {
+                mip.tailX |= ((slotOffset >> (9u + 2u * bit)) & 1u) << bit;
+                mip.tailY |= ((slotOffset >> (8u + 2u * bit)) & 1u) << bit;
+            }
+            mip.tailX *= microBlock[element][0];
+            mip.tailY *= microBlock[element][1];
+            mip.blocksPerRow = 1u;
+            mip.pitchBytes = block[0] * bytesPerElement;
+            mip.tiledOffset = 0;
+            mip.tiledSize = blockBytes;
+        } else if (tileMode == TextureTileMode::kLinear) {
+            const auto paddedWidth = AlignUp(mip.width, block[0]);
+            mip.pitchBytes = paddedWidth * bytesPerElement;
+            mip.blocksPerRow = paddedWidth;
+            mip.tiledSize = static_cast<std::uint64_t>(mip.pitchBytes) * mip.height;
+        } else {
+            const auto paddedWidth = AlignUp(ShiftCeil(width, level), block[0]);
+            mip.pitchBytes = paddedWidth * bytesPerElement;
+            mip.blocksPerRow = paddedWidth / block[0];
+            mip.tiledSize = static_cast<std::uint64_t>(mip.blocksPerRow) * (AlignUp(ShiftCeil(height, level), block[1]) / block[1]) * blockBytes;
+        }
+        if (!mip.tail) {
+            mip.tiledOffset = tiledOffset;
+            tiledOffset += mip.tiledSize;
+        }
         mip.linearSize = static_cast<std::uint64_t>(mip.pitchBytes) * mip.height;
-        linearCursor += mip.linearSize;
+        mip.linearOffset = linearOffset;
+        linearOffset += mip.linearSize;
     }
-    result.sliceLinearBytes = linearCursor;
+    result.slabBytes = tiledOffset;
+    result.sliceLinearBytes = linearOffset;
     result.guestBytes = result.slabBytes * ((depth + result.blockDepth - 1u) / result.blockDepth);
     return result;
 }
 
 SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor) {
     SurfaceGeometry geometry;
-    const bool sliceChains = descriptor.tileMode == TextureTileMode::kD64KBX || descriptor.tileMode == TextureTileMode::kR64KBX || (descriptor.tileMode == TextureTileMode::kLinear && descriptor.mipCount > 1);
-    if (descriptor.dimension == TextureDimension::k3D && sliceChains) {
+    if (descriptor.dimension == TextureDimension::k3D && (descriptor.tileMode == TextureTileMode::kD64KBX || descriptor.tileMode == TextureTileMode::kR64KBX)) {
         const auto depth = descriptor.depthOrLastArray + 1u;
         geometry.mips = ComputeMipLayout(descriptor.tileMode, descriptor.format, descriptor.width, descriptor.height, descriptor.mipCount);
         geometry.layers = depth;

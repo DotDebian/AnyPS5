@@ -737,7 +737,8 @@ bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
         }
     };
     thread_local const Bounds bounds;
-    const auto frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
+    const volatile unsigned char marker = 0;
+    const auto frame = reinterpret_cast<std::uintptr_t>(&marker);
     return bounds.high != 0 && frame >= bounds.low && frame < bounds.high && address >= frame && address < bounds.high && bytes <= bounds.high - address;
 }
 

@@ -35,6 +35,7 @@ public:
     ShaderRecompiler::SpirvTarget Target() const;
     // SpirvTarget::localMemoryProbe of this device's targets (the context is its state).
     static std::optional<std::uint32_t> ProbeComputeLocalMemory(void* context, std::span<const std::uint32_t> spirv, std::span<const ShaderRecompiler::DescriptorBinding> bindings, std::uint64_t codeAddress);
+    ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize) const;
     // Distinguishes this device from every earlier one in the process (a memo keyed by the device
     // cannot rely on the pointer, which a replacement may reuse).
     std::uint64_t Serial() const { return serial; }

@@ -286,10 +286,31 @@ constexpr std::array<OpcodeMeta, static_cast<std::size_t>(IrOpcode::Count)> Meta
     makeMeta("FPCeil32", F32, F32),
     makeMeta("FPTrunc32", F32, F32),
     makeMeta("FPFract32", F32, F32),
+    makeMeta("FPAdd64", U64, U64, U64),
+    makeMeta("FPMul64", U64, U64, U64),
+    makeMeta("FPFma64", U64, U64, U64, U64),
+    makeMeta("FPMin64", U64, U64, U64),
+    makeMeta("FPMax64", U64, U64, U64),
+    makeMeta("FPSaturate64", U64, U64),
+    makeMeta("FPLdexp64", U64, U64, U32),
+    makeMeta("FPRoundEven64", U64, U64),
+    makeMeta("FPFloor64", U64, U64),
+    makeMeta("FPCeil64", U64, U64),
+    makeMeta("FPTrunc64", U64, U64),
+    makeMeta("FPFract64", U64, U64),
+    makeMeta("FPFrexpMant64", U64, U64),
+    makeMeta("FPFrexpExp64", U32, U64),
+    makeMeta("ConvertF32F64", F32, U64),
+    makeMeta("ConvertF64F32", U64, F32),
+    makeMeta("ConvertF64S32", U64, U32),
+    makeMeta("ConvertF64U32", U64, U32),
+    makeMeta("ConvertS32F64", U32, U64),
+    makeMeta("ConvertU32F64", U32, U64),
     makeMeta("LaneId", U32),
     makeMeta("WriteLane", U32, U32, U32, U32),
     makeMeta("Permlane16U32", U32, U32, U32, U32, U1),
     makeMeta("BpermuteU32", U32, U32, U32, U1),
+    makeMeta("PermuteU32", U32, U32, U32, U1),
     makeMeta("GetSrtResource", SrtResource),
     makeMeta("GetBufferResource", BufferResource, U32, U32, U32, U32),
     makeMeta("GetAddressResource", AddressResource, U32, U32),
@@ -383,6 +404,12 @@ constexpr std::array<OpcodeMeta, static_cast<std::size_t>(IrOpcode::Count)> Meta
     makeMeta("ImageAtomicAnd32", U32, ImageResource, ImageAddress, U32, U1),
     makeMeta("ImageAtomicOr32", U32, ImageResource, ImageAddress, U32, U1),
     makeMeta("ImageAtomicXor32", U32, ImageResource, ImageAddress, U32, U1),
+    makeMeta("ImageAtomicCmpSwap32", U32, ImageResource, ImageAddress, U32, U32, U1),
+    makeMeta("ImageAtomicISub32", U32, ImageResource, ImageAddress, U32, U1),
+    makeMeta("ImageAtomicSMin32", U32, ImageResource, ImageAddress, U32, U1),
+    makeMeta("ImageAtomicSMax32", U32, ImageResource, ImageAddress, U32, U1),
+    makeMeta("ImageAtomicInc32", U32, ImageResource, ImageAddress, U32, U1),
+    makeMeta("ImageAtomicDec32", U32, ImageResource, ImageAddress, U32, U1),
     makeMeta("GetAttribute", U32, U32, U32),
     makeMeta("GetInterpolationParameter", U32, U32, U32, U32),
     makeMeta("SetAttribute", Void, U32x4, U1),
@@ -590,10 +617,20 @@ ImageOpcodeInfo ImageOpcodeInfoOf(IrOpcode opcode) {
         case IrOpcode::ImageAtomicAnd32:
         case IrOpcode::ImageAtomicOr32:
         case IrOpcode::ImageAtomicXor32:
+        case IrOpcode::ImageAtomicCmpSwap32:
+        case IrOpcode::ImageAtomicISub32:
+        case IrOpcode::ImageAtomicSMin32:
+        case IrOpcode::ImageAtomicSMax32:
+        case IrOpcode::ImageAtomicInc32:
+        case IrOpcode::ImageAtomicDec32:
             return {ImageAccess::Atomic, ImageResourceClass::Storage, false};
         default:
             return {};
     }
+}
+
+bool IsFloat64Opcode(IrOpcode opcode) {
+    return opcode >= IrOpcode::FPAdd64 && opcode <= IrOpcode::ConvertU32F64;
 }
 
 bool IrOpcodeHasSideEffects(IrOpcode opcode) {

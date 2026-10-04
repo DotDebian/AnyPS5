@@ -26,8 +26,8 @@ private:
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
 };
 
-// The shader modules, layout, render pass and VkPipeline of one draw configuration. Viewport and
-// scissor are dynamic state set at Begin, so pipelines are shared by draws that differ only there
+// The shader modules, layout, render pass and VkPipeline of one draw configuration. Viewport,
+// scissor, depth bounds and depth bias are dynamic state set at Begin, so pipelines are shared by draws that differ only there
 // (see CachedPipeline).
 class Pipeline {
 public:
@@ -75,6 +75,7 @@ private:
     std::size_t attachments = 0;
     bool depthAttachment = false;
     bool depthBounds = false;
+    bool depthBias = false;
     std::vector<CachedFramebuffer> framebuffers;
 };
 

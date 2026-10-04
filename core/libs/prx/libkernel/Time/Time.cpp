@@ -14,6 +14,7 @@
 #include <vector>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <x86intrin.h>
 
 #ifdef _WIN32
@@ -250,6 +251,37 @@ int APS5_VABI usleep_nid_postfix(KernelUseconds microseconds) {
     return 0;
 }
 
+#ifdef _WIN32
+static std::uint64_t CpuTimeNanos(bool callingThread) {
+    FILETIME creation{};
+    FILETIME exitTime{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (callingThread) {
+        if (!GetThreadTimes(GetCurrentThread(), &creation, &exitTime, &kernel, &user))
+            throw std::system_error(GetLastError(), std::system_category(), "clock_gettime: GetThreadTimes failed");
+    } else {
+        if (!GetProcessTimes(GetCurrentProcess(), &creation, &exitTime, &kernel, &user))
+            throw std::system_error(GetLastError(), std::system_category(), "clock_gettime: GetProcessTimes failed");
+    }
+    const auto toTicks = [](const FILETIME& time) {
+        return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+    };
+    return (toTicks(kernel) + toTicks(user)) * 100ULL;
+}
+
+static std::uint64_t CpuTimeResolutionNanos() {
+    DWORD adjustment = 0;
+    DWORD increment = 0;
+    BOOL adjustmentDisabled = FALSE;
+    if (!GetSystemTimeAdjustment(&adjustment, &increment, &adjustmentDisabled))
+        throw std::system_error(GetLastError(), std::system_category(), "clock_getres: GetSystemTimeAdjustment failed");
+    if (increment == 0)
+        throw std::runtime_error("clock_getres: GetSystemTimeAdjustment reported no clock interrupt period");
+    return static_cast<std::uint64_t>(increment) * 100ULL;
+}
+#endif
+
 int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
     if (tp == nullptr) {
         APS5_INVALID_ARG_EX;
@@ -277,6 +309,12 @@ int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
     }
     if (clockId == 4 || clockId == 1 || clockId == 5 || clockId == 7 || clockId == 8 || clockId == 11 || clockId == 12) {
         std::uint64_t nanos = GetMonotonicNanos();
+        tp->tv_sec = static_cast<std::int64_t>(nanos / 1000000000ULL);
+        tp->tv_nsec = static_cast<std::int64_t>(nanos % 1000000000ULL);
+        return 0;
+    }
+    if (clockId == 14 || clockId == 15) {
+        const std::uint64_t nanos = CpuTimeNanos(clockId == 14);
         tp->tv_sec = static_cast<std::int64_t>(nanos / 1000000000ULL);
         tp->tv_nsec = static_cast<std::int64_t>(nanos % 1000000000ULL);
         return 0;
@@ -371,6 +409,12 @@ int APS5_VABI clock_getres_nid_postfix(int clockId, KernelTimespec* res) {
         std::uint64_t nsPerTick = (1000000000ULL + freq - 1ULL) / freq;
         res->tv_sec = 0;
         res->tv_nsec = static_cast<std::int64_t>(nsPerTick);
+        return 0;
+    }
+    if (clockId == 14 || clockId == 15) {
+        const std::uint64_t nanos = CpuTimeResolutionNanos();
+        res->tv_sec = static_cast<std::int64_t>(nanos / 1000000000ULL);
+        res->tv_nsec = static_cast<std::int64_t>(nanos % 1000000000ULL);
         return 0;
     }
     throw std::runtime_error(std::string(__func__) + ": unsupported clock_id " + std::to_string(clockId));

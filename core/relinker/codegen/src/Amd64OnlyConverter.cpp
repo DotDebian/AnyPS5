@@ -25,28 +25,6 @@ auto _atFileOffset(const Domain::FileByteOffset base, const TOperation& operatio
     }
 }
 
-bool _vexRipRelative(const std::span<const std::uint8_t> bytes) {
-    std::size_t pos = 0;
-    while (pos < bytes.size() && (bytes[pos] == 0x66 || bytes[pos] == 0x67 || bytes[pos] == 0xF2 || bytes[pos] == 0xF3 || bytes[pos] == 0x2E || bytes[pos] == 0x3E || bytes[pos] == 0x26 || bytes[pos] == 0x36 || bytes[pos] == 0x64 || bytes[pos] == 0x65))
-        ++pos;
-    if (pos >= bytes.size())
-        return false;
-    std::size_t payload = 0;
-    if (bytes[pos] == 0xC5)
-        payload = 1;
-    else if (bytes[pos] == 0xC4)
-        payload = 2;
-    else if (bytes[pos] == 0x62)
-        payload = 3;
-    else
-        return false;
-    const auto modrmOffset = pos + 1 + payload + 1;
-    if (modrmOffset >= bytes.size())
-        return false;
-    const auto modrm = bytes[modrmOffset];
-    return (modrm & 0xC7) == 0x05;
-}
-
 class Amd64OnlyConverter : public IAmd64OnlyConverter {
 public:
     [[nodiscard]] ConvertResult Convert(
@@ -166,7 +144,7 @@ void Amd64OnlyConverter::_convertSegment(
                         if (amdOnly && trailingBytes == 0) {
                             sequence.push_back(bytes);
                             taken.push_back(next);
-                        } else if (amdOnly || info.FlowKind != ControlFlowKind::Sequential || info.HasRipRelativeDisp || _vexRipRelative(bytes) || info.HasBranchTarget) {
+                        } else if (amdOnly || info.FlowKind != ControlFlowKind::Sequential || info.HasRipRelativeDisp || info.HasBranchTarget) {
                             throw CodegenException("AMD-only instruction too short for a jump is followed by an instruction that cannot move", ph.Offset + following.Offset);
                         } else {
                             trailingBytes += following.Length;

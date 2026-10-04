@@ -416,6 +416,7 @@ int main(int argc, char** argv) {
         else if (argc == 2 && std::string(argv[1]) == "backtoback") testBackToBack();
         else if (argc == 2 && std::string(argv[1]) == "aftergpu") testFlipAfterGpuWork();
         else if (argc == 2 && std::string(argv[1]) == "pacing") testReleaseVblank();
+        else if (argc == 2 && std::string(argv[1]) == "aftergpu") testFlipAfterGpuWork();
         else if (argc == 2 && std::string(argv[1]) == "unavailable") testPresentation(true);
         else testLifetime(argc == 2 && std::string(argv[1]) == "reopen");
         std::puts("VideoOut flip tests passed");

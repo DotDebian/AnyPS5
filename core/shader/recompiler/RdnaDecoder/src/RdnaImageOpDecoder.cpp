@@ -42,6 +42,7 @@ constexpr ImageOpcodeInfo imageOpcodes[] = {
     {0x37u, RdnaOpcode::ImageSampleLzO, "image_sample_lz_o", RdnaImageSampleFlagLevelZero | RdnaImageSampleFlagOffset, true, false, false},
     {0x38u, RdnaOpcode::ImageSampleCO, "image_sample_c_o", RdnaImageSampleFlagCompare | RdnaImageSampleFlagOffset, true, false, false},
     {0x68u, RdnaOpcode::ImageSample, "image_sample_cd", RdnaImageSampleFlagDerivative | RdnaImageSampleFlagCd, true, false, false},
+    {0x33u, RdnaOpcode::ImageSample, "image_sample_d_cl_o", RdnaImageSampleFlagDerivative | RdnaImageSampleFlagLodClamp | RdnaImageSampleFlagOffset, true, false, false},
     {0xa0u, RdnaOpcode::ImageSample, "image_sample_a", RdnaImageSampleFlagAdjust, true, false, false},
     {0xa1u, RdnaOpcode::ImageSample, "image_sample_cl_a", RdnaImageSampleFlagLodClamp | RdnaImageSampleFlagAdjust, true, false, false},
     {0xa5u, RdnaOpcode::ImageSample, "image_sample_b_a", RdnaImageSampleFlagBias | RdnaImageSampleFlagAdjust, true, false, false},
@@ -89,6 +90,12 @@ constexpr ImageOpcodeInfo imageOpcodes[] = {
     {0x18u, RdnaOpcode::ImageAtomicAnd, nullptr, 0, false, false, true},
     {0x19u, RdnaOpcode::ImageAtomicOr, nullptr, 0, false, false, true},
     {0x1au, RdnaOpcode::ImageAtomicXor, nullptr, 0, false, false, true},
+    {0x10u, RdnaOpcode::ImageAtomicCmpswap, nullptr, 0, false, false, true},
+    {0x12u, RdnaOpcode::ImageAtomicSub, nullptr, 0, false, false, true},
+    {0x14u, RdnaOpcode::ImageAtomicSmin, nullptr, 0, false, false, true},
+    {0x16u, RdnaOpcode::ImageAtomicSmax, nullptr, 0, false, false, true},
+    {0x1bu, RdnaOpcode::ImageAtomicInc, nullptr, 0, false, false, true},
+    {0x1cu, RdnaOpcode::ImageAtomicDec, nullptr, 0, false, false, true},
     {0x00u, RdnaOpcode::ImageLoad, nullptr, 0, false, false, false},
     {0x01u, RdnaOpcode::ImageLoadMip, nullptr, 0, false, false, false},
     {0x08u, RdnaOpcode::ImageStore, nullptr, 0, false, false, false},
@@ -280,7 +287,8 @@ RdnaInstruction DecodeRdnaMimg(std::uint32_t programCounter, std::span<const std
         throw std::runtime_error("unsupported multisampled MIMG operation");
     }
     const auto dmask = (word0 >> 8u) & 15u;
-    if (dmask == 0u || ((info.gather || info.atomic) && !std::has_single_bit(dmask))) {
+    const bool compareSwap = info.opcode == RdnaOpcode::ImageAtomicCmpswap;
+    if (dmask == 0u || (compareSwap ? dmask != 3u : (info.gather || info.atomic) && !std::has_single_bit(dmask))) {
         throw std::runtime_error("invalid MIMG data mask");
     }
     if (d16 && !(info.sample || info.gather || opcode == 0u || opcode == 1u || opcode == 8u || opcode == 9u)) {

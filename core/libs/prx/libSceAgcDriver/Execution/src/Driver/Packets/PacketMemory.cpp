@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <limits>
 #include <cstring>
+#include <limits>
 
 namespace AgcDriver::DriverDetail {
 
