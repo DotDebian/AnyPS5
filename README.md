@@ -4,21 +4,27 @@ This fork's `main` mirrors `astrobot`, my integration branch for running Astro B
 
 ## Astro Bot status
 
-Linux, measured on my machine (October 2026). Frame rates are the game's own, with no frame generation.
+Linux, measured on my machine (5 October 2026: CachyOS, i9-14900KF, RTX 4090). Frame rates are the game's own, with no frame generation.
 
 | Part | State | Frame rate |
 | --- | --- | --- |
 | Boot, PlayStation Studios video, logos | Renders | video at about 57 fps |
-| Title screen | Renders, including the copyright line (console fonts or the Noto substitutes) | about 50 fps |
-| NEW GAME menu | Renders | about 49 fps |
-| Intro cinematic and space scene | Renders | 40 to 45 fps |
-| Tutorial (Crash Site hub) | Playable with a DualSense | 6 to 13 fps |
-| World map, controller ship flight | Renders | about 28 fps |
-| Sky Garden | Reached and flown | about 4 fps |
-| Snowy Canyon | Reached | about 3.5 fps |
+| Title screen | Renders, including the copyright line (console fonts or the Noto substitutes) | 50 to 52 fps |
+| NEW GAME menu | Renders | about 50 fps |
+| Intro cinematic and space scene | Renders, no more GPU hangs | 40 to 47 fps |
+| Tutorial (Crash Site hub) | Playable with a DualSense | about 13 fps |
+| World map, controller ship flight | Renders | about 27 fps |
+| Sky Garden | Reached and flown | about 4.3 fps |
+| Snowy Canyon | Reached | about 5.7 fps |
 | Windows | In game up to the first Gorilla Nebula level ([report](https://github.com/boykopovar/AnyPS5/discussions/357)) | |
 
-Known issues: the frame rate in levels (the queue worker's CPU time per draw is the main limit there), a short white flash on the world map, and occasional minor glitches.
+Known issues: the frame rate in levels (the queue worker's CPU time per draw is the main limit there, and the title is now limited by the GPU), a short white flash on the world map, and occasional minor glitches.
+
+New on this branch (5 October):
+- **GPU hang fixed:** a pixel shader in the intro got a 32 KiB per-thread LDS array, which hung the GPU (Xid 109/31) about 100 s in. LDS arrays are now sized to the addresses they reach (#586). no hangs in any run since.
+- **Faster levels:** Snowy Canyon went from about 3.6 to 5.7 fps (cheaper occlusion query packets and per-draw cleanup off the queue worker), and shader register spills are down (#611, #612).
+- **Worker pinning:** on hybrid Intel CPUs the queue workers are pinned to P-cores by default on Linux (`APS5_NO_WORKER_AFFINITY=1` turns it off), up to 19% faster in busy scenes.
+- **Level select:** run with `APS5_LEVEL_MENU=1` and press F2 in game to pick any of the game's levels; Enter restarts straight into it (Linux only).
 
 <img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/video.jpg" width="400" alt="PlayStation Studios video"> <img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/title.jpg" width="400" alt="Title screen">
 <img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/menu.jpg" width="400" alt="NEW GAME menu"> <img src="https://raw.githubusercontent.com/oneandonlydean/AnyPS5/410db37d25bec16eb67aabdde02e7c2ba932bdc3/readme/2026-10-04/intro-ships.jpg" width="400" alt="Intro space scene">
@@ -27,7 +33,7 @@ Known issues: the frame rate in levels (the queue worker's CPU time per draw is 
 
 ## Upstream contributions
 
-98 pull requests from this work are merged into [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), among them Linux write tracking (#120, #121), the shader disk and pipeline cache (#129), NGG geometry as mesh shaders (#133), resident 10-bit scanout (#278), flips that complete after the frame's GPU work (#417), large DMA copies on the GPU in queue order (#439), triangle fan geometry input (#440), occlusion counter dumps on the GPU (#463), cross-queue submission order (#465), exact reciprocals for `--to-intel` (#464) and DualSense output and audio (#179, #180). Open: #461, #489, #490.
+99 pull requests from this work are merged into [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), among them Linux write tracking (#120, #121), the shader disk and pipeline cache (#129), NGG geometry as mesh shaders (#133), resident 10-bit scanout (#278), the Linux argv fix behind `-lvl` (#418), flips that complete after the frame's GPU work (#417), large DMA copies on the GPU in queue order (#439), triangle fan geometry input (#440), occlusion counter dumps on the GPU (#463), cross-queue submission order (#465), exact reciprocals for `--to-intel` (#464) and DualSense output and audio (#179, #180). Open: #461, #490, #503, #505, #586, #611, #612, #618, #619.
 
 ---
 
