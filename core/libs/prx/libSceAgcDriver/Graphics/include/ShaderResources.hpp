@@ -20,6 +20,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace AgcDriver {
+struct DrawRecipe;
+}
+
 namespace AgcDriver::Graphics {
 
 class Recorder;
@@ -235,6 +239,12 @@ public:
     // One use's completion work (WriteBackBuffers runs it for a shared build): the fault check and
     // the write marks. The caller releases the use's hold afterwards.
     void CompleteSharedUse();
+    // Draw plans (APS5_DRAW_PLANS, see Draw.hpp): the recipes of the draws this cached object
+    // served, by the draws' plan key (their state key and push constant placement), most recently
+    // attached first and bounded; an attach under a key replaces that key's plan. Under
+    // GuestMemory::GpuMutex.
+    std::shared_ptr<const DrawRecipe> FindPlan(std::uint64_t planKey) const;
+    void AttachPlan(std::uint64_t planKey, std::shared_ptr<const DrawRecipe> plan);
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
@@ -494,6 +504,7 @@ private:
     // A use of this shared build reported a fault (set under GuestMemory::GpuMutex by a completion,
     // atomic for the reader's sake): it serves no further use.
     std::atomic<bool> faulted{false};
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<const DrawRecipe>>> plans;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
@@ -552,7 +563,9 @@ private:
 class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
-    std::shared_ptr<ShaderResources> Find(const Key& key);
+    // `probe`: a lookup the caller repeats on a miss (a draw plan's, before the draw's own), left
+    // out of the miss churn accounting so one draw's miss is charged once.
+    std::shared_ptr<ShaderResources> Find(const Key& key, bool probe = false);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).

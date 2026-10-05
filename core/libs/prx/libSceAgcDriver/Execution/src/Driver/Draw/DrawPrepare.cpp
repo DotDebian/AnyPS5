@@ -63,7 +63,7 @@ std::shared_ptr<PreparedDraw> Driver::prepareDrawAhead(const QueueState& queue, 
     const bool useDrawEntries = drawEntries();
     if (useDrawEntries && !registerKeyEnabled()) return nullptr;
     if (useDrawEntries) {
-        prepared->drawKey = drawRegisterKey(queue, *submission.shaders, prepared->deviceSerial);
+        prepared->drawKey = drawRegisterKey(queue, *submission.shaders, prepared->deviceSerial, &prepared->stateKey);
         static const bool skipKnown = std::getenv("APS5_DRAW_AHEAD_SKIP_KNOWN") != nullptr;
         std::lock_guard cacheLock(drawCacheMutex);
         prepared->keyKnown = drawCache.contains(prepared->drawKey);
