@@ -675,10 +675,10 @@ AddressDrawStats& AddressDraws() {
     return stats;
 }
 
-// APS5_TRACE_ADDRDRAW_TIMES=1: a plan hit's time split into its proof (the address space, the
-// template's proof, the moved buffers), its bindings (PrepareDrawBindings: the snapshots, the
-// draw's set) and the rest of its record, for the [drawplan] line; five clock reads a plan hit,
-// none without the switch.
+// APS5_TRACE_ADDRDRAW_TIMES=1: a plan hit's time split into everything before its record (the
+// inputs, the targets' refresh, the address space, the template's proof, the moved buffers: its
+// "proof"), its bindings (PrepareDrawBindings: the snapshots, the draw's set) and the rest of
+// its record, for the [drawplan] line; five clock reads a plan hit, none without the switch.
 bool AddressDrawTimes() {
     static const bool enabled = std::getenv("APS5_TRACE_ADDRDRAW_TIMES") != nullptr;
     return enabled;
@@ -733,7 +733,7 @@ void reportDrawPlans() {
     if (AddressDrawTimes()) {
         auto& times = PlanTimeTotals();
         const auto average = [&](double total) { return times.hits != 0 ? total / static_cast<double>(times.hits) : 0.0; };
-        std::fprintf(stderr, "[drawplan] times of %llu plan hits (10 s), avg us: proof %.1f (address space, template proof, moved buffers), bindings %.1f (snapshots, data buffers, the draw's set), record %.1f (inputs, targets, pass, commands, keep)\n", static_cast<unsigned long long>(times.hits), average(times.proofUs), average(times.bindingsUs), average(times.recordUs));
+        std::fprintf(stderr, "[drawplan] times of %llu plan hits (10 s), avg us: proof %.1f (inputs, targets, address space, template proof, moved buffers), bindings %.1f (snapshots, data buffers, the draw's set), record %.1f (pipeline, pass, commands, keep)\n", static_cast<unsigned long long>(times.hits), average(times.proofUs), average(times.bindingsUs), average(times.recordUs));
         times = {};
     }
     const auto last = stats.lastReport;
