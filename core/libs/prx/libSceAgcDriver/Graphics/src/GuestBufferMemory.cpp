@@ -2860,6 +2860,11 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     return result;
 }
 
+std::uint64_t GuestBufferMemory::ReadSetToken() const {
+    const auto* mapped = mappedSpace();
+    return uploaded && !committed && mapped != nullptr && regions.empty() ? mapped->serial : 0;
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (!uploaded) return result;
