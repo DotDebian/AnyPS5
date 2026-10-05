@@ -135,6 +135,7 @@ public:
     // requested prefix, the range the reuse check covers), and a new one replaces the shorter ones.
     enum class SnapshotUse : std::uint8_t { Storage, Vertex, Index16, Index32 };
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
+    std::shared_ptr<Buffer> CollectedDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t& generation);
     // APS5_PROFILE_DRAW: the snapshot cache's lookups that found no entry, found a stale one, and
     // entries evicted to make room; of the stale ones, those reused with unchanged bytes and those patched in place
     // (cumulative, all recorders).
@@ -883,6 +884,7 @@ private:
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
+    std::shared_ptr<Buffer> reuseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator found, std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation);
 };
 
 }

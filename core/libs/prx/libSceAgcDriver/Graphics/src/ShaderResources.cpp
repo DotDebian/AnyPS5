@@ -3154,8 +3154,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         // made after the collect (during the copy) is stamped newer by the next one and drops the
         // snapshot then.
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        const auto generation = GuestMemory::CollectWrites(begin, bytes);
-        auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+        std::uint64_t generation = 0;
+        auto buffer = recorder.CollectedDrawSnapshot(begin, bytes, generation);
         if (buffer != nullptr) {
             CountDrawSnapshot(true, bytes);
         } else {
