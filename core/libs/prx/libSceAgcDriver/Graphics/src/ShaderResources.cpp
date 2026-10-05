@@ -171,7 +171,15 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
     return cache.entries.end();
 }
 
+// Sampled textures dropped by their cache so far (see Texture::NoteDeparted).
+std::atomic<std::uint64_t>& SampledDepartures() {
+    static std::atomic<std::uint64_t> departures{0};
+    return departures;
+}
+
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
+    if (it->texture != nullptr) it->texture->NoteDeparted();
+    SampledDepartures().fetch_add(1, std::memory_order_relaxed);
     cache.bytes -= it->accounted;
     cache.hostBytes -= it->bytes.size();
     cache.index.erase(it->key);
@@ -1708,10 +1716,15 @@ void ShaderResources::reportDescriptorCaches() const {
 }
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
+    std::vector<std::uint32_t> key;
+    AppendContentKey(key, shader, dataWords, movableBuffers);
+    return key;
+}
+
+void ShaderResources::AppendContentKey(std::vector<std::uint32_t>& key, const CompiledShader& shader, bool dataWords, bool movableBuffers) {
     Require(shader.program != nullptr, "missing compiled shader");
     const auto& program = *shader.program;
-    std::vector<std::uint32_t> key;
-    key.reserve(8 + program.bindings.size() * 12);
+    key.reserve(key.size() + 8 + program.bindings.size() * 12);
     key.push_back(dataWords ? 1u : 0u);
     key.push_back(static_cast<std::uint32_t>(shader.stage));
     key.push_back(static_cast<std::uint32_t>(program.variantId));
@@ -1748,7 +1761,6 @@ std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& sha
         // must not serve a build with another (the variant implies it, this makes it explicit).
         packBits(binding.bufferWritten);
     }
-    return key;
 }
 
 namespace {
@@ -1888,6 +1900,9 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
     std::fprintf(stderr, "[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
 }
+
+// Revalidate calls answered by a shared build's proof of the same collect epoch (cumulative).
+std::atomic<std::uint64_t> proofsReused{0};
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
 // flush and import lookups of every Revalidate, as before the epoch gate.
@@ -2226,6 +2241,33 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
         return ok;
     };
+    // A shared address-based build proved in this collect epoch (APS5_REUSE_ADDRESS_DRAWS; a
+    // frame's draws use a template tens of times an epoch): the image proof below is a function
+    // of what `proofStamp` names, each read before the checks it stands for, plus the CPU's
+    // stores, which a second collect in the epoch would not look at again (the collect memo's
+    // contract). The stamp: the driver's own stamps (an image flush, a write-back, a key store),
+    // the recorder's write notes, the allocation registry, the pending image registry, the
+    // caches' evictions and the depth holdings. While it is the stamp of the last successful
+    // proof, only the imports are asked again. What it gives up is what the snapshots' epoch
+    // reuse gives up (Recorder::EpochSnapshot): a CPU store another thread's walk stamped within
+    // the epoch. APS5_NO_PROOF_EPOCH_REUSE=1 proves every use.
+    static const bool proofReuse = std::getenv("APS5_NO_PROOF_EPOCH_REUSE") == nullptr && std::getenv("APS5_NO_COLLECT_MEMO") == nullptr;
+    ProofStamp proofStamp;
+    if (proofReuse && guestMemory.Shared()) {
+        if (const auto* recorder = Recorder::Active(); recorder != nullptr) {
+            const auto stamp = recorder->CurrentSnapshotStamp(0);
+            proofStamp = {stamp.epoch, stamp.driverStores, stamp.writeNotes, stamp.registry, StorageTexture::PendingSerial(), SampledDepartures().load(std::memory_order_relaxed) + StorageDepartures().load(std::memory_order_relaxed), DepthHoldingGeneration()};
+        }
+        if (proofStamp.epoch != 0 && proofStamp == provedStamp) {
+            if (report != nullptr) report->path = ProofPath::Fast;
+            proofsReused.fetch_add(1, std::memory_order_relaxed);
+            if (!guestMemory.SharedImportsStand()) {
+                provedStamp = {};
+                return finish(true, false, ProofFailure::Imports);
+            }
+            return finish(true, true);
+        }
+    }
     // Loaded before any check (the memo rule of fastRevalidate): kept as the memo only when the
     // registry did not move through the whole proof, flushes of this call included.
     const auto serialBefore = StorageTexture::PendingSerial();
@@ -2396,7 +2438,13 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
     }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
+    // The proof stands for the epoch under the stamp read before it (zero: not a shared build).
+    provedStamp = proofStamp;
     return finish(fast, true);
+}
+
+std::uint64_t ShaderResources::ProofsReused() {
+    return proofsReused.load(std::memory_order_relaxed);
 }
 
 namespace {
@@ -2604,12 +2652,8 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     // dispatch and draw content.
     static const std::size_t capacity = [] {
         const char* value = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
-        // APS5_REUSE_ADDRESS_DRAWS: the address-based draws of a frame come in as templates too
-        // (one per material and texture set: ~2800 in the scene that showed a full cache
-        // building 280 of them a second), hence a bound of 4096 unless one is given.
-        const auto fallback = ShaderResources::ReuseAddressDraws() ? 4096ull : 1024ull;
-        const auto parsed = value ? std::strtoull(value, nullptr, 10) : fallback;
-        return static_cast<std::size_t>(parsed != 0 ? parsed : fallback);
+        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 1024ull;
+        return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
     while (entries.size() > capacity) {
         NoteEviction(entries.back().first, false);
@@ -3330,10 +3374,15 @@ namespace {
 // system memory cross PCIe, a snapshot can sit in video memory), from
 // APS5_SNAPSHOT_ADDRESS_DRAWS_MIN_KIB (0: no lower bound; the GPU caches small windows of imported
 // memory, which a copy does not beat) up to APS5_SNAPSHOT_ADDRESS_DRAWS_MAX_KIB (8192) each.
+// APS5_SNAPSHOT_ADDRESS_DRAWS_SMALL_BYTES (4096; 0: none): an element up to that size is copied
+// into the batch arena on its first use in a collect epoch instead of being kept in the snapshot
+// cache (per-draw constants at fresh addresses are copied once and never bound again: a
+// write-watch walk for a generation nobody uses costs more than their bytes).
 struct AddressSnapshotWindow {
     bool enabled;
     std::size_t floor;
     std::size_t limit;
+    std::size_t small;
 };
 
 const AddressSnapshotWindow& AddressSnapshots() {
@@ -3342,14 +3391,26 @@ const AddressSnapshotWindow& AddressSnapshots() {
             const char* value = std::getenv(name);
             return static_cast<std::size_t>(value != nullptr ? std::strtoull(value, nullptr, 10) : fallback) << 10u;
         };
-        return AddressSnapshotWindow{std::getenv("APS5_SNAPSHOT_ADDRESS_DRAWS") != nullptr, kib("APS5_SNAPSHOT_ADDRESS_DRAWS_MIN_KIB", 0), kib("APS5_SNAPSHOT_ADDRESS_DRAWS_MAX_KIB", 8192)};
+        const char* small = std::getenv("APS5_SNAPSHOT_ADDRESS_DRAWS_SMALL_BYTES");
+        return AddressSnapshotWindow{std::getenv("APS5_SNAPSHOT_ADDRESS_DRAWS") != nullptr, kib("APS5_SNAPSHOT_ADDRESS_DRAWS_MIN_KIB", 0), kib("APS5_SNAPSHOT_ADDRESS_DRAWS_MAX_KIB", 8192), std::min<std::size_t>(small != nullptr ? static_cast<std::size_t>(std::strtoull(small, nullptr, 10)) : 4096, Recorder::ArenaMaxBytes)};
     }();
     return window;
 }
 
 ShaderResources::AddressSnapshotStats addressSnapshotStats;
-// The recorder's snapshot stamp for the PrepareDrawBindings call in progress (addressSnapshot).
+// The recorder's snapshot stamp for the addressDrawBindings call in progress (addressSnapshot).
 thread_local Recorder::SnapshotStamp addressSnapshotStamp;
+
+// The descriptor sets of a batch's address-based draws, freed back to the descriptor cache when
+// the batch's kept objects go (Recorder::BatchScratch).
+struct DrawBatchSets {
+    DescriptorCache* cache = nullptr;
+    std::vector<DescriptorCache::SetAllocation> sets;
+    ~DrawBatchSets() {
+        if (cache == nullptr) return;
+        for (const auto& allocation : sets) cache->Free(allocation);
+    }
+};
 
 }
 
@@ -3357,17 +3418,18 @@ const ShaderResources::AddressSnapshotStats& ShaderResources::AddressSnapshotCou
     return addressSnapshotStats;
 }
 
-std::shared_ptr<Buffer> ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, std::size_t bytes) const {
+bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, std::size_t bytes, VkDescriptorBufferInfo& info) const {
     auto& stats = addressSnapshotStats;
     const auto& window = AddressSnapshots();
-    const auto leave = [&](SnapshotRefusal reason) -> std::shared_ptr<Buffer> {
+    const auto leave = [&](SnapshotRefusal reason) {
         ++stats.inPlace[static_cast<std::size_t>(reason)];
-        return nullptr;
+        return false;
     };
-    const auto bind = [&](std::shared_ptr<Buffer> buffer) {
+    const auto bind = [&](VkBuffer buffer, VkDeviceSize offset, bool video) {
         ++stats.bound;
-        if (buffer->InVideoMemory()) ++stats.video;
-        return buffer;
+        if (video) ++stats.video;
+        info = {buffer, offset, bytes};
+        return true;
     };
     // What depends on this build and on the range alone, whatever the epoch.
     if (bytes < window.floor) return leave(SnapshotRefusal::UnderWindow);
@@ -3376,16 +3438,29 @@ std::shared_ptr<Buffer> ShaderResources::addressSnapshot(Recorder& recorder, std
     if (!guestMemory.BoundInPlace(begin, bytes)) return leave(SnapshotRefusal::OutsideImport);
     // A range proved in this collect epoch under the stamp still in force: no check is repeated.
     const auto& now = addressSnapshotStamp;
-    bool rechecked = false;
-    if (auto proved = recorder.EpochSnapshot(begin, bytes, now, &rechecked)) {
+    if (const auto proved = recorder.EpochSnapshot(begin, bytes, now); proved.buffer != VK_NULL_HANDLE) {
         ++stats.epochSkips;
-        if (rechecked) ++stats.epochRechecks;
-        return bind(std::move(proved));
+        if (proved.rechecked) ++stats.epochRechecks;
+        return bind(proved.buffer, proved.offset, proved.video);
     }
-    // The reuse checks of the snapshot path (PrepareDrawBindings, MovedReadOnlyBuffers): nothing
-    // pending over the range, its pages readable, then the collect and the cache's own proof.
-    if (recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return leave(SnapshotRefusal::Pending);
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return leave(SnapshotRefusal::OutsideImport);
+    // What the recorded work still has to write is read in place, behind it. (Pending image
+    // results and unit shadows are not asked about: an address-based build binds its elements in
+    // place without flushing them either, so a copy of the import's bytes reads what the import
+    // would; the snapshot path of the builds never asked.)
+    if (recorder.PendingWriteHits(begin, bytes)) return leave(SnapshotRefusal::Pending);
+    // A small element: its bytes into the batch arena, with no collect and no cache entry. Its
+    // proof is the copy itself, good for the collect epoch like a memo hit's (a later use in the
+    // epoch binds the same bytes, the next epoch copies again); the range lies in an import the
+    // lease pins, so its pages are there to read.
+    if (bytes <= window.small) {
+        if (const auto arena = recorder.ArenaAllocate(bytes); arena.bytes != nullptr) {
+            std::memcpy(arena.bytes, reinterpret_cast<const void*>(begin), bytes);
+            recorder.NoteEpochSnapshot(begin, bytes, now, 0, arena.block, arena.offset);
+            ++stats.small;
+            stats.smallBytes += bytes;
+            return bind(arena.block->Handle(), arena.offset, arena.block->InVideoMemory());
+        }
+    }
     // Collected before the lookup and before a copy: the snapshot is then current as of a collect
     // of this epoch, which is what lets the epoch stand for it afterwards (a store made during
     // the copy is stamped newer by the next walk and compared then). A range that is not
@@ -3396,6 +3471,7 @@ std::shared_ptr<Buffer> ShaderResources::addressSnapshot(Recorder& recorder, std
     if (buffer != nullptr) {
         ++stats.reused;
     } else {
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return leave(SnapshotRefusal::OutsideImport);
         buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, GpuReadProperties(GpuReadKind::StorageCopy));
         // As PrepareDrawBindings copies: a snapshot in video memory keeps its bytes in system
         // memory too, for the compares.
@@ -3412,32 +3488,158 @@ std::shared_ptr<Buffer> ShaderResources::addressSnapshot(Recorder& recorder, std
     }
     recorder.NoteEpochSnapshot(begin, bytes, now, generation, buffer);
     CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
-    return bind(std::move(buffer));
+    return bind(buffer->Handle(), 0, buffer->InVideoMemory());
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+    const auto& window = AddressSnapshots();
+    if (!window.enabled && moved.empty()) return {};
+    // The call's result and scratch, kept per thread: nearly every address-based draw gets here.
+    thread_local DrawBindings result;
+    thread_local std::vector<std::size_t> selected;
+    // What each selected element binds, in `selected`'s order.
+    thread_local std::vector<VkDescriptorBufferInfo> infos;
+    thread_local std::vector<VkCopyDescriptorSet> copies;
+    thread_local std::vector<VkWriteDescriptorSet> writes;
+    result.pushPatches.clear();
+    result.allocation = {};
+    selected.clear();
+    infos.clear();
+    // One stamp for the call: nothing below waits for recorded work or notes a write.
+    addressSnapshotStamp = recorder.CurrentSnapshotStamp(guestMemory.ReadSetToken());
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        if (override != moved.end() && !override->words.empty()) {
+            // The draw's own data buffer, from the arena (a Buffer of its own when it is too large).
+            VkDescriptorBufferInfo info{};
+            std::byte* bytes = nullptr;
+            if (const auto arena = recorder.ArenaAllocate(override->size); arena.bytes != nullptr) {
+                info = {arena.block->Handle(), arena.offset, override->size};
+                bytes = arena.bytes;
+            } else {
+                auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, GpuReadProperties(GpuReadKind::StorageCopy));
+                info = {buffer->Handle(), 0, buffer->Bytes().size()};
+                bytes = buffer->Bytes().data();
+                recorder.Keep(std::move(buffer));
+            }
+            std::memcpy(bytes, override->words.data(), override->size);
+            for (const auto& patch : dataPatches) {
+                if (patch.allocation == index && patch.byte < override->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+            }
+            // The adjustments of the moved elements that this buffer carries, over the build's:
+            // zero leaves the byte the words hold, as the build leaves it.
+            for (const auto& entry : moved) {
+                if (!entry.inPlace) continue;
+                const auto& element = allocations[entry.allocation];
+                if (element.pushByte >= 0 || element.dataAllocation != static_cast<std::int64_t>(index) || element.dataByte >= override->size) continue;
+                bytes[element.dataByte] = entry.adjustment != 0 ? static_cast<std::byte>(entry.adjustment) : reinterpret_cast<const std::byte*>(override->words.data())[element.dataByte];
+            }
+            selected.push_back(index);
+            infos.push_back(info);
+            continue;
+        }
+        if (override != moved.end() && override->inPlace) {
+            if (override->adjustment != item.adjustment && item.pushByte >= 0) result.pushPatches.emplace_back(static_cast<std::uint32_t>(item.pushByte), override->adjustment);
+            // A snapshot when the range qualifies, from the adjustment the import gives the
+            // range (the one the shader is told), so every template snapshots a buffer alike;
+            // else in place, as MovedReadOnlyBuffers found it.
+            auto info = override->info;
+            if (window.enabled) addressSnapshot(recorder, override->address - override->adjustment, override->size + override->adjustment, info);
+            selected.push_back(index);
+            infos.push_back(info);
+            continue;
+        }
+        if (!window.enabled || !item.guest) continue;
+        if (item.written) {
+            ++addressSnapshotStats.inPlace[static_cast<std::size_t>(SnapshotRefusal::Written)];
+            continue;
+        }
+        VkDescriptorBufferInfo info{};
+        if (!addressSnapshot(recorder, item.address - item.adjustment, item.size + item.adjustment, info)) continue;
+        selected.push_back(index);
+        infos.push_back(info);
+    }
+    if (selected.empty()) return {};
+    Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    if (drawBindingSizes.empty()) {
+        std::map<VkDescriptorType, std::uint32_t> counts;
+        for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
+        for (const auto& [type, count] : counts) drawBindingSizes.push_back({type, count});
+    }
+    const auto allocation = context.descriptorCache->Allocate(_layout, drawBindingSizes);
+    Require(allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+    // The batch frees the set with its kept objects.
+    auto& scratch = recorder.BatchScratch();
+    if (scratch == nullptr) {
+        auto sets = std::make_shared<DrawBatchSets>();
+        sets->cache = context.descriptorCache;
+        scratch = sets;
+        recorder.Keep(std::move(sets));
+    }
+    static_cast<DrawBatchSets*>(scratch.get())->sets.push_back(allocation);
+    copies.clear();
+    for (const auto& binding : bindings) {
+        VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+        copy.srcSet = _set;
+        copy.srcBinding = binding.layout.binding;
+        copy.dstSet = allocation.set;
+        copy.dstBinding = binding.layout.binding;
+        copy.descriptorCount = binding.layout.descriptorCount;
+        copies.push_back(copy);
+    }
+    writes.clear();
+    for (const auto& binding : bindings) {
+        for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+            const auto found = std::find(selected.begin(), selected.end(), binding.allocations[element]);
+            if (found == selected.end()) continue;
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.dstSet = allocation.set;
+            write.dstBinding = binding.layout.binding;
+            write.dstArrayElement = static_cast<std::uint32_t>(element);
+            write.descriptorCount = 1;
+            write.descriptorType = binding.layout.descriptorType;
+            write.pBufferInfo = &infos[static_cast<std::size_t>(found - selected.begin())];
+            writes.push_back(write);
+        }
+    }
+    const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
+    update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
+    update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    // The set only: `cache` stays null, so the scratch frees nothing.
+    result.allocation.set = allocation.set;
+    return std::shared_ptr<DrawBindings>(std::shared_ptr<void>(), &result);
 }
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
     std::vector<MovedBuffer> moved;
+    if (!MovedReadOnlyBuffers(shaders, recorder, moved)) return std::nullopt;
+    return moved;
+}
+
+bool ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, std::vector<MovedBuffer>& moved) const {
+    moved.clear();
     // An address-based build that is not shared serves no second use.
-    if (_set == VK_NULL_HANDLE || (usesBda && !guestMemory.Shared())) return moved;
+    if (_set == VK_NULL_HANDLE || (usesBda && !guestMemory.Shared())) return true;
     for (const auto& shader : shaders) {
-        if (shader.program == nullptr) return std::nullopt;
+        if (shader.program == nullptr) return false;
         for (const auto& binding : shader.program->bindings) {
             if (DataRole(binding.role)) {
                 const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
-                if (kept == bindings.end() || kept->allocations.size() != 1) return std::nullopt;
+                if (kept == bindings.end() || kept->allocations.size() != 1) return false;
                 const auto index = kept->allocations.front();
                 const auto& item = allocations[index];
-                if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return std::nullopt;
+                if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return false;
                 const bool patched = std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == index; });
                 const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
                 if (same) continue;
-                if (item.dataWords.empty() && patched) return std::nullopt;
+                if (item.dataWords.empty() && patched) return false;
                 moved.push_back({index, 0, item.size, binding.guestDescriptor});
                 continue;
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
             const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
-            if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return std::nullopt;
+            if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return false;
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
@@ -3448,26 +3650,27 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const bool empty = size == 0 || address == 0;
                 if (!item.guest) {
                     if (empty) continue;
-                    return std::nullopt;
+                    return false;
                 }
                 if (item.address == address && item.size == size) continue;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
-                if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
+                if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return false;
                 if (guestMemory.Shared()) {
                     // Bound in place through the address space, as the build binds its own
                     // elements (no copy: the lease pins the range and the pass tracking treats
                     // an address-based draw's reads as unknown). An adjustment other than the
                     // build's needs somewhere to go, as a build's nonzero one does.
                     std::uint32_t adjustment = 0;
-                    if (!guestMemory.SharedDescriptor(address, static_cast<std::size_t>(size), adjustment).has_value()) return std::nullopt;
-                    if (adjustment != item.adjustment && item.pushByte < 0 && item.dataAllocation < 0) return std::nullopt;
-                    moved.push_back({index, address, static_cast<std::size_t>(size), {}, true, adjustment});
+                    const auto info = guestMemory.SharedDescriptor(address, static_cast<std::size_t>(size), adjustment);
+                    if (!info.has_value()) return false;
+                    if (adjustment != item.adjustment && item.pushByte < 0 && item.dataAllocation < 0) return false;
+                    moved.push_back({index, address, static_cast<std::size_t>(size), {}, true, adjustment, *info});
                     continue;
                 }
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(size) + item.adjustment;
-                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
-                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return false;
+                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return false;
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
             }
         }
@@ -3482,10 +3685,10 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
         const auto data = static_cast<std::size_t>(item.dataAllocation);
         if (std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == data && !entry.words.empty(); })) continue;
         const auto& source = allocations[data];
-        if (source.dataWords.empty() || item.dataByte >= source.size) return std::nullopt;
+        if (source.dataWords.empty() || item.dataByte >= source.size) return false;
         moved.push_back({data, 0, source.size, source.dataWords});
     }
-    return moved;
+    return true;
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
@@ -3494,25 +3697,20 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const bool addressDraws = AddressSnapshots().enabled;
     const auto addressDrawLimit = AddressSnapshots().limit;
     const auto addressDrawFloor = AddressSnapshots().floor;
-    // A shared address-based build's use (`moved` not empty) binds its own data buffers and its
-    // moved elements, in place or to a snapshot; the build's other elements stay as the set has
-    // them unless they take a snapshot too.
-    if (_set == VK_NULL_HANDLE || (usesBda && !addressDraws && moved.empty())) return {};
-    // APS5_REUSE_ADDRESS_DRAWS: an address-based draw's snapshots come from addressSnapshot (one
-    // owner search instead of the scan of the ~1200 in-place ranges, the epoch reuse, no copy of
-    // a range outside the write watch), under one stamp for the call: nothing below waits for
-    // recorded work or notes a write, so the stamp holds for every element.
-    const bool fastAddress = usesBda && addressDraws && ReuseAddressDraws();
-    if (fastAddress) addressSnapshotStamp = recorder.CurrentSnapshotStamp(guestMemory.ReadSetToken());
-    const auto reads = usesBda && (!addressDraws || fastAddress) ? std::vector<std::pair<std::uint64_t, std::uint64_t>>{} : guestMemory.InPlaceReads();
+    if (_set == VK_NULL_HANDLE) return {};
+    // APS5_REUSE_ADDRESS_DRAWS: an address-based build's draws (a shared template's uses with
+    // what they moved, and every build's read-only elements under the snapshot switch) are bound
+    // by addressDrawBindings.
+    if (usesBda && ReuseAddressDraws()) return addressDrawBindings(recorder, moved);
+    if (usesBda && !addressDraws) return {};
+    const auto reads = guestMemory.InPlaceReads();
     auto result = std::make_shared<DrawBindings>();
-    // Scratch of the call, kept per thread: a draw's own set is made for most address-based draws.
+    // Scratch of the call, kept per thread.
     thread_local std::vector<std::size_t> selected;
     // What each selected element binds, in `selected`'s order.
     thread_local std::vector<VkDescriptorBufferInfo> infos;
     selected.clear();
     infos.clear();
-    result->snapshots.reserve(moved.size() + (fastAddress ? allocations.size() : 0));
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -3522,34 +3720,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             for (const auto& patch : dataPatches) {
                 if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
-            // The adjustments of the elements bound in place that this buffer carries, over the
-            // build's: zero leaves the byte the words hold, as the build leaves it.
-            for (const auto& entry : moved) {
-                if (!entry.inPlace) continue;
-                const auto& element = allocations[entry.allocation];
-                if (element.pushByte >= 0 || element.dataAllocation != static_cast<std::int64_t>(index) || element.dataByte >= override->size) continue;
-                buffer->Bytes()[element.dataByte] = entry.adjustment != 0 ? static_cast<std::byte>(entry.adjustment) : reinterpret_cast<const std::byte*>(override->words.data())[element.dataByte];
-            }
             selected.push_back(index);
             infos.push_back({buffer->Handle(), 0, buffer->Bytes().size()});
             result->snapshots.push_back({0, std::move(buffer)});
-            continue;
-        }
-        if (override != moved.end() && override->inPlace) {
-            std::uint32_t adjustment = 0;
-            const auto info = guestMemory.SharedDescriptor(override->address, override->size, adjustment);
-            Require(info.has_value() && adjustment == override->adjustment, "a moved buffer of an address-based draw is no longer served in place");
-            if (adjustment != item.adjustment && item.pushByte >= 0) result->pushPatches.emplace_back(static_cast<std::uint32_t>(item.pushByte), adjustment);
-            selected.push_back(index);
-            // A snapshot when the range qualifies, from the adjustment the import gives the
-            // range (the one the shader is told), so every template snapshots a buffer alike.
-            const auto begin = override->address - adjustment;
-            if (auto snapshot = fastAddress ? addressSnapshot(recorder, begin, override->size + adjustment) : nullptr) {
-                infos.push_back({snapshot->Handle(), 0, snapshot->Bytes().size()});
-                result->snapshots.push_back({begin, std::move(snapshot)});
-            } else {
-                infos.push_back(*info);
-            }
             continue;
         }
         std::uint64_t address = item.address;
@@ -3558,21 +3731,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             address = override->address;
             size = override->size;
         } else {
-            if (usesBda && !addressDraws) continue;
-            if (fastAddress) {
-                if (!item.guest) continue;
-                if (item.written) {
-                    ++addressSnapshotStats.inPlace[static_cast<std::size_t>(SnapshotRefusal::Written)];
-                    continue;
-                }
-                const auto begin = item.address - item.adjustment;
-                auto snapshot = addressSnapshot(recorder, begin, item.size + item.adjustment);
-                if (snapshot == nullptr) continue;
-                selected.push_back(index);
-                infos.push_back({snapshot->Handle(), 0, snapshot->Bytes().size()});
-                result->snapshots.push_back({begin, std::move(snapshot)});
-                continue;
-            }
             if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
             if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
@@ -3937,7 +4095,7 @@ void ShaderResources::WriteBack() {
     }
 }
 
-void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+void ShaderResources::MarkGpuWrites(Recorder& recorder, bool repeated) {
     // The CP's next read of the GDS is ordered after this work (Pm4::InstallGdsBacking).
     if (usesGds) Pm4::NoteGdsShaderUse();
     // APS5_RESIDENT_STAGING: stores through addresses carry no stamp until the batch completes.
@@ -3960,6 +4118,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
     // and the note and mark below cover them like direct writes.
+    // A shared build's later use in the same batch: the batch holds its notes and marks already.
+    if (repeated) return;
     guestMemory.RecordCopyBacks(recorder);
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
@@ -4033,6 +4193,68 @@ std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
         if (texture != nullptr && texture->StorageSource() != nullptr) images.emplace_back(texture->StorageSource()->Image(), false);
     }
     return images;
+}
+
+const std::vector<std::pair<VkImage, bool>>& ShaderResources::StorageImageList() const {
+    if (!storageImagesListed) {
+        storageImageList = StorageImages();
+        storageImagesListed = true;
+    }
+    return storageImageList;
+}
+
+bool ShaderResources::PinsDeparted() const {
+    for (const auto& texture : textures) {
+        if (texture == nullptr) continue;
+        if (texture->Departed()) return true;
+        if (const auto* source = texture->StorageSource(); source != nullptr && !source->Cached()) return true;
+    }
+    for (const auto& image : storageTextures) {
+        if (image != nullptr && !image->Cached()) return true;
+    }
+    return false;
+}
+
+std::uint64_t ShaderResources::DepartedBytes() const {
+    std::uint64_t bytes = 0;
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->Departed() && !texture->ViewsStorageImage()) bytes += texture->AllocationBytes();
+    }
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (index != 0 && storageTextures[index] == storageTextures[index - 1]) continue;
+        if (storageTextures[index] != nullptr && !storageTextures[index]->Cached()) bytes += storageTextures[index]->GuestBytes();
+    }
+    return bytes;
+}
+
+std::size_t ResourceCache::SweepDeparted(std::uint64_t* bytes) {
+    static const bool enabled = std::getenv("APS5_NO_RESOURCE_CACHE_SWEEP") == nullptr;
+    if (!enabled) return 0;
+    // Plain: every caller holds GuestMemory::GpuMutex (the draw path).
+    static std::uint64_t sweptFrame = ~0ull;
+    static std::uint64_t sweptDepartures = ~0ull;
+    const auto frame = ResidencyClock::Frame();
+    if (frame == sweptFrame) return 0;
+    sweptFrame = frame;
+    const auto departures = SampledDepartures().load(std::memory_order_relaxed) + StorageDepartures().load(std::memory_order_relaxed);
+    if (departures == sweptDepartures) return 0;
+    sweptDepartures = departures;
+    std::vector<std::shared_ptr<ShaderResources>> dropped;
+    {
+        std::lock_guard lock(mutex);
+        for (auto it = entries.begin(); it != entries.end();) {
+            // Only a completed object's lists are fixed; one still building is its builder's.
+            if (it->second == nullptr || !it->second->Completed() || !it->second->PinsDeparted()) {
+                ++it;
+                continue;
+            }
+            if (bytes != nullptr) *bytes += it->second->DepartedBytes();
+            dropped.push_back(std::move(it->second));
+            index.erase(it->first);
+            it = entries.erase(it);
+        }
+    }
+    return dropped.size();
 }
 
 bool ShaderResources::ReadsImage(const StorageTexture* image) const {

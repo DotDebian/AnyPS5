@@ -159,29 +159,33 @@ public:
     // APS5_SNAPSHOT_ADDRESS_DRAWS: a frame's draws bind the same few thousand read-only buffers
     // tens of thousands of times, and each bind looked the snapshot up, collected its range and
     // asked the tracker). A snapshot's proof is what its reuse checks say: no pending GPU write
-    // or image result over the range, the registry unchanged, the range collected and unstamped
-    // since the snapshot's generation. Within one collect epoch of the proving thread a second
-    // collect of the range is a memo hit by contract (GuestMemory.hpp: a CPU store landing after
-    // the first is seen by the next epoch), so the proof can only change through what the stamp
-    // below names, each read BEFORE the checks it stands for: the driver's own stamps anywhere
-    // (GuestMemory::DriverStoreSerial), a pending write noted on this recorder, the pending image
-    // registry (StorageTexture::PendingSerial, which a unit shadow's fresh results move too) and
-    // the allocation registry. `space` names what the range was found bound in place by (the
-    // cached address space's serial). While a snapshot's stamp is the current one, EpochSnapshot
-    // returns it with no lookup, collect or tracker query; when only the driver's stamps or the
-    // write notes moved (a draw that writes a buffer moves both), the range alone is asked again
-    // (UnchangedSince from the proof's generation, PendingWriteOverlaps: `rechecked`) and the
-    // slot takes the new counts; anything else is a miss and the caller proves the range anew.
-    // What this gives up against the reuse check: a CPU store made after the range's collect
-    // that ANOTHER thread's walk stamped within the epoch, while no driver stamp moved (the
-    // reuse check saw that stamp by accident of timing; this path sees it at the next epoch, as
-    // the contract promises and no sooner). Held weakly: the snapshot cache's budget stays what
-    // keeps a buffer alive.
+    // over the range, the registry unchanged, the range collected and unstamped since the
+    // snapshot's generation. Within one collect epoch of the proving thread a second collect of
+    // the range is a memo hit by contract (GuestMemory.hpp: a CPU store landing after the first
+    // is seen by the next epoch), so the proof can only change through what the stamp below
+    // names, each read BEFORE the checks it stands for: the driver's own stamps anywhere
+    // (GuestMemory::DriverStoreSerial), a pending write noted on this recorder and the allocation
+    // registry. `space` names what the range was found bound in place by (the cached address
+    // space's serial). While a snapshot's stamp is the current one, EpochSnapshot returns it with
+    // no lookup, collect or tracker query; when only the driver's stamps or the write notes moved
+    // (a draw that writes a buffer moves both), the range alone is asked again (UnchangedSince
+    // from the proof's generation, PendingWriteHits: `rechecked`) and the slot takes the new
+    // counts; anything else is a miss and the caller proves the range anew. What this gives up
+    // against the reuse check: a CPU store made after the range's collect that ANOTHER thread's
+    // walk stamped within the epoch, while no driver stamp moved (the reuse check saw that stamp
+    // by accident of timing; this path sees it at the next epoch, as the contract promises and no
+    // sooner).
+    // A proof made without a collect (`generation` 0: a small element copied straight into the
+    // batch arena, see ArenaAllocate) stands on the same contract a memo hit does, with nothing to
+    // ask the tracker about: any driver stamp since ends it, and so does the epoch (the next use
+    // copies the bytes again, which is all its proof ever was).
+    // The table holds its buffers weakly (the snapshot cache's budget, or the batch that owns an
+    // arena block, keeps them alive) and keeps each one in the open batch at its first use there
+    // (KeepOnce), so a hit hands out the handle with no reference counting.
     struct SnapshotStamp {
         std::uint64_t epoch = 0;
         std::uint64_t driverStores = 0;
         std::uint64_t writeNotes = 0;
-        std::uint64_t pendingSerial = 0;
         std::uint64_t registry = 0;
         std::uint64_t space = 0;
         bool operator==(const SnapshotStamp&) const = default;
@@ -189,10 +193,60 @@ public:
     // The stamp in force now; `epoch` is 0 on a thread without a collect epoch (nothing is noted
     // or returned for it).
     SnapshotStamp CurrentSnapshotStamp(std::uint64_t space) const;
-    std::shared_ptr<Buffer> EpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& now, bool* rechecked = nullptr);
+    struct EpochSnapshotHit {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        bool video = false;
+        bool rechecked = false;
+    };
+    // The buffer and offset proved for the range under `now`, kept by the open batch; a null
+    // buffer when there is none.
+    EpochSnapshotHit EpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& now);
     // `generation`: the collect of the range the proof was made under (every stamp up to it was
-    // accounted for).
-    void NoteEpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& stamp, std::uint64_t generation, const std::shared_ptr<Buffer>& buffer);
+    // accounted for), 0 for a proof without a collect. `buffer` is kept by the open batch here.
+    void NoteEpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& stamp, std::uint64_t generation, const std::shared_ptr<Buffer>& buffer, VkDeviceSize offset = 0);
+    // Whether a pending write may overlap the range: PendingWriteOverlaps answered from the
+    // published union of the pending writes (one search; a batch's ranges stay in it until its
+    // completions ran, so it can say yes a little longer, never no too soon).
+    bool PendingWriteHits(std::uint64_t address, std::size_t bytes) const;
+    // The open batch's identity, never reused (a batch's serial is its submission's, which a
+    // batch that is dropped shares with the next).
+    std::uint64_t OpenBatchId();
+    // Keeps `object` until the open batch completed, like Keep, but once: a batch's draws keep
+    // the same pipeline, framebuffer, targets and templates a thousand times. A direct-mapped
+    // table of the pointers kept so far; a collision keeps the object again, which is harmless.
+    template <typename T>
+    void KeepOnce(const std::shared_ptr<T>& object) {
+        if (object == nullptr) return;
+        auto& slot = keptOnceSlot(object.get());
+        if (slot == object.get()) return;
+        slot = object.get();
+        Keep(object);
+    }
+    // One object of the caller's for the open batch, made at the first call in it and released
+    // with the batch's kept objects (ShaderResources' draw scratch: the descriptor sets of the
+    // batch's draws and the arena below).
+    std::shared_ptr<void>& BatchScratch();
+    // Small host-visible storage for the open batch's draws (the snapshots of small read-only
+    // elements, a draw's own data buffers): sub-allocated from blocks in the memory the storage
+    // snapshots use (GpuReadKind::StorageCopy: video memory under APS5_VRAM_BUFFERS), aligned to
+    // the device's storage buffer offset alignment, kept by the batch and returned to the buffer
+    // pool with it, so an element costs neither a pool take nor an owner of its own. Null bytes
+    // when `bytes` is over ArenaMaxBytes or a block cannot be had (the caller makes a Buffer).
+    struct ArenaBytes {
+        std::shared_ptr<Buffer> block;
+        VkDeviceSize offset = 0;
+        std::byte* bytes = nullptr;
+    };
+    static constexpr std::size_t ArenaBlockBytes = std::size_t{1} << 20u;
+    static constexpr std::size_t ArenaMaxBytes = 65536;
+    ArenaBytes ArenaAllocate(std::size_t bytes);
+    // Blocks taken and bytes handed out so far (cumulative, the [addrdraw] line).
+    struct ArenaStatistics {
+        std::uint64_t blocks = 0;
+        std::uint64_t bytes = 0;
+    };
+    static ArenaStatistics ArenaCounts();
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
@@ -633,6 +687,12 @@ private:
         std::vector<Read> reads;
         // The set of ranges last noted whole into `reads` (see ReadSetNoted); 0: none.
         std::uint64_t readSet = 0;
+        // See OpenBatchId, KeepOnce, BatchScratch and ArenaAllocate.
+        std::uint64_t id = 0;
+        std::array<const void*, 1024> keptOnce{};
+        std::shared_ptr<void> scratch;
+        std::shared_ptr<Buffer> arenaBlock;
+        std::size_t arenaUsed = 0;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         // The programs whose work was recorded (APS5_TRACE_RECORD=1), printed at submit.
@@ -961,7 +1021,13 @@ private:
         SnapshotStamp stamp;
         std::uint64_t generation = 0;
         std::weak_ptr<Buffer> buffer;
+        VkBuffer handle = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        // The batch that keeps the buffer (OpenBatchId): no reference is taken for a hit in it.
+        std::uint64_t keptBatch = 0;
+        bool video = false;
     };
+    const void*& keptOnceSlot(const void* object);
     static constexpr std::size_t EpochSnapshotSlots = 16384;
     std::vector<EpochSnapshotSlot> epochSnapshots;
     static std::size_t epochSnapshotBucket(std::uint64_t address, std::size_t bytes) {

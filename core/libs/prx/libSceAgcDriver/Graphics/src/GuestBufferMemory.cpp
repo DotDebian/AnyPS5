@@ -3079,7 +3079,13 @@ GuestBufferMemory::SpaceLease GuestBufferMemory::AcquireShared(std::span<const G
     }
     if (mirrorsEnabled()) {
         if (!sharedMirrors.empty()) ++Mirrors().builds;
-        sweepMirrors();
+        // A mirror goes when its registered range does, which moves the registry's generation:
+        // a use sweeps once per generation instead of once per draw (under GuestMemory::GpuMutex).
+        static std::uint64_t sweptGeneration = ~0ull;
+        if (sweptGeneration != generation) {
+            sweptGeneration = generation;
+            sweepMirrors();
+        }
         reportMirrors();
         reportVramMirrors();
     }
