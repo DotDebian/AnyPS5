@@ -255,6 +255,30 @@ std::array<std::uint32_t, 3> ThinBlockLayout(TextureTileMode tileMode, std::uint
     return {block.blockSize, block.blockWidth, block.blockHeight};
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> CoveredMipBytes(TextureTileMode tileMode, std::uint32_t bytesPerElement, const TileMipLayout& mip) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
+    if (mip.tail || mip.width == 0 || mip.height == 0) return covered;
+    const auto add = [&](std::uint64_t begin, std::uint64_t end) {
+        end = std::min(end, mip.tiledSize);
+        if (begin >= end) return;
+        if (!covered.empty() && covered.back().second == begin) covered.back().second = end;
+        else covered.emplace_back(begin, end);
+    };
+    if (tileMode == TextureTileMode::kLinear) {
+        const auto rowBytes = static_cast<std::uint64_t>(mip.width) * bytesPerElement;
+        for (std::uint32_t row = 0; row < mip.height; ++row) add(static_cast<std::uint64_t>(row) * mip.pitchBytes, static_cast<std::uint64_t>(row) * mip.pitchBytes + rowBytes);
+        return covered;
+    }
+    const auto block = ThinBlockLayout(tileMode, bytesPerElement);
+    const auto wholeColumns = std::min(mip.width / block[1], mip.blocksPerRow);
+    const auto wholeRows = mip.height / block[2];
+    for (std::uint32_t row = 0; row < wholeRows && wholeColumns != 0; ++row) {
+        const auto first = static_cast<std::uint64_t>(row) * mip.blocksPerRow;
+        add(first * block[0], (first + wholeColumns) * block[0]);
+    }
+    return covered;
+}
+
 ThickLayout ComputeThickLayout(TextureTileMode tileMode, std::uint32_t format, std::uint32_t width, std::uint32_t height, std::uint32_t depth, std::uint32_t mipCount) {
     Require(width != 0 && height != 0 && depth != 0, "cannot compute layout for a zero-sized 3D texture");
     Require(mipCount != 0 && mipCount <= 16u, "3D texture mip count is out of range");
