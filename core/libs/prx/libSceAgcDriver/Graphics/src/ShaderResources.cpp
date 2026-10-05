@@ -3121,7 +3121,15 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
-    if (_set == VK_NULL_HANDLE || usesBda) return {};
+    // APS5_SNAPSHOT_ADDRESS_DRAWS=1 (local experiment): an address-based draw also binds snapshots
+    // of its read-only buffer elements instead of the imports, up to
+    // APS5_SNAPSHOT_ADDRESS_DRAWS_MAX_KIB (8192) each.
+    static const bool addressDraws = std::getenv("APS5_SNAPSHOT_ADDRESS_DRAWS") != nullptr;
+    static const std::size_t addressDrawLimit = [] {
+        const char* value = std::getenv("APS5_SNAPSHOT_ADDRESS_DRAWS_MAX_KIB");
+        return static_cast<std::size_t>(value != nullptr ? std::strtoull(value, nullptr, 10) : 8192ull) << 10u;
+    }();
+    if (_set == VK_NULL_HANDLE || (usesBda && !addressDraws)) return {};
     const auto reads = guestMemory.InPlaceReads();
     auto result = std::make_shared<DrawBindings>();
     std::vector<std::size_t> selected;
@@ -3150,6 +3158,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         const auto begin = address - item.adjustment;
         const auto bytes = size + item.adjustment;
+        if (usesBda && bytes > addressDrawLimit) continue;
         // The range's CPU stores so far are stamped first, so the reuse check sees them; a store
         // made after the collect (during the copy) is stamped newer by the next one and drops the
         // snapshot then.

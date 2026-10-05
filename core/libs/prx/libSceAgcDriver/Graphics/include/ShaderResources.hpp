@@ -157,6 +157,7 @@ public:
     PassBlock LegacyPassBlock() const;
     bool UsesGds() const { return usesGds; }
     bool BdaWrites() const { return bdaWrites; }
+    bool UsesBda() const { return usesBda; }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     bool ReadsImage(const StorageTexture* image) const;
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }

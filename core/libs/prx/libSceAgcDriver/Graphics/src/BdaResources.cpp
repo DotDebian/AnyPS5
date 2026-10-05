@@ -128,7 +128,7 @@ bool fullFaultScan() {
 BdaResources::BdaResources(const Context& context, bool writes) : scansWrittenPages(writes || fullFaultScan()) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
-    fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, GpuReadProperties(GpuReadKind::Fault));
     const auto cleared = scansWrittenPages ? fault->Bytes().size() : ShaderRecompiler::BdaAbi::WrittenSlotsWord * sizeof(std::uint32_t);
     std::memset(fault->Bytes().data(), 0, cleared);
 }
