@@ -1038,6 +1038,50 @@ struct ThreadCollectMemo {
 };
 thread_local ThreadCollectMemo threadCollectMemo;
 
+// The default per-thread memo: every page range this thread walked during its current epoch, as a
+// sorted list of disjoint intervals (a walk is merged with the ones it touches or overlaps). The
+// 64-entry ring above forgets a walk once 64 others followed it, which costs nothing while an
+// epoch lasts a few draws but walks the same surfaces again and again once the epochs are longer
+// (a frame's draws bind hundreds of distinct surfaces), and it scans every entry of the epoch on a
+// miss. Here a collect is a hit when one interval covers its pages: found by a binary search, and
+// true for a range whose pages were walked by several adjacent collects, which no single ring
+// entry covers. The list is dropped when the thread's epoch or the unwatch serial moves, exactly
+// the two conditions a ring entry is matched on. A thread that never bumped its epoch keeps none
+// (each of its collects has an epoch of its own). APS5_COLLECT_MEMO_RING=1 restores the ring.
+struct ThreadWalkedRanges {
+    std::uint64_t epoch = 0;
+    std::uint64_t unwatched = 0;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;
+
+    bool Covers(std::uintptr_t first, std::uintptr_t stop) const {
+        auto next = std::upper_bound(ranges.begin(), ranges.end(), first, [](std::uintptr_t address, const std::pair<std::uintptr_t, std::uintptr_t>& range) { return address < range.first; });
+        if (next == ranges.begin()) return false;
+        --next;
+        return stop <= next->second;
+    }
+
+    void Add(std::uintptr_t first, std::uintptr_t stop) {
+        // Bounded: a list this long means the epoch is not ending; starting over only costs walks.
+        if (ranges.size() >= 4096) ranges.clear();
+        auto at = std::lower_bound(ranges.begin(), ranges.end(), first, [](const std::pair<std::uintptr_t, std::uintptr_t>& range, std::uintptr_t address) { return range.first < address; });
+        if (at != ranges.begin() && std::prev(at)->second >= first) --at;
+        else at = ranges.insert(at, {first, first});
+        at->second = std::max(at->second, stop);
+        auto last = std::next(at);
+        while (last != ranges.end() && last->first <= at->second) {
+            at->second = std::max(at->second, last->second);
+            ++last;
+        }
+        ranges.erase(std::next(at), last);
+    }
+};
+thread_local ThreadWalkedRanges threadWalkedRanges;
+
+bool collectMemoRing() {
+    static const bool ring = std::getenv("APS5_COLLECT_MEMO_RING") != nullptr;
+    return ring;
+}
+
 bool newestCollectFirst() {
     static const bool enabled = std::getenv("APS5_SCAN_WHOLE_COLLECT_MEMO") == nullptr;
     return enabled;
@@ -1120,7 +1164,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto epoch = currentCollectEpoch();
     const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
-    if (useMemo && !sharedCollectMemo()) {
+    if (useMemo && !sharedCollectMemo() && !collectMemoRing()) {
+        // As for a ring entry below: only completed walks of in-arena ranges are listed.
+        const auto& list = threadWalkedRanges;
+        if (threadCollectEpoch != 0 && list.epoch == epoch && list.unwatched == unwatched && list.Covers(first, stop)) {
+            collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+            return tracker.generation.load(std::memory_order_relaxed);
+        }
+    } else if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
         const auto count = threadCollectMemo.entries.size();
@@ -1160,8 +1211,19 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
-        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
-        else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+        if (sharedCollectMemo()) {
+            tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
+        } else if (collectMemoRing()) {
+            threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+        } else if (threadCollectEpoch != 0) {
+            auto& list = threadWalkedRanges;
+            if (list.epoch != epoch || list.unwatched != serial) {
+                list.ranges.clear();
+                list.epoch = epoch;
+                list.unwatched = serial;
+            }
+            list.Add(first, stop);
+        }
     }
     return tracker.generation;
 }
