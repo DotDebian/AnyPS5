@@ -174,6 +174,12 @@ std::uint32_t SpirvModule::DefineGlobalVariable(std::uint32_t pointerType, std::
     return id;
 }
 
+std::uint32_t SpirvModule::DefineInitializedGlobalVariable(std::uint32_t pointerType, std::uint32_t storageClass, std::uint32_t initializer) {
+    const auto id = AllocateId();
+    appendInstruction(declarations, spv::OpVariable, pointerType, id, storageClass, initializer);
+    return id;
+}
+
 void SpirvModule::DefineGlobalVariable(std::uint32_t id, std::uint32_t pointerType, std::uint32_t storageClass) {
     appendInstruction(declarations, spv::OpVariable, pointerType, id, storageClass);
 }
