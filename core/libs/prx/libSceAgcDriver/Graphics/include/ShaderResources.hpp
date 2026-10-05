@@ -93,7 +93,10 @@ private:
 class ShaderResources {
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
-    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots = {});
+    // `stageWrites` (APS5_DRAW_STAGING): the draw will be recorded, so its written buffer elements
+    // inside host imports may be staged in device memory (GuestBufferMemory::AllowDrawStaging); a
+    // build made with it must not serve a synchronous draw (see StagesBuffers).
+    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots = {}, bool stageWrites = false);
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots = {});
     // Two-stage build for dispatches (see build): with `deferred` the constructor runs stage A only,
     // which needs no device lock, and Complete() runs stage B under GuestMemory::GpuMutex; until
@@ -140,6 +143,10 @@ public:
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
+    // Whether a buffer region is staged in device memory: every use must then be recorded and call
+    // MarkGpuWrites (the copy-back), which a synchronous draw does not.
+    bool StagesBuffers() const { return guestMemory.HasStagedRegions(); }
+    GuestBufferMemory::DrawStagingTally DrawStaging() const { return guestMemory.DrawStaging(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     // Whether a region the recorded work reads in place through a host import overlaps the range.
     bool ReadsOverlap(std::uint64_t address, std::size_t bytes) const;
