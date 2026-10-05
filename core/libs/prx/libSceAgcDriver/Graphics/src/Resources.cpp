@@ -47,6 +47,10 @@ VkMemoryPropertyFlags GpuReadProperties(GpuReadKind kind) {
     return (VramBufferMask() & static_cast<unsigned>(kind)) != 0 ? VramHost : HostDefault;
 }
 
+VkMemoryPropertyFlags VideoMemoryProperties() {
+    return VramHost;
+}
+
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags requested) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(usage), properties(requested == HostDefault ? GpuReadProperties(GpuReadKind::Everything) : requested) {
     const auto properties = this->properties;
     Require(size != 0, "zero-sized GPU buffer");
@@ -61,6 +65,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         allocationBytes = allocation->allocationBytes;
         offset = allocation->offset;
         slab = allocation->slab;
+        video = allocation->video;
         ready = true;
         return;
     }
@@ -112,6 +117,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
                 initializeAddress(usage);
                 mapping = slot->mapping;
                 ready = true;
+                video = vram;
                 if (vram) CountVramBuffer(capacity, false);
                 return;
             }
@@ -125,6 +131,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             allocated = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
         }
         Check(allocated, "vkAllocateMemory buffer");
+        video = vram;
         if (vram) CountVramBuffer(capacity, false);
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
@@ -142,7 +149,7 @@ Buffer::~Buffer() {
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab});
+        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, video});
         return;
     }
     if (slab) {

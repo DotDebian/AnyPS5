@@ -53,6 +53,10 @@ struct ImageMirror {
     // Identity for the life of this mirror (see ImageMirrorSerial); the top bit keeps mirror serials
     // apart from host import serials.
     std::uint64_t serial = 0;
+    // APS5_VRAM_MIRROR: a heap mirror of a selected range (see vramMirrorSelected), and the newest
+    // collect epoch a refresh of it ran in (0: none yet), by which later builds skip theirs.
+    bool selected = false;
+    std::uint64_t refreshedEpoch = 0;
 };
 
 // The address space. An address-based build maps every readable registered range; building that
@@ -519,6 +523,9 @@ struct ImageMirrors {
     VkDevice device = VK_NULL_HANDLE;
     std::map<std::uint64_t, std::shared_ptr<ImageMirror>> entries;
     std::set<std::uint64_t> failed;
+    // APS5_VRAM_MIRROR: bases whose selected mirror the device or the heap budget refused; their
+    // ranges keep the import (and, without one, the ordinary heap mirror, which `failed` would stop).
+    std::set<std::uint64_t> selectedRefused;
     std::uint64_t heapBytes = 0;
     // APS5_PROFILE_DRAW counters, reported every 10 s as [buffers] image mirrors.
     std::uint64_t builds = 0;
@@ -589,6 +596,93 @@ std::uint64_t heapMirrorBudget() {
     std::fprintf(stderr, "FATAL: heap mirror of 0x%llx+0x%llx: %s; heap mirrors hold %llu MiB of %llu MiB (APS5_HEAP_MIRROR_MIB)\n", static_cast<unsigned long long>(range.address), static_cast<unsigned long long>(range.bytes), reason, static_cast<unsigned long long>(held >> 20u), static_cast<unsigned long long>(heapMirrorBudget() >> 20u));
     std::fflush(stderr);
     std::abort();
+}
+
+// Selected mirrors (local experiment, not for upstream). Address-based shaders read the registered
+// heaps in place through their host imports: system memory, across PCIe on every load.
+// APS5_VRAM_MIRROR=<address>[,<address>...] (hexadecimal, 0x optional) serves each releasable
+// registered range containing a listed address to address-based builds from a heap mirror made in
+// mappable video memory instead (VideoMemoryProperties: system memory when the device refuses,
+// whatever APS5_VRAM_BUFFERS says). Every other range keeps its import, and so does every other
+// path to a selected range (descriptor-only builds, GPU-direct stores and labels: HostImportFor
+// still makes the import on demand); a range whose mirror is refused takes its import in the
+// address space too. The table entry of a mirrored range is read-only, so a store through a
+// pointer into it faults (BdaResources::CheckFault).
+// Every build refreshes a heap mirror, cache hit or not (refreshHeapMirrors). A selected one is
+// refreshed by the first build of a collect epoch only (GuestMemory::CollectEpoch): a CPU write
+// landing later in the epoch is seen by the next one, as the collect memo already orders it, but
+// so are the driver's own stores and the GPU's writes into the range made later in that epoch,
+// which a per-build refresh picks up. APS5_VRAM_MIRROR_REFRESH_EVERY_BUILD=1 restores the
+// per-build refresh. APS5_VRAM_MIRROR_NO_FLUSH=1 skips the refresh's flush of GPU results pending
+// in the range and its wait for recorded work writing it (prepareRange), as a heap imported in
+// place is exempt from the flush (UploadFinish): a block the GPU has yet to write is then copied
+// early and stays stale until its next stamp. The [vram-mirror] line gives the cost every 10 s
+// (cumulative counts).
+const std::vector<std::uint64_t>& vramMirrorAddresses() {
+    static const std::vector<std::uint64_t> addresses = [] {
+        std::vector<std::uint64_t> parsed;
+        const char* text = std::getenv("APS5_VRAM_MIRROR");
+        while (text != nullptr && *text != '\0') {
+            char* end = nullptr;
+            const auto address = std::strtoull(text, &end, 16);
+            if (end == text || (*end != ',' && *end != '\0')) throw std::runtime_error(std::string("APS5_VRAM_MIRROR: expected comma-separated hexadecimal addresses at '") + text + "'");
+            parsed.push_back(address);
+            text = *end == ',' ? end + 1 : end;
+        }
+        return parsed;
+    }();
+    return addresses;
+}
+
+bool vramMirrorSelected(const GuestAllocations::Range& range) {
+    if (!range.releasable) return false;
+    for (const auto address : vramMirrorAddresses()) {
+        if (address >= range.address && address - range.address < range.bytes) return true;
+    }
+    return false;
+}
+
+bool vramMirrorEveryBuild() {
+    static const bool every = std::getenv("APS5_VRAM_MIRROR_REFRESH_EVERY_BUILD") != nullptr;
+    return every;
+}
+
+bool vramMirrorNoFlush() {
+    static const bool skipped = std::getenv("APS5_VRAM_MIRROR_NO_FLUSH") != nullptr;
+    return skipped;
+}
+
+// The [vram-mirror] counters: refreshes of selected mirrors (one per mirror and refreshing build)
+// with the time of their preparation, collect and block scan, the 64 KiB blocks they copied, the
+// builds that skipped a refresh by the epoch, the refreshes that waited for recorded work, the
+// mirrors made (a first fill of the whole range each) and the times one was refused.
+struct VramMirrorStats {
+    std::atomic<std::uint64_t> refreshes{0};
+    std::atomic<std::uint64_t> refreshNs{0};
+    std::atomic<std::uint64_t> blocksCopied{0};
+    std::atomic<std::uint64_t> bytesCopied{0};
+    std::atomic<std::uint64_t> epochSkips{0};
+    std::atomic<std::uint64_t> syncs{0};
+    std::atomic<std::uint64_t> rebuilds{0};
+    std::atomic<std::uint64_t> refusals{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+VramMirrorStats& VramMirrors() {
+    static VramMirrorStats stats;
+    return stats;
+}
+
+// Whether this build refreshes the heap mirror: always, but for a selected one whose last refresh
+// ran in an epoch at least as new as the calling thread's. Epochs are ordered across threads, so
+// a refresh another worker made after this thread's epoch began serves this thread too; a thread
+// without an epoch (no ordering point) always refreshes.
+bool heapRefreshDue(const ImageMirror& mirror) {
+    if (!mirror.selected || vramMirrorEveryBuild()) return true;
+    const auto epoch = GuestMemory::CollectEpoch();
+    if (epoch == 0 || mirror.refreshedEpoch < epoch) return true;
+    VramMirrors().epochSkips.fetch_add(1, std::memory_order_relaxed);
+    return false;
 }
 
 bool sameRange(const std::weak_ptr<const GuestAllocations::Range>& mirrored, const std::shared_ptr<const GuestAllocations::Range>& range) {
@@ -715,22 +809,29 @@ private:
 // completes first, so its results reach the guest and the shadow before the compare and no batch
 // writes a block being replaced; GPU reads of the mirror by earlier recorded work (an address-based
 // dispatch whose lease is released at completion) see the newer bytes, as they would on hardware.
-void prepareRange(std::uint64_t address, std::uint64_t bytes) {
+// Returns whether it waited for recorded work. Without `flush` (APS5_VRAM_MIRROR_NO_FLUSH, selected
+// mirrors only) neither the flush nor the wait is made.
+bool prepareRange(std::uint64_t address, std::uint64_t bytes, bool flush = true) {
     // The compare reads the pages directly; a mirror is only reused while its Range exists, but a
     // lease of a build in flight can keep a replaced Range alive past a protection change.
     Require(GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
-    // Named for the [hooksync] attribution: the flush goes through the hook, which waits when
-    // recorded work notes a write inside the range (a descriptor written inside a writable exe
-    // range; the lease itself maps the range read-only). The access is the whole range.
-    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
-    GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
     auto& state = Mirrors();
-    if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes))) {
-        Recorder::CountSync(4);
-        ++state.syncs;
-        recorder->Sync();
+    bool synced = false;
+    if (flush) {
+        // Named for the [hooksync] attribution: the flush goes through the hook, which waits when
+        // recorded work notes a write inside the range (a descriptor written inside a writable exe
+        // range; the lease itself maps the range read-only). The access is the whole range.
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
+        GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes))) {
+            Recorder::CountSync(4);
+            ++state.syncs;
+            recorder->Sync();
+            synced = true;
+        }
     }
     ++state.refreshes;
+    return synced;
 }
 
 bool prepareRefresh(ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes) {
@@ -771,13 +872,19 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
     std::sort(mirrors.begin(), mirrors.end(), [](const ImageMirror* left, const ImageMirror* right) { return left->base < right->base; });
     thread_local std::vector<std::uint8_t> changed;
     for (std::size_t first = 0; first < mirrors.size();) {
+        // Adjacent mirrors are prepared and collected as one range; a selected mirror (see
+        // vramMirrorSelected) only with selected ones, whose preparation may differ.
+        const bool selected = mirrors[first]->selected;
         auto last = first + 1;
-        while (last < mirrors.size() && mirrors[last]->base == mirrors[last - 1]->base + mirrors[last - 1]->bytes) ++last;
+        while (last < mirrors.size() && mirrors[last]->base == mirrors[last - 1]->base + mirrors[last - 1]->bytes && mirrors[last]->selected == selected) ++last;
         const auto begin = mirrors[first]->base;
         const auto bytes = mirrors[last - 1]->base + mirrors[last - 1]->bytes - begin;
-        prepareRange(begin, bytes);
+        const auto started = selected ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool synced = prepareRange(begin, bytes, !(selected && vramMirrorNoFlush()));
         const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes));
         Require(generation != 0, "a heap mirror's range is no longer write-watched");
+        std::uint64_t copiedBlocks = 0;
+        std::uint64_t copiedBytes = 0;
         for (auto index = first; index < last; ++index) {
             auto& mirror = *mirrors[index];
             changed.assign(mirror.generations.size(), 0);
@@ -790,8 +897,22 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
                 const auto from = std::max(mirror.base, aligned + at * block);
                 blocks.push_back({&mirror, from, static_cast<std::size_t>(std::min(end, aligned + (at + 1) * block) - from), generation});
                 refilled = true;
+                ++copiedBlocks;
+                copiedBytes += blocks.back().length;
             }
             if (refilled) ++Mirrors().heapRefills;
+            // The epoch this refresh serves (heapRefreshDue): the collect above saw every CPU write
+            // made before the calling thread's epoch began.
+            if (selected) mirror.refreshedEpoch = std::max(mirror.refreshedEpoch, GuestMemory::CollectEpoch());
+        }
+        if (selected) {
+            // A changed block of a heap mirror is always copied (compareBlock), by the caller's compare.
+            auto& stats = VramMirrors();
+            stats.refreshes.fetch_add(last - first, std::memory_order_relaxed);
+            stats.refreshNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+            stats.blocksCopied.fetch_add(copiedBlocks, std::memory_order_relaxed);
+            stats.bytesCopied.fetch_add(copiedBytes, std::memory_order_relaxed);
+            if (synced) stats.syncs.fetch_add(1, std::memory_order_relaxed);
         }
         first = last;
     }
@@ -800,7 +921,7 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
 // The mirror for a leased image range: the existing one, or a new one when none exists or the
 // registered Range object changed (a protection change). Null when the range cannot be mirrored. An
 // existing writable mirror's blocks are appended to `blocks` for the caller's one compare of every
-std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::shared_ptr<const GuestAllocations::Range>& range, std::vector<RefreshBlock>& blocks, bool heap) {
+std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::shared_ptr<const GuestAllocations::Range>& range, std::vector<RefreshBlock>& blocks, bool heap, bool selected = false) {
     auto& state = Mirrors();
     std::shared_ptr<ImageMirror> mirror;
     {
@@ -808,24 +929,39 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         if (state.device != context.device) {
             state.entries.clear();
             state.failed.clear();
+            state.selectedRefused.clear();
             state.heapBytes = 0;
             state.device = context.device;
         }
-        if (state.failed.contains(range->address)) return nullptr;
+        if (state.failed.contains(range->address) || (selected && state.selectedRefused.contains(range->address))) return nullptr;
         const auto found = state.entries.find(range->address);
-        if (found != state.entries.end() && sameRange(found->second->range, range) && found->second->bytes == range->bytes && found->second->writable == range->writable && found->second->heap == heap) mirror = found->second;
+        if (found != state.entries.end() && sameRange(found->second->range, range) && found->second->bytes == range->bytes && found->second->writable == range->writable && found->second->heap == heap && found->second->selected == selected) mirror = found->second;
     }
     if (mirror != nullptr) {
         if (!heap && prepareRefresh(*mirror, range->address, range->bytes)) appendBlocks(blocks, *mirror, range->address, range->bytes);
         return mirror;
     }
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range->address), range->bytes, range->writable && !heap)) return nullptr;
+    // APS5_VRAM_MIRROR: a selected mirror (a heap mirror asked for in video memory, see
+    // vramMirrorSelected) that cannot be made is no error, whatever the reason: null, remembered
+    // (under the registry mutex), and the caller serves the range as it would unselected.
+    const auto refuseSelected = [&](const char* reason) {
+        std::fprintf(stderr, "[vram-mirror] mirror of 0x%llx+0x%llx refused: %s; the range keeps its import\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes), reason);
+        state.selectedRefused.insert(range->address);
+    };
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range->address), range->bytes, range->writable && !heap)) {
+        if (selected) {
+            std::lock_guard lock(state.mutex);
+            refuseSelected("unreadable pages");
+        }
+        return nullptr;
+    }
     mirror = std::make_shared<ImageMirror>();
     mirror->base = range->address;
     mirror->bytes = range->bytes;
     mirror->writable = range->writable;
     mirror->heap = heap;
     mirror->range = range;
+    mirror->selected = selected;
     if (heap) {
         prepareRefresh(*mirror, range->address, range->bytes);
         const auto generation = GuestMemory::CollectWrites(range->address, range->bytes);
@@ -834,15 +970,25 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         std::lock_guard lock(state.mutex);
         if (generation == 0) {
             ++state.heapUnwatched;
+            if (selected) refuseSelected("outside the write-watched arena");
             return nullptr;
         }
         std::uint64_t held = state.heapBytes;
         if (const auto found = state.entries.find(range->address); found != state.entries.end() && found->second->heap) held -= found->second->bytes;
-        if (held + range->bytes > heapMirrorBudget()) heapMirrorFatal(*range, held, "past the budget");
+        if (held + range->bytes > heapMirrorBudget()) {
+            if (!selected) heapMirrorFatal(*range, held, "past the budget");
+            refuseSelected("past APS5_HEAP_MIRROR_MIB");
+            return nullptr;
+        }
     }
     try {
-        mirror->buffer = std::make_shared<Buffer>(context, range->bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, GpuReadProperties(GpuReadKind::Mirror));
+        mirror->buffer = std::make_shared<Buffer>(context, range->bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, selected ? VideoMemoryProperties() : GpuReadProperties(GpuReadKind::Mirror));
     } catch (const std::runtime_error& error) {
+        if (selected) {
+            std::lock_guard lock(state.mutex);
+            refuseSelected(error.what());
+            return nullptr;
+        }
         if (heap) heapMirrorFatal(*range, state.heapBytes, error.what());
         std::fprintf(stderr, "[gpu] image mirror of 0x%llx+0x%llx failed: %s; falling back to copies\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes), error.what());
         std::lock_guard lock(state.mutex);
@@ -858,6 +1004,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     if (range->writable && !heap) mirror->shadow.assign(mirror->buffer->Bytes().begin(), mirror->buffer->Bytes().end());
     std::lock_guard lock(state.mutex);
     ++state.rebuilds;
+    if (selected) VramMirrors().rebuilds.fetch_add(1, std::memory_order_relaxed);
     mirror->serial = (1ull << 63u) | ++state.serials;
     // A replaced mirror lives on in the regions of recorded work that bound it.
     if (const auto found = state.entries.find(range->address); found != state.entries.end() && found->second->heap) state.heapBytes -= found->second->bytes;
@@ -915,6 +1062,31 @@ void reportMirrors() {
         heapBytes = state.heapBytes;
     }
     std::fprintf(stderr, "[buffers] image mirrors: %zu ranges (%.1f MiB, %zu writable, %zu heap %.1f MiB), %llu address-based builds served, %llu descriptor sub-ranges bound, %llu rebuilds, %llu refreshes: %llu blocks compared, %llu copied, %llu refresh syncs; heap refills %llu, unwatched heaps %llu\n", count, bytes / 1048576.0, writable, heaps, heapBytes / 1048576.0, static_cast<unsigned long long>(state.builds), static_cast<unsigned long long>(state.subranges), static_cast<unsigned long long>(state.rebuilds), static_cast<unsigned long long>(state.refreshes), static_cast<unsigned long long>(state.blocksCompared), static_cast<unsigned long long>(state.blocksCopied), static_cast<unsigned long long>(state.syncs), static_cast<unsigned long long>(state.heapRefills), static_cast<unsigned long long>(state.heapUnwatched));
+}
+
+// APS5_VRAM_MIRROR: the selected mirrors and what they cost so far, every 10 s (see
+// VramMirrorStats). 'In video memory' is the memory type the buffer was allocated from; whether
+// the system later demoted it to shared memory is not visible here.
+void reportVramMirrors() {
+    if (vramMirrorAddresses().empty()) return;
+    auto& stats = VramMirrors();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = stats.lastReport.load(std::memory_order_relaxed);
+    if (nowMs - last < 10000 || !stats.lastReport.compare_exchange_strong(last, nowMs)) return;
+    std::size_t ranges = 0;
+    std::uint64_t videoBytes = 0;
+    std::uint64_t systemBytes = 0;
+    {
+        auto& state = Mirrors();
+        std::lock_guard lock(state.mutex);
+        for (const auto& [base, mirror] : state.entries) {
+            if (!mirror->selected) continue;
+            ++ranges;
+            (mirror->buffer->InVideoMemory() ? videoBytes : systemBytes) += mirror->bytes;
+        }
+    }
+    const auto count = [](const std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.load(std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[vram-mirror] %zu ranges selected for %zu addresses: %.1f MiB in video memory, %.1f MiB fell back to system memory, a refused mirror left to its import %llu times; %llu refreshes (%.1f ms before the copies): %llu blocks copied (%.1f MiB), %llu refreshes skipped by the epoch, %llu refresh syncs, %llu mirror rebuilds%s%s\n", ranges, vramMirrorAddresses().size(), videoBytes / 1048576.0, systemBytes / 1048576.0, count(stats.refusals), count(stats.refreshes), stats.refreshNs.load(std::memory_order_relaxed) / 1e6, count(stats.blocksCopied), stats.bytesCopied.load(std::memory_order_relaxed) / 1048576.0, count(stats.epochSkips), count(stats.syncs), count(stats.rebuilds), vramMirrorEveryBuild() ? "; refreshed by every build" : "", vramMirrorNoFlush() ? "; no flush before a refresh" : "");
 }
 
 // Deferred lease release. The lease an address-based build takes (AcquireRegistered) is dropped by its
@@ -1318,7 +1490,10 @@ void GuestBufferMemory::AcquireRegistered() {
             for (const auto& region : space->base) {
                 if (region.mirror == nullptr) continue;
                 mirrored = true;
-                if (region.mirror->heap) heaps.push_back(region.mirror.get());
+                // A selected heap mirror (APS5_VRAM_MIRROR) only once per collect epoch.
+                if (region.mirror->heap) {
+                    if (heapRefreshDue(*region.mirror)) heaps.push_back(region.mirror.get());
+                }
                 else if (region.mirror->writable && prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
             }
             lap(timing.mirrorsUs, at);
@@ -1348,6 +1523,20 @@ void GuestBufferMemory::AcquireRegistered() {
             if (!range->readable) continue;
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
+            // APS5_VRAM_MIRROR: a selected range is served by its mirror in video memory rather
+            // than by its import; one whose mirror is refused takes the path below as before, so
+            // it keeps the import (never the copies a refused mirror alone would mean).
+            if (mirrorsEnabled() && vramMirrorSelected(*range)) {
+                region.mirror = acquireMirror(context, range, blocks, true, true);
+                lap(timing.mirrorsUs, at);
+                if (region.mirror != nullptr) {
+                    mirrored = true;
+                    if (heapRefreshDue(*region.mirror)) heaps.push_back(region.mirror.get());
+                    regions.push_back(std::move(region));
+                    continue;
+                }
+                VramMirrors().refusals.fetch_add(1, std::memory_order_relaxed);
+            }
             const HostImport* entry = nullptr;
             if (importable) {
                 auto& state = Imports();
@@ -1391,6 +1580,36 @@ void GuestBufferMemory::AcquireRegistered() {
             std::fprintf(stderr, "FATAL: %s\n", overflow.c_str());
             std::fflush(stderr);
             std::abort();
+        }
+        // APS5_TRACE_ADDRESS_SPACE=<MiB> (local experiment): the map this rebuild made, at most
+        // every 10 s: the readable registered ranges by how address-based builds are served them,
+        // then each one of at least <MiB> MiB (0 lists them all) with its size, access and kind
+        // (a releasable heap or a range of the image).
+        static const char* const traceSpace = std::getenv("APS5_TRACE_ADDRESS_SPACE");
+        if (traceSpace != nullptr) {
+            static const std::uint64_t listedBytes = std::strtoull(traceSpace, nullptr, 10) << 20u;
+            static std::atomic<std::int64_t> lastTrace{0};
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            auto last = lastTrace.load(std::memory_order_relaxed);
+            if (nowMs - last >= 10000 && lastTrace.compare_exchange_strong(last, nowMs)) {
+                struct Served {
+                    std::size_t ranges = 0;
+                    std::uint64_t bytes = 0;
+                } imported, mirroredRanges, copied;
+                for (const auto& region : regions) {
+                    auto& served = region.direct != nullptr ? imported : region.mirror != nullptr ? mirroredRanges : copied;
+                    ++served.ranges;
+                    served.bytes += region.end - region.begin;
+                }
+                std::fprintf(stderr, "[space] generation %llu: %zu readable ranges: %zu imported (%.1f MiB), %zu mirrored (%.1f MiB), %zu copied (%.1f MiB); those of at least %llu MiB:\n", static_cast<unsigned long long>(generation), regions.size(), imported.ranges, imported.bytes / 1048576.0, mirroredRanges.ranges, mirroredRanges.bytes / 1048576.0, copied.ranges, copied.bytes / 1048576.0, static_cast<unsigned long long>(listedBytes >> 20u));
+                for (const auto& region : regions) {
+                    const auto bytes = region.end - region.begin;
+                    if (bytes < listedBytes) continue;
+                    const auto* range = leasedRangeAt(lease, region.begin);
+                    const char* served = region.direct != nullptr ? "import" : region.mirror == nullptr ? "copied" : region.mirror->selected ? (region.mirror->buffer->InVideoMemory() ? "selected mirror in video memory" : "selected mirror in system memory") : region.mirror->heap ? "heap mirror" : region.mirror->writable ? "image mirror with a shadow" : "image mirror";
+                    std::fprintf(stderr, "[space]   0x%llx+0x%llx (%.1f MiB) %s %s: %s\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(bytes), bytes / 1048576.0, region.writable ? "rw" : "r-", range != nullptr && range->releasable ? "heap" : "image", served);
+                }
+            }
         }
         lap(timing.importsUs, at);
         if (addressSpaceCacheEnabled()) {
@@ -1450,6 +1669,7 @@ void GuestBufferMemory::AcquireRegistered() {
         if (mirrored) ++Mirrors().builds;
         sweepMirrors();
         reportMirrors();
+        reportVramMirrors();
     }
 }
 
