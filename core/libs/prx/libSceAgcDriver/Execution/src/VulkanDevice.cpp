@@ -40,6 +40,7 @@
 #include <deque>
 #include <limits>
 #include <list>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -3297,6 +3298,26 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recordStep(PhaseRecordDataRefresh);
     }
     using CommandClass = Graphics::Recorder::CommandClass;
+    // APS5_DISPATCH_SNAPSHOTS: this use's own set, with read-only elements bound to copies in
+    // video memory (ShaderResources::PrepareDispatchBindings); copies it recorded become visible
+    // through the leading barrier below, which is then not skipped.
+    bool snapshotCopies = false;
+    const auto snapshotBindings = Graphics::ShaderResources::DispatchSnapshotsEnabled() ? resources.PrepareDispatchBindings(recorder, commands, snapshotCopies) : nullptr;
+    if (snapshotCopies) covered = 0;
+    // APS5_PROFILE_GPU: once per program (the [gputime] key), what it reads and writes and where.
+    if (Graphics::Recorder::GpuTimingEnabled()) {
+        static std::set<std::uint64_t> described;
+        const auto key = record.programAddress != 0 ? record.programAddress : record.shader->program->variantId;
+        if (described.size() < 4096 && described.insert(key).second) {
+            std::size_t written = 0;
+            std::size_t atomic = 0;
+            for (const auto& binding : record.shader->program->bindings) {
+                written += static_cast<std::size_t>(std::count(binding.bufferWritten.begin(), binding.bufferWritten.end(), true));
+                atomic += static_cast<std::size_t>(std::count(binding.bufferAtomic.begin(), binding.bufferAtomic.end(), true));
+            }
+            std::fprintf(stderr, "[dispatch-res] 0x%llx: program 0x%llx; address-based %d, stores by address %d, written elements %zu, atomic elements %zu;%s;%.1500s\n", static_cast<unsigned long long>(key), static_cast<unsigned long long>(record.programAddress), resources.UsesBda() ? 1 : 0, resources.BdaWrites() ? 1 : 0, written, atomic, resources.DescribePlacements().c_str(), resources.Describe().c_str());
+        }
+    }
     if (Graphics::Recorder::BarrierValidate()) {
         if (argumentImport != nullptr) {
             const std::pair<std::uint64_t, std::uint64_t> argumentRange{arguments, arguments + 12};
@@ -3328,7 +3349,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         ++d.preBarriersRecorded;
     }
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
-    resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+    if (snapshotBindings != nullptr) {
+        const auto set = snapshotBindings->allocation.set;
+        context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &set, 0, nullptr);
+    } else {
+        resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+    }
     if (record.pushStages != 0) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes, record.pushBytes->data());
     }

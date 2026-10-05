@@ -3471,6 +3471,271 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
+namespace {
+
+// APS5_DISPATCH_SNAPSHOTS (local experiment, not for upstream): a recorded dispatch binds copies of
+// its read-only guest buffer elements instead of the imports they are bound in place in (a
+// scattered shader read of imported system memory costs ~5.7 ns on the RTX 5080 against ~0.1 ns
+// from video memory). =1: the snapshot cache draws use (Recorder::ReusableDrawSnapshot): a range
+// with no GPU write or image result pending is copied by the CPU into mappable video memory once
+// and reused while the write watch proves it unchanged, changed 64 KiB blocks being patched in.
+// =2: also the ranges recorded work still writes (the previous dispatch's output), which no CPU
+// copy can serve: a vkCmdCopyBuffer out of the import into a device-local buffer, recorded right
+// before the dispatch, per use. From APS5_DISPATCH_SNAPSHOTS_MIN_KIB (0) up to
+// APS5_DISPATCH_SNAPSHOTS_MAX_KIB (16384) per element. A build that stores by address
+// (GPU-selected V#s) takes none: its stores could land in a range it also reads.
+struct DispatchSnapshotWindow {
+    int mode;
+    std::size_t floor;
+    std::size_t limit;
+};
+
+const DispatchSnapshotWindow& DispatchSnapshots() {
+    static const DispatchSnapshotWindow window = [] {
+        const auto kib = [](const char* name, unsigned long long fallback) {
+            const char* value = std::getenv(name);
+            return static_cast<std::size_t>(value != nullptr ? std::strtoull(value, nullptr, 10) : fallback) << 10u;
+        };
+        const char* mode = std::getenv("APS5_DISPATCH_SNAPSHOTS");
+        return DispatchSnapshotWindow{mode == nullptr ? 0 : mode[0] == '2' ? 2 : 1, kib("APS5_DISPATCH_SNAPSHOTS_MIN_KIB", 0), kib("APS5_DISPATCH_SNAPSHOTS_MAX_KIB", 16384)};
+    }();
+    return window;
+}
+
+// The [dispatch-snap] line, every 10 s. Under GuestMemory::GpuMutex (plain counters).
+enum class DispatchRefusal : std::size_t { UnderWindow, OverWindow, PendingWrite, PendingImage, OutsideImport, Unwatched, AddressStores, NoBuffer, Count };
+
+struct DispatchSnapshotStats {
+    std::uint64_t dispatches = 0;
+    std::uint64_t served = 0;
+    std::uint64_t bound = 0;
+    std::uint64_t video = 0;
+    std::uint64_t reused = 0;
+    std::uint64_t cpuCopies = 0;
+    std::uint64_t cpuBytes = 0;
+    std::uint64_t gpuCopies = 0;
+    std::uint64_t gpuBytes = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(DispatchRefusal::Count)> inPlace{};
+};
+
+void reportDispatchSnapshots(DispatchSnapshotStats& stats) {
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    const auto seconds = std::chrono::duration<double>(now - last).count();
+    last = now;
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    const auto left = [&](DispatchRefusal reason) { return count(stats.inPlace[static_cast<std::size_t>(reason)]); };
+    std::fprintf(stderr, "[dispatch-snap] %.1f s: %llu dispatches, %llu bound a set with copies; read-only elements bound to a copy: %llu (%llu in video memory): %llu reused, %llu copied by the CPU (%.1f MiB), %llu copied by the GPU (%.1f MiB); left in place: %llu under the size window, %llu over it, %llu GPU write pending, %llu image result pending, %llu not in an import bound in place, %llu not write-watched, %llu in a build that stores by address, %llu without a buffer\n", seconds, count(stats.dispatches), count(stats.served), count(stats.bound), count(stats.video), count(stats.reused), count(stats.cpuCopies), stats.cpuBytes / 1048576.0, count(stats.gpuCopies), stats.gpuBytes / 1048576.0, left(DispatchRefusal::UnderWindow), left(DispatchRefusal::OverWindow), left(DispatchRefusal::PendingWrite), left(DispatchRefusal::PendingImage), left(DispatchRefusal::OutsideImport), left(DispatchRefusal::Unwatched), left(DispatchRefusal::AddressStores), left(DispatchRefusal::NoBuffer));
+    stats = {};
+}
+
+}
+
+bool ShaderResources::DispatchSnapshotsEnabled() {
+    return DispatchSnapshots().mode != 0;
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDispatchBindings(Recorder& recorder, VkCommandBuffer commands, bool& copiedOnGpu) const {
+    copiedOnGpu = false;
+    const auto& window = DispatchSnapshots();
+    if (window.mode == 0 || _set == VK_NULL_HANDLE) return {};
+    static DispatchSnapshotStats stats;
+    ++stats.dispatches;
+    const auto leave = [&](DispatchRefusal reason) { ++stats.inPlace[static_cast<std::size_t>(reason)]; };
+    auto result = std::make_shared<DrawBindings>();
+    thread_local std::vector<std::size_t> selected;
+    thread_local std::vector<VkDescriptorBufferInfo> infos;
+    // The import ranges the GPU copies: source, then the snapshot's index in `result->snapshots`.
+    thread_local std::vector<std::pair<VkDescriptorBufferInfo, std::size_t>> gpuCopies;
+    selected.clear();
+    infos.clear();
+    gpuCopies.clear();
+    const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        if (!item.guest || item.written) continue;
+        const auto begin = item.address - item.adjustment;
+        const auto bytes = item.size + item.adjustment;
+        if (guestMemory.WritesOverlap(begin, bytes)) continue;
+        if (bdaWrites) {
+            leave(DispatchRefusal::AddressStores);
+            continue;
+        }
+        if (bytes < window.floor) {
+            leave(DispatchRefusal::UnderWindow);
+            continue;
+        }
+        if (bytes > window.limit) {
+            leave(DispatchRefusal::OverWindow);
+            continue;
+        }
+        if (!guestMemory.BoundInPlace(begin, bytes)) {
+            leave(DispatchRefusal::OutsideImport);
+            continue;
+        }
+        // An image result still to be stored into the range is not in the import yet: in place,
+        // as before (the build's flush left it pending only when it could not be stored).
+        if (PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) {
+            leave(DispatchRefusal::PendingImage);
+            continue;
+        }
+        std::shared_ptr<Buffer> buffer;
+        if (recorder.PendingWriteOverlaps(begin, bytes)) {
+            // Recorded work still writes the range, in queue order before this dispatch: only a
+            // copy recorded here, after it, holds what the dispatch would read in place.
+            if (window.mode < 2) {
+                leave(DispatchRefusal::PendingWrite);
+                continue;
+            }
+            std::uint32_t adjustment = 0;
+            const auto source = guestMemory.SharedDescriptor(item.address, item.size, adjustment);
+            if (!source.has_value() || adjustment != item.adjustment) {
+                leave(DispatchRefusal::OutsideImport);
+                continue;
+            }
+            try {
+                buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            } catch (const std::exception&) {
+                leave(DispatchRefusal::NoBuffer);
+                continue;
+            }
+            gpuCopies.emplace_back(*source, result->snapshots.size());
+            ++stats.gpuCopies;
+            stats.gpuBytes += bytes;
+            ++stats.video;
+        } else {
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) {
+                leave(DispatchRefusal::OutsideImport);
+                continue;
+            }
+            // Collected before the lookup and before a copy, as addressSnapshot does: the reuse
+            // check then sees every CPU store so far, and a store made during the copy is stamped
+            // newer by the next walk. A range outside the write watch could never be reused.
+            const auto generation = GuestMemory::CollectWrites(begin, bytes);
+            if (generation == 0) {
+                leave(DispatchRefusal::Unwatched);
+                continue;
+            }
+            buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+            if (buffer != nullptr) {
+                ++stats.reused;
+            } else {
+                // Mappable video memory whatever APS5_VRAM_BUFFERS says (system memory when the
+                // device has none); a snapshot there keeps its bytes in system memory too, for
+                // the cache's compares.
+                try {
+                    buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                } catch (const std::exception&) {
+                    leave(DispatchRefusal::NoBuffer);
+                    continue;
+                }
+                std::vector<std::byte> shadow;
+                if (buffer->InVideoMemory()) {
+                    shadow.assign(reinterpret_cast<const std::byte*>(begin), reinterpret_cast<const std::byte*>(begin) + bytes);
+                    std::memcpy(buffer->Bytes().data(), shadow.data(), bytes);
+                } else {
+                    std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                }
+                recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer, Recorder::SnapshotUse::Storage, 0, std::move(shadow));
+                ++stats.cpuCopies;
+                stats.cpuBytes += bytes;
+            }
+            if (buffer->InVideoMemory()) ++stats.video;
+        }
+        ++stats.bound;
+        selected.push_back(index);
+        infos.push_back({buffer->Handle(), 0, bytes});
+        result->snapshots.push_back({begin, std::move(buffer)});
+    }
+    if (!selected.empty()) ++stats.served;
+    reportDispatchSnapshots(stats);
+    if (selected.empty()) return {};
+    Require(context.descriptorCache != nullptr, "dispatch snapshots require a descriptor cache");
+    if (drawBindingSizes.empty()) {
+        std::map<VkDescriptorType, std::uint32_t> counts;
+        for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
+        for (const auto& [type, count] : counts) drawBindingSizes.push_back({type, count});
+    }
+    result->cache = context.descriptorCache;
+    result->allocation = result->cache->Allocate(_layout, drawBindingSizes);
+    Require(result->allocation.set != VK_NULL_HANDLE, "dispatch snapshot descriptor allocation failed");
+    // The build's set, copied, with the selected elements rebound (as PrepareDrawBindings does).
+    thread_local std::vector<VkCopyDescriptorSet> copies;
+    copies.clear();
+    for (const auto& binding : bindings) {
+        VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+        copy.srcSet = _set;
+        copy.srcBinding = binding.layout.binding;
+        copy.dstSet = result->allocation.set;
+        copy.dstBinding = binding.layout.binding;
+        copy.descriptorCount = binding.layout.descriptorCount;
+        copies.push_back(copy);
+    }
+    const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
+    update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
+    thread_local std::vector<VkWriteDescriptorSet> writes;
+    writes.clear();
+    for (const auto& binding : bindings) {
+        for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+            const auto found = std::find(selected.begin(), selected.end(), binding.allocations[element]);
+            if (found == selected.end()) continue;
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.dstSet = result->allocation.set;
+            write.dstBinding = binding.layout.binding;
+            write.dstArrayElement = static_cast<std::uint32_t>(element);
+            write.descriptorCount = 1;
+            write.descriptorType = binding.layout.descriptorType;
+            write.pBufferInfo = &infos[static_cast<std::size_t>(found - selected.begin())];
+            writes.push_back(write);
+        }
+    }
+    update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    if (!gpuCopies.empty()) {
+        // After every write recorded so far (the leading barrier), before the dispatch, whose own
+        // leading barrier (transfer writes to compute reads, forced by `copiedOnGpu`) makes the
+        // copies visible to it. The imports are live, or retired ones this batch already keeps.
+        const auto timing = recorder.BeginGpuTiming(Recorder::CommandClass::DispatchSnapshot);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::DispatchSnapshot);
+        std::uint64_t copiedBytes = 0;
+        for (const auto& [source, snapshot] : gpuCopies) {
+            CopyBuffer(context, commands, source.buffer, source.offset, result->snapshots[snapshot].buffer->Handle(), 0, source.range);
+            copiedBytes += source.range;
+        }
+        recorder.EndGpuTiming(timing, copiedBytes);
+        copiedOnGpu = true;
+    }
+    recorder.Keep(result);
+    return result;
+}
+
+std::string ShaderResources::DescribePlacements() const {
+    using Placement = GuestBufferMemory::Placement;
+    static constexpr std::array<const char*, static_cast<std::size_t>(Placement::Count)> names{"staged device-local", "in place (read-only)", "in place (address-based)", "in place (outside the staging window)", "in place (not stageable)", "copied by the GPU (misaligned)", "mirror", "copied by the CPU (outside an import)", "unbound"};
+    std::array<std::size_t, static_cast<std::size_t>(Placement::Count)> counts{};
+    std::string elements;
+    std::size_t listed = 0;
+    for (const auto& item : allocations) {
+        if (!item.guest) continue;
+        const auto placement = static_cast<std::size_t>(guestMemory.PlacementOf(item.address, item.size, usesBda));
+        ++counts[placement];
+        if (listed++ >= 16) continue;
+        char text[128];
+        std::snprintf(text, sizeof(text), " 0x%llx+0x%zx %s: %s;", static_cast<unsigned long long>(item.address), item.size, item.written ? "written" : "read-only", names[placement]);
+        elements += text;
+    }
+    std::string text = " elements:";
+    for (std::size_t placement = 0; placement < counts.size(); ++placement) {
+        if (counts[placement] == 0) continue;
+        char entry[96];
+        std::snprintf(entry, sizeof(entry), " %zu %s,", counts[placement], names[placement]);
+        text += entry;
+    }
+    if (listed == 0) text += " none";
+    return text + elements;
+}
+
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
     if (_set == VK_NULL_HANDLE) return;
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);

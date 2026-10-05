@@ -3098,6 +3098,21 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     return result;
 }
 
+GuestBufferMemory::Placement GuestBufferMemory::PlacementOf(std::uint64_t address, std::size_t bytes, bool addressable) const {
+    if (!uploaded || committed || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return Placement::Unbound;
+    const auto* found = owner(address);
+    if (found == nullptr || address < found->begin || address + bytes > found->end) return Placement::Unbound;
+    const auto& region = *found;
+    if (region.gpuCopy) return region.deviceLocal ? Placement::Staged : Placement::GpuCopy;
+    if (region.mirror != nullptr) return Placement::Mirror;
+    if (region.direct == nullptr) return Placement::CpuCopy;
+    // Bound in place in an import: why stagingEligible left it there.
+    if (!WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) return Placement::InPlaceReadOnly;
+    if (addressable) return Placement::InPlaceAddressBased;
+    if (!stagingAllowed || region.unstaged || region.sparse || !gpuCopiesEnabled()) return Placement::InPlaceOther;
+    return Placement::InPlaceSizeWindow;
+}
+
 bool GuestBufferMemory::BoundInPlace(std::uint64_t address, std::size_t bytes) const {
     if (!uploaded || committed || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     const auto* found = owner(address);
