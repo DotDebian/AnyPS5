@@ -1365,13 +1365,71 @@ std::uint64_t renderPassKey(const State& state, std::span<const VkImageView> vie
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
-std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
+//
+// The proof is made once per render pass and collect epoch (`memoSlot`: the attachment's index in
+// Draw; DrawWithRecipe passes none). Draw after draw into the same pass repeated the cache lookup
+// and the proof (the storage cache's mutex, two collects, the tracker's stamps of the surface and
+// of its keys, the key proof of materializeRegisterClear) with nothing between them that could
+// change the answer. The image a lookup returned is remembered per thread and attachment with
+// what the proof depends on, and the next draw takes it without a lookup while all of this holds:
+// - the same ColorTarget on the same device, the image still the storage cache's;
+// - the render pass that was open after the lookup is still open (Recorder::OpenPassSerial):
+//   nothing but draws continuing it was recorded since, by any thread (an upload, a clear, a key
+//   store run, a dispatch or a fill ends the pass);
+// - the pending registry did not change (StorageTexture::PendingSerial): no image over this
+//   memory gained results, was flushed or written back;
+// - the thread's collect epoch is the same: within one the lookup's collects are memo hits that
+//   see no new CPU write anyway (GuestMemory::BumpCollectEpoch).
+// What the skipped proof could still have seen is a CPU write another thread's walk stamped inside
+// the epoch; it is seen by the first lookup of the next pass or epoch instead, the order the epoch
+// already allows. A pass thus costs two lookups (the one before its first draw is made under the
+// previous pass's serial). APS5_TARGET_REFRESH_EACH_DRAW=1 makes the lookup for every draw as before.
+struct TargetMemo {
+    VkDevice device = VK_NULL_HANDLE;
+    ColorTarget color{};
+    std::weak_ptr<StorageTexture> resident;
+    std::uint64_t epoch = 0;
+    std::uint64_t pendingSerial = 0;
+    std::uint64_t passSerial = 0;
+};
+constexpr std::size_t NoTargetMemo = static_cast<std::size_t>(-1);
+thread_local std::array<TargetMemo, 8> targetMemos;
+
+bool TargetMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_TARGET_REFRESH_EACH_DRAW") == nullptr;
+    return enabled;
+}
+
+bool sameColorTarget(const ColorTarget& a, const ColorTarget& b) {
+    return a.address == b.address && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.bytes == b.bytes && a.componentMapping == b.componentMapping && a.tileMode == b.tileMode && a.elementBytes == b.elementBytes && a.dccAddress == b.dccAddress && a.dccAlphaOnMsb == b.dccAlphaOnMsb && a.clearWords == b.clearWords && a.surfaceAddress == b.surfaceAddress && a.surfaceExtent.width == b.surfaceExtent.width && a.surfaceExtent.height == b.surfaceExtent.height && a.mipCount == b.mipCount && a.mip == b.mip && a.mipTail == b.mipTail && a.slot == b.slot && a.exportIndex == b.exportIndex && a.depth == b.depth && a.depthSlice == b.depthSlice;
+}
+
+std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup, std::size_t memoSlot = NoTargetMemo) {
+    auto* memo = memoSlot < targetMemos.size() && TargetMemoEnabled() ? &targetMemos[memoSlot] : nullptr;
+    const auto epoch = memo != nullptr ? GuestMemory::ThreadCollectEpoch() : 0;
+    auto* passRecorder = memo != nullptr && epoch != 0 && GuestMemory::GpuMutex().HeldByThisThread() ? Recorder::Active() : nullptr;
+    if (passRecorder != nullptr) {
+        const auto pass = passRecorder->OpenPassSerial();
+        if (pass != 0 && memo->passSerial == pass && memo->epoch == epoch && memo->pendingSerial == StorageTexture::PendingSerial() && memo->device == context.device && sameColorTarget(memo->color, color)) {
+            if (auto remembered = memo->resident.lock(); remembered != nullptr && remembered->Cached()) {
+                // As a proved Refresh notes it: the image is in use at this present.
+                remembered->NoteProved();
+                GuestMemory::CountTrace(GuestMemory::TraceCount::TargetRefreshSkipped);
+                return remembered;
+            }
+        }
+    }
+    if (memo != nullptr) *memo = {};
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::shared_ptr<StorageTexture> resident;
     try {
         resident = lookup();
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
+        GuestMemory::CountTrace(GuestMemory::TraceCount::TargetRefreshMade);
+        // Taken after the lookup: what it recorded itself (an upload, a clear) ended the pass, and
+        // what it flushed moved the registry.
+        if (memo != nullptr && passRecorder != nullptr && resident != nullptr) *memo = {context.device, color, resident, epoch, StorageTexture::PendingSerial(), passRecorder->OpenPassSerial()};
     } catch (const std::exception& error) {
         static std::mutex reportMutex;
         static std::set<std::uint64_t> reported;
@@ -2075,7 +2133,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
                 return resident;
-            });
+            }, index);
         }
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);

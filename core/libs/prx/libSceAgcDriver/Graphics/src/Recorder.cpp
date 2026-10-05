@@ -1574,7 +1574,10 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, PassBreak for
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, PassBlock block, const PassAccess& access) {
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;
-    if (!pass.open) pass.timing = timing;
+    if (!pass.open) {
+        pass.timing = timing;
+        pass.serial = ++renderPassSerials;
+    }
     pass.open = true;
     pass.key = key;
     pass.block = block;
