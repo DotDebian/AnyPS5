@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -68,9 +69,9 @@ void Driver::traceLabel(std::span<const std::uint32_t> packet, std::uint32_t que
         entry = {target, length, queue, opcode};
     }
     if (watched == 0 || target + length + 0x100 < watched || target > watched + 0x100) return;
-    std::fprintf(stderr, "[label] %lld ms queue 0x%x %s 0x%llx:", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), queue, kind, static_cast<unsigned long long>(target));
-    for (std::size_t i = 1; i < packet.size() && i < 9; ++i) std::fprintf(stderr, " %08x", packet[i]);
-    std::fprintf(stderr, "\n");
+    AgcDriver::ReportLine("[label] %lld ms queue 0x%x %s 0x%llx:", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), queue, kind, static_cast<unsigned long long>(target));
+    for (std::size_t i = 1; i < packet.size() && i < 9; ++i) AgcDriver::ReportLine(" %08x", packet[i]);
+    AgcDriver::ReportLine("\n");
 }
 
 std::array<WriteRecord, 16384>& Driver::writeHistory() {

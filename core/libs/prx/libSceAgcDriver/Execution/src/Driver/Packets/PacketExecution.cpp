@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureResidency.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -35,7 +36,7 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
     static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (report && end - profile.reported > std::chrono::seconds(10)) {
         profile.reported = end;
-        std::fprintf(stderr, "[gpu] worker at %.0f s: dispatch %.1f s, draw %.1f s, wait %.1f s\n", std::chrono::duration<double>(end - profile.start).count(), profile.dispatchMs / 1000, profile.drawMs / 1000, profile.waitMs / 1000);
+        AgcDriver::ReportLine("[gpu] worker at %.0f s: dispatch %.1f s, draw %.1f s, wait %.1f s\n", std::chrono::duration<double>(end - profile.start).count(), profile.dispatchMs / 1000, profile.drawMs / 1000, profile.waitMs / 1000);
     }
 }
 
@@ -84,7 +85,7 @@ void Driver::execute(const Submission& submission) {
     }
     auto& queue = *state;
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
-    if (traceGpu) std::fprintf(stderr, "[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
+    if (traceGpu) AgcDriver::ReportLine("[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
 
     static const long dumpQueue = [] { const char* text = std::getenv("APS5_DUMP_QUEUE"); return text ? std::strtol(text, nullptr, 16) : -1L; }();
     if (static_cast<long>(submission.queue) == dumpQueue) {
@@ -237,9 +238,9 @@ void Driver::execute(const Submission& submission) {
                     const auto nextHeader = submission.commands[next];
                     const auto nextCount = Pm4::PacketWords(nextHeader);
                     const auto nextPacket = std::span(submission.commands).subspan(next, nextCount);
-                    std::fprintf(stderr, "[gpu]   then %s", Pm4::Name(nextHeader).c_str());
-                    for (std::size_t i = 1; i < nextPacket.size() && i < 7; ++i) std::fprintf(stderr, " %08x", nextPacket[i]);
-                    std::fprintf(stderr, "\n");
+                    AgcDriver::ReportLine("[gpu]   then %s", Pm4::Name(nextHeader).c_str());
+                    for (std::size_t i = 1; i < nextPacket.size() && i < 7; ++i) AgcDriver::ReportLine(" %08x", nextPacket[i]);
+                    AgcDriver::ReportLine("\n");
                     next += nextCount;
                 }
             }
@@ -256,7 +257,7 @@ void Driver::execute(const Submission& submission) {
                 };
 
                 const auto skipped = [&](const std::string& what) {
-                    if (traceDraws) std::fprintf(stderr, "[draw] target 0x%llx mask 0x%x failed: %.160s\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), what.c_str());
+                    if (traceDraws) AgcDriver::ReportLine("[draw] target 0x%llx mask 0x%x failed: %.160s\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), what.c_str());
 
                     char suffix[80];
                     std::snprintf(suffix, sizeof(suffix), " [%s, color target 0x%llx]", Pm4::Name(header).c_str(), static_cast<unsigned long long>(color));
@@ -288,7 +289,7 @@ void Driver::execute(const Submission& submission) {
                     } else if (verdict == DrawVerdict::Nothing) {
                         countSkip(Graphics::DrawSkip::Nothing);
                     } else if (traceDraws) {
-                        std::fprintf(stderr, "[draw] target 0x%llx mask 0x%x ok\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e));
+                        AgcDriver::ReportLine("[draw] target 0x%llx mask 0x%x ok\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e));
                     }
                 } catch (const std::exception& error) {
                     CaptureTrace::Log("draw-error submission=%llu offset=%zu reason=%.256s", static_cast<unsigned long long>(submission.serial), cursor, error.what());

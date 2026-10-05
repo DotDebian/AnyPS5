@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureResidency.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -224,11 +225,11 @@ void ReportSyncTrace(std::chrono::steady_clock::time_point now) {
         syncCounts[source] = 0;
         syncWaitedMs[source] = 0;
     }
-    std::fprintf(stderr, "[synctrace] %.1f s: %llu frames, %llu submits, %.0f ms waited for the GPU under the mutex or in the hook, %llu unlocked serial waits %.0f ms%s; by thread (count/wait):%s; top sites (source@caller syncs/batches/wait):%s\n", seconds, static_cast<unsigned long long>(frames), static_cast<unsigned long long>(trace.submits), waitedMs, static_cast<unsigned long long>(serialWaits), serialUs / 1000.0, report.c_str(), ThreadSyncReport().c_str(), SyncSiteReport().c_str());
+    AgcDriver::ReportLine("[synctrace] %.1f s: %llu frames, %llu submits, %.0f ms waited for the GPU under the mutex or in the hook, %llu unlocked serial waits %.0f ms%s; by thread (count/wait):%s; top sites (source@caller syncs/batches/wait):%s\n", seconds, static_cast<unsigned long long>(frames), static_cast<unsigned long long>(trace.submits), waitedMs, static_cast<unsigned long long>(serialWaits), serialUs / 1000.0, report.c_str(), ThreadSyncReport().c_str(), SyncSiteReport().c_str());
     // The same window's collect epochs and write-watch walks (GuestMemory::CollectTraceReport).
-    std::fprintf(stderr, "[synctrace] %.1f s, %llu frames: %s\n", seconds, static_cast<unsigned long long>(frames), GuestMemory::CollectTraceReport().c_str());
+    AgcDriver::ReportLine("[synctrace] %.1f s, %llu frames: %s\n", seconds, static_cast<unsigned long long>(frames), GuestMemory::CollectTraceReport().c_str());
     // And who walked (GuestMemory::WalkTraceReport).
-    std::fprintf(stderr, "[synctrace] %.1f s, %llu frames: %s\n", seconds, static_cast<unsigned long long>(frames), GuestMemory::WalkTraceReport().c_str());
+    AgcDriver::ReportLine("[synctrace] %.1f s, %llu frames: %s\n", seconds, static_cast<unsigned long long>(frames), GuestMemory::WalkTraceReport().c_str());
     {
         std::lock_guard lock(threadSyncsMutex);
         threadSyncs.clear();
@@ -904,7 +905,7 @@ void ReportHookSyncs(HookSyncStats& stats) {
         std::snprintf(text, sizeof(text), " [0x%x %s %s +0x%llx/+0x%llx/+0x%llx/+0x%llx/+0x%llx/+0x%llx: %llu/%.0fms u%llu/%llu/%llu c%llu s%llu %.0fK/%.0fK]", key.queue, PacketName(key.opcode).c_str(), GuestMemory::ReadSiteName(key.site), key.frames[0], key.frames[1], key.frames[2], key.frames[3], key.frames[4], key.frames[5], count(totals.count), totals.waitedMs, count(k.unchangedOpen), count(k.unchangedPending), count(k.unchangedSignaled), count(k.changed), count(k.stores), totals.rangeBytes / 1024.0 / totals.count, totals.accessBytes / 1024.0 / totals.count);
         report += text;
     }
-    std::fprintf(stderr, "%s\n", report.c_str());
+    AgcDriver::ReportLine("%s\n", report.c_str());
     stats = HookSyncStats{};
 }
 
@@ -1025,7 +1026,7 @@ void ReportRecordedStoreSyncs(RecordedStoreStats& stats) {
         std::snprintf(text, sizeof(text), " [0x%x %s %s +0x%llx/+0x%llx/+0x%llx: %llu/%.0fms k%llu y%llu/n%llu c%llu/u%llu d%llu/l%llu]", key.queue, PacketName(key.opcode).c_str(), GuestMemory::ReadSiteName(key.site), key.frames[0], key.frames[1], key.frames[2], count(k.count), k.waitedMs, count(k.skipped), count(k.cpuWrittenYes), count(k.cpuWrittenNo), count(k.changed), count(k.unchanged), count(k.imagesDead), count(k.imagesLive));
         report += text;
     }
-    std::fprintf(stderr, "%s\n", report.c_str());
+    AgcDriver::ReportLine("%s\n", report.c_str());
     stats.byKey.clear();
     stats.totals = {};
 }
@@ -1218,7 +1219,7 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
     VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
     const auto result = context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &timeline);
     if (result != VK_SUCCESS) {
-        std::fprintf(stderr, "[gpu] timeline semaphore creation failed (Vulkan result %d); drains wait under the GPU mutex\n", static_cast<int>(result));
+        AgcDriver::ReportLine("[gpu] timeline semaphore creation failed (Vulkan result %d); drains wait under the GPU mutex\n", static_cast<int>(result));
         timeline = VK_NULL_HANDLE;
     }
 }
@@ -1227,7 +1228,7 @@ Recorder::~Recorder() {
     try {
         Sync();
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
+        AgcDriver::ReportLine("[gpu] recorder teardown: %s\n", error.what());
     }
     if (activeRecorder == this) {
         activeRecorder = nullptr;
@@ -1963,7 +1964,7 @@ void reportBarriers() {
         std::snprintf(text, sizeof(text), " %s %llu", CommandClassNames[i], static_cast<unsigned long long>(mergedCount));
         mergedLine += text;
     }
-    std::fprintf(stderr, "[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str());
+    AgcDriver::ReportLine("[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str());
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -1982,7 +1983,7 @@ void reportBarriers() {
             std::snprintf(text, sizeof(text), " %s %llu", HazardNames[i], static_cast<unsigned long long>(validateKinds[i].exchange(0, std::memory_order_relaxed)));
             kinds += text;
         }
-        std::fprintf(stderr, "; validate: would emit %llu (%s) + %llu batch ends, would skip %llu; emitted/skipped by class:%s", static_cast<unsigned long long>(emitted), kinds.c_str() + 1, static_cast<unsigned long long>(validateBatchEnds.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(skipped), classes.c_str());
+        AgcDriver::ReportLine("; validate: would emit %llu (%s) + %llu batch ends, would skip %llu; emitted/skipped by class:%s", static_cast<unsigned long long>(emitted), kinds.c_str() + 1, static_cast<unsigned long long>(validateBatchEnds.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(skipped), classes.c_str());
     }
     std::fputc('\n', stderr);
     std::uint64_t breaks = 0;
@@ -2009,8 +2010,8 @@ void reportBarriers() {
         std::snprintf(text, sizeof(text), " %s %llu", PassBlockNames[i], static_cast<unsigned long long>(count));
         blockLine += text;
     }
-    std::fprintf(stderr, "[passes] %s: %llu draws continued a pass, %llu began one (10 s); breaks by reason:%s; hazards:%s; previous draw wrote:%s; begin barriers elided %llu, merged with the pass end %llu\n", Recorder::PassHazardsEnabled() ? "hazard-tracked" : "legacy", static_cast<unsigned long long>(passContinued.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(breaks), breakLine.c_str(), hazardLine.c_str(), blockLine.c_str(), static_cast<unsigned long long>(passBarriersElided.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(passBarriersMerged.exchange(0, std::memory_order_relaxed)));
-    std::fprintf(stderr, "[samples] occlusion dumps (cumulative): %llu queued (%llu inside an open pass), %llu recorded at once; %llu segments closed; %llu folds of queued dumps\n", static_cast<unsigned long long>(dumpsQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsQueuedInPass.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsAtOnce.load(std::memory_order_relaxed)), static_cast<unsigned long long>(segmentsClosed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpFolds.load(std::memory_order_relaxed)));
+    AgcDriver::ReportLine("[passes] %s: %llu draws continued a pass, %llu began one (10 s); breaks by reason:%s; hazards:%s; previous draw wrote:%s; begin barriers elided %llu, merged with the pass end %llu\n", Recorder::PassHazardsEnabled() ? "hazard-tracked" : "legacy", static_cast<unsigned long long>(passContinued.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(breaks), breakLine.c_str(), hazardLine.c_str(), blockLine.c_str(), static_cast<unsigned long long>(passBarriersElided.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(passBarriersMerged.exchange(0, std::memory_order_relaxed)));
+    AgcDriver::ReportLine("[samples] occlusion dumps (cumulative): %llu queued (%llu inside an open pass), %llu recorded at once; %llu segments closed; %llu folds of queued dumps\n", static_cast<unsigned long long>(dumpsQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsQueuedInPass.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsAtOnce.load(std::memory_order_relaxed)), static_cast<unsigned long long>(segmentsClosed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpFolds.load(std::memory_order_relaxed)));
 }
 
 }
@@ -2096,7 +2097,7 @@ void Recorder::NoteAccess(CommandClass which, const Access& access) {
             const auto first = [](const auto& ranges) { return ranges.empty() ? std::pair<std::uint64_t, std::uint64_t>{0, 0} : std::pair<std::uint64_t, std::uint64_t>{ranges.front().first, ranges.front().second}; };
             const auto reads = first(access.reads);
             const auto writes = first(access.writes);
-            std::fprintf(stderr, "[barriers] would skip %s: reads %zu (first 0x%llx+0x%llx), writes %zu (first 0x%llx+0x%llx), images %zu; since the last barrier: %zu reads, %zu writes, %zu images\n", CommandClassNames[index], access.reads.size(), static_cast<unsigned long long>(reads.first), static_cast<unsigned long long>(reads.second - reads.first), access.writes.size(), static_cast<unsigned long long>(writes.first), static_cast<unsigned long long>(writes.second - writes.first), access.images.size(), tracker.reads.size(), tracker.writes.size(), tracker.images.size());
+            AgcDriver::ReportLine("[barriers] would skip %s: reads %zu (first 0x%llx+0x%llx), writes %zu (first 0x%llx+0x%llx), images %zu; since the last barrier: %zu reads, %zu writes, %zu images\n", CommandClassNames[index], access.reads.size(), static_cast<unsigned long long>(reads.first), static_cast<unsigned long long>(reads.second - reads.first), access.writes.size(), static_cast<unsigned long long>(writes.first), static_cast<unsigned long long>(writes.second - writes.first), access.images.size(), tracker.reads.size(), tracker.writes.size(), tracker.images.size());
         }
     }
     for (const auto& [begin, end] : access.reads) tracker.reads.push_back({begin, end, access.stages});
@@ -2258,7 +2259,7 @@ bool Recorder::gpuSampleCounter() {
         dumpLayout = VK_NULL_HANDLE;
         sampleLayout = VK_NULL_HANDLE;
         sampleCounter.reset();
-        std::fprintf(stderr, "[gpu] occlusion counter dumps drain the device: %s\n", error.what());
+        AgcDriver::ReportLine("[gpu] occlusion counter dumps drain the device: %s\n", error.what());
         return false;
     }
     sampleCounterState = 1;
@@ -2291,7 +2292,7 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
             meshArgumentState = 1;
         } catch (const std::exception& error) {
             if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
-            std::fprintf(stderr, "[gpu] mesh indirect draws read their records on the CPU: %s\n", error.what());
+            AgcDriver::ReportLine("[gpu] mesh indirect draws read their records on the CPU: %s\n", error.what());
         }
     }
     if (meshArgumentState < 0) return false;
@@ -2429,7 +2430,7 @@ bool Recorder::gpuTimestamps() {
         if (stampLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, stampLayout, nullptr);
         stampLayout = VK_NULL_HANDLE;
         stampBuffer.reset();
-        std::fprintf(stderr, "[gpu] GPU timestamps are stored after a device drain: %s\n", error.what());
+        AgcDriver::ReportLine("[gpu] GPU timestamps are stored after a device drain: %s\n", error.what());
         return false;
     }
     stampState = 1;
@@ -2806,10 +2807,10 @@ void Recorder::readGpuTiming(Batch& batch) {
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
-    std::fprintf(stderr, "[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
+    AgcDriver::ReportLine("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     static const std::size_t listed = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr ? 40 : 12;
-    for (std::size_t i = 0; i < hot.size() && i < listed; ++i) std::fprintf(stderr, " 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
-    std::fprintf(stderr, "; by class:%s\n", classes.c_str());
+    for (std::size_t i = 0; i < hot.size() && i < listed; ++i) AgcDriver::ReportLine(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
+    AgcDriver::ReportLine("; by class:%s\n", classes.c_str());
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
@@ -3276,7 +3277,7 @@ void Recorder::publishNotedWrites() const {
         const auto merge = merged;
         publishPendingWrites();
         const auto rebuilt = pendingWrites.load(std::memory_order_acquire);
-        if (rebuilt != nullptr && *rebuilt != *merge && mismatches.fetch_add(1) < 20) std::fprintf(stderr, "[recorder] verify: merged write snapshot (%zu ranges) differs from the rebuild (%zu ranges)\n", merge->size(), rebuilt->size());
+        if (rebuilt != nullptr && *rebuilt != *merge && mismatches.fetch_add(1) < 20) AgcDriver::ReportLine("[recorder] verify: merged write snapshot (%zu ranges) differs from the rebuild (%zu ranges)\n", merge->size(), rebuilt->size());
         return;
     }
     pendingWrites.store(std::move(merged), std::memory_order_release);
@@ -3738,7 +3739,7 @@ void Recorder::Submit() {
             std::snprintf(item, sizeof(item), " %llx", static_cast<unsigned long long>(program));
             line += item;
         }
-        std::fprintf(stderr, "[submit] serial %llu programs%s\n", static_cast<unsigned long long>(batch->serial), line.c_str());
+        AgcDriver::ReportLine("[submit] serial %llu programs%s\n", static_cast<unsigned long long>(batch->serial), line.c_str());
         batch->tracePrograms.clear();
     }
     batch->submittedAt = std::chrono::steady_clock::now();
@@ -3794,7 +3795,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     auto result = waitSemaphores(device, &wait, 5'000'000'000ull);
     for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
         // As for the fence wait in finish(): a hung batch is reported every 5 s.
-        std::fprintf(stderr, "[gpu] recorded batch %llu still running on the GPU after %d s (timeline wait; the waiting thread last recorded program 0x%llx)\n", static_cast<unsigned long long>(serial), waited, static_cast<unsigned long long>(notedProgram));
+        AgcDriver::ReportLine("[gpu] recorded batch %llu still running on the GPU after %d s (timeline wait; the waiting thread last recorded program 0x%llx)\n", static_cast<unsigned long long>(serial), waited, static_cast<unsigned long long>(notedProgram));
         result = waitSemaphores(device, &wait, 5'000'000'000ull);
     }
     return result;
@@ -3967,7 +3968,7 @@ void ReportSyncWaits(SyncWaitStats& stats) {
         else std::snprintf(text, sizeof(text), " 0x%x %llu", queue, static_cast<unsigned long long>(count));
         report += text;
     }
-    std::fprintf(stderr, "%s\n", report.c_str());
+    AgcDriver::ReportLine("%s\n", report.c_str());
     stats = SyncWaitStats{};
 }
 
@@ -4087,7 +4088,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         static std::atomic<int> lines{0};
         if (lines.fetch_add(1) < 600) {
             const auto packet = GuestMemory::CurrentPacket();
-            std::fprintf(stderr, "[capsync] sync q0x%x %s %s 0x%llx+0x%llx: target %llu (newest %llu), %zu batches up to it (%zu unsignaled at the start), target noted %zu ranges, hit 0x%llx+0x%llx, GPU wait %.1f ms\n", packet.queue, PacketName(packet.opcode).c_str(), GuestMemory::ReadSiteName(readSite), static_cast<unsigned long long>(address), static_cast<unsigned long long>(end - address), static_cast<unsigned long long>(targetSerial), static_cast<unsigned long long>(newestSerial), batchesToTarget, unsignaledAtStart, targetRanges, static_cast<unsigned long long>(hit.first), static_cast<unsigned long long>(hit.second - hit.first), ms);
+            AgcDriver::ReportLine("[capsync] sync q0x%x %s %s 0x%llx+0x%llx: target %llu (newest %llu), %zu batches up to it (%zu unsignaled at the start), target noted %zu ranges, hit 0x%llx+0x%llx, GPU wait %.1f ms\n", packet.queue, PacketName(packet.opcode).c_str(), GuestMemory::ReadSiteName(readSite), static_cast<unsigned long long>(address), static_cast<unsigned long long>(end - address), static_cast<unsigned long long>(targetSerial), static_cast<unsigned long long>(newestSerial), batchesToTarget, unsignaledAtStart, targetRanges, static_cast<unsigned long long>(hit.first), static_cast<unsigned long long>(hit.second - hit.first), ms);
         }
     }
     if (!RecorderAlive(myId)) {
@@ -4180,11 +4181,11 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
                 if (now - lastReport > std::chrono::seconds(10)) {
                     lastReport = now;
                     const auto& h = holdCounters;
-                    std::fprintf(stderr, "[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
-                    std::fprintf(stderr, "[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
-                    std::fprintf(stderr, "[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
+                    AgcDriver::ReportLine("[recorder] %llu syncs waited %.1f s for the GPU in total (sources, count/wait: idle %llu/%.1fs, pending write %llu/%.1fs, recorded store %llu/%.1fs, address-based %llu/%.1fs, other %llu/%.1fs); hook %llu calls, %llu locked; %llu targeted syncs left %llu batches in flight; snapshot %llu rebuilds %.0f ms, %llu notes covered; %llu unlocked timeline waits %.1f s; %llu submissions, %zu label entries, %llu completion labels pending; fence waits by thread (count/wait):%s; top sync sites (source@caller syncs/batches/wait):%s; under holds (cumulative): %llu completions ran %.0f ms (kept objects released %.0f ms), pending-write syncs from completions: %llu skipped, %llu waited %.0f ms; %llu reaps (%llu with work) retired %llu batches in %.0f ms; hook waits unlocked %llu / %.0f ms GPU (pending write %llu / %.0f ms, recorded store %llu / %.0f ms) + %.0f ms relock (%llu found the recorder torn down), locked %llu; deferred releases: on the release thread %llu batches (%llu objects) in %.0f ms, inline %llu batches (%llu objects) in %.0f ms (%llu batches over the queue bound of %zu), queue max %llu batches, %llu pending\n",static_cast<unsigned long long>(waits), waitedMs / 1000, static_cast<unsigned long long>(syncCounts[0]), syncWaitedMs[0] / 1000, static_cast<unsigned long long>(syncCounts[1]), syncWaitedMs[1] / 1000, static_cast<unsigned long long>(syncCounts[2]), syncWaitedMs[2] / 1000, static_cast<unsigned long long>(syncCounts[3]), syncWaitedMs[3] / 1000, static_cast<unsigned long long>(syncCounts[4]), syncWaitedMs[4] / 1000, static_cast<unsigned long long>(hookCalls.load()), static_cast<unsigned long long>(hookLocks.load()), static_cast<unsigned long long>(targetedSyncs.load()), static_cast<unsigned long long>(batchesLeftInFlight.load()), static_cast<unsigned long long>(snapshotRebuilds), snapshotRebuildMs, static_cast<unsigned long long>(snapshotCovered), static_cast<unsigned long long>(unlockedWaits.load()), unlockedWaitedUs.load() / 1e6, static_cast<unsigned long long>(recorder.submissions), recorder.PendingLabels(), static_cast<unsigned long long>(completionLabels.load()), ThreadSyncReport().c_str(), SyncSiteReport().c_str(), static_cast<unsigned long long>(h.completions), h.completionMs, h.keptReleaseMs, static_cast<unsigned long long>(h.completionSyncsSkipped), static_cast<unsigned long long>(h.completionSyncsWaited), h.completionSyncWaitMs, static_cast<unsigned long long>(h.reaps), static_cast<unsigned long long>(h.reapsWithWork), static_cast<unsigned long long>(h.reapBatches), h.reapMs, static_cast<unsigned long long>(h.hookUnlockedWaits), h.hookUnlockedWaitMs, static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[1]), h.hookUnlockedWaitMsBySource[1], static_cast<unsigned long long>(h.hookUnlockedWaitsBySource[2]), h.hookUnlockedWaitMsBySource[2], h.hookRelockMs, static_cast<unsigned long long>(h.hookUnlockedTornDown), static_cast<unsigned long long>(h.hookLockedWaits), static_cast<unsigned long long>(threadReleases.load()), static_cast<unsigned long long>(threadObjects.load()), threadReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineReleases.load()), static_cast<unsigned long long>(inlineObjects.load()), inlineReleaseUs.load() / 1000.0, static_cast<unsigned long long>(inlineOverBound.load()), ReleaseQueueBound(), static_cast<unsigned long long>(releaseQueueMax.load()), static_cast<unsigned long long>(deferredPending.load()));
+                    AgcDriver::ReportLine("[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
+                    AgcDriver::ReportLine("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
                     const auto reads = Recorder::ReadCounts();
-                    std::fprintf(stderr, "[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.staleIgnored));
+                    AgcDriver::ReportLine("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.staleIgnored));
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
@@ -4192,7 +4193,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
-            std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s (the waiting thread last recorded program 0x%llx)\n", waited, static_cast<unsigned long long>(notedProgram));
+            AgcDriver::ReportLine("[gpu] recorded batch still running on the GPU after %d s (the waiting thread last recorded program 0x%llx)\n", waited, static_cast<unsigned long long>(notedProgram));
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         if (SyncTraced()) {
@@ -4238,7 +4239,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
             try {
                 action();
             } catch (const std::exception& error) {
-                std::fprintf(stderr, "[gpu] deferred write-back failed: %s\n", error.what());
+                AgcDriver::ReportLine("[gpu] deferred write-back failed: %s\n", error.what());
             }
         }
     }

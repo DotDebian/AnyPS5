@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -38,7 +39,7 @@ void CountVramBuffer(std::uint64_t bytes, bool fallback) {
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = vramLastReport.load(std::memory_order_relaxed);
     if (now - last < 10 || !vramLastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
-    std::fprintf(stderr, "[vram-buffers] mask 0x%x: %llu buffers made in mappable video memory so far (%.1f MiB), %llu fell back to system memory\n", VramBufferMask(), static_cast<unsigned long long>(vramBuffers.load()), vramBytes.load() / 1048576.0, static_cast<unsigned long long>(vramFallbacks.load()));
+    AgcDriver::ReportLine("[vram-buffers] mask 0x%x: %llu buffers made in mappable video memory so far (%.1f MiB), %llu fell back to system memory\n", VramBufferMask(), static_cast<unsigned long long>(vramBuffers.load()), vramBytes.load() / 1048576.0, static_cast<unsigned long long>(vramFallbacks.load()));
 }
 
 }

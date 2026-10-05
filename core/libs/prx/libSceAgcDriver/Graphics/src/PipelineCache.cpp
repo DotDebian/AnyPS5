@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include <chrono>
 #include <cstdio>
@@ -51,7 +52,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
     const auto create = context.Function<PFN_vkCreatePipelineCache>("vkCreatePipelineCache");
     VkResult result = create(context.device, &info, nullptr, &cache);
     if (result != VK_SUCCESS && !initialData.empty()) {
-        std::fprintf(stderr, "[pipeline-cache] the driver refused %s (Vulkan result %d); starting empty\n", path.string().c_str(), static_cast<int>(result));
+        AgcDriver::ReportLine("[pipeline-cache] the driver refused %s (Vulkan result %d); starting empty\n", path.string().c_str(), static_cast<int>(result));
         info.initialDataSize = 0;
         info.pInitialData = nullptr;
         savedBytes = 0;
@@ -78,7 +79,7 @@ void PipelineCache::load(std::vector<std::byte>& initialData) {
     std::vector<std::byte> file;
     if (!ShaderRecompiler::ReadWholeFile(path, file)) return;
     const auto reject = [&](const char* why) {
-        std::fprintf(stderr, "[pipeline-cache] ignoring %s: %s\n", path.string().c_str(), why);
+        AgcDriver::ReportLine("[pipeline-cache] ignoring %s: %s\n", path.string().c_str(), why);
     };
     FileHeader header{};
     if (file.size() < sizeof(header)) return reject("truncated");
@@ -100,7 +101,7 @@ void PipelineCache::load(std::vector<std::byte>& initialData) {
     if (vulkan.headerSize < sizeof(vulkan) || vulkan.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || vulkan.vendorID != properties.vendorID || vulkan.deviceID != properties.deviceID || std::memcmp(vulkan.uuid, properties.pipelineCacheUUID, VK_UUID_SIZE) != 0) return reject("made for another device or driver");
     initialData.assign(data.begin(), data.end());
     savedBytes = initialData.size();
-    std::fprintf(stderr, "[pipeline-cache] loaded %.1f KiB from %s\n", static_cast<double>(initialData.size()) / 1024.0, path.string().c_str());
+    AgcDriver::ReportLine("[pipeline-cache] loaded %.1f KiB from %s\n", static_cast<double>(initialData.size()) / 1024.0, path.string().c_str());
 }
 
 void PipelineCache::save(bool final) {
@@ -115,11 +116,11 @@ void PipelineCache::save(bool final) {
     std::memcpy(file.data(), &header, sizeof(header));
     const auto started = std::chrono::steady_clock::now();
     if (!ShaderRecompiler::WriteFileAtomically(path, file)) {
-        std::fprintf(stderr, "[pipeline-cache] cannot write %s\n", path.string().c_str());
+        AgcDriver::ReportLine("[pipeline-cache] cannot write %s\n", path.string().c_str());
         return;
     }
     savedBytes = size;
-    if (final || profiling()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), final ? " (teardown)" : "");
+    if (final || profiling()) AgcDriver::ReportLine("[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), final ? " (teardown)" : "");
 }
 
 void PipelineCache::run() {

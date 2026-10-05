@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
 
@@ -168,7 +169,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     }
                 }
             } else {
-                if (traceCache) std::fprintf(stderr, "[dispatch-cache] 0x%llx captured memory changed\n", static_cast<unsigned long long>(address));
+                if (traceCache) AgcDriver::ReportLine("[dispatch-cache] 0x%llx captured memory changed\n", static_cast<unsigned long long>(address));
 
                 missedEntry = entry;
                 missedDiffering = outcome == EntryOutcome::Differing;

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -248,22 +249,22 @@ void decideImportWatch(const Context& context, HostImports& state) {
     state.unwatchImports = false;
     if (context.hostImportAlignment == 0 || !GuestMemory::WriteWatched()) return;
     if (request == ImportWatchRequest::Watch) {
-        std::fprintf(stderr, "[write-watch] host imports stay watched (APS5_WRITE_WATCH_IMPORTS=watch)\n");
+        AgcDriver::ReportLine("[write-watch] host imports stay watched (APS5_WRITE_WATCH_IMPORTS=watch)\n");
         return;
     }
     if (request == ImportWatchRequest::Unwatch) {
         state.unwatchImports = true;
-        std::fprintf(stderr, "[write-watch] host imports are compared, not watched (APS5_WRITE_WATCH_IMPORTS=unwatch)\n");
+        AgcDriver::ReportLine("[write-watch] host imports are compared, not watched (APS5_WRITE_WATCH_IMPORTS=unwatch)\n");
         return;
     }
     const auto probe = ProbeImportWriteProtection(context);
     if (probe.failure != nullptr) {
         state.unwatchImports = true;
-        std::fprintf(stderr, "[write-watch] host imports resolve write protection: unknown (probe failed at %s, %d); imported ranges are compared\n", probe.failure, static_cast<int>(probe.result));
+        AgcDriver::ReportLine("[write-watch] host imports resolve write protection: unknown (probe failed at %s, %d); imported ranges are compared\n", probe.failure, static_cast<int>(probe.result));
         return;
     }
     state.unwatchImports = probe.writtenAfterSubmit != 0;
-    std::fprintf(stderr, "[write-watch] host imports resolve write protection: %s (%u of %u scratch pages written after a GPU read, %u after the import); imported ranges %s\n", state.unwatchImports ? "yes" : "no", probe.writtenAfterSubmit, probe.pages, probe.writtenAtImport, state.unwatchImports ? "are compared" : "stay watched");
+    AgcDriver::ReportLine("[write-watch] host imports resolve write protection: %s (%u of %u scratch pages written after a GPU read, %u after the import); imported ranges %s\n", state.unwatchImports ? "yes" : "no", probe.writtenAfterSubmit, probe.pages, probe.writtenAtImport, state.unwatchImports ? "are compared" : "stay watched");
 #endif
 }
 }
@@ -378,7 +379,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         refusedBytes += bytes;
         if (std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
             lastReport = std::chrono::steady_clock::now();
-            std::fprintf(stderr, "[gpu] host import budget: %llu MiB live of %llu MiB (APS5_HOST_IMPORT_MIB); %llu imports (%llu MiB) refused so far, last 0x%llx+0x%llx\n", static_cast<unsigned long long>(live >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(refused), static_cast<unsigned long long>(refusedBytes >> 20u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
+            AgcDriver::ReportLine("[gpu] host import budget: %llu MiB live of %llu MiB (APS5_HOST_IMPORT_MIB); %llu imports (%llu MiB) refused so far, last 0x%llx+0x%llx\n", static_cast<unsigned long long>(live >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(refused), static_cast<unsigned long long>(refusedBytes >> 20u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
         }
         return nullptr;
     }
@@ -420,7 +421,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     if (!unchecked) {
         if (const char* refusal = HostImportRefusal(HostMappings(base, base + bytes), base, base + bytes)) {
             state.failed.insert(base);
-            std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx not attempted: %s; served by a mirror or copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), refusal);
+            AgcDriver::ReportLine("[gpu] host import of 0x%llx+0x%llx not attempted: %s; served by a mirror or copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), refusal);
             return nullptr;
         }
     }
@@ -439,15 +440,15 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
         state.failed.insert(base);
-        std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result));
-        if (bytes <= PoisoningImportBytes && std::strcmp(step, "vkAllocateMemory") == 0) std::fprintf(stderr, "[gpu] WARNING: a refused host import of 64 KiB or less leaves NVIDIA drivers unable to allocate device-local memory on this device; expect VK_ERROR_OUT_OF_DEVICE_MEMORY from here on\n");
+        AgcDriver::ReportLine("[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result));
+        if (bytes <= PoisoningImportBytes && std::strcmp(step, "vkAllocateMemory") == 0) AgcDriver::ReportLine("[gpu] WARNING: a refused host import of 64 KiB or less leaves NVIDIA drivers unable to allocate device-local memory on this device; expect VK_ERROR_OUT_OF_DEVICE_MEMORY from here on\n");
 #ifdef _WIN32
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
         for (std::uint64_t cursor = base; trace && cursor < base + bytes;) {
             MEMORY_BASIC_INFORMATION info{};
             if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) break;
             const auto regionEnd = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
-            std::fprintf(stderr, "[gpu]   0x%llx+0x%llx state 0x%lx protect 0x%lx type 0x%lx allocation 0x%llx\n", static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(std::min(regionEnd, base + bytes) - cursor), info.State, info.Protect, info.Type, reinterpret_cast<unsigned long long>(info.AllocationBase));
+            AgcDriver::ReportLine("[gpu]   0x%llx+0x%llx state 0x%lx protect 0x%lx type 0x%lx allocation 0x%llx\n", static_cast<unsigned long long>(cursor), static_cast<unsigned long long>(std::min(regionEnd, base + bytes) - cursor), info.State, info.Protect, info.Type, reinterpret_cast<unsigned long long>(info.AllocationBase));
             cursor = regionEnd;
         }
 #endif
@@ -458,7 +459,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     std::uint64_t liveBytes = bytes;
     for (const auto& [address, existing] : state.imports) liveBytes += existing.bytes;
-    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, liveBytes / 1048576.0, importedBytes / 1048576.0);
+    if (trace) AgcDriver::ReportLine("[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, liveBytes / 1048576.0, importedBytes / 1048576.0);
     return &state.imports.emplace(base, entry).first->second;
 }
 
@@ -606,7 +607,7 @@ std::uint64_t heapMirrorBudget() {
 }
 
 [[noreturn]] void heapMirrorFatal(const GuestAllocations::Range& range, std::uint64_t held, const char* reason) {
-    std::fprintf(stderr, "FATAL: heap mirror of 0x%llx+0x%llx: %s; heap mirrors hold %llu MiB of %llu MiB (APS5_HEAP_MIRROR_MIB)\n", static_cast<unsigned long long>(range.address), static_cast<unsigned long long>(range.bytes), reason, static_cast<unsigned long long>(held >> 20u), static_cast<unsigned long long>(heapMirrorBudget() >> 20u));
+    AgcDriver::ReportLine("FATAL: heap mirror of 0x%llx+0x%llx: %s; heap mirrors hold %llu MiB of %llu MiB (APS5_HEAP_MIRROR_MIB)\n", static_cast<unsigned long long>(range.address), static_cast<unsigned long long>(range.bytes), reason, static_cast<unsigned long long>(held >> 20u), static_cast<unsigned long long>(heapMirrorBudget() >> 20u));
     std::fflush(stderr);
     std::abort();
 }
@@ -984,7 +985,7 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
                 std::lock_guard lock(state.mutex);
                 for (auto index = first; index < last; ++index) {
                     const auto& mirror = *mirrors[index];
-                    std::fprintf(stderr, "[vram-mirror] mirror of 0x%llx+0x%llx given up: %s; the range goes back to its import\n", static_cast<unsigned long long>(mirror.base), static_cast<unsigned long long>(mirror.bytes), reason);
+                    AgcDriver::ReportLine("[vram-mirror] mirror of 0x%llx+0x%llx given up: %s; the range goes back to its import\n", static_cast<unsigned long long>(mirror.base), static_cast<unsigned long long>(mirror.bytes), reason);
                     state.selectedRefused.insert(mirror.base);
                     if (const auto found = state.entries.find(mirror.base); found != state.entries.end() && found->second.get() == &mirror) {
                         state.heapBytes -= mirror.bytes;
@@ -1077,7 +1078,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     // vramMirrorSelected) that cannot be made is no error, whatever the reason: null, remembered
     // (under the registry mutex), and the caller serves the range as it would unselected.
     const auto refuseSelected = [&](const char* reason) {
-        std::fprintf(stderr, "[vram-mirror] mirror of 0x%llx+0x%llx refused: %s; the range keeps its import\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), reason);
+        AgcDriver::ReportLine("[vram-mirror] mirror of 0x%llx+0x%llx refused: %s; the range keeps its import\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), reason);
         state.selectedRefused.insert(base);
     };
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), range->writable && !heap)) {
@@ -1125,7 +1126,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             return nullptr;
         }
         if (heap) heapMirrorFatal(*range, state.heapBytes, error.what());
-        std::fprintf(stderr, "[gpu] image mirror of 0x%llx+0x%llx failed: %s; falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), error.what());
+        AgcDriver::ReportLine("[gpu] image mirror of 0x%llx+0x%llx failed: %s; falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), error.what());
         std::lock_guard lock(state.mutex);
         state.failed.insert(base);
         return nullptr;
@@ -1196,7 +1197,7 @@ void reportMirrors() {
         }
         heapBytes = state.heapBytes;
     }
-    std::fprintf(stderr, "[buffers] image mirrors: %zu ranges (%.1f MiB, %zu writable, %zu heap %.1f MiB), %llu address-based builds served, %llu descriptor sub-ranges bound, %llu rebuilds, %llu refreshes: %llu blocks compared, %llu copied, %llu refresh syncs; heap refills %llu, unwatched heaps %llu\n", count, bytes / 1048576.0, writable, heaps, heapBytes / 1048576.0, static_cast<unsigned long long>(state.builds), static_cast<unsigned long long>(state.subranges), static_cast<unsigned long long>(state.rebuilds), static_cast<unsigned long long>(state.refreshes), static_cast<unsigned long long>(state.blocksCompared), static_cast<unsigned long long>(state.blocksCopied), static_cast<unsigned long long>(state.syncs), static_cast<unsigned long long>(state.heapRefills), static_cast<unsigned long long>(state.heapUnwatched));
+    AgcDriver::ReportLine("[buffers] image mirrors: %zu ranges (%.1f MiB, %zu writable, %zu heap %.1f MiB), %llu address-based builds served, %llu descriptor sub-ranges bound, %llu rebuilds, %llu refreshes: %llu blocks compared, %llu copied, %llu refresh syncs; heap refills %llu, unwatched heaps %llu\n", count, bytes / 1048576.0, writable, heaps, heapBytes / 1048576.0, static_cast<unsigned long long>(state.builds), static_cast<unsigned long long>(state.subranges), static_cast<unsigned long long>(state.rebuilds), static_cast<unsigned long long>(state.refreshes), static_cast<unsigned long long>(state.blocksCompared), static_cast<unsigned long long>(state.blocksCopied), static_cast<unsigned long long>(state.syncs), static_cast<unsigned long long>(state.heapRefills), static_cast<unsigned long long>(state.heapUnwatched));
 }
 
 // APS5_VRAM_MIRROR: the selected mirrors and what they cost so far, every 10 s (see
@@ -1223,7 +1224,7 @@ void reportVramMirrors() {
     }
     const auto count = [](const std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.load(std::memory_order_relaxed)); };
     const auto refreshes = stats.refreshes.load(std::memory_order_relaxed);
-    std::fprintf(stderr, "[vram-mirror] %zu ranges and %zu sub-ranges selected for %zu entries: %.1f MiB in video memory, %.1f MiB fell back to system memory, a refused mirror left to its import %llu times; %llu refreshes (%.1f ms before the copies, %.2f MiB scanned per refresh): %llu blocks copied (%.1f MiB), %llu refreshes skipped by the epoch, %llu made for recorded writes, %llu refresh syncs, %llu mirror rebuilds%s%s%s\n", ranges, subranges, vramMirrorEntries().size(), videoBytes / 1048576.0, systemBytes / 1048576.0, count(stats.refusals), static_cast<unsigned long long>(refreshes), stats.refreshNs.load(std::memory_order_relaxed) / 1e6, refreshes != 0 ? stats.scannedBytes.load(std::memory_order_relaxed) / 1048576.0 / static_cast<double>(refreshes) : 0.0, count(stats.blocksCopied), stats.bytesCopied.load(std::memory_order_relaxed) / 1048576.0, count(stats.epochSkips), count(stats.writeRefreshes), count(stats.syncs), count(stats.rebuilds), vramMirrorEveryBuild() ? "; refreshed by every build" : "", vramMirrorNoFlush() ? "; no flush before a refresh" : "", vramMirrorFollowWrites() ? "; following recorded writes" : "");
+    AgcDriver::ReportLine("[vram-mirror] %zu ranges and %zu sub-ranges selected for %zu entries: %.1f MiB in video memory, %.1f MiB fell back to system memory, a refused mirror left to its import %llu times; %llu refreshes (%.1f ms before the copies, %.2f MiB scanned per refresh): %llu blocks copied (%.1f MiB), %llu refreshes skipped by the epoch, %llu made for recorded writes, %llu refresh syncs, %llu mirror rebuilds%s%s%s\n", ranges, subranges, vramMirrorEntries().size(), videoBytes / 1048576.0, systemBytes / 1048576.0, count(stats.refusals), static_cast<unsigned long long>(refreshes), stats.refreshNs.load(std::memory_order_relaxed) / 1e6, refreshes != 0 ? stats.scannedBytes.load(std::memory_order_relaxed) / 1048576.0 / static_cast<double>(refreshes) : 0.0, count(stats.blocksCopied), stats.bytesCopied.load(std::memory_order_relaxed) / 1048576.0, count(stats.epochSkips), count(stats.writeRefreshes), count(stats.syncs), count(stats.rebuilds), vramMirrorEveryBuild() ? "; refreshed by every build" : "", vramMirrorNoFlush() ? "; no flush before a refresh" : "", vramMirrorFollowWrites() ? "; following recorded writes" : "");
 }
 
 // Deferred lease release. The lease an address-based build takes (AcquireRegistered) is dropped by its
@@ -1314,7 +1315,7 @@ bool WaitForLeases() noexcept {
                 std::this_thread::yield();
             }
         } catch (const std::exception& error) {
-            std::fprintf(stderr, "[gpu] lease wait failed: %s\n", error.what());
+            AgcDriver::ReportLine("[gpu] lease wait failed: %s\n", error.what());
         }
     }
     auto& state = Leases();
@@ -1367,7 +1368,7 @@ void CountLeaseOutcome(bool synced, std::uint64_t batchSerial) {
     const auto& stats = state.stats;
     const auto table = BdaResources::TableCacheCounters();
     const auto& snapshots = Snapshots();
-    std::fprintf(stderr, "[address-sync] leases: %llu released at completion, %llu synced at once; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s; BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)));
+    AgcDriver::ReportLine("[address-sync] leases: %llu released at completion, %llu synced at once; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s; BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)));
 }
 
 LeaseStats LeaseCounters() {
@@ -1571,7 +1572,7 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
     const auto space = AddressSpaceCounters();
     const auto& spaceSeen = totals.spaceSeen;
-    std::fprintf(stderr, "[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
+    AgcDriver::ReportLine("[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
     totals.tableSeen = table;
     totals.spaceSeen = space;
     totals.builds = 0;
@@ -1717,7 +1718,7 @@ void GuestBufferMemory::AcquireRegistered() {
             if (!vramMirrorSubranges(*range).empty()) {
                 VramMirrors().refusals.fetch_add(1, std::memory_order_relaxed);
                 static std::atomic<bool> reported{false};
-                if (!reported.exchange(true, std::memory_order_relaxed)) std::fprintf(stderr, "[vram-mirror] sub-ranges of 0x%llx+0x%llx are not mirrored: the range is not imported\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes));
+                if (!reported.exchange(true, std::memory_order_relaxed)) AgcDriver::ReportLine("[vram-mirror] sub-ranges of 0x%llx+0x%llx are not mirrored: the range is not imported\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes));
             }
             if (mirrorsEnabled()) {
                 region.mirror = acquireMirror(context, range, blocks, range->releasable);
@@ -1745,7 +1746,7 @@ void GuestBufferMemory::AcquireRegistered() {
             return (value ? std::strtoull(value, nullptr, 10) : 64ull) << 20u;
         }();
         if (const auto overflow = AddressCopyOverflow(std::move(copies), copyLimit); !overflow.empty()) {
-            std::fprintf(stderr, "FATAL: %s\n", overflow.c_str());
+            AgcDriver::ReportLine("FATAL: %s\n", overflow.c_str());
             std::fflush(stderr);
             std::abort();
         }
@@ -1769,18 +1770,18 @@ void GuestBufferMemory::AcquireRegistered() {
                     ++served.ranges;
                     served.bytes += region.end - region.begin;
                 }
-                std::fprintf(stderr, "[space] generation %llu: %zu readable ranges: %zu imported (%.1f MiB), %zu mirrored (%.1f MiB), %zu copied (%.1f MiB); those of at least %llu MiB:\n", static_cast<unsigned long long>(generation), regions.size(), imported.ranges, imported.bytes / 1048576.0, mirroredRanges.ranges, mirroredRanges.bytes / 1048576.0, copied.ranges, copied.bytes / 1048576.0, static_cast<unsigned long long>(listedBytes >> 20u));
+                AgcDriver::ReportLine("[space] generation %llu: %zu readable ranges: %zu imported (%.1f MiB), %zu mirrored (%.1f MiB), %zu copied (%.1f MiB); those of at least %llu MiB:\n", static_cast<unsigned long long>(generation), regions.size(), imported.ranges, imported.bytes / 1048576.0, mirroredRanges.ranges, mirroredRanges.bytes / 1048576.0, copied.ranges, copied.bytes / 1048576.0, static_cast<unsigned long long>(listedBytes >> 20u));
                 for (const auto& region : regions) {
                     const auto bytes = region.end - region.begin;
                     if (bytes < listedBytes) continue;
                     const auto* range = leasedRangeAt(lease, region.begin);
                     const char* served = region.direct != nullptr ? "import" : region.mirror == nullptr ? "copied" : region.mirror->selected ? (region.mirror->buffer->InVideoMemory() ? "selected mirror in video memory" : "selected mirror in system memory") : region.mirror->heap ? "heap mirror" : region.mirror->writable ? "image mirror with a shadow" : "image mirror";
-                    std::fprintf(stderr, "[space]   0x%llx+0x%llx (%.1f MiB) %s %s: %s\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(bytes), bytes / 1048576.0, region.writable ? "rw" : "r-", range != nullptr && range->releasable ? "heap" : "image", served);
+                    AgcDriver::ReportLine("[space]   0x%llx+0x%llx (%.1f MiB) %s %s: %s\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(bytes), bytes / 1048576.0, region.writable ? "rw" : "r-", range != nullptr && range->releasable ? "heap" : "image", served);
                     // The pieces of an imported range that by-address reads take from a mirror
                     // (used once the space is published), with the padding each one holds.
                     for (const auto& mirror : overlays) {
                         if (region.direct == nullptr || mirror->base < region.begin || mirror->base >= region.end) continue;
-                        std::fprintf(stderr, "[space]     sub-range 0x%llx+0x%llx (%.2f MiB, 0x%llx of padding): mirror in %s memory\n", static_cast<unsigned long long>(mirror->base), static_cast<unsigned long long>(mirror->bytes - mirror->padding), (mirror->bytes - mirror->padding) / 1048576.0, static_cast<unsigned long long>(mirror->padding), mirror->buffer->InVideoMemory() ? "video" : "system");
+                        AgcDriver::ReportLine("[space]     sub-range 0x%llx+0x%llx (%.2f MiB, 0x%llx of padding): mirror in %s memory\n", static_cast<unsigned long long>(mirror->base), static_cast<unsigned long long>(mirror->bytes - mirror->padding), (mirror->bytes - mirror->padding) / 1048576.0, static_cast<unsigned long long>(mirror->padding), mirror->buffer->InVideoMemory() ? "video" : "system");
                     }
                 }
             }
@@ -2198,7 +2199,7 @@ std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes,
         return std::make_shared<Buffer>(context, bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     } catch (const std::exception& error) {
         static std::atomic<int> reported{0};
-        if (reported.fetch_add(1, std::memory_order_relaxed) < 4) std::fprintf(stderr, "[buffers] staging shadow of %zu bytes refused: %s\n", bytes, error.what());
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 4) AgcDriver::ReportLine("[buffers] staging shadow of %zu bytes refused: %s\n", bytes, error.what());
         Copies().stagingRefused.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
@@ -2213,7 +2214,7 @@ void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
     static std::set<std::pair<std::uint64_t, std::uint64_t>> seen;
     std::lock_guard lock(mutex);
     if (!seen.insert({begin, end}).second) return;
-    std::fprintf(stderr, "[staging] 0x%llx+0x%llx (%.1f KiB)%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "");
+    AgcDriver::ReportLine("[staging] 0x%llx+0x%llx (%.1f KiB)%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "");
 }
 
 void reportStaging() {
@@ -2226,7 +2227,7 @@ void reportStaging() {
     const auto staged = stats.staged.load();
     const auto in = stats.stagedInBytes.load();
     const auto out = stats.stagedOutBytes.load();
-    std::fprintf(stderr, "[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
+    AgcDriver::ReportLine("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
@@ -2420,7 +2421,7 @@ void reportResidentStaging() {
             liveBytes += std::get<2>(key) - std::get<1>(key);
         }
     }
-    std::fprintf(stderr, "[resident-staging] %.1f s: %llu staged region uses; copy-ins avoided %llu (%.1f MiB); copy-ins made %llu (%.1f MiB) by reason (count/MiB):%s; shadows: %llu made, %llu shared with an earlier build, %llu refused by the device, %zu live (%.1f MiB)\n", seconds, static_cast<unsigned long long>(stats.uses), static_cast<unsigned long long>(stats.skipped), stats.skippedBytes / 1048576.0, static_cast<unsigned long long>(madeCount), madeBytes / 1048576.0, made.c_str(), static_cast<unsigned long long>(stats.created.exchange(0)), static_cast<unsigned long long>(stats.attached.exchange(0)), static_cast<unsigned long long>(stats.refused.exchange(0)), live, liveBytes / 1048576.0);
+    AgcDriver::ReportLine("[resident-staging] %.1f s: %llu staged region uses; copy-ins avoided %llu (%.1f MiB); copy-ins made %llu (%.1f MiB) by reason (count/MiB):%s; shadows: %llu made, %llu shared with an earlier build, %llu refused by the device, %zu live (%.1f MiB)\n", seconds, static_cast<unsigned long long>(stats.uses), static_cast<unsigned long long>(stats.skipped), stats.skippedBytes / 1048576.0, static_cast<unsigned long long>(madeCount), madeBytes / 1048576.0, made.c_str(), static_cast<unsigned long long>(stats.created.exchange(0)), static_cast<unsigned long long>(stats.attached.exchange(0)), static_cast<unsigned long long>(stats.refused.exchange(0)), live, liveBytes / 1048576.0);
     stats.uses = stats.skipped = stats.skippedBytes = 0;
     stats.copied = {};
     stats.copiedBytes = {};
@@ -2762,7 +2763,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     const auto uploads = uploadsProfiled.fetch_add(1, std::memory_order_relaxed) + 1;
     if (uploads % 2000 == 0) {
         const auto& copies = Copies();
-        std::fprintf(stderr, "[buffers] %llu uploads: import lookup %.0f ms, buffer allocation %.0f ms, guest read %.0f ms; copies on the GPU: %llu regions (%.0f KiB) copied out of imports, %llu written sub-ranges (%.0f KiB) copied back, %llu staging stores by the CPU at write-back\n", static_cast<unsigned long long>(uploads), importUs.load(std::memory_order_relaxed) / 1000.0, allocateUs.load(std::memory_order_relaxed) / 1000.0, readUs.load(std::memory_order_relaxed) / 1000.0, static_cast<unsigned long long>(copies.gpuCopies.load(std::memory_order_relaxed)), copies.gpuCopyBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.gpuCopyBacks.load(std::memory_order_relaxed)), copies.gpuCopyBackBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.stagingStores.load(std::memory_order_relaxed)));
+        AgcDriver::ReportLine("[buffers] %llu uploads: import lookup %.0f ms, buffer allocation %.0f ms, guest read %.0f ms; copies on the GPU: %llu regions (%.0f KiB) copied out of imports, %llu written sub-ranges (%.0f KiB) copied back, %llu staging stores by the CPU at write-back\n", static_cast<unsigned long long>(uploads), importUs.load(std::memory_order_relaxed) / 1000.0, allocateUs.load(std::memory_order_relaxed) / 1000.0, readUs.load(std::memory_order_relaxed) / 1000.0, static_cast<unsigned long long>(copies.gpuCopies.load(std::memory_order_relaxed)), copies.gpuCopyBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.gpuCopyBacks.load(std::memory_order_relaxed)), copies.gpuCopyBackBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.stagingStores.load(std::memory_order_relaxed)));
     }
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     if (ms > 50) {
@@ -2774,13 +2775,13 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             largest = std::max<std::uint64_t>(largest, region.end - region.begin);
             if (region.buffer != nullptr) copied += region.end - region.begin;
         }
-        std::fprintf(stderr, "[resources] guest upload of %zu regions, %.1f MiB (largest %.1f MiB, copied %.1f MiB, addressable %d) took %.0f ms to finish\n", regions.size(), total / 1048576.0, largest / 1048576.0, copied / 1048576.0, addressable ? 1 : 0, ms);
+        AgcDriver::ReportLine("[resources] guest upload of %zu regions, %.1f MiB (largest %.1f MiB, copied %.1f MiB, addressable %d) took %.0f ms to finish\n", regions.size(), total / 1048576.0, largest / 1048576.0, copied / 1048576.0, addressable ? 1 : 0, ms);
     }
     // Debug aid: APS5_TRACE_BIGBUF lists every copied region of at least 1 MiB.
     static const bool traceBig = std::getenv("APS5_TRACE_BIGBUF") != nullptr;
     if (traceBig) {
         for (const auto& region : regions) {
-            if (region.buffer != nullptr && region.end - region.begin >= (1u << 20u)) std::fprintf(stderr, "[bigbuf] upload 0x%llx+0x%llx writable=%d hostBacked=%d sparse=%d addressable=%d\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end - region.begin), region.writable ? 1 : 0, region.hostBacked ? 1 : 0, region.sparse ? 1 : 0, addressable ? 1 : 0);
+            if (region.buffer != nullptr && region.end - region.begin >= (1u << 20u)) AgcDriver::ReportLine("[bigbuf] upload 0x%llx+0x%llx writable=%d hostBacked=%d sparse=%d addressable=%d\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end - region.begin), region.writable ? 1 : 0, region.hostBacked ? 1 : 0, region.sparse ? 1 : 0, addressable ? 1 : 0);
         }
     }
 }
@@ -2814,9 +2815,9 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         if (++uploads % 1000 == 0) {
             // 'misaligned in imports' are the ones the GPU did not copy: over APS5_GPU_COPY_MAX_KIB,
             // sparse, APS5_CPU_COPIES, no recorder, or an import gone by UploadFinish.
-            std::fprintf(stderr, "[buffers] %llu copied regions on the CPU: %llu snapshots (%.0f MiB), %llu misaligned in imports (%.0f MiB), %llu outside imports (%.0f MiB):", static_cast<unsigned long long>(uploads), static_cast<unsigned long long>(snapshotOnly), snapshotBytes / 1048576.0, static_cast<unsigned long long>(misaligned), misalignedBytes / 1048576.0, static_cast<unsigned long long>(noImport), noImportBytes / 1048576.0);
-            for (const auto& [granule, counts] : outside) std::fprintf(stderr, " 0x%llx0000000:%llu/%.0fMiB", static_cast<unsigned long long>(granule), static_cast<unsigned long long>(counts.first), counts.second / 1048576.0);
-            std::fprintf(stderr, "\n");
+            AgcDriver::ReportLine("[buffers] %llu copied regions on the CPU: %llu snapshots (%.0f MiB), %llu misaligned in imports (%.0f MiB), %llu outside imports (%.0f MiB):", static_cast<unsigned long long>(uploads), static_cast<unsigned long long>(snapshotOnly), snapshotBytes / 1048576.0, static_cast<unsigned long long>(misaligned), misalignedBytes / 1048576.0, static_cast<unsigned long long>(noImport), noImportBytes / 1048576.0);
+            for (const auto& [granule, counts] : outside) AgcDriver::ReportLine(" 0x%llx0000000:%llu/%.0fMiB", static_cast<unsigned long long>(granule), static_cast<unsigned long long>(counts.first), counts.second / 1048576.0);
+            AgcDriver::ReportLine("\n");
         }
     }
     const auto allocateStart = std::chrono::steady_clock::now();
@@ -3233,7 +3234,7 @@ void GuestBufferMemory::WriteBack() {
         }
         Require(region.buffer != nullptr && region.writable && end <= region.end, "write-back range exceeds its GPU owner");
         static const bool traceBig = std::getenv("APS5_TRACE_BIGBUF") != nullptr;
-        if (traceBig && end - begin >= (1u << 20u)) std::fprintf(stderr, "[bigbuf] writeback 0x%llx+0x%llx sparse=%d\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), region.sparse ? 1 : 0);
+        if (traceBig && end - begin >= (1u << 20u)) AgcDriver::ReportLine("[bigbuf] writeback 0x%llx+0x%llx sparse=%d\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), region.sparse ? 1 : 0);
         if (!region.sparse) {
             const auto first = static_cast<std::size_t>(begin - region.begin);
             const auto length = static_cast<std::size_t>(end - begin);

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -99,7 +100,7 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         std::uint32_t queue;
         ~Clear() {
             const bool failed = std::uncaught_exceptions() != 0;
-            if (failed) std::fprintf(stderr, "[gpu] queue 0x%x dropped %zu queued labels: their record failed\n", queue, labels.size());
+            if (failed) AgcDriver::ReportLine("[gpu] queue 0x%x dropped %zu queued labels: their record failed\n", queue, labels.size());
             labels.clear();
 
             Graphics::Recorder::CloseLabelGroup(failed ? 0 : GuestMemory::TrackerGeneration());

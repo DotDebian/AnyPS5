@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/LocalMemoryProbe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -120,11 +121,11 @@ std::optional<std::uint32_t> MeasureComputeLocalMemory(const LocalMemoryProbeCon
             }
         }
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "[wave64] program 0x%llx: the local memory probe failed (%s)\n", static_cast<unsigned long long>(codeAddress), error.what());
+        AgcDriver::ReportLine("[wave64] program 0x%llx: the local memory probe failed (%s)\n", static_cast<unsigned long long>(codeAddress), error.what());
         bytes.reset();
     }
     release();
-    if (trace) std::fprintf(stderr, "[wave64] program 0x%llx: %zu SPIR-V words: %s\n", static_cast<unsigned long long>(codeAddress), spirv.size(), evidence.c_str());
+    if (trace) AgcDriver::ReportLine("[wave64] program 0x%llx: %zu SPIR-V words: %s\n", static_cast<unsigned long long>(codeAddress), spirv.size(), evidence.c_str());
     return bytes;
 }
 

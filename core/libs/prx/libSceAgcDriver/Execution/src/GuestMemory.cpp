@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -320,31 +321,31 @@ public:
         auto last = state.lastReport.load();
         if (nowMs - last < 10000 || !state.lastReport.compare_exchange_strong(last, nowMs)) return;
         const auto totals = FoldMemoryCounters();
-        std::fprintf(stderr, "[guestmem]");
+        AgcDriver::ReportLine("[guestmem]");
         for (std::size_t i = 0; i < MemoryCounterCount; ++i) {
-            std::fprintf(stderr, " %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
+            AgcDriver::ReportLine(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
-        std::fprintf(stderr, " collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
-        std::fprintf(stderr, " collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
-        std::fprintf(stderr, " | verify: own stack %llu, uncached maps scans %llu", static_cast<unsigned long long>(ownStackVerifies.load()), static_cast<unsigned long long>(uncachedMapsScans.load()));
-        std::fprintf(stderr, " | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
+        AgcDriver::ReportLine(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        AgcDriver::ReportLine(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
+        AgcDriver::ReportLine(" | verify: own stack %llu, uncached maps scans %llu", static_cast<unsigned long long>(ownStackVerifies.load()), static_cast<unsigned long long>(uncachedMapsScans.load()));
+        AgcDriver::ReportLine(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
             std::lock_guard lock(state.callersMutex);
-            std::fprintf(stderr, " | read callers:");
+            AgcDriver::ReportLine(" | read callers:");
             for (const auto& [caller, count] : state.callers) {
-                if (count != 0) std::fprintf(stderr, " +0x%llx=%llu", caller, static_cast<unsigned long long>(count));
+                if (count != 0) AgcDriver::ReportLine(" +0x%llx=%llu", caller, static_cast<unsigned long long>(count));
             }
-            std::fprintf(stderr, " | write callers:");
+            AgcDriver::ReportLine(" | write callers:");
             for (const auto& [caller, count] : state.writeCallers) {
-                if (count != 0) std::fprintf(stderr, " +0x%llx=%llu", caller, static_cast<unsigned long long>(count));
+                if (count != 0) AgcDriver::ReportLine(" +0x%llx=%llu", caller, static_cast<unsigned long long>(count));
             }
         }
-        std::fprintf(stderr, " | read sites:");
+        AgcDriver::ReportLine(" | read sites:");
         for (std::size_t site = 0; site < static_cast<std::size_t>(ReadSite::Count); ++site) {
             const auto count = readSiteSamples[site].load(std::memory_order_relaxed);
-            if (count != 0) std::fprintf(stderr, " %s=%llu", ReadSiteName(static_cast<ReadSite>(site)), static_cast<unsigned long long>(count));
+            if (count != 0) AgcDriver::ReportLine(" %s=%llu", ReadSiteName(static_cast<ReadSite>(site)), static_cast<unsigned long long>(count));
         }
-        std::fprintf(stderr, "\n");
+        AgcDriver::ReportLine("\n");
     }
 private:
     MemoryCounterKind kind;
@@ -662,7 +663,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             static std::atomic<std::uint32_t> queries{0};
             if (queries.fetch_add(1) % 16 == 0) {
                 const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - queryStart).count();
-                std::fprintf(stderr, "[query] 0x%llx range 0x%zx: base 0x%llx size 0x%llx state 0x%lx protect 0x%lx type 0x%lx %.0f us gen %llu from +0x%llx\n", static_cast<unsigned long long>(cursor), bytes, reinterpret_cast<unsigned long long>(memory.BaseAddress), static_cast<unsigned long long>(memory.RegionSize), memory.State, memory.Protect, memory.Type, us, static_cast<unsigned long long>(GuestAllocations::GuestAllocationsGeneration_nid_postfix()), ModuleOffset(__builtin_return_address(0)));
+                AgcDriver::ReportLine("[query] 0x%llx range 0x%zx: base 0x%llx size 0x%llx state 0x%lx protect 0x%lx type 0x%lx %.0f us gen %llu from +0x%llx\n", static_cast<unsigned long long>(cursor), bytes, reinterpret_cast<unsigned long long>(memory.BaseAddress), static_cast<unsigned long long>(memory.RegionSize), memory.State, memory.Protect, memory.Type, us, static_cast<unsigned long long>(GuestAllocations::GuestAllocationsGeneration_nid_postfix()), ModuleOffset(__builtin_return_address(0)));
             }
         }
         const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
@@ -796,7 +797,7 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
     if (!reason.empty()) {
         // Debug aid: APS5_TRACE_UNREADABLE names the code that checked an inaccessible range.
         static const bool trace = std::getenv("APS5_TRACE_UNREADABLE") != nullptr;
-        if (trace) std::fprintf(stderr, "[unreadable] %s from +0x%llx\n", reason.c_str(), ModuleOffset(__builtin_return_address(0)));
+        if (trace) AgcDriver::ReportLine("[unreadable] %s from +0x%llx\n", reason.c_str(), ModuleOffset(__builtin_return_address(0)));
         require(false, reason.c_str());
     }
 }
@@ -1949,7 +1950,7 @@ std::uint32_t GpuMutexType::DepthOnThisThread() const {
 void AssertGpuLockHeld(const char* where) {
     static const bool enabled = std::getenv("APS5_ASSERT_GPU_LOCK") != nullptr;
     if (!enabled || GpuMutex().HeldByThisThread()) return;
-    std::fprintf(stderr, "[lock] ASSERT: %s reached without GuestMemory::GpuMutex on thread tagged 0x%x\n", where, GpuLockThreadTag());
+    AgcDriver::ReportLine("[lock] ASSERT: %s reached without GuestMemory::GpuMutex on thread tagged 0x%x\n", where, GpuLockThreadTag());
     std::abort();
 }
 
@@ -2022,8 +2023,8 @@ void GpuMutexType::lock() {
         char counts[160];
         std::snprintf(counts, sizeof(counts), "; lock() %llu / try %llu / try failed %llu; locked GPU waits %llu / %.0f ms", static_cast<unsigned long long>(stats.acquisitions), static_cast<unsigned long long>(stats.tries), static_cast<unsigned long long>(stats.triesFailed), static_cast<unsigned long long>(stats.lockedGpuWaits), stats.lockedGpuWaitMs);
         holds += counts;
-        if (stats.tag == 0xffffffffu) std::fprintf(stderr, "[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.holderColumn == PresenterColumn ? "presenter" : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
-        else std::fprintf(stderr, "[lock] queue 0x%x waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.tag, stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
+        if (stats.tag == 0xffffffffu) AgcDriver::ReportLine("[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.holderColumn == PresenterColumn ? "presenter" : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
+        else AgcDriver::ReportLine("[lock] queue 0x%x waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.tag, stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
         stats.waitedMs = 0;
         stats.waits = 0;
         stats.acquisitions = 0;
@@ -2117,7 +2118,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
         CheckRange(source, destination.size(), alignment);
     } catch (const std::runtime_error&) {
         static const bool trace = std::getenv("APS5_TRACE_UNREADABLE") != nullptr;
-        if (trace) std::fprintf(stderr, "[unreadable]   read from +0x%llx\n", ModuleOffset(__builtin_return_address(0)));
+        if (trace) AgcDriver::ReportLine("[unreadable]   read from +0x%llx\n", ModuleOffset(__builtin_return_address(0)));
         throw;
     }
     std::memcpy(destination.data(), source, destination.size());

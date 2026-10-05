@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -138,7 +139,7 @@ void materializeRegisterClear(const Context& context, const ColorTarget& color, 
     if (trace && traced.fetch_add(1, std::memory_order_relaxed) % 97 < 12) {
         char pending[96] = "no pending key writer";
         if (writer.has_value()) std::snprintf(pending, sizeof(pending), "key writer %s%s, %zu batches up to it", writer->open ? "in the open batch" : "in flight", writer->signaled ? " (signaled)" : "", writer->batchesToFinish);
-        std::fprintf(stderr, "[regclear] target 0x%llx %ux%u bytes %llu dcc 0x%llx: %s, pending keys known as %s, shortcut %d; first fill %s, synced %d, then %s (%s)\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.bytes), static_cast<unsigned long long>(color.dccAddress), pending, known.has_value() ? DccKeysName(*known) : "unknown", shortcut, firstRefusal != nullptr ? firstRefusal : "done", synced, cleared ? "cleared on the GPU" : "texels stored by the CPU", refusal != nullptr ? refusal : "-");
+        AgcDriver::ReportLine("[regclear] target 0x%llx %ux%u bytes %llu dcc 0x%llx: %s, pending keys known as %s, shortcut %d; first fill %s, synced %d, then %s (%s)\n", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.bytes), static_cast<unsigned long long>(color.dccAddress), pending, known.has_value() ? DccKeysName(*known) : "unknown", shortcut, firstRefusal != nullptr ? firstRefusal : "done", synced, cleared ? "cleared on the GPU" : "texels stored by the CPU", refusal != nullptr ? refusal : "-");
     }
     if (cleared) {
         MarkDccUncompressed(context, color.dccAddress, color.bytes);
@@ -404,8 +405,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     for (std::size_t i = 1; i < profile.recipeMisses.size() && room(); ++i) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
-    std::fprintf(stderr, "%s\n", line);
-    std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    AgcDriver::ReportLine("%s\n", line);
+    AgcDriver::ReportLine("[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
@@ -532,11 +533,11 @@ void reportDrawPlans() {
     for (std::size_t i = 1; i < stats.misses.size(); ++i) {
         if (stats.misses[i] != 0) misses += " " + std::string(DrawRecipeMissName(static_cast<DrawRecipeMiss>(i))) + " " + std::to_string(stats.misses[i]);
     }
-    std::fprintf(stderr, "[drawplan] draws with a state key (10 s): %llu plan hits avg %.1f us; no plan tried: %llu not eligible, %llu no template, %llu template without a plan for the state; plans that missed:%s; %llu plans attached\n", static_cast<unsigned long long>(stats.hits), stats.hits != 0 ? stats.hitUs / static_cast<double>(stats.hits) : 0.0, static_cast<unsigned long long>(stats.ineligible), static_cast<unsigned long long>(stats.noTemplate), static_cast<unsigned long long>(stats.noPlan), misses.empty() ? " none" : misses.c_str(), static_cast<unsigned long long>(stats.attached));
+    AgcDriver::ReportLine("[drawplan] draws with a state key (10 s): %llu plan hits avg %.1f us; no plan tried: %llu not eligible, %llu no template, %llu template without a plan for the state; plans that missed:%s; %llu plans attached\n", static_cast<unsigned long long>(stats.hits), stats.hits != 0 ? stats.hitUs / static_cast<double>(stats.hits) : 0.0, static_cast<unsigned long long>(stats.ineligible), static_cast<unsigned long long>(stats.noTemplate), static_cast<unsigned long long>(stats.noPlan), misses.empty() ? " none" : misses.c_str(), static_cast<unsigned long long>(stats.attached));
     if (AddressDrawTimes()) {
         auto& times = PlanTimeTotals();
         const auto average = [&](double total) { return times.hits != 0 ? total / static_cast<double>(times.hits) : 0.0; };
-        std::fprintf(stderr, "[drawplan] times of %llu plan hits (10 s), avg us: proof %.1f (inputs, targets, address space, template proof, moved buffers), bindings %.1f (snapshots, data buffers, the draw's set), record %.1f (pipeline, pass, commands, keep)\n", static_cast<unsigned long long>(times.hits), average(times.proofUs), average(times.bindingsUs), average(times.recordUs));
+        AgcDriver::ReportLine("[drawplan] times of %llu plan hits (10 s), avg us: proof %.1f (inputs, targets, address space, template proof, moved buffers), bindings %.1f (snapshots, data buffers, the draw's set), record %.1f (pipeline, pass, commands, keep)\n", static_cast<unsigned long long>(times.hits), average(times.proofUs), average(times.bindingsUs), average(times.recordUs));
         times = {};
     }
     const auto last = stats.lastReport;
@@ -558,7 +559,7 @@ void reportAddressDraws() {
         }
         return text.empty() ? std::string(" none") : text;
     };
-    std::fprintf(stderr, "[addrdraw] address-based draws (10 s): %llu template hits avg %.1f us (%llu with a set of their own: %llu data buffers rebuilt, %llu buffers rebound in place), %llu builds avg %.1f us; built because:%s; proof failures by reason:%s; builds then:%s; %zu templates and dispatch entries cached\n", static_cast<unsigned long long>(stats.hits), stats.hits != 0 ? stats.hitUs / static_cast<double>(stats.hits) : 0.0, static_cast<unsigned long long>(stats.ownSets), static_cast<unsigned long long>(stats.dataBuffers), static_cast<unsigned long long>(stats.reboundBuffers), static_cast<unsigned long long>(builds), builds != 0 ? stats.buildUs / static_cast<double>(builds) : 0.0, list(stats.builds, AddressDrawBuildNames, 0).c_str(), list(stats.proofFailures, ProofFailureNames, 1).c_str(), list(stats.fates, AddressDrawFateNames, 0).c_str(), SharedResourceCache().Size());
+    AgcDriver::ReportLine("[addrdraw] address-based draws (10 s): %llu template hits avg %.1f us (%llu with a set of their own: %llu data buffers rebuilt, %llu buffers rebound in place), %llu builds avg %.1f us; built because:%s; proof failures by reason:%s; builds then:%s; %zu templates and dispatch entries cached\n", static_cast<unsigned long long>(stats.hits), stats.hits != 0 ? stats.hitUs / static_cast<double>(stats.hits) : 0.0, static_cast<unsigned long long>(stats.ownSets), static_cast<unsigned long long>(stats.dataBuffers), static_cast<unsigned long long>(stats.reboundBuffers), static_cast<unsigned long long>(builds), builds != 0 ? stats.buildUs / static_cast<double>(builds) : 0.0, list(stats.builds, AddressDrawBuildNames, 0).c_str(), list(stats.proofFailures, ProofFailureNames, 1).c_str(), list(stats.fates, AddressDrawFateNames, 0).c_str(), SharedResourceCache().Size());
     // The read-only elements of those draws under APS5_SNAPSHOT_ADDRESS_DRAWS (a build's own and
     // the ones a hit moved; a plan hit's too): ShaderResources' cumulative counters, as the
     // window's difference. "rebound in place" above counts every moved element, whichever of the
@@ -571,7 +572,7 @@ void reportAddressDraws() {
     for (std::size_t i = 0; i < refusals.size(); ++i) {
         if (snapshots.inPlace[i] != seen.inPlace[i]) left += " " + std::string(refusals[i]) + " " + std::to_string(snapshots.inPlace[i] - seen.inPlace[i]);
     }
-    std::fprintf(stderr, "[addrdraw] read-only elements (10 s): %llu bound to a snapshot (%llu in video memory): %llu by the collect epoch without a check (%llu of them after asking the range again), %llu reused after their checks, %llu copied (%.1f MiB), %llu small ones copied without a collect (%.1f MiB); left in place:%s\n", delta(snapshots.bound, seen.bound), delta(snapshots.video, seen.video), delta(snapshots.epochSkips, seen.epochSkips), delta(snapshots.epochRechecks, seen.epochRechecks), delta(snapshots.reused, seen.reused), delta(snapshots.copied, seen.copied), static_cast<double>(snapshots.copiedBytes - seen.copiedBytes) / 1048576.0, delta(snapshots.small, seen.small), static_cast<double>(snapshots.smallBytes - seen.smallBytes) / 1048576.0, left.empty() ? " none" : left.c_str());
+    AgcDriver::ReportLine("[addrdraw] read-only elements (10 s): %llu bound to a snapshot (%llu in video memory): %llu by the collect epoch without a check (%llu of them after asking the range again), %llu reused after their checks, %llu copied (%.1f MiB), %llu small ones copied without a collect (%.1f MiB); left in place:%s\n", delta(snapshots.bound, seen.bound), delta(snapshots.video, seen.video), delta(snapshots.epochSkips, seen.epochSkips), delta(snapshots.epochRechecks, seen.epochRechecks), delta(snapshots.reused, seen.reused), delta(snapshots.copied, seen.copied), static_cast<double>(snapshots.copiedBytes - seen.copiedBytes) / 1048576.0, delta(snapshots.small, seen.small), static_cast<double>(snapshots.smallBytes - seen.smallBytes) / 1048576.0, left.empty() ? " none" : left.c_str());
     seen = snapshots;
     // What the hits no longer pay per draw: the batch arena (small snapshots and the draws' own
     // data buffers), the template proofs answered by the epoch, the templates the sweep dropped.
@@ -579,7 +580,7 @@ void reportAddressDraws() {
     static std::uint64_t proofsSeen = 0;
     const auto arena = Recorder::ArenaCounts();
     const auto proofs = ShaderResources::ProofsReused();
-    std::fprintf(stderr, "[addrdraw] per-draw work (10 s): batch arena %.1f MiB in %llu blocks of 1 MiB; template proofs answered by the collect epoch %llu; templates dropped for images that left their cache %llu (%.1f MiB of such images held)\n", static_cast<double>(arena.bytes - arenaSeen.bytes) / 1048576.0, delta(arena.blocks, arenaSeen.blocks), delta(proofs, proofsSeen), static_cast<unsigned long long>(stats.swept), static_cast<double>(stats.sweptBytes) / 1048576.0);
+    AgcDriver::ReportLine("[addrdraw] per-draw work (10 s): batch arena %.1f MiB in %llu blocks of 1 MiB; template proofs answered by the collect epoch %llu; templates dropped for images that left their cache %llu (%.1f MiB of such images held)\n", static_cast<double>(arena.bytes - arenaSeen.bytes) / 1048576.0, delta(arena.blocks, arenaSeen.blocks), delta(proofs, proofsSeen), static_cast<unsigned long long>(stats.swept), static_cast<double>(stats.sweptBytes) / 1048576.0);
     arenaSeen = arena;
     proofsSeen = proofs;
     const auto last = stats.lastReport;
@@ -760,7 +761,7 @@ void CountDrawStaging(const ShaderResources& resources, bool recorded) {
     const auto seconds = std::chrono::duration<double>(now - last).count();
     last = now;
     const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
-    std::fprintf(stderr, "[draw-staging] %.1f s: %llu draws write guest buffers; %llu staged (%llu regions, %llu elements, %.1f MiB copied in, %.1f MiB copied back); draws left in place: %llu not recorded, %llu address-based; regions left in place: %llu outside the size window (%.1f MiB), %llu outside an import, %llu other\n", seconds, count(draws), count(stagedDraws), count(total.staged), count(total.elements), total.inBytes / 1048576.0, total.backBytes / 1048576.0, count(notRecorded), count(addressBased), count(total.pastWindow), total.pastWindowBytes / 1048576.0, count(total.outsideImport), count(total.other));
+    AgcDriver::ReportLine("[draw-staging] %.1f s: %llu draws write guest buffers; %llu staged (%llu regions, %llu elements, %.1f MiB copied in, %.1f MiB copied back); draws left in place: %llu not recorded, %llu address-based; regions left in place: %llu outside the size window (%.1f MiB), %llu outside an import, %llu other\n", seconds, count(draws), count(stagedDraws), count(total.staged), count(total.elements), total.inBytes / 1048576.0, total.backBytes / 1048576.0, count(notRecorded), count(addressBased), count(total.pastWindow), total.pastWindowBytes / 1048576.0, count(total.outsideImport), count(total.other));
     draws = stagedDraws = notRecorded = addressBased = 0;
     total = {};
 }
@@ -938,7 +939,7 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
             if (timer.us[i] <= 0) continue;
             n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.0fus", DrawPhaseNames[i], timer.us[i]);
         }
-        std::fprintf(stderr, "%s\n", line);
+        AgcDriver::ReportLine("%s\n", line);
     }
     reportDraw(timer.us, built, outcome);
 }
@@ -960,7 +961,7 @@ void CountDrawInput(bool index, bool reused, std::size_t bytes) {
     const auto now = std::chrono::steady_clock::now();
     if (now - last < std::chrono::seconds(10)) return;
     last = now;
-    std::fprintf(stderr, "[drawinput] draw inputs (10 s): index copied %llu (%.1f MiB), reused %llu (%.1f MiB); vertex copied %llu (%.1f MiB), reused %llu (%.1f MiB)\n", static_cast<unsigned long long>(counts[1][0]), sizes[1][0] / 1048576.0, static_cast<unsigned long long>(counts[1][1]), sizes[1][1] / 1048576.0, static_cast<unsigned long long>(counts[0][0]), sizes[0][0] / 1048576.0, static_cast<unsigned long long>(counts[0][1]), sizes[0][1] / 1048576.0);
+    AgcDriver::ReportLine("[drawinput] draw inputs (10 s): index copied %llu (%.1f MiB), reused %llu (%.1f MiB); vertex copied %llu (%.1f MiB), reused %llu (%.1f MiB)\n", static_cast<unsigned long long>(counts[1][0]), sizes[1][0] / 1048576.0, static_cast<unsigned long long>(counts[1][1]), sizes[1][1] / 1048576.0, static_cast<unsigned long long>(counts[0][0]), sizes[0][0] / 1048576.0, static_cast<unsigned long long>(counts[0][1]), sizes[0][1] / 1048576.0);
     for (auto& row : counts) row[0] = row[1] = 0;
     for (auto& row : sizes) row[0] = row[1] = 0;
 }
@@ -1251,7 +1252,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         static std::mutex reportMutex;
         static std::set<std::uint64_t> reported;
         std::lock_guard lock(reportMutex);
-        if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
+        if (reported.insert(color.address).second) AgcDriver::ReportLine("[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
@@ -1521,12 +1522,12 @@ std::function<void()> indirectRecordCheck(const IndirectRecord* indirect) {
                 const bool ignoredInstance = args.instanceRule == Rule::Constant && arguments.firstInstance != 0;
                 ++checked;
                 if (ignoredVertex || ignoredInstance) ++ignoredValues;
-                if (printed.fetch_add(1) < 16) std::fprintf(stderr, "[draw] indirect record 0x%llx: count %u instances %u first %u vertexOffset %u startInstance %u (vertex %s, instance %s)\n", static_cast<unsigned long long>(args.arguments + static_cast<std::uint64_t>(record) * args.stride), arguments.count, arguments.instances, arguments.firstVertexOrIndex, arguments.vertexOffset, arguments.firstInstance, args.vertexRule == Rule::Constant ? "const: record value ignored" : "in-place", args.instanceRule == Rule::Constant ? "const: record value ignored" : "in-place");
+                if (printed.fetch_add(1) < 16) AgcDriver::ReportLine("[draw] indirect record 0x%llx: count %u instances %u first %u vertexOffset %u startInstance %u (vertex %s, instance %s)\n", static_cast<unsigned long long>(args.arguments + static_cast<std::uint64_t>(record) * args.stride), arguments.count, arguments.instances, arguments.firstVertexOrIndex, arguments.vertexOffset, arguments.firstInstance, args.vertexRule == Rule::Constant ? "const: record value ignored" : "in-place", args.instanceRule == Rule::Constant ? "const: record value ignored" : "in-place");
             }
         } catch (const std::exception& error) {
-            std::fprintf(stderr, "[draw] indirect record read-back failed: %s\n", error.what());
+            AgcDriver::ReportLine("[draw] indirect record read-back failed: %s\n", error.what());
         }
-        if (checked % 64 == 0) std::fprintf(stderr, "[draw] indirect records checked %llu, with a value in a Constant dimension %llu\n", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(ignoredValues.load()));
+        if (checked % 64 == 0) AgcDriver::ReportLine("[draw] indirect records checked %llu, with a value in a Constant dimension %llu\n", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(ignoredValues.load()));
     };
 }
 
@@ -1889,7 +1890,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
                 std::snprintf(text, sizeof(text), " %d:%llx", static_cast<int>(shader.stage), static_cast<unsigned long long>(shader.program->variantId));
                 stages += text;
             }
-            std::fprintf(stderr, "[drawkey] 0x%llx: stages%s; %zu targets, first 0x%llx %ux%u format %d, render extent %ux%u, depth %d; %s%s indexCount %u instances %u indexed %d\n", static_cast<unsigned long long>(key), stages.c_str(), state.colors.size(), static_cast<unsigned long long>(state.colors.empty() ? 0 : state.colors.front().address), state.colors.empty() ? 0 : state.colors.front().extent.width, state.colors.empty() ? 0 : state.colors.front().extent.height, state.colors.empty() ? 0 : static_cast<int>(state.colors.front().format), state.renderExtent.width, state.renderExtent.height, record.depth != nullptr, state.stages.mesh ? "mesh " : "", args != nullptr ? (gpuIndirect ? "gpu-indirect" : "indirect") : "direct", draw.indexCount, draw.instanceCount, draw.indexed);
+            AgcDriver::ReportLine("[drawkey] 0x%llx: stages%s; %zu targets, first 0x%llx %ux%u format %d, render extent %ux%u, depth %d; %s%s indexCount %u instances %u indexed %d\n", static_cast<unsigned long long>(key), stages.c_str(), state.colors.size(), static_cast<unsigned long long>(state.colors.empty() ? 0 : state.colors.front().address), state.colors.empty() ? 0 : state.colors.front().extent.width, state.colors.empty() ? 0 : state.colors.front().extent.height, state.colors.empty() ? 0 : static_cast<int>(state.colors.front().format), state.renderExtent.width, state.renderExtent.height, record.depth != nullptr, state.stages.mesh ? "mesh " : "", args != nullptr ? (gpuIndirect ? "gpu-indirect" : "indirect") : "direct", draw.indexCount, draw.instanceCount, draw.indexed);
             std::size_t written = 0;
             std::size_t atomic = 0;
             for (const auto& shader : shaders) {
@@ -1898,7 +1899,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
                     atomic += static_cast<std::size_t>(std::count(binding.bufferAtomic.begin(), binding.bufferAtomic.end(), true));
                 }
             }
-            std::fprintf(stderr, "[drawkey-res] 0x%llx: program 0x%llx; address-based %d, stores by address %d, written elements %zu, atomic elements %zu;%.1500s\n", static_cast<unsigned long long>(key), static_cast<unsigned long long>(Recorder::NotedProgram()), resources.UsesBda() ? 1 : 0, resources.BdaWrites() ? 1 : 0, written, atomic, resources.Describe().c_str());
+            AgcDriver::ReportLine("[drawkey-res] 0x%llx: program 0x%llx; address-based %d, stores by address %d, written elements %zu, atomic elements %zu;%.1500s\n", static_cast<unsigned long long>(key), static_cast<unsigned long long>(Recorder::NotedProgram()), resources.UsesBda() ? 1 : 0, resources.BdaWrites() ? 1 : 0, written, atomic, resources.Describe().c_str());
         }
         // 0xd8...: the draw continues a pass whose previous draw had the same key (no pipeline
         // change between them), apart from the others, to tell a per-switch cost from a per-draw one.
@@ -2147,7 +2148,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                     for (std::size_t offset = 0; offset + color.elementBytes <= pixels.size(); offset += color.elementBytes) std::memcpy(pixels.data() + offset, texel.data(), color.elementBytes);
                 } else if (!FillDccClear(color.format, keys, color.dccAlphaOnMsb, pixels)) {
                     static std::set<std::pair<std::uint64_t, int>> reported;
-                    if (reported.size() < 32 && reported.insert({color.address, static_cast<int>(keys)}).second) std::fprintf(stderr, "[gpu] color target 0x%llx (VkFormat %d) has %s DCC keys; its stored texels are used\n", static_cast<unsigned long long>(color.address), static_cast<int>(color.format), DccKeysName(keys));
+                    if (reported.size() < 32 && reported.insert({color.address, static_cast<int>(keys)}).second) AgcDriver::ReportLine("[gpu] color target 0x%llx (VkFormat %d) has %s DCC keys; its stored texels are used\n", static_cast<unsigned long long>(color.address), static_cast<int>(color.format), DccKeysName(keys));
                     if (binding.gpuTiling) std::memcpy(pixels.data(), binding.original.data(), binding.original.size());
                     else ReadColorTarget(color, pixels);
                 }
@@ -2591,7 +2592,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             sampled = bytes.size() / 64;
             for (std::size_t i = 0; i < bytes.size(); i += 64) nonzero += bytes[i] != std::byte{0};
         }
-        std::fprintf(stderr, "[draw]   inputs:%s\n", resources->Describe().c_str());
+        AgcDriver::ReportLine("[draw]   inputs:%s\n", resources->Describe().c_str());
         if (targets.size() > 1) {
             std::string list;
             for (const auto& binding : targets) {
@@ -2599,7 +2600,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 std::snprintf(entry, sizeof(entry), " 0x%llx(%d,%ux%u)", static_cast<unsigned long long>(binding.color.address), static_cast<int>(binding.color.format), binding.color.extent.width, binding.color.extent.height);
                 list += entry;
             }
-            std::fprintf(stderr, "[draw]   targets:%s\n", list.c_str());
+            AgcDriver::ReportLine("[draw]   targets:%s\n", list.c_str());
         }
         timer.phase(PhaseDescribe);
         char suffix[160];

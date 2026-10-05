@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include <cstdlib>
 #include <functional>
@@ -63,7 +64,7 @@ std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::R
             std::fclose(file);
         }
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "[gpu] could not serialize request for 0x%llx: %s\n", static_cast<unsigned long long>(address), error.what());
+        AgcDriver::ReportLine("[gpu] could not serialize request for 0x%llx: %s\n", static_cast<unsigned long long>(address), error.what());
     }
     return name;
 }
