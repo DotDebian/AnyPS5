@@ -9,6 +9,7 @@
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <list>
 #include <map>
@@ -18,6 +19,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+namespace AgcDriver {
+struct DrawRecipe;
+}
 
 namespace AgcDriver::Graphics {
 
@@ -122,6 +127,10 @@ public:
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        // Push constant bytes of the elements bound in place at another alignment adjustment than
+        // the build's (MovedBuffer::inPlace): the position in the block and the adjustment, zero
+        // meaning the byte the stages assembled (the build records no patch for it either).
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -129,6 +138,10 @@ public:
         std::uint64_t address;
         std::size_t size;
         std::vector<std::uint32_t> words;
+        // A read-only V# of a shared address-based build's later use: bound in place through the
+        // address space, like the build's own elements, at `adjustment` (see PrepareDrawBindings).
+        bool inPlace = false;
+        std::uint32_t adjustment = 0;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
@@ -193,6 +206,52 @@ public:
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
+    // Address-based draw templates (APS5_REUSE_ADDRESS_DRAWS=1, default off; ignored under
+    // APS5_SYNC_LEASE_DISPATCH). A build that maps registered memory through BDA tables was never
+    // reusable, for five reasons, each handled as follows when the switch is on:
+    //  - the lease: the build pins every registered allocation until its write-back, and an object
+    //    kept in the resource cache would pin them for good. A shared build holds no lease of its
+    //    own: every use holds the cached address space (ShareLease for the first, AcquireSharedLease
+    //    for a later one) and its completion releases it, as a single-use build's write-back does;
+    //  - the space and the table: the descriptor set names the imports and the BDA table of the
+    //    address space the build mapped. A later use must find that very space still cached and
+    //    current (AcquireSharedLease) and its imports unretired once the lookups ran (Revalidate);
+    //    any change of the registry or the imports fails it and the draw builds anew;
+    //  - per-build memory state: mirrors are refreshed per build, copied ranges and captured
+    //    regions outside the space are copied per build. A use refreshes the mirrors as a build
+    //    does; a build with a region of its own is not shared, and a use whose captured regions do
+    //    not all lie in the space takes a build;
+    //  - the write-back: a single-use build commits once. A shared build has only written ranges
+    //    bound in place (anything else is not shared), so a use's completion only marks them
+    //    written (CompleteSharedUse);
+    //  - the fault buffer: one per build, read at completion. Uses in flight share it, so a fault
+    //    is reported by every use completing after it and retires the object (the next use
+    //    builds); a build that scans the buffer's written-page slots (stores by address) clears
+    //    per-use state there and is not shared.
+    // Only a draw's build can be shared; SharingRefusal says why one was not (Count: not asked).
+    static bool ReuseAddressDraws();
+    enum class AddressRefusal : std::size_t { None, StoresByAddress, NoSpace, OwnRegions, MirrorWrites, Count };
+    AddressRefusal SharingRefusal() const { return addressRefusal; }
+    using SharedLease = GuestBufferMemory::SpaceLease;
+    bool SharesLease() const { return guestMemory.Shared(); }
+    // Turns a reusable address-based build into a shared one before it goes into the resource
+    // cache; the result is the building draw's hold, to be released by its completion.
+    SharedLease ShareLease();
+    // Another use of a shared build, before its Revalidate, under GuestMemory::GpuMutex: null with
+    // the reason (a fault reported since, the address space replaced or its imports moved, a
+    // captured region outside the space: only then does the object stay valid for other draws),
+    // else the use's hold, without which no other member of a shared build may be used.
+    enum class SharedMiss : std::size_t { None, Faulted, Space, Snapshot, Count };
+    SharedLease AcquireSharedLease(std::span<const GuestMemorySnapshot> snapshots, SharedMiss& miss);
+    // One use's completion work (WriteBackBuffers runs it for a shared build): the fault check and
+    // the write marks. The caller releases the use's hold afterwards.
+    void CompleteSharedUse();
+    // Draw plans (APS5_DRAW_PLANS, see Draw.hpp): the recipes of the draws this cached object
+    // served, by the draws' plan key (their state key and push constant placement), most recently
+    // attached first and bounded; an attach under a key replaces that key's plan. Under
+    // GuestMemory::GpuMutex.
+    std::shared_ptr<const DrawRecipe> FindPlan(std::uint64_t planKey) const;
+    void AttachPlan(std::uint64_t planKey, std::shared_ptr<const DrawRecipe> plan);
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
@@ -357,6 +416,7 @@ private:
     void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
+    AddressRefusal sharingRefusal() const;
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys
@@ -444,6 +504,14 @@ private:
     std::vector<bool> storageWritten;
     std::vector<std::shared_ptr<Sampler>> samplers;
     bool reusable = false;
+    // A draw's build under APS5_REUSE_ADDRESS_DRAWS: it keeps the template records and may be
+    // shared when it holds a lease (see ReuseAddressDraws).
+    bool addressReuse = false;
+    AddressRefusal addressRefusal = AddressRefusal::Count;
+    // A use of this shared build reported a fault (set under GuestMemory::GpuMutex by a completion,
+    // atomic for the reader's sake): it serves no further use.
+    std::atomic<bool> faulted{false};
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<const DrawRecipe>>> plans;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
@@ -502,7 +570,9 @@ private:
 class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
-    std::shared_ptr<ShaderResources> Find(const Key& key);
+    // `probe`: a lookup the caller repeats on a miss (a draw plan's, before the draw's own), left
+    // out of the miss churn accounting so one draw's miss is charged once.
+    std::shared_ptr<ShaderResources> Find(const Key& key, bool probe = false);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
