@@ -762,6 +762,13 @@ private:
     PFN_vkEndCommandBuffer endCommandBuffer = nullptr;
     PFN_vkQueueSubmit queueSubmit = nullptr;
     PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
+    PFN_vkCmdBeginQuery cmdBeginQuery = nullptr;
+    PFN_vkCmdEndQuery cmdEndQuery = nullptr;
+    PFN_vkCmdResetQueryPool cmdResetQueryPool = nullptr;
+    PFN_vkCmdCopyQueryPoolResults cmdCopyQueryPoolResults = nullptr;
+    PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
+    PFN_vkCmdPushConstants cmdPushConstants = nullptr;
+    PFN_vkCmdDispatch cmdDispatch = nullptr;
     template<typename TFunction>
     TFunction function(TFunction resolved, const char* name) const {
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);

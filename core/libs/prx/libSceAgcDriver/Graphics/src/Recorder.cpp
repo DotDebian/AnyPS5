@@ -1090,6 +1090,13 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
         endCommandBuffer = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer");
         queueSubmit = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit");
         cmdPipelineBarrier = context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
+        cmdBeginQuery = context.Function<PFN_vkCmdBeginQuery>("vkCmdBeginQuery");
+        cmdEndQuery = context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery");
+        cmdResetQueryPool = context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool");
+        cmdCopyQueryPoolResults = context.Function<PFN_vkCmdCopyQueryPoolResults>("vkCmdCopyQueryPoolResults");
+        cmdBindPipeline = context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
+        cmdPushConstants = context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants");
+        cmdDispatch = context.Function<PFN_vkCmdDispatch>("vkCmdDispatch");
     }
     if (!timelineSemaphores) return;
     // The timeline starts at 0 and every Submit signals its serial (1, 2, ...): a value that only
@@ -2023,7 +2030,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
                 return NoTiming;
             }
         }
-        context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(commands, open->queries, 0, queryCount);
+        function(cmdResetQueryPool, "vkCmdResetQueryPool")(commands, open->queries, 0, queryCount);
     }
     if (open->timedKeys.size() >= queryCount / 2) {
         timingDropped.fetch_add(1, std::memory_order_relaxed);
@@ -2166,15 +2173,15 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
     }
     if (meshArgumentState < 0) return false;
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-    context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, meshArgumentPipeline);
+    function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, meshArgumentPipeline);
     struct {
         VkDeviceAddress record;
         VkDeviceAddress arguments;
         std::array<std::uint32_t, 8> rules;
     } parameters{record, arguments, {rules[0], rules[1], rules[2], rules[3], rules[4], rules[5], rules[6], 0u}};
     static_assert(sizeof(parameters) == PushBytes);
-    context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, meshArgumentLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
-    context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+    function(cmdPushConstants, "vkCmdPushConstants")(commands, meshArgumentLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
+    function(cmdDispatch, "vkCmdDispatch")(commands, 1, 1, 1);
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
     CountBarriers(CommandClass::Draw, 2);
     return true;
@@ -2247,7 +2254,7 @@ void Recorder::takeStampPool(Batch& batch) {
     }
     batch.stampNext = 0;
     if (context.hostQueryReset) context.Function<PFN_vkResetQueryPoolEXT>("vkResetQueryPoolEXT")(context.device, batch.stamps, 0, StampSlots);
-    else context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(batch.commands, batch.stamps, 0, StampSlots);
+    else function(cmdResetQueryPool, "vkCmdResetQueryPool")(batch.commands, batch.stamps, 0, StampSlots);
 }
 
 Recorder::TimestampQuery Recorder::WriteTimestamp(VkPipelineStageFlagBits stage) {
@@ -2317,7 +2324,7 @@ bool Recorder::convertStamps(VkCommandBuffer commands, std::span<const Batch::St
     }
     if (stamps.empty()) return false;
     Require(stamps.size() <= StampFoldCapacity, "queued GPU timestamps exceed the fold capacity");
-    const auto copy = context.Function<PFN_vkCmdCopyQueryPoolResults>("vkCmdCopyQueryPoolResults");
+    const auto copy = function(cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
     for (std::size_t i = 0; i < stamps.size();) {
         std::size_t run = 1;
         while (i + run < stamps.size() && stamps[i + run]->stampQueries == stamps[i]->stampQueries && stamps[i + run]->stampSlot == stamps[i]->stampSlot + run) ++run;
@@ -2326,7 +2333,7 @@ bool Recorder::convertStamps(VkCommandBuffer commands, std::span<const Batch::St
     }
     function(cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, stampBuffer->Handle(), StampTargetsOffset, targets.size() * sizeof(std::uint32_t), targets.data());
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, stampPipeline);
+    function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, stampPipeline);
     struct {
         VkDeviceAddress stamps;
         VkDeviceAddress targets;
@@ -2337,8 +2344,8 @@ bool Recorder::convertStamps(VkCommandBuffer commands, std::span<const Batch::St
         std::uint32_t reserved;
     } parameters{stampBuffer->DeviceAddress(), stampBuffer->DeviceAddress() + StampTargetsOffset, clockMapping.hostOrigin, clockMapping.guestOrigin, clockMapping.factor, static_cast<std::uint32_t>(stamps.size()), 0u};
     static_assert(sizeof(parameters) == StampPushBytes);
-    context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, stampLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, StampPushBytes, &parameters);
-    context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+    function(cmdPushConstants, "vkCmdPushConstants")(commands, stampLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, StampPushBytes, &parameters);
+    function(cmdDispatch, "vkCmdDispatch")(commands, 1, 1, 1);
     stampsOnGpu.fetch_add(stamps.size(), std::memory_order_relaxed);
     return true;
 }
@@ -2410,18 +2417,18 @@ void Recorder::takeSegmentPool(Batch& batch) {
         throw;
     }
     batch.segmentNext = 0;
-    context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(batch.commands, batch.segments, 0, SegmentSlots);
+    function(cmdResetQueryPool, "vkCmdResetQueryPool")(batch.commands, batch.segments, 0, SegmentSlots);
 }
 
 void Recorder::beginSegment(Batch& batch) {
     Require(batch.segments != VK_NULL_HANDLE && batch.segmentNext < SegmentSlots, "an occlusion segment begins without a reset query slot");
     batch.segmentSlot = batch.segmentNext++;
-    context.Function<PFN_vkCmdBeginQuery>("vkCmdBeginQuery")(batch.commands, batch.segments, batch.segmentSlot, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
+    function(cmdBeginQuery, "vkCmdBeginQuery")(batch.commands, batch.segments, batch.segmentSlot, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
     batch.segmentActive = true;
 }
 
 void Recorder::endSegment(Batch& batch) {
-    context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(batch.commands, batch.segments, batch.segmentSlot);
+    function(cmdEndQuery, "vkCmdEndQuery")(batch.commands, batch.segments, batch.segmentSlot);
     batch.segmentActive = false;
     pendingSamples.push_back({batch.segmentPool, batch.segments, batch.segmentSlot});
     segmentsClosed.fetch_add(1, std::memory_order_relaxed);
@@ -2429,7 +2436,7 @@ void Recorder::endSegment(Batch& batch) {
 
 void Recorder::copySegments(VkCommandBuffer commands, std::uint32_t count) {
     Require(count <= pendingSamples.size() && count <= SegmentFoldCapacity, "occlusion segments exceed the fold capacity");
-    const auto copy = context.Function<PFN_vkCmdCopyQueryPoolResults>("vkCmdCopyQueryPoolResults");
+    const auto copy = function(cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
     for (std::uint32_t i = 0; i < count;) {
         const auto& first = pendingSamples[i];
         std::uint32_t run = 1;
@@ -2461,7 +2468,7 @@ void Recorder::recordQueuedDumps(VkCommandBuffer commands, std::span<const Batch
 
 void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, std::uint32_t dumps, std::uint32_t firstSegment, std::uint32_t lastSegment) {
     recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, dumpPipeline);
+    function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, dumpPipeline);
     struct {
         VkDeviceAddress counter;
         VkDeviceAddress list;
@@ -2471,8 +2478,8 @@ void Recorder::dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, 
         std::uint32_t lastSegment;
     } parameters{sampleCounter->DeviceAddress(), sampleCounter->DeviceAddress() + DumpListOffset, firstDump, dumps, firstSegment, lastSegment};
     static_assert(sizeof(parameters) == SampleDumpPushBytes);
-    context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, dumpLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleDumpPushBytes, &parameters);
-    context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+    function(cmdPushConstants, "vkCmdPushConstants")(commands, dumpLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SampleDumpPushBytes, &parameters);
+    function(cmdDispatch, "vkCmdDispatch")(commands, 1, 1, 1);
 }
 
 void Recorder::foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end, std::uint32_t& dumpIndex, std::uint32_t& consumed) {
@@ -2501,7 +2508,7 @@ void Recorder::foldSegments() {
 
 void Recorder::endSamples(Batch& batch) {
     if (!batch.sampleActive) return;
-    context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(batch.commands, batch.samples, 0);
+    function(cmdEndQuery, "vkCmdEndQuery")(batch.commands, batch.samples, 0);
     batch.sampleActive = false;
     if (sampleCounterState > 0 && batch.samplesDrawn) pendingSamples.push_back({batch.samplePool, batch.samples});
     batch.samplesDrawn = false;
@@ -2509,10 +2516,10 @@ void Recorder::endSamples(Batch& batch) {
 
 void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
     const auto commands = batch.commands;
-    const auto copy = context.Function<PFN_vkCmdCopyQueryPoolResults>("vkCmdCopyQueryPoolResults");
-    const auto bind = context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
-    const auto push = context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants");
-    const auto dispatch = context.Function<PFN_vkCmdDispatch>("vkCmdDispatch");
+    const auto copy = function(cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
+    const auto bind = function(cmdBindPipeline, "vkCmdBindPipeline");
+    const auto push = function(cmdPushConstants, "vkCmdPushConstants");
+    const auto dispatch = function(cmdDispatch, "vkCmdDispatch");
     std::size_t done = 0;
     do {
         const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(SampleFoldCapacity, pendingSamples.size() - done));
@@ -2599,8 +2606,8 @@ void Recorder::beginSamples(Batch& batch) {
             throw;
         }
     }
-    context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(batch.commands, batch.samples, 0, 1);
-    context.Function<PFN_vkCmdBeginQuery>("vkCmdBeginQuery")(batch.commands, batch.samples, 0, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
+    function(cmdResetQueryPool, "vkCmdResetQueryPool")(batch.commands, batch.samples, 0, 1);
+    function(cmdBeginQuery, "vkCmdBeginQuery")(batch.commands, batch.samples, 0, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
     batch.sampleActive = true;
     batch.samplesDrawn = false;
 }
