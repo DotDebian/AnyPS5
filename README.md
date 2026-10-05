@@ -9,8 +9,8 @@ Linux, measured on my machine (6 October 2026: CachyOS, i9-14900KF, RTX 4090). F
 | Part | State | Frame rate |
 | --- | --- | --- |
 | Boot, PlayStation Studios video, logos | Renders | video at about 57 fps |
-| Title screen | Renders, including the copyright line (console fonts or the Noto substitutes) | about 52 fps |
-| NEW GAME menu | Renders | about 50 fps |
+| Title screen | Renders, including the copyright line (console fonts or the Noto substitutes) | about 54 fps |
+| NEW GAME menu | Renders | about 52 fps |
 | Intro cinematic and space scene | Renders, no more GPU hangs | 40 to 47 fps |
 | Tutorial (Crash Site hub) | Playable with a DualSense | about 13 fps |
 | World map, controller ship flight | Renders | about 27 fps |
