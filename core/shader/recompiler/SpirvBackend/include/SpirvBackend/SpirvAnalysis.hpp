@@ -4,6 +4,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -18,6 +19,9 @@ struct SpirvRequirements {
     bool functionLds = false;
     // With functionLds: the dwords the per-invocation LDS array needs (see FunctionLdsDwords).
     std::uint32_t functionLdsDwords = 0;
+    // With functionLds: when not empty, every LDS access's byte address with the lane term taken
+    // out (see FunctionLdsLaneAddresses); the array is indexed by these constant addresses.
+    std::unordered_map<const IrValue*, std::uint32_t> functionLdsAddresses;
     bool functionScratch = false;
     bool pixelValidMask = false;
     bool bufferInt64Atomics = false;
@@ -36,6 +40,13 @@ struct SpirvRequirements {
 // memory, where 32 KiB per invocation hung the GPU (Xid 31 / Xid 109).
 inline constexpr std::uint32_t FunctionLdsDwordLimit = 8192u;
 [[nodiscard]] std::uint32_t FunctionLdsDwords(const IrProgram& program);
+// When every LDS access of such a stage has the address `lane * stride + constant` (lane id,
+// constants, adds, multiplies and left shifts of those), with one stride that is a multiple of 4
+// for all of them and no wrap past 2^32: each access's `constant` plus its instruction offset, by
+// access. Otherwise (or with no lane term at all) empty. The lane id is the same for every access
+// of an invocation, so taking `lane * stride` out of every address maps the addresses one to one
+// and keeps which accesses alias; the per-invocation array then sees only constant indices.
+[[nodiscard]] std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const IrProgram& program);
 [[nodiscard]] std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program);
 
 }

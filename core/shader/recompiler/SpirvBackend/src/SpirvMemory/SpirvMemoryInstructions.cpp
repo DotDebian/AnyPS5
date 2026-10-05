@@ -88,6 +88,11 @@ std::uint32_t ByteAddress(SpirvValueEmitContext& ctx, const IrValue& inst, const
         return BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2), ctx.Arg(inst, 3));
     case ResourceKind::Lds:
     case ResourceKind::Gds:
+        if (mem.kind == ResourceKind::Lds) {
+            if (const auto found = state.requirements.functionLdsAddresses.find(&inst); found != state.requirements.functionLdsAddresses.end()) {
+                return ConstantU32(state, found->second);
+            }
+        }
         if (mem.offset == 0u) {
             return ctx.Arg(inst, 0);
         }

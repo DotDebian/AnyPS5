@@ -222,6 +222,69 @@ std::uint32_t FunctionLdsDwords(const IrProgram& program) {
     return static_cast<std::uint32_t>(std::min<std::uint64_t>(std::max<std::uint64_t>((needed + 63u) & ~63ull, 64u), FunctionLdsDwordLimit));
 }
 
+namespace {
+
+// An address as `lane * stride + constant`, in unsigned 64-bit arithmetic; nullopt for any other form.
+struct LaneAffine {
+    std::uint64_t stride = 0;
+    std::uint64_t constant = 0;
+};
+
+std::optional<LaneAffine> LaneAffineOf(const IrValue* value, std::uint32_t depth = 0) {
+    if (value == nullptr || depth > 64u) return std::nullopt;
+    value = value->Resolve();
+    if (value == nullptr) return std::nullopt;
+    if (value->HasImmediate()) return LaneAffine{0u, value->ImmediateU32()};
+    const auto argument = [&](std::size_t index) { return index < value->ArgumentCount() ? LaneAffineOf(value->Argument(index), depth + 1u) : std::nullopt; };
+    switch (value->Opcode()) {
+    case IrOpcode::LaneId:
+        return LaneAffine{1u, 0u};
+    case IrOpcode::IAdd32: {
+        const auto a = argument(0), b = argument(1);
+        if (!a || !b) return std::nullopt;
+        return LaneAffine{a->stride + b->stride, a->constant + b->constant};
+    }
+    case IrOpcode::IMul32: {
+        const auto a = argument(0), b = argument(1);
+        if (!a || !b) return std::nullopt;
+        if (a->stride == 0u) return LaneAffine{b->stride * a->constant, b->constant * a->constant};
+        if (b->stride == 0u) return LaneAffine{a->stride * b->constant, a->constant * b->constant};
+        return std::nullopt;
+    }
+    case IrOpcode::ShiftLeftLogical32:
+    case IrOpcode::IShiftLeft32: {
+        const auto a = argument(0), b = argument(1);
+        if (!a || !b || b->stride != 0u || b->constant >= 32u) return std::nullopt;
+        return LaneAffine{a->stride << b->constant, a->constant << b->constant};
+    }
+    default:
+        return std::nullopt;
+    }
+}
+
+}
+
+std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const IrProgram& program) {
+    std::unordered_map<const IrValue*, std::uint32_t> addresses;
+    if (FunctionLdsDwords(program) >= FunctionLdsDwordLimit) return {};
+    std::optional<std::uint64_t> stride;
+    for (const IrBlock* block : program.BlockOrder()) {
+        for (const IrValue* inst : block->Instructions()) {
+            if (SharedAccessOf(inst->Opcode()) == SharedAccess::None) continue;
+            const auto& memory = program.Resources().memoryInfo[inst->Flags<MemoryFlags>().index];
+            if (memory.kind != ResourceKind::Lds) continue;
+            const auto affine = LaneAffineOf(inst->Argument(0));
+            if (!affine || affine->stride % 4u != 0u || (stride && *stride != affine->stride)) return {};
+            stride = affine->stride;
+            const auto address = affine->constant + memory.offset;
+            if (address > 0xffffffffull) return {};
+            addresses.emplace(inst, static_cast<std::uint32_t>(address));
+        }
+    }
+    if (!stride || *stride == 0u) return {};
+    return addresses;
+}
+
 SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
     SpirvRequirements requirements {};
     for (const IrBlock* block : program.BlockOrder()) {
@@ -348,7 +411,15 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
             }
         }
     }
-    if (requirements.functionLds) requirements.functionLdsDwords = FunctionLdsDwords(program);
+    if (requirements.functionLds) {
+        requirements.functionLdsDwords = FunctionLdsDwords(program);
+        requirements.functionLdsAddresses = FunctionLdsLaneAddresses(program);
+        if (!requirements.functionLdsAddresses.empty()) {
+            std::uint64_t needed = 0;
+            for (const auto& [inst, address] : requirements.functionLdsAddresses) needed = std::max<std::uint64_t>(needed, (address >> 2u) + SharedAccessDwords(inst->Opcode()));
+            requirements.functionLdsDwords = static_cast<std::uint32_t>(std::max<std::uint64_t>((needed + 63u) & ~63ull, 64u));
+        }
+    }
     return requirements;
 }
 
