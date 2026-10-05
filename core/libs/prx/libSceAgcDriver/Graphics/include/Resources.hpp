@@ -48,7 +48,7 @@ private:
 // through a write-combined mapping and must not read them back in bulk. One bit per kind, so a run
 // tells which kind the GPU time depends on; Everything moves every default host buffer. A kind whose
 // bit is clear, or a device without such a memory type, keeps the default.
-enum class GpuReadKind : unsigned { BdaTable = 1, DrawInput = 2, StorageCopy = 4, RegionCopy = 8, Mirror = 16, Everything = 128 };
+enum class GpuReadKind : unsigned { BdaTable = 1, DrawInput = 2, StorageCopy = 4, RegionCopy = 8, Mirror = 16, Fault = 32, MeshArguments = 64, Everything = 128 };
 VkMemoryPropertyFlags GpuReadProperties(GpuReadKind kind);
 
 // Device-local scratch memory for GPU-side layout conversion. The detiler reads and writes scattered

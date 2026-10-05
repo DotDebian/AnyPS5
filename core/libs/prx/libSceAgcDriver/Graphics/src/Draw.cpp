@@ -1505,7 +1505,7 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
 std::shared_ptr<Buffer> recordMeshArguments(const Context& context, VkCommandBuffer commands, Recorder* recorder, bool recorded, const State& state, const Pm4::DrawParameters& draw, const IndirectRecord& indirect, const std::function<void(std::uint32_t)>& countBarrier) {
     const auto* args = indirect.args;
     const auto rules = MeshArgumentRulesFor(context, *state.stages.mesh, draw.indexCount);
-    auto arguments = std::make_shared<Buffer>(context, ShaderRecompiler::MeshArgumentBytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    auto arguments = std::make_shared<Buffer>(context, ShaderRecompiler::MeshArgumentBytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, GpuReadProperties(GpuReadKind::MeshArguments));
     if (indirect.path == IndirectDrawPath::Gpu && recorder != nullptr && indirect.argumentImport->address != 0) {
         const std::array<std::uint32_t, 7> words{rules.indexCount, rules.inputSize, rules.step, rules.primitivesPerGroup, rules.maxGroups, rules.maxInstances, rules.maxTotal};
         if (recorder->RecordMeshArguments(commands, indirect.argumentImport->address + (args->arguments - indirect.argumentImport->base), arguments->DeviceAddress(), words)) {
@@ -1857,6 +1857,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
                 stages += text;
             }
             std::fprintf(stderr, "[drawkey] 0x%llx: stages%s; %zu targets, first 0x%llx %ux%u format %d, render extent %ux%u, depth %d; %s%s indexCount %u instances %u indexed %d\n", static_cast<unsigned long long>(key), stages.c_str(), state.colors.size(), static_cast<unsigned long long>(state.colors.empty() ? 0 : state.colors.front().address), state.colors.empty() ? 0 : state.colors.front().extent.width, state.colors.empty() ? 0 : state.colors.front().extent.height, state.colors.empty() ? 0 : static_cast<int>(state.colors.front().format), state.renderExtent.width, state.renderExtent.height, record.depth != nullptr, state.stages.mesh ? "mesh " : "", args != nullptr ? (gpuIndirect ? "gpu-indirect" : "indirect") : "direct", draw.indexCount, draw.instanceCount, draw.indexed);
+            std::size_t written = 0;
+            std::size_t atomic = 0;
+            for (const auto& shader : shaders) {
+                for (const auto& binding : shader.program->bindings) {
+                    written += static_cast<std::size_t>(std::count(binding.bufferWritten.begin(), binding.bufferWritten.end(), true));
+                    atomic += static_cast<std::size_t>(std::count(binding.bufferAtomic.begin(), binding.bufferAtomic.end(), true));
+                }
+            }
+            std::fprintf(stderr, "[drawkey-res] 0x%llx: program 0x%llx; address-based %d, stores by address %d, written elements %zu, atomic elements %zu;%.1500s\n", static_cast<unsigned long long>(key), static_cast<unsigned long long>(Recorder::NotedProgram()), resources.UsesBda() ? 1 : 0, resources.BdaWrites() ? 1 : 0, written, atomic, resources.Describe().c_str());
         }
         // 0xd8...: the draw continues a pass whose previous draw had the same key (no pipeline
         // change between them), apart from the others, to tell a per-switch cost from a per-draw one.
