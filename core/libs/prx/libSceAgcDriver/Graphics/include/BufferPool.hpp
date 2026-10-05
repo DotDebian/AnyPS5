@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <cstdint>
+#include <string>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -74,6 +75,7 @@ public:
     std::optional<SlabSlot> TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable);
     void PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept;
     std::size_t SlabBlocks();
+    std::string Describe();
 
 private:
     struct SlabBlock {

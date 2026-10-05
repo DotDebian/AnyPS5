@@ -2610,6 +2610,43 @@ void ResourceCache::Clear() {
     entries.clear();
 }
 
+// APS5_TRACE_VRAM: what the two texture caches count against their budgets and the template
+// cache's entries. The images alive are the ledger's; more of them than cache entries means
+// images evicted from a cache and still held (a template, a plan, a recipe, a batch in flight).
+std::string DescribeTextureCaches() {
+    std::size_t sampled = 0, storage = 0;
+    std::uint64_t sampledBytes = 0, sampledHost = 0, storageBytes = 0;
+    {
+        auto& cache = Textures();
+        std::lock_guard lock(cache.mutex);
+        sampled = cache.entries.size();
+        sampledBytes = cache.bytes;
+        sampledHost = cache.hostBytes;
+    }
+    {
+        auto& cache = StorageTextures();
+        std::lock_guard lock(cache.mutex);
+        storage = cache.entries.size();
+        storageBytes = cache.bytes;
+    }
+    char text[256];
+    std::snprintf(text, sizeof(text), "sampled texture cache %zu entries/%.0f MiB accounted (%.0f MiB host copies); storage texture cache %zu entries/%.0f MiB accounted; template cache %zu entries", sampled, sampledBytes / 1048576.0, sampledHost / 1048576.0, storage, storageBytes / 1048576.0, SharedResourceCache().Size());
+    return text;
+}
+
+namespace {
+const Vram::SectionRegistration textureSection([](const Context& context) {
+    auto text = DescribeTextureCaches();
+    if (context.descriptorCache != nullptr) {
+        const auto descriptors = context.descriptorCache->Counters();
+        char piece[128];
+        std::snprintf(piece, sizeof(piece), "; descriptors: %llu sets from %llu pools, %llu layouts", static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.layoutMisses));
+        text += piece;
+    }
+    return text;
+});
+}
+
 std::size_t ResourceCache::Size() const {
     std::lock_guard lock(mutex);
     return entries.size();

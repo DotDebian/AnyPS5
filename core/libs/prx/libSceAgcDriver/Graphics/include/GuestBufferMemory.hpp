@@ -175,6 +175,8 @@ std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t l
 
 // A device-local staging shadow kept between uses (APS5_RESIDENT_STAGING, GuestBufferMemory.cpp).
 struct ResidentShadow;
+// APS5_TRACE_VRAM: the [vram] line's segment for the staging shadows and the host imports.
+std::string DescribeGuestBufferHolders(const Context& context);
 
 class GuestBufferMemory {
 public:

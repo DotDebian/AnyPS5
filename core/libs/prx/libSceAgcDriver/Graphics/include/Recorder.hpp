@@ -241,6 +241,8 @@ public:
     static constexpr std::size_t ArenaBlockBytes = std::size_t{1} << 20u;
     static constexpr std::size_t ArenaMaxBytes = 65536;
     ArenaBytes ArenaAllocate(std::size_t bytes);
+    // APS5_TRACE_VRAM: the [vram] line (Recorder.cpp), every 30 s from Submit.
+    void reportVram();
     // Blocks taken and bytes handed out so far (cumulative, the [addrdraw] line).
     struct ArenaStatistics {
         std::uint64_t blocks = 0;

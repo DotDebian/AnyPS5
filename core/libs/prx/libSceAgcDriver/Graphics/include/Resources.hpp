@@ -26,6 +26,10 @@ public:
 private:
     void initializeAddress(VkBufferUsageFlags usage);
     void release() noexcept;
+    // APS5_TRACE_VRAM (VramLedger.hpp): counted alive under the purpose of its maker.
+    void countLive();
+    std::uint8_t ledgerPurpose = 0;
+    bool ledgerCounted = false;
     Context context;
     VkDeviceAddress deviceAddress = 0;
     VkBuffer buffer = VK_NULL_HANDLE;

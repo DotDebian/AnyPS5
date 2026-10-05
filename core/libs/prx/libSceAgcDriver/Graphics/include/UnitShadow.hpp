@@ -148,6 +148,7 @@ void PublishAllShadows(const Context& context, PublishReason reason);
 void DestroyShadows(VkDevice device);
 // The [storage] line's shadow segment (10 s deltas, live slab totals).
 std::string ShadowReport();
+std::string DescribeUnitShadows();
 // APS5_SHADOW_VERIFY=1: after a shadow-sourced upload, the units read must carry no stamp newer
 // than their generation (counted as mismatches otherwise).
 bool ShadowVerify();

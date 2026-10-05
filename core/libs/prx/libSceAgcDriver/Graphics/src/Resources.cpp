@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -68,6 +69,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         slab = allocation->slab;
         video = allocation->video;
         ready = true;
+        countLive();
         return;
     }
     try {
@@ -120,6 +122,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
                 ready = true;
                 video = vram;
                 if (vram) CountVramBuffer(capacity, false);
+                countLive();
                 return;
             }
         }
@@ -132,12 +135,14 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             allocated = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
         }
         Check(allocated, "vkAllocateMemory buffer");
+        Vram::Allocated(context, memory, allocation.allocationSize, allocation.memoryTypeIndex, Vram::Class::BufferMemory);
         video = vram;
         if (vram) CountVramBuffer(capacity, false);
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
         ready = true;
+        countLive();
     } catch (...) {
         release();
         throw;
@@ -148,7 +153,20 @@ Buffer::~Buffer() {
     release();
 }
 
+// APS5_TRACE_VRAM: the buffer is alive for its maker's purpose until release; device-local memory
+// counts as video memory whether or not it is mappable.
+void Buffer::countLive() {
+    if (!Vram::Traced()) return;
+    ledgerPurpose = static_cast<std::uint8_t>(Vram::ThreadPurpose());
+    ledgerCounted = true;
+    Vram::BufferLives(Vram::ThreadPurpose(), capacity, video || (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0, true);
+}
+
 void Buffer::release() noexcept {
+    if (ledgerCounted) {
+        ledgerCounted = false;
+        Vram::BufferLives(static_cast<Vram::Purpose>(ledgerPurpose), capacity, video || (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0, false);
+    }
     if (ready && cache) {
         cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, video});
         return;
@@ -160,6 +178,7 @@ void Buffer::release() noexcept {
     }
     if (mapping) context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")(context.device, memory);
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+    Vram::Freed(memory);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
 }
 
@@ -203,6 +222,7 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory device buffer");
+        Vram::Allocated(context, memory, allocation.allocationSize, allocation.memoryTypeIndex, Vram::Class::DeviceBuffer);
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
     } catch (...) {
         release();
@@ -220,6 +240,7 @@ void DeviceBuffer::release() noexcept {
         return;
     }
     if (buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
+    Vram::Freed(memory);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
 }
 
@@ -300,6 +321,7 @@ RenderTarget::RenderTarget(const Context& context, const ColorTarget& target, bo
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory render target");
+        Vram::Allocated(context, memory, allocation.allocationSize, allocation.memoryTypeIndex, Vram::Class::RenderTarget);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory");
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = image;
@@ -320,6 +342,7 @@ RenderTarget::~RenderTarget() {
 void RenderTarget::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
+    Vram::Freed(memory);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
 }
 

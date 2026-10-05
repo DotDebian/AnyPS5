@@ -747,6 +747,7 @@ private:
 // The process-wide cache the device and the draw path share (keys name the device; a device clears
 // it when it goes). Never destroyed: entries belong to the device, not to static teardown.
 ResourceCache& SharedResourceCache();
+std::string DescribeTextureCaches();
 
 }
 

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -121,6 +122,7 @@ DepthImage::DepthImage(const Context& context, const DepthTarget& target, VkForm
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory depth target");
+        Vram::Allocated(context, memory, allocation.allocationSize, allocation.memoryTypeIndex, Vram::Class::Depth);
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory depth");
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         viewInfo.image = image;
@@ -141,6 +143,7 @@ DepthImage::~DepthImage() {
 void DepthImage::release() noexcept {
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
+    Vram::Freed(memory);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
     view = VK_NULL_HANDLE;
     image = VK_NULL_HANDLE;

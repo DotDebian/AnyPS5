@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include <algorithm>
 #include <bit>
@@ -78,9 +79,11 @@ std::optional<SlabSlot> BufferPool::TakeSlot(const Context& context, std::uint32
     allocation.allocationSize = blockBytes;
     allocation.memoryTypeIndex = memoryType;
     if (allocateMemory(device, &allocation, nullptr, &block->memory) != VK_SUCCESS) return std::nullopt;
+    Vram::Allocated(context, block->memory, blockBytes, memoryType, Vram::Class::SlabBlock);
     if ((context.memory.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
         void* mapping = nullptr;
         if (mapMemory(device, block->memory, 0, VK_WHOLE_SIZE, 0, &mapping) != VK_SUCCESS) {
+            Vram::Freed(block->memory);
             freeMemory(device, block->memory, nullptr);
             return std::nullopt;
         }
@@ -100,6 +103,7 @@ std::optional<SlabSlot> BufferPool::TakeSlot(const Context& context, std::uint32
 
 void BufferPool::freeBlock(SlabBlock& block) noexcept {
     if (block.mapping != nullptr) unmap(device, block.memory);
+    Vram::Freed(block.memory);
     freeMemory(device, block.memory, nullptr);
 }
 
@@ -125,6 +129,31 @@ void BufferPool::PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept {
     freeBlock(*released);
 }
 
+// APS5_TRACE_VRAM: what the pool retains (allocations no Buffer holds) per tier, and the slab
+// blocks with their slots in use (a block is freed only once every slot of it is back).
+std::string BufferPool::Describe() {
+    char text[320];
+    std::size_t blocks = 0, slots = 0, used = 0;
+    VkDeviceSize blockBytes = 0;
+    {
+        std::lock_guard lock(slabMutex);
+        for (const auto& [memory, block] : slabBlocks) {
+            ++blocks;
+            const auto capacity = block->used + block->free.size();
+            slots += capacity;
+            used += block->used;
+            blockBytes += capacity * block->slotBytes;
+        }
+    }
+    std::lock_guard lock(mutex);
+    std::snprintf(text, sizeof(text), "retained small %zu/%.0f MiB, large %zu/%.0f MiB, device %zu/%.0f MiB; slab blocks %zu (%.0f MiB), slots in use %zu of %zu", smallTier.slots, smallTier.retainedBytes / 1048576.0, largeTier.slots, largeTier.retainedBytes / 1048576.0, deviceTier.slots, deviceTier.retainedBytes / 1048576.0, blocks, blockBytes / 1048576.0, used, slots);
+    return text;
+}
+
+namespace {
+const Vram::SectionRegistration poolSection([](const Context& context) { return "buffer pool: " + GetBufferPool(context)->Describe(); });
+}
+
 std::size_t BufferPool::SlabBlocks() {
     std::lock_guard lock(slabMutex);
     return slabBlocks.size();
@@ -147,6 +176,7 @@ void BufferPool::destroy(const BufferAllocation& allocation) noexcept {
     // Device-local allocations (see DeviceBuffer) are never mapped.
     if (allocation.mapping != nullptr) unmap(device, allocation.memory);
     destroyBuffer(device, allocation.buffer, nullptr);
+    Vram::Freed(allocation.memory);
     freeMemory(device, allocation.memory, nullptr);
 }
 

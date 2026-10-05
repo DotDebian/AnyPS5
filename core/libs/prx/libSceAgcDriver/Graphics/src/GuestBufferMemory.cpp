@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -153,6 +154,7 @@ HostImports& Imports() {
 
 void destroyImport(const Context& context, const HostImport& entry) {
     context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
+    Vram::Freed(entry.memory);
     context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
 #ifdef _WIN32
     GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
@@ -191,6 +193,7 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
     void* const host = entry.alias != nullptr ? entry.alias : reinterpret_cast<void*>(entry.base);
     const auto failed = [&](const char* step, VkResult result) -> const char* {
         if (entry.buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
+        Vram::Freed(entry.memory);
         if (entry.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
         entry.buffer = VK_NULL_HANDLE;
         entry.memory = VK_NULL_HANDLE;
@@ -216,6 +219,7 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
     allocation.allocationSize = bytes;
     allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
     if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &entry.memory); result != VK_SUCCESS) return failed("vkAllocateMemory", result);
+    Vram::Allocated(context, entry.memory, bytes, allocation.memoryTypeIndex, Vram::Class::HostImport);
     if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return failed("vkBindBufferMemory", result);
     const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, entry.buffer};
     entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
@@ -484,6 +488,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         for (const auto& [address, entry] : state.imports) {
             if (state.device != VK_NULL_HANDLE && state.destroyBuffer != nullptr && state.freeMemory != nullptr) {
                 state.destroyBuffer(state.device, entry.buffer, nullptr);
+                Vram::Freed(entry.memory);
                 state.freeMemory(state.device, entry.memory, nullptr);
             }
 #ifdef _WIN32
@@ -2195,6 +2200,7 @@ CopyStats& Copies() {
 // shadow is its own VkDeviceMemory, retained by cached builds) is no error: nullptr, and the
 // region takes the path it would take without staging (Region::unstaged).
 std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes, VkBufferUsageFlags usage) {
+    const Vram::PurposeScope purpose(Vram::Purpose::StagingShadow);
     try {
         return std::make_shared<Buffer>(context, bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     } catch (const std::exception& error) {
@@ -3086,6 +3092,39 @@ bool GuestBufferMemory::HasCopiedWrites() const {
         return true;
     }
     return false;
+}
+
+// APS5_TRACE_VRAM: the resident staging shadows alive (their registry) and the host imports (system
+// memory the device maps, named for completeness).
+std::string DescribeGuestBufferHolders(const Context& context) {
+    std::size_t shadows = 0, imports = 0;
+    std::uint64_t shadowBytes = 0, importBytes = 0;
+    {
+        auto& registry = ResidentShadows();
+        std::lock_guard lock(registry.mutex);
+        for (const auto& [key, entry] : registry.entries) {
+            if (entry.expired()) continue;
+            ++shadows;
+            shadowBytes += std::get<2>(key) - std::get<1>(key);
+        }
+    }
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (state.device == context.device) {
+            for (const auto& [base, entry] : state.imports) {
+                ++imports;
+                importBytes += entry.bytes;
+            }
+        }
+    }
+    char text[160];
+    std::snprintf(text, sizeof(text), "resident staging shadows %zu/%.0f MiB; host imports %zu/%.0f MiB (system memory)", shadows, shadowBytes / 1048576.0, imports, importBytes / 1048576.0);
+    return text;
+}
+
+namespace {
+const Vram::SectionRegistration guestBufferSection(&DescribeGuestBufferHolders);
 }
 
 void GuestBufferMemory::NoteAddressStores() {

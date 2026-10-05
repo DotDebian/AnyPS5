@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureResidency.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -3132,6 +3133,7 @@ Recorder::ArenaBytes Recorder::ArenaAllocate(std::size_t bytes) {
     auto offset = (open->arenaUsed + alignment - 1) / alignment * alignment;
     if (open->arenaBlock == nullptr || offset + bytes > ArenaBlockBytes) {
         try {
+            const Vram::PurposeScope purpose(Vram::Purpose::ArenaBlock);
             open->arenaBlock = std::make_shared<Buffer>(context, ArenaBlockBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, GpuReadProperties(GpuReadKind::StorageCopy));
         } catch (const std::exception&) {
             open->arenaBlock.reset();
@@ -3147,6 +3149,64 @@ Recorder::ArenaBytes Recorder::ArenaAllocate(std::size_t bytes) {
     open->arenaUsed = offset + bytes;
     arenaBytes.fetch_add(bytes, std::memory_order_relaxed);
     return {open->arenaBlock, offset, open->arenaBlock->Bytes().data() + offset};
+}
+
+// APS5_TRACE_VRAM=1: the [vram] line, every 30 s from Submit (see VramLedger.hpp): the ledger by
+// allocation class, the Vulkan heaps' usage and budget (VK_EXT_memory_budget, already enabled when
+// the device has it), then each holder's own figures.
+void Recorder::reportVram() {
+    if (!Vram::Traced()) return;
+    static auto last = std::chrono::steady_clock::now();
+    static const auto start = last;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(30)) return;
+    last = now;
+    auto& ledger = Vram::State();
+    std::uint64_t video = 0, system = 0;
+    const auto classes = Vram::Describe(ledger.classes, Vram::ClassNames, &video, &system);
+    char text[512];
+    std::string line;
+    std::snprintf(text, sizeof(text), "[vram] %.0f s: device memory by class (objects/video MiB/system MiB):%s; total %.0f MiB video, %.0f MiB system, %llu allocations and %llu frees so far", std::chrono::duration<double>(now - start).count(), classes.c_str(), video / 1048576.0, system / 1048576.0, static_cast<unsigned long long>(ledger.allocations.load()), static_cast<unsigned long long>(ledger.frees.load()));
+    line = text;
+    if (context.memoryBudget && context.memoryProperties2 != nullptr) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budgets{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budgets};
+        context.memoryProperties2(context.physical, &properties);
+        line += "; vulkan heaps (usage of budget MiB):";
+        for (std::uint32_t heap = 0; heap < properties.memoryProperties.memoryHeapCount; ++heap) {
+            std::snprintf(text, sizeof(text), " %u %s %.0f of %.0f", heap, (properties.memoryProperties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 ? "video" : "system", budgets.heapUsage[heap] / 1048576.0, budgets.heapBudget[heap] / 1048576.0);
+            line += text;
+        }
+    } else {
+        line += "; vulkan heaps: VK_EXT_memory_budget is not available on this device";
+    }
+    line += "; live buffers by purpose (objects/video MiB/system MiB):" + Vram::Describe(ledger.purposes, Vram::PurposeNames);
+    {
+        std::vector<std::string (*)(const Context&)> sections;
+        {
+            std::lock_guard lock(ledger.mutex);
+            sections = ledger.sections;
+        }
+        for (const auto section : sections) line += "; " + section(context);
+    }
+    std::array<std::size_t, 2> entries{};
+    std::size_t inVideo = 0;
+    std::uint64_t videoBytes = 0, hostCopies = 0;
+    for (const auto& [key, entry] : drawSnapshots) {
+        ++entries[SnapshotPool(std::get<1>(key))];
+        hostCopies += entry.shadow.size();
+        if (entry.buffer != nullptr && entry.buffer->InVideoMemory()) {
+            ++inVideo;
+            videoBytes += std::get<2>(key);
+        }
+    }
+    std::snprintf(text, sizeof(text), "; draw snapshot cache: pool 0 %zu entries/%.0f MiB accounted, pool 1 %zu entries/%.0f MiB accounted, %zu buffers in video memory (%.0f MiB), %.0f MiB host copies of them", entries[0], drawSnapshotPools[0].bytes / 1048576.0, entries[1], drawSnapshotPools[1].bytes / 1048576.0, inVideo, videoBytes / 1048576.0, hostCopies / 1048576.0);
+    line += text;
+    std::size_t kept = open != nullptr ? open->kept.size() : 0;
+    for (const auto& batch : inFlight) kept += batch->kept.size();
+    std::snprintf(text, sizeof(text), "; batches in flight %zu with %zu kept objects; arena blocks made so far %llu", inFlight.size(), kept, static_cast<unsigned long long>(arenaBlocks.load(std::memory_order_relaxed)));
+    line += text;
+    AgcDriver::ReportLine("%s\n", line.c_str());
 }
 
 Recorder::ArenaStatistics Recorder::ArenaCounts() {
@@ -3680,6 +3740,7 @@ bool Recorder::writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std
 }
 
 void Recorder::Submit() {
+    reportVram();
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
     // count behind, and the callers that act on it would otherwise take the mutex for nothing at
