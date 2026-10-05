@@ -1,4 +1,5 @@
 #include <cstdio>
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -96,7 +97,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
         static bool reported = false;
         if (!reported) {
             reported = true;
-            std::fprintf(stderr, "[gpu] texture streaming feedback (LOD warning / mip statistics) is not reported\n");
+            AgcDriver::ReportLine("[gpu] texture streaming feedback (LOD warning / mip statistics) is not reported\n");
         }
     }
     Require(!cornerSample, "guest texture descriptor uses corner sampling which is not implemented");
@@ -113,7 +114,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
         static bool reported = false;
         if (!reported) {
             reported = true;
-            std::fprintf(stderr, "[gpu] texture DCC color transform is ignored (word6=0x%08x word7=0x%08x)\n", words[6], words[7]);
+            AgcDriver::ReportLine("[gpu] texture DCC color transform is ignored (word6=0x%08x word7=0x%08x)\n", words[6], words[7]);
         }
     }
     Require(bcSwizzle == 0, "guest texture descriptor uses a BC swizzle which is not implemented");

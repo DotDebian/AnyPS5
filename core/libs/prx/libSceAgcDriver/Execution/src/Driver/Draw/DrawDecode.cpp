@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
@@ -107,13 +108,13 @@ void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submis
                 if (Graphics::DrawKeyCovers(read)) continue;
                 ++facadeMismatches;
                 static std::atomic<std::uint64_t> reports{0};
-                if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: the decoders read %s register 0x%x, which DrawKeyRegisters lacks\n", Graphics::RegisterBankName(read.bank), read.offset);
+                if (reports.fetch_add(1) < 20) AgcDriver::ReportLine("[draw-cache] verify: the decoders read %s register 0x%x, which DrawKeyRegisters lacks\n", Graphics::RegisterBankName(read.bank), read.offset);
             }
             std::uint64_t decodeMismatches = 0;
             if (decode != nullptr && !sameDecode(*decode, *fresh)) {
                 decodeMismatches = 1;
                 static std::atomic<std::uint64_t> reports{0};
-                if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: the entry's decode differs from a fresh decode (key 0x%llx, target 0x%llx)\n", static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(fresh->state.color.address));
+                if (reports.fetch_add(1) < 20) AgcDriver::ReportLine("[draw-cache] verify: the entry's decode differs from a fresh decode (key 0x%llx, target 0x%llx)\n", static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(fresh->state.color.address));
             }
             std::lock_guard cacheLock(drawCacheMutex);
             drawEntryCounters.facadeMismatches += facadeMismatches;

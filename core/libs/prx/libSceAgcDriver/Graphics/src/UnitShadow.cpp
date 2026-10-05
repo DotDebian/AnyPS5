@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -275,7 +276,7 @@ void verifyPublished(const UnitShadow& shadow, const std::vector<SlabCopies>& co
             if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(region.size)) || std::memcmp(reinterpret_cast<const void*>(address), host.Bytes().data(), static_cast<std::size_t>(region.size)) != 0) {
                 Stats().mismatches.fetch_add(1, std::memory_order_relaxed);
                 static std::atomic<int> reports{0};
-                if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[shadow] verify: published bytes differ from the slab at 0x%llx+0x%llx\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(region.size));
+                if (reports.fetch_add(1) < 8) AgcDriver::ReportLine("[shadow] verify: published bytes differ from the slab at 0x%llx+0x%llx\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(region.size));
             }
         }
     }
@@ -348,7 +349,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     Stats().publishedBytes[static_cast<std::size_t>(reason)].fetch_add(bytes, std::memory_order_relaxed);
     if (tracePublishesLeft.load(std::memory_order_relaxed) > 0 && tracePublishesLeft.fetch_sub(1, std::memory_order_relaxed) > 0) {
         const auto packet = GuestMemory::CurrentPacket();
-        std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
+        AgcDriver::ReportLine("[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
     }
     recordCopies(*shadow, copies, ranges, bytes);
     if (ShadowVerify()) verifyPublished(*shadow, copies);
@@ -400,7 +401,7 @@ bool evictOne(Shadows& registry) {
     std::lock_guard lock(registry.mutex);
     auto& slab = victim->slabs[victimSlab];
     if (slab == nullptr) return true;
-    if (TraceEnabled()) std::fprintf(stderr, "[shadow] evict slab %zu of import 0x%llx (%.1f MiB, %zu units published)\n", victimSlab, static_cast<unsigned long long>(victim->importBase), SlabBytes(*slab) / 1048576.0, published);
+    if (TraceEnabled()) AgcDriver::ReportLine("[shadow] evict slab %zu of import 0x%llx (%.1f MiB, %zu units published)\n", victimSlab, static_cast<unsigned long long>(victim->importBase), SlabBytes(*slab) / 1048576.0, published);
     // Its units read from the import from now on (the publish put their bytes there).
     for (auto unit = firstUnit; unit <= lastUnit; ++unit) {
         victim->generation[unit] = 0;
@@ -429,7 +430,7 @@ bool ShadowVerify() {
 void NoteShadowSeed(std::uint64_t begin, std::uint64_t end) {
     Stats().seeds.fetch_add(1, std::memory_order_relaxed);
     Stats().seedBytes.fetch_add(end - begin, std::memory_order_relaxed);
-    if (traceSeedsLeft.load(std::memory_order_relaxed) > 0 && traceSeedsLeft.fetch_sub(1, std::memory_order_relaxed) > 0) std::fprintf(stderr, "[shadow] seed 0x%llx+0x%llx from the import\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+    if (traceSeedsLeft.load(std::memory_order_relaxed) > 0 && traceSeedsLeft.fetch_sub(1, std::memory_order_relaxed) > 0) AgcDriver::ReportLine("[shadow] seed 0x%llx+0x%llx from the import\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
 }
 
 PublishReason PublishReasonFor(const char* flushReason) {
@@ -725,7 +726,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
     if (lost != 0) {
         Stats().slabLost.fetch_add(lost, std::memory_order_relaxed);
         static std::atomic<int> reports{0};
-        if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[shadow] %llu retiled units of import 0x%llx lost their slab before they were marked\n", static_cast<unsigned long long>(lost), static_cast<unsigned long long>(import.base));
+        if (reports.fetch_add(1) < 4) AgcDriver::ReportLine("[shadow] %llu retiled units of import 0x%llx lost their slab before they were marked\n", static_cast<unsigned long long>(lost), static_cast<unsigned long long>(import.base));
     }
     Stats().retiled.fetch_add(1, std::memory_order_relaxed);
     Stats().retiledBytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -769,7 +770,7 @@ void RetireShadow(const Context& context, const HostImport& import, const std::f
         } else {
             Stats().lostOnRetire.fetch_add(shadow->liveUnits, std::memory_order_relaxed);
             static std::atomic<int> reports{0};
-            if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[shadow] import 0x%llx+0x%llx retired outside the device lock: %u shadowed units lost\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(import.bytes), shadow->liveUnits);
+            if (reports.fetch_add(1) < 4) AgcDriver::ReportLine("[shadow] import 0x%llx+0x%llx retired outside the device lock: %u shadowed units lost\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(import.bytes), shadow->liveUnits);
         }
     }
     std::lock_guard lock(registry.mutex);
@@ -781,7 +782,7 @@ void RetireShadow(const Context& context, const HostImport& import, const std::f
         --registry.liveSlabs;
     }
     ++registry.retired;
-    if (TraceEnabled()) std::fprintf(stderr, "[shadow] retire import 0x%llx+0x%llx: %zu units published, %llu dropped (memory no longer registered)\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(import.bytes), published, static_cast<unsigned long long>(dropped));
+    if (TraceEnabled()) AgcDriver::ReportLine("[shadow] retire import 0x%llx+0x%llx: %zu units published, %llu dropped (memory no longer registered)\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(import.bytes), published, static_cast<unsigned long long>(dropped));
     registry.byBase.erase(found);
 }
 

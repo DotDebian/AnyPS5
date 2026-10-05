@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
 #include <algorithm>
@@ -84,7 +85,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
                 if (!unwritten.empty()) {
                     linked = ZeroFragmentInputs(shader.spirv.Words(), unwritten);
                     static std::atomic<bool> reported{false};
-                    if (!reported.exchange(true)) std::fprintf(stderr, "[gpu] pixel shaders read parameters the stage before them does not export (first at location %u); they read zero\n", *unwritten.begin());
+                    if (!reported.exchange(true)) AgcDriver::ReportLine("[gpu] pixel shaders read parameters the stage before them does not export (first at location %u); they read zero\n", *unwritten.begin());
                 }
             }
             const auto& words = linked.empty() ? shader.spirv.Words() : linked;
@@ -483,7 +484,7 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    std::fprintf(stderr, "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
+    AgcDriver::ReportLine("[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
     store.hits = store.misses = store.uncached = store.evicted = 0;
 }
 

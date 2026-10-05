@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -142,7 +143,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     validate(submission.commands, queue, descriptor.addr);
     waitForFlipRoom(submission);
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
-    if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
+    if (trace) AgcDriver::ReportLine("[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
     const auto validated = profile ? std::chrono::steady_clock::now() : start;
     throttleSubmit(queue);
     {
@@ -203,7 +204,7 @@ long Driver::MaxQueuedFlips() {
         char* end = nullptr;
         const long parsed = std::strtol(value, &end, 10);
         if (end == value || *end != '\0' || parsed < 1) {
-            std::fprintf(stderr, "[gpu] APS5_MAX_QUEUED_FLIPS=%s refused (a count of 1 or more, or off); using 1\n", value);
+            AgcDriver::ReportLine("[gpu] APS5_MAX_QUEUED_FLIPS=%s refused (a count of 1 or more, or off); using 1\n", value);
             return 1L;
         }
         return parsed;
@@ -231,7 +232,7 @@ void Driver::throttleSubmit(std::uint32_t queue) {
             progressAt = now;
         } else if (now - progressAt > std::chrono::milliseconds(500)) {
             static std::atomic<std::uint64_t> released{0};
-            if (released.fetch_add(1, std::memory_order_relaxed) % 100 == 0) std::fprintf(stderr, "[gpu] queue 0x%x made no progress for 500 ms with %llu flips queued; the title submits past the throttle (APS5_MAX_QUEUED_FLIPS)\n", queue, static_cast<unsigned long long>(worker->queuedFlips.load()));
+            if (released.fetch_add(1, std::memory_order_relaxed) % 100 == 0) AgcDriver::ReportLine("[gpu] queue 0x%x made no progress for 500 ms with %llu flips queued; the title submits past the throttle (APS5_MAX_QUEUED_FLIPS)\n", queue, static_cast<unsigned long long>(worker->queuedFlips.load()));
             return;
         }
     }

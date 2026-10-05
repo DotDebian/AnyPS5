@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -73,7 +74,7 @@ VkFormat DepthAttachmentFormat(const Context& context, const DepthTarget& target
     }
     for (const auto format : candidates) {
         if (!attachable(context, format)) continue;
-        if (format != candidates.front()) std::fprintf(stderr, "[gpu] depth format Z%u%s renders as VkFormat %d on this device\n", target.zFormat, target.stencil ? "+S8" : "", static_cast<int>(format));
+        if (format != candidates.front()) AgcDriver::ReportLine("[gpu] depth format Z%u%s renders as VkFormat %d on this device\n", target.zFormat, target.stencil ? "+S8" : "", static_cast<int>(format));
         known.emplace(key, format);
         return format;
     }
@@ -373,7 +374,7 @@ std::shared_ptr<DepthImage> CachedDepthImage(const Context& context, const Depth
     }
     auto image = std::make_shared<DepthImage>(context, target, format);
     static const bool trace = std::getenv("APS5_TRACE_DEPTH") != nullptr;
-    if (trace || store.entries.size() < 16) std::fprintf(stderr, "[depth] resident depth image for 0x%llx layer %u (stencil 0x%llx, HTILE 0x%llx) %ux%u VkFormat %d, %zu resident\n", static_cast<unsigned long long>(target.address), target.slice, static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.htileAddress), target.extent.width, target.extent.height, static_cast<int>(format), store.entries.size() + 1);
+    if (trace || store.entries.size() < 16) AgcDriver::ReportLine("[depth] resident depth image for 0x%llx layer %u (stencil 0x%llx, HTILE 0x%llx) %ux%u VkFormat %d, %zu resident\n", static_cast<unsigned long long>(target.address), target.slice, static_cast<unsigned long long>(target.stencilAddress), static_cast<unsigned long long>(target.htileAddress), target.extent.width, target.extent.height, static_cast<int>(format), store.entries.size() + 1);
     store.entries.push_back({context.device, context.bufferPool, target.address, target.stencilAddress, target.slice, target.extent.width, target.extent.height, format, image});
     ++store.generation;
     // Beyond the bound the least recently used image no recorded draw holds goes.
@@ -416,7 +417,7 @@ std::size_t NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std:
             entry.image->RequestClear(true);
             ++marked;
         }
-        if (store.reportedFills.insert(htile).second) std::fprintf(stderr, "[depth] fill 0x%llx+0x%zx with 0x%08x over the HTILE 0x%llx (0x%llx bytes) of depth 0x%llx: %s\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(htile), static_cast<unsigned long long>(htileBytes(target)), static_cast<unsigned long long>(target.address), clear ? "cleared" : covers ? "not a clear pattern, ignored" : "partial, ignored");
+        if (store.reportedFills.insert(htile).second) AgcDriver::ReportLine("[depth] fill 0x%llx+0x%zx with 0x%08x over the HTILE 0x%llx (0x%llx bytes) of depth 0x%llx: %s\n", static_cast<unsigned long long>(address), bytes, pattern, static_cast<unsigned long long>(htile), static_cast<unsigned long long>(htileBytes(target)), static_cast<unsigned long long>(target.address), clear ? "cleared" : covers ? "not a clear pattern, ignored" : "partial, ignored");
     }
     return marked;
 }
@@ -678,7 +679,7 @@ void CountDepthDraw(const DepthState& state) {
     const auto now = std::chrono::steady_clock::now();
     if (now - counts.lastReport < std::chrono::seconds(10)) return;
     counts.lastReport = now;
-    std::fprintf(stderr, "[depth] %llu draws with a depth attachment in 10 s (%llu clear draws, %llu with a stencil test), %llu whole-image clears\n", static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.clearDraws), static_cast<unsigned long long>(counts.stencilDraws), static_cast<unsigned long long>(counts.imageClears));
+    AgcDriver::ReportLine("[depth] %llu draws with a depth attachment in 10 s (%llu clear draws, %llu with a stencil test), %llu whole-image clears\n", static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.clearDraws), static_cast<unsigned long long>(counts.stencilDraws), static_cast<unsigned long long>(counts.imageClears));
     counts.draws = counts.clearDraws = counts.stencilDraws = counts.imageClears = 0;
 }
 

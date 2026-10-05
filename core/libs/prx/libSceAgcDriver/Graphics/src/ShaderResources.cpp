@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -363,7 +364,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; residency: sampled %llu MiB held (%llu MiB host copies, soft %llu, hard %llu), %llu evicted (%llu MiB), %llu rescued, %llu dead views dropped; storage %llu MiB held (soft %llu, hard %llu), %llu evicted (%llu MiB); %llu retries after device memory ran out\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.sampledBytes) >> 20u, count(counters.sampledHostBytes) >> 20u, count(counters.sampledSoft) >> 20u, count(counters.sampledHard) >> 20u, count(counters.sampledEvicted), count(counters.sampledEvictedBytes) >> 20u, count(counters.sampledRescued), count(counters.deadViews), count(counters.storageBytes) >> 20u, count(counters.storageSoft) >> 20u, count(counters.storageHard) >> 20u, count(counters.storageEvicted), count(counters.storageEvictedBytes) >> 20u, count(counters.exhaustedRetries));
+    AgcDriver::ReportLine("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; residency: sampled %llu MiB held (%llu MiB host copies, soft %llu, hard %llu), %llu evicted (%llu MiB), %llu rescued, %llu dead views dropped; storage %llu MiB held (soft %llu, hard %llu), %llu evicted (%llu MiB); %llu retries after device memory ran out\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.sampledBytes) >> 20u, count(counters.sampledHostBytes) >> 20u, count(counters.sampledSoft) >> 20u, count(counters.sampledHard) >> 20u, count(counters.sampledEvicted), count(counters.sampledEvictedBytes) >> 20u, count(counters.sampledRescued), count(counters.deadViews), count(counters.storageBytes) >> 20u, count(counters.storageSoft) >> 20u, count(counters.storageHard) >> 20u, count(counters.storageEvicted), count(counters.storageEvictedBytes) >> 20u, count(counters.exhaustedRetries));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -453,7 +454,7 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
     } catch (const std::exception& error) {
         counters.storageFallbacks.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard lock(failures.mutex);
-        if (failures.generations.size() < 4096 && failures.generations.emplace(surface, generation).second) std::fprintf(stderr, "[textures] sampled texture 0x%llx (%ux%u format %u) keeps the snapshot path: %s\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, error.what());
+        if (failures.generations.size() < 4096 && failures.generations.emplace(surface, generation).second) AgcDriver::ReportLine("[textures] sampled texture 0x%llx (%ux%u format %u) keeps the snapshot path: %s\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, error.what());
         return nullptr;
     }
 }
@@ -525,7 +526,7 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
             static std::mutex reportedMutex;
             static std::set<std::uint32_t> reported;
             std::lock_guard lock(reportedMutex);
-            if (reported.insert(resource.format).second) std::fprintf(stderr, "[gpu] comparison sampling of guest format %u (VkFormat %d%s) goes through its color image\n", resource.format, static_cast<int>(format), resource.dimension == TextureDimension::k3D ? ", 3D" : "");
+            if (reported.insert(resource.format).second) AgcDriver::ReportLine("[gpu] comparison sampling of guest format %u (VkFormat %d%s) goes through its color image\n", resource.format, static_cast<int>(format), resource.dimension == TextureDimension::k3D ? ", 3D" : "");
             depthCompare = false;
         }
     }
@@ -549,7 +550,7 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
                 throw std::runtime_error(text);
             }
             static const bool traceKeys = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
-            if (traceKeys) std::fprintf(stderr, "[dcc-keys] sampled 0x%llx through keys 0x%llx reads the %s fill, not the pending image\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(resource.dccAddress), DccKeysName(*keys));
+            if (traceKeys) AgcDriver::ReportLine("[dcc-keys] sampled 0x%llx through keys 0x%llx reads the %s fill, not the pending image\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(resource.dccAddress), DccKeysName(*keys));
             source.reset();
             clearThroughKeys = true;
         }
@@ -661,7 +662,7 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
         if (traceTextures) {
             std::size_t nonzero = 0;
             for (std::size_t i = 0; i < entry.bytes.size(); i += 64) nonzero += entry.bytes[i] != std::byte{0};
-            std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
+            AgcDriver::ReportLine("[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
         }
         entry.texture = makeWithSampledMemory(cache, [&] { return std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare); });
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
@@ -877,7 +878,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         // memory), and a new one is made below from memory under the keys the descriptor names; views
         // and recipes holding the old one see it gone from the cache (StorageImageCached).
         static std::atomic<int> reports{0};
-        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx (%ux%u format %u): DCC keys moved from 0x%llx to 0x%llx; the image is remade under the new keys\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned long long>(it->texture->Descriptor().dccAddress), static_cast<unsigned long long>(resource.dccAddress));
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) AgcDriver::ReportLine("[gpu] storage image 0x%llx (%ux%u format %u): DCC keys moved from 0x%llx to 0x%llx; the image is remade under the new keys\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<unsigned long long>(it->texture->Descriptor().dccAddress), static_cast<unsigned long long>(resource.dccAddress));
         evictStorage(cache, it);
     } else if (it != cache.entries.end()) {
         it->texture->Refresh();
@@ -1148,7 +1149,7 @@ struct ThreadBuildProfile {
         builds = 0;
         std::string report;
         for (std::size_t i = 0; i < BuildPhaseCount; ++i) report += " " + std::string(BuildPhaseNames[i]) + "=" + std::to_string(static_cast<long long>(profile.ms[i])) + "ms";
-        std::fprintf(stderr, "[resources] %llu builds, phase totals:%s\n", static_cast<unsigned long long>(profile.builds), report.c_str());
+        AgcDriver::ReportLine("[resources] %llu builds, phase totals:%s\n", static_cast<unsigned long long>(profile.builds), report.c_str());
     }
 };
 
@@ -1183,7 +1184,7 @@ double ShaderResources::phase(BuildPhase which) {
     const auto now = std::chrono::steady_clock::now();
     const auto ms = std::chrono::duration<double, std::milli>(now - phaseStart).count();
     addBuildPhase(which, ms);
-    if (ms > 50) std::fprintf(stderr, "[resources] %s took %.0f ms (%zu textures, %zu storage images, %zu buffers, bda %d)\n", BuildPhaseNames[static_cast<std::size_t>(which)], ms, textures.size(), storageTextures.size(), allocations.size(), usesBda ? 1 : 0);
+    if (ms > 50) AgcDriver::ReportLine("[resources] %s took %.0f ms (%zu textures, %zu storage images, %zu buffers, bda %d)\n", BuildPhaseNames[static_cast<std::size_t>(which)], ms, textures.size(), storageTextures.size(), allocations.size(), usesBda ? 1 : 0);
     phaseStart = now;
     return ms;
 }
@@ -1578,7 +1579,7 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto descriptors = context.descriptorCache != nullptr ? context.descriptorCache->Counters() : DescriptorCache::Stats{};
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
-    std::fprintf(stderr, "[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools, %llu recycled, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.recycled), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    AgcDriver::ReportLine("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools, %llu recycled, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.recycled), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {
@@ -1764,7 +1765,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto reasons = byReason(profile.fastFails, FastFailNames);
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
-    std::fprintf(stderr, "[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    AgcDriver::ReportLine("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
 }
 
 // Revalidate calls answered by a shared build's proof of the same collect epoch (cumulative).
@@ -2235,7 +2236,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             const bool same = fullWalk();
             const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
             if (!same || moved != versions.end()) {
-                std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the T1 proof (%s) disagrees with the full walk (%s)\n", ownRefreshed ? "own-object refresh" : "accepted overlap", !same ? "another object" : "an upload");
+                AgcDriver::ReportLine("[rescache] APS5_VERIFY_PROOFS: the T1 proof (%s) disagrees with the full walk (%s)\n", ownRefreshed ? "own-object refresh" : "accepted overlap", !same ? "another object" : "an upload");
                 std::fflush(stderr);
                 std::abort();
             }
@@ -2290,7 +2291,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         try {
             guestMemory.RecordStagingCopies(*recorder);
         } catch (const std::exception& error) {
-            std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
+            AgcDriver::ReportLine("[resources] staging copies of a reused build failed: %s\n", error.what());
             return finish(fast, false);
         }
     }
@@ -2456,7 +2457,7 @@ void ResourceCache::noteMiss(const Key& key) {
         }
         std::snprintf(item, sizeof(item), "; layout %llu, draw target/index %llu, same key %llu (not inserted or evicted), first seen %llu", static_cast<unsigned long long>(churn.layout), static_cast<unsigned long long>(churn.drawWords), static_cast<unsigned long long>(churn.sameKey), static_cast<unsigned long long>(churn.firstSeen));
         line += item;
-        std::fprintf(stderr, "%s\n", line.c_str());
+        AgcDriver::ReportLine("%s\n", line.c_str());
     };
     report("dispatch", churn.dispatch);
     report("draws", churn.draws);
@@ -3185,7 +3186,7 @@ void CountDrawSnapshot(bool reused, std::size_t bytes) {
     if (now - last < std::chrono::seconds(10)) return;
     last = now;
     const auto cache = Recorder::DrawSnapshotCounts();
-    std::fprintf(stderr, "[drawsnap] draw input snapshots (10 s): copied %llu (%.1f MiB), reused %llu (%.1f MiB); cache (cumulative): %llu lookups found no entry, %llu found a stale one (%llu of them reused with unchanged bytes, %llu with only their changed blocks copied), %llu evicted\n", static_cast<unsigned long long>(copies), copiedBytes / 1048576.0, static_cast<unsigned long long>(reuses), reusedBytes / 1048576.0, static_cast<unsigned long long>(cache.absent), static_cast<unsigned long long>(cache.stale), static_cast<unsigned long long>(cache.revalidated), static_cast<unsigned long long>(cache.patched), static_cast<unsigned long long>(cache.evicted));
+    AgcDriver::ReportLine("[drawsnap] draw input snapshots (10 s): copied %llu (%.1f MiB), reused %llu (%.1f MiB); cache (cumulative): %llu lookups found no entry, %llu found a stale one (%llu of them reused with unchanged bytes, %llu with only their changed blocks copied), %llu evicted\n", static_cast<unsigned long long>(copies), copiedBytes / 1048576.0, static_cast<unsigned long long>(reuses), reusedBytes / 1048576.0, static_cast<unsigned long long>(cache.absent), static_cast<unsigned long long>(cache.stale), static_cast<unsigned long long>(cache.revalidated), static_cast<unsigned long long>(cache.patched), static_cast<unsigned long long>(cache.evicted));
     copies = copiedBytes = reuses = reusedBytes = 0;
 }
 }
@@ -3688,7 +3689,7 @@ void reportDispatchSnapshots(DispatchSnapshotStats& stats) {
     last = now;
     const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
     const auto left = [&](DispatchRefusal reason) { return count(stats.inPlace[static_cast<std::size_t>(reason)]); };
-    std::fprintf(stderr, "[dispatch-snap] %.1f s: %llu dispatches, %llu bound a set with copies; read-only elements bound to a copy: %llu (%llu in video memory): %llu reused, %llu copied by the CPU (%.1f MiB), %llu copied by the GPU (%.1f MiB); left in place: %llu under the size window, %llu over it, %llu GPU write pending, %llu image result pending, %llu not in an import bound in place, %llu not write-watched, %llu in a build that stores by address, %llu without a buffer\n", seconds, count(stats.dispatches), count(stats.served), count(stats.bound), count(stats.video), count(stats.reused), count(stats.cpuCopies), stats.cpuBytes / 1048576.0, count(stats.gpuCopies), stats.gpuBytes / 1048576.0, left(DispatchRefusal::UnderWindow), left(DispatchRefusal::OverWindow), left(DispatchRefusal::PendingWrite), left(DispatchRefusal::PendingImage), left(DispatchRefusal::OutsideImport), left(DispatchRefusal::Unwatched), left(DispatchRefusal::AddressStores), left(DispatchRefusal::NoBuffer));
+    AgcDriver::ReportLine("[dispatch-snap] %.1f s: %llu dispatches, %llu bound a set with copies; read-only elements bound to a copy: %llu (%llu in video memory): %llu reused, %llu copied by the CPU (%.1f MiB), %llu copied by the GPU (%.1f MiB); left in place: %llu under the size window, %llu over it, %llu GPU write pending, %llu image result pending, %llu not in an import bound in place, %llu not write-watched, %llu in a build that stores by address, %llu without a buffer\n", seconds, count(stats.dispatches), count(stats.served), count(stats.bound), count(stats.video), count(stats.reused), count(stats.cpuCopies), stats.cpuBytes / 1048576.0, count(stats.gpuCopies), stats.gpuBytes / 1048576.0, left(DispatchRefusal::UnderWindow), left(DispatchRefusal::OverWindow), left(DispatchRefusal::PendingWrite), left(DispatchRefusal::PendingImage), left(DispatchRefusal::OutsideImport), left(DispatchRefusal::Unwatched), left(DispatchRefusal::AddressStores), left(DispatchRefusal::NoBuffer));
     stats = {};
 }
 
@@ -3960,7 +3961,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder, bool repeated) {
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto elements = counters.elements.load();
     const auto readOnly = counters.readOnly.load();
-    std::fprintf(stderr, "[buffers] descriptor elements bound: %llu total, %llu written, %llu read-only; %llu pending-write notes skipped\n", static_cast<unsigned long long>(elements), static_cast<unsigned long long>(elements - readOnly), static_cast<unsigned long long>(readOnly), static_cast<unsigned long long>(counters.notesSkipped.load()));
+    AgcDriver::ReportLine("[buffers] descriptor elements bound: %llu total, %llu written, %llu read-only; %llu pending-write notes skipped\n", static_cast<unsigned long long>(elements), static_cast<unsigned long long>(elements - readOnly), static_cast<unsigned long long>(readOnly), static_cast<unsigned long long>(counters.notesSkipped.load()));
 }
 
 void ShaderResources::WriteBackBuffers() {

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -236,7 +237,7 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
             const auto& region = captured[index];
             const auto begin = region.guestAddress;
             const auto end = begin + region.bytes.size();
-            std::fprintf(stderr, "[capsync] dispatch-cache q0x%x program 0x%llx region 0x%llx+0x%zx (%zu of %zu pending) %s: waited %.1f ms, same %d raw %d;%s; writers:%s\n", queue, static_cast<unsigned long long>(program), static_cast<unsigned long long>(begin), region.bytes.size(), pending.size(), captured.size(), outcome, waited, same ? 1 : 0, rawSame ? 1 : 0, describeSelf(compiled, begin, end).c_str(), describeWriters(begin, end).c_str());
+            AgcDriver::ReportLine("[capsync] dispatch-cache q0x%x program 0x%llx region 0x%llx+0x%zx (%zu of %zu pending) %s: waited %.1f ms, same %d raw %d;%s; writers:%s\n", queue, static_cast<unsigned long long>(program), static_cast<unsigned long long>(begin), region.bytes.size(), pending.size(), captured.size(), outcome, waited, same ? 1 : 0, rawSame ? 1 : 0, describeSelf(compiled, begin, end).c_str(), describeWriters(begin, end).c_str());
         }
     }
     if (verify || verifyKnown) return same;

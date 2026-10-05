@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -76,7 +77,7 @@ private:
                 output.flush();
             }
         } catch (const std::exception& error) {
-            std::fprintf(stderr, "Capture trace failed: %s\n", error.what());
+            AgcDriver::ReportLine("Capture trace failed: %s\n", error.what());
             std::terminate();
         }
     }

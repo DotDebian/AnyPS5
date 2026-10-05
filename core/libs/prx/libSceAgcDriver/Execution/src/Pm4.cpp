@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
@@ -72,7 +73,7 @@ void writeRegister(QueueState& queue, std::uint32_t opcode, std::uint32_t offset
     if ((opcode == 0x69 || opcode == 0x9f) && (offset == 0x8e || offset == 0x8f || offset == 0x318 || offset == 0x31b || offset == 0x31c || offset == 0x31d || offset == 0x390 || offset == 0x3b0 || offset == 0x3b8))
         APS5_LOG_OUT_DEBUG("CONTEXT WRITE opcode=0x%x offset=0x%x value=0x%x", opcode, offset, value);
     registersFor(queue, opcode).insert_or_assign(offset, value);
-    if (TraceContextState() && (opcode == 0x69 || opcode == 0x9f) && ((offset >= 0x318 && offset < 0x318 + 8 * 0xf && (offset - 0x318) % 0xf == 0) || offset == 0x8e)) std::fprintf(stderr, "[context]   write %x = %08x (0x%x)\n", offset, value, opcode);
+    if (TraceContextState() && (opcode == 0x69 || opcode == 0x9f) && ((offset >= 0x318 && offset < 0x318 + 8 * 0xf && (offset - 0x318) % 0xf == 0) || offset == 0x8e)) AgcDriver::ReportLine("[context]   write %x = %08x (0x%x)\n", offset, value, opcode);
     if ((opcode == 0x64 || opcode == 0x79 || opcode == 0x7a) && offset == 0x243) queue.indexType = value & 3u;
 }
 
@@ -784,9 +785,9 @@ void ApplyRegisterPairs(std::span<const std::uint32_t> packet, QueueState& queue
     for (std::size_t i = 0; i < pairs.size(); i += 2) registerOffset(pairs[i]);
     for (std::size_t i = 0; i < pairs.size(); i += 2) writeRegister(queue, opcode, registerOffset(pairs[i]), pairs[i + 1]);
     if (queue.savedContext.has_value() && TraceContextState()) {
-        std::fprintf(stderr, "[context]   indirect 0x%x:", opcode);
-        for (std::size_t i = 0; i < pairs.size(); i += 2) std::fprintf(stderr, " %x", registerOffset(pairs[i]));
-        std::fprintf(stderr, "\n");
+        AgcDriver::ReportLine("[context]   indirect 0x%x:", opcode);
+        for (std::size_t i = 0; i < pairs.size(); i += 2) AgcDriver::ReportLine(" %x", registerOffset(pairs[i]));
+        AgcDriver::ReportLine("\n");
     }
 }
 
@@ -824,7 +825,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
                     queue.markers.pop_back();
                     return;
                 case 0x1a:
-                    if (TraceContextState()) std::fprintf(stderr, "[context] op %u: %zu registers, saved %d, cb0 %x info %x mask %x\n", packet[1], queue.context.size(), queue.savedContext.has_value() ? 1 : 0, queue.context.contains(0x318) ? queue.context.at(0x318) : 0u, queue.context.contains(0x31c) ? queue.context.at(0x31c) : 0u, queue.context.contains(0x8e) ? queue.context.at(0x8e) : 0u);
+                    if (TraceContextState()) AgcDriver::ReportLine("[context] op %u: %zu registers, saved %d, cb0 %x info %x mask %x\n", packet[1], queue.context.size(), queue.savedContext.has_value() ? 1 : 0, queue.context.contains(0x318) ? queue.context.at(0x318) : 0u, queue.context.contains(0x31c) ? queue.context.at(0x31c) : 0u, queue.context.contains(0x8e) ? queue.context.at(0x8e) : 0u);
                     APS5_LOG_OUT_DEBUG("CONTEXT_STATE operation=%u targetMaskBefore=0x%x shaderMaskBefore=0x%x", packet[1], queue.context.contains(0x8e) ? queue.context.at(0x8e) : 0u, queue.context.contains(0x8f) ? queue.context.at(0x8f) : 0u);
                     switch (packet[1]) {
                         case 0: queue.ClearContext(); break;
@@ -863,7 +864,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
                 if (!warned && std::chrono::steady_clock::now() - start > std::chrono::seconds(5)) {
                     warned = true;
-                    std::fprintf(stderr, "[gpu] WAIT_REG_MEM at 0x%llx still waiting after 5s (function %u ref 0x%x mask 0x%x)\n",
+                    AgcDriver::ReportLine("[gpu] WAIT_REG_MEM at 0x%llx still waiting after 5s (function %u ref 0x%x mask 0x%x)\n",
                                  static_cast<unsigned long long>(address(packet[2], packet[3])), packet[1] & 7u, packet[4], packet[5]);
                 }
             }

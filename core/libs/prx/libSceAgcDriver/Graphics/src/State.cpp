@@ -1,4 +1,5 @@
 #include <cstdio>
+#include "prx/libSceAgcDriver/Execution/include/Report.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -97,7 +98,7 @@ enum class DepthReport { Ignored, PassThrough, DroppedStencil, Count };
 void reportOnce(DepthReport kind, const char* format, std::uint32_t value) {
     static std::array<std::atomic<bool>, static_cast<std::size_t>(DepthReport::Count)> reported{};
     if (reported[static_cast<std::size_t>(kind)].exchange(true)) return;
-    std::fprintf(stderr, format, value);
+    AgcDriver::ReportLine(format, value);
 }
 
 std::string depthMessage(const char* reason, std::uint32_t offset, std::uint32_t value) {
@@ -584,7 +585,7 @@ State DecodeState(const QueueState& queue) {
         static bool reported = false;
         if (!reported) {
             reported = true;
-            std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
+            AgcDriver::ReportLine("[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
         }
     }
     zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
@@ -761,7 +762,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
         static bool reported = false;
         if (!reported) {
             reported = true;
-            std::fprintf(stderr, "[gpu] color targets with CMASK fast clears (CB_COLOR_INFO.FAST_CLEAR) are rendered uncompressed; CMASK clears are not modeled\n");
+            AgcDriver::ReportLine("[gpu] color targets with CMASK fast clears (CB_COLOR_INFO.FAST_CLEAR) are rendered uncompressed; CMASK clears are not modeled\n");
         }
     }
     if ((info & ~(0x00039f7cu | 0x00040000u | 0x10000000u | 0x2000u)) != 0) throw std::runtime_error("AGC graphics: color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported (CB_COLOR_INFO 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", info); return std::string(text); }() + ")");
@@ -822,7 +823,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
             static bool reported = false;
             if (!reported) {
                 reported = true;
-                std::fprintf(stderr, "[gpu] DCC keys of mipmapped color targets are ignored\n");
+                AgcDriver::ReportLine("[gpu] DCC keys of mipmapped color targets are ignored\n");
             }
         }
     }
