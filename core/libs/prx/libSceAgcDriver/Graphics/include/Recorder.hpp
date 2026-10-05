@@ -198,6 +198,8 @@ public:
         VkDeviceSize offset = 0;
         bool video = false;
         bool rechecked = false;
+        // A proof without a collect (a copy in a batch arena).
+        bool transient = false;
     };
     // The buffer and offset proved for the range under `now`, kept by the open batch; a null
     // buffer when there is none.

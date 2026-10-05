@@ -318,6 +318,23 @@ public:
         std::uint64_t copiedBytes = 0;
         std::uint64_t small = 0;
         std::uint64_t smallBytes = 0;
+        // Window collects (see ShaderResources.cpp CollectWindowed): windows walked whole, the
+        // element collects those walks answered (each would have been a walk of its own, less
+        // the one per window that the window walk replaced) and the windows that could not be
+        // walked whole.
+        std::uint64_t windowWalks = 0;
+        std::uint64_t windowServed = 0;
+        std::uint64_t windowRefused = 0;
+        // A draw's own set (addressDrawBindings): bound again from an identical draw of the same
+        // batch, or built; of the built ones, those whose bindings repeated a recent draw of the
+        // template in another batch (a set kept across batches would have served), and those
+        // that repeated one but for the batch arena's copies (the draw's data buffers, its small
+        // elements): what a set whose arena-backed bindings were not part of its identity
+        // would serve.
+        std::uint64_t setsReused = 0;
+        std::uint64_t setsBuilt = 0;
+        std::uint64_t setsRepeatedAcrossBatches = 0;
+        std::uint64_t setsRepeatedButArena = 0;
         std::array<std::uint64_t, static_cast<std::size_t>(SnapshotRefusal::Count)> inPlace{};
     };
     static const AddressSnapshotStats& AddressSnapshotCounters();
@@ -496,7 +513,8 @@ private:
     // one of its elements instead of the import (see AddressSnapshotStats): `info` receives it,
     // kept by the recorder's open batch; false leaves the element in place. Under the stamp
     // addressDrawBindings took for the call.
-    bool addressSnapshot(Recorder& recorder, std::uint64_t begin, std::size_t bytes, VkDescriptorBufferInfo& info) const;
+    // `transient`: the snapshot is a copy in the batch arena (good for the collect epoch only).
+    bool addressSnapshot(Recorder& recorder, std::uint64_t begin, std::size_t bytes, VkDescriptorBufferInfo& info, bool& transient) const;
     // PrepareDrawBindings for an address-based build under APS5_REUSE_ADDRESS_DRAWS: the draw's
     // own data buffers (from the batch arena), its moved elements and, under
     // APS5_SNAPSHOT_ADDRESS_DRAWS, the snapshots of its read-only elements, in a set the batch
@@ -601,6 +619,18 @@ private:
     // atomic for the reader's sake): it serves no further use.
     std::atomic<bool> faulted{false};
     std::uint64_t lastUseBatch = 0;
+    // The last few sets addressDrawBindings made for this object: the hash of everything they
+    // bound (and of the push constant patches that go with it), the same with the arena-backed
+    // bindings left out, the set and the batch that owns it. A draw of the same batch with the
+    // same hash binds the set again; the rest is counted (AddressSnapshotStats).
+    struct DrawSetMemo {
+        std::uint64_t full = 0;
+        std::uint64_t stable = 0;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        std::uint64_t batch = 0;
+    };
+    mutable std::array<DrawSetMemo, 4> drawSetMemos{};
+    mutable std::uint8_t drawSetNext = 0;
     mutable std::vector<std::pair<VkImage, bool>> storageImageList;
     mutable bool storageImagesListed = false;
     // A shared build's image proof within a collect epoch (APS5_REUSE_ADDRESS_DRAWS; see

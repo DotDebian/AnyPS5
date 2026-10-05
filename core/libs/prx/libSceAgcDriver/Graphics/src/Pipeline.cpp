@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthTarget.hpp"
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -365,6 +366,39 @@ void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
     context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
     if (depthBounds) context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.depth.depthBoundsMin, state.depth.depthBoundsMax);
     if (depthBias) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, state.depth.depthBiasConstant, state.depth.depthBiasClamp, state.depth.depthBiasSlope);
+}
+
+Pipeline::PassDynamics Pipeline::Dynamics(const State& state) const {
+    return {this, state.viewport, state.scissor, state.depth.depthBoundsMin, state.depth.depthBoundsMax, state.depth.depthBiasConstant, state.depth.depthBiasClamp, state.depth.depthBiasSlope};
+}
+
+void Pipeline::Continue(VkCommandBuffer commands, const State& state, PassDynamics& last) const {
+    // Another pipeline (or none known): everything, as Continue does. Dynamic state survives a
+    // bind in Vulkan, but which of it the other pipeline set is not tracked here.
+    if (last.pipeline != this) {
+        Continue(commands, state);
+        last = Dynamics(state);
+        return;
+    }
+    if (std::memcmp(&last.viewport, &state.viewport, sizeof(VkViewport)) != 0) {
+        context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
+        last.viewport = state.viewport;
+    }
+    if (std::memcmp(&last.scissor, &state.scissor, sizeof(VkRect2D)) != 0) {
+        context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
+        last.scissor = state.scissor;
+    }
+    if (depthBounds && (std::memcmp(&last.depthBoundsMin, &state.depth.depthBoundsMin, sizeof(float)) != 0 || std::memcmp(&last.depthBoundsMax, &state.depth.depthBoundsMax, sizeof(float)) != 0)) {
+        context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.depth.depthBoundsMin, state.depth.depthBoundsMax);
+        last.depthBoundsMin = state.depth.depthBoundsMin;
+        last.depthBoundsMax = state.depth.depthBoundsMax;
+    }
+    if (depthBias && (std::memcmp(&last.depthBiasConstant, &state.depth.depthBiasConstant, sizeof(float)) != 0 || std::memcmp(&last.depthBiasClamp, &state.depth.depthBiasClamp, sizeof(float)) != 0 || std::memcmp(&last.depthBiasSlope, &state.depth.depthBiasSlope, sizeof(float)) != 0)) {
+        context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, state.depth.depthBiasConstant, state.depth.depthBiasClamp, state.depth.depthBiasSlope);
+        last.depthBiasConstant = state.depth.depthBiasConstant;
+        last.depthBiasClamp = state.depth.depthBiasClamp;
+        last.depthBiasSlope = state.depth.depthBiasSlope;
+    }
 }
 
 void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {

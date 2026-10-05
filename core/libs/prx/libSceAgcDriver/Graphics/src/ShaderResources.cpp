@@ -1906,6 +1906,97 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
 // Revalidate calls answered by a shared build's proof of the same collect epoch (cumulative).
 std::atomic<std::uint64_t> proofsReused{0};
 
+// Window collects (APS5_REUSE_ADDRESS_DRAWS; APS5_COLLECT_WINDOW_KIB, default 2048, 0: none).
+// A walk costs about 8 us whatever its size plus 34 ns a page, and the first use of every cached
+// snapshot and of every proved surface in a collect epoch is a walk of its own: a few thousand a
+// frame. The collect memo answers any range whose pages the epoch already walked, and a walk
+// only visits the pages it does not cover, so one walk of the aligned window around an element
+// serves every other element of the window for the rest of the epoch. A window walk of 2 MiB
+// costs 25 us, three single walks: a window is walked whole only when the last epoch that
+// touched it made at least APS5_COLLECT_WINDOW_MIN_USES (3) collects in it (the draws of one
+// pass come back with the same buffers), and never for a range that does not fit one window.
+// `bounds` clamps the window to the range the element is known to lie in (an imported
+// allocation: committed and watched as a whole); a window that cannot be walked whole (it
+// leaves the watched arena, or covers uncommitted pages) is left alone for the next 256 epochs
+// that touch it. Exact under the epoch contract: it only makes more pages "collected in this
+// epoch", which is what every collect of the thread already does for its own range.
+struct CollectWindows {
+    std::uint64_t bytes;
+    std::uint32_t minUses;
+};
+
+const CollectWindows& CollectWindowSetting() {
+    static const CollectWindows setting = [] {
+        const char* kib = std::getenv("APS5_COLLECT_WINDOW_KIB");
+        const char* uses = std::getenv("APS5_COLLECT_WINDOW_MIN_USES");
+        auto bytes = ShaderResources::ReuseAddressDraws() ? (kib != nullptr ? std::strtoull(kib, nullptr, 10) : 2048ull) << 10u : 0ull;
+        // A power of two of at least a tracker block, so windows nest on the tracker's blocks.
+        if (bytes != 0) bytes = std::bit_ceil(std::max<std::uint64_t>(bytes, 65536));
+        return CollectWindows{bytes, static_cast<std::uint32_t>(std::max(1ull, uses != nullptr ? std::strtoull(uses, nullptr, 10) : 3ull))};
+    }();
+    return setting;
+}
+
+struct CollectWindowCounts {
+    std::atomic<std::uint64_t> walks{0};
+    std::atomic<std::uint64_t> served{0};
+    std::atomic<std::uint64_t> refused{0};
+};
+
+CollectWindowCounts& CollectWindowCounters() {
+    static CollectWindowCounts counts;
+    return counts;
+}
+
+std::uint64_t CollectWindowed(std::uint64_t address, std::size_t bytes, const std::pair<std::uint64_t, std::uint64_t>* bounds = nullptr) {
+    const auto& setting = CollectWindowSetting();
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    if (setting.bytes == 0 || epoch == 0 || bytes == 0 || bytes >= setting.bytes) return GuestMemory::CollectWrites(address, bytes);
+    const auto window = address / setting.bytes;
+    if ((address + bytes - 1) / setting.bytes != window) return GuestMemory::CollectWrites(address, bytes);
+    // Per thread, like the epochs: the window, the epoch that touched it last with its collects
+    // so far, the collects of the epoch before that one, whether this epoch walked it whole.
+    struct Slot {
+        std::uint64_t window = ~0ull;
+        std::uint64_t epoch = 0;
+        std::uint32_t uses = 0;
+        std::uint32_t previous = 0;
+        std::uint32_t skip = 0;
+        bool walked = false;
+    };
+    thread_local std::array<Slot, 4096> slots;
+    auto& slot = slots[static_cast<std::size_t>((window * 0x9e3779b97f4a7c15ull) >> 52u)];
+    if (slot.window != window) slot = Slot{window, epoch, 0, 0, 0, false};
+    if (slot.epoch != epoch) {
+        slot.previous = slot.uses;
+        slot.uses = 0;
+        slot.walked = false;
+        slot.epoch = epoch;
+        if (slot.skip != 0) --slot.skip;
+    }
+    ++slot.uses;
+    auto& counts = CollectWindowCounters();
+    if (slot.walked) {
+        counts.served.fetch_add(1, std::memory_order_relaxed);
+    } else if (slot.previous >= setting.minUses && slot.skip == 0) {
+        auto begin = window * setting.bytes;
+        auto end = begin + setting.bytes;
+        if (bounds != nullptr) {
+            begin = std::max(begin, bounds->first & ~std::uint64_t{4095});
+            end = std::min(end, (bounds->second + 4095) & ~std::uint64_t{4095});
+        }
+        if (begin <= address && address + bytes <= end && GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)) != 0) {
+            slot.walked = true;
+            counts.walks.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            slot.skip = 256;
+            counts.refused.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    // A memo hit after a window walk: the generation every collect of the epoch returns.
+    return GuestMemory::CollectWrites(address, bytes);
+}
+
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
 // flush and import lookups of every Revalidate, as before the epoch gate.
 bool EpochRevalidate() {
@@ -1992,7 +2083,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (!surface.valid) return fail(FastFail::NoRecord);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
-        surface.collected = GuestMemory::CollectWrites(address, bytes);
+        surface.collected = CollectWindowed(address, bytes);
         if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
         if (!keyProofs) {
@@ -2045,7 +2136,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
+        if (CollectWindowed(address, bytes) == 0) return fail(FastFail::Collect);
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
@@ -3418,10 +3509,15 @@ struct DrawBatchSets {
 }
 
 const ShaderResources::AddressSnapshotStats& ShaderResources::AddressSnapshotCounters() {
+    const auto& windows = CollectWindowCounters();
+    addressSnapshotStats.windowWalks = windows.walks.load(std::memory_order_relaxed);
+    addressSnapshotStats.windowServed = windows.served.load(std::memory_order_relaxed);
+    addressSnapshotStats.windowRefused = windows.refused.load(std::memory_order_relaxed);
     return addressSnapshotStats;
 }
 
-bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, std::size_t bytes, VkDescriptorBufferInfo& info) const {
+bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, std::size_t bytes, VkDescriptorBufferInfo& info, bool& transient) const {
+    transient = false;
     auto& stats = addressSnapshotStats;
     const auto& window = AddressSnapshots();
     const auto leave = [&](SnapshotRefusal reason) {
@@ -3438,12 +3534,14 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
     if (bytes < window.floor) return leave(SnapshotRefusal::UnderWindow);
     if (bytes > window.limit) return leave(SnapshotRefusal::OverWindow);
     if (guestMemory.WritesOverlap(begin, bytes)) return leave(SnapshotRefusal::Written);
-    if (!guestMemory.BoundInPlace(begin, bytes)) return leave(SnapshotRefusal::OutsideImport);
+    std::pair<std::uint64_t, std::uint64_t> region;
+    if (!guestMemory.BoundInPlace(begin, bytes, &region)) return leave(SnapshotRefusal::OutsideImport);
     // A range proved in this collect epoch under the stamp still in force: no check is repeated.
     const auto& now = addressSnapshotStamp;
     if (const auto proved = recorder.EpochSnapshot(begin, bytes, now); proved.buffer != VK_NULL_HANDLE) {
         ++stats.epochSkips;
         if (proved.rechecked) ++stats.epochRechecks;
+        transient = proved.transient;
         return bind(proved.buffer, proved.offset, proved.video);
     }
     // What the recorded work still has to write is read in place, behind it. (Pending image
@@ -3461,6 +3559,7 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
             recorder.NoteEpochSnapshot(begin, bytes, now, 0, arena.block, arena.offset);
             ++stats.small;
             stats.smallBytes += bytes;
+            transient = true;
             return bind(arena.block->Handle(), arena.offset, arena.block->InVideoMemory());
         }
     }
@@ -3469,7 +3568,8 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
     // the copy is stamped newer by the next walk and compared then). A range that is not
     // write-watched has no generation and would be copied for every draw: left in place.
     const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::DrawSnapshot);
-    const auto generation = GuestMemory::CollectWrites(begin, bytes);
+    // With its window (CollectWindowed), clamped to the import the range lies in.
+    const auto generation = CollectWindowed(begin, bytes, &region);
     if (generation == 0) return leave(SnapshotRefusal::Unwatched);
     auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
     if (buffer != nullptr) {
@@ -3511,6 +3611,25 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
     infos.clear();
     // One stamp for the call: nothing below waits for recorded work or notes a write.
     addressSnapshotStamp = recorder.CurrentSnapshotStamp(guestMemory.ReadSetToken());
+    // What the set will bind, hashed as it is gathered: everything (`full`), and everything but
+    // the batch arena's copies, which a later draw never binds again at the same place (`stable`).
+    std::uint64_t full = 14695981039346656037ull;
+    std::uint64_t stable = 14695981039346656037ull;
+    const auto mixInto = [](std::uint64_t& hash, std::uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
+    const auto mixBinding = [&](std::size_t index, const VkDescriptorBufferInfo& info, bool arena) {
+        mixInto(full, index);
+        mixInto(full, reinterpret_cast<std::uint64_t>(info.buffer));
+        mixInto(full, info.offset);
+        mixInto(full, info.range);
+        mixInto(stable, index);
+        if (arena) {
+            mixInto(stable, info.range);
+            return;
+        }
+        mixInto(stable, reinterpret_cast<std::uint64_t>(info.buffer));
+        mixInto(stable, info.offset);
+        mixInto(stable, info.range);
+    };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -3541,6 +3660,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
             }
             selected.push_back(index);
             infos.push_back(info);
+            mixBinding(index, info, true);
             continue;
         }
         if (override != moved.end() && override->inPlace) {
@@ -3549,9 +3669,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
             // range (the one the shader is told), so every template snapshots a buffer alike;
             // else in place, as MovedReadOnlyBuffers found it.
             auto info = override->info;
-            if (window.enabled) addressSnapshot(recorder, override->address - override->adjustment, override->size + override->adjustment, info);
+            bool transient = false;
+            if (window.enabled) addressSnapshot(recorder, override->address - override->adjustment, override->size + override->adjustment, info, transient);
             selected.push_back(index);
             infos.push_back(info);
+            mixBinding(index, info, transient);
+            // The adjustment the shader is told goes with the binding (two ranges can share an
+            // aligned offset and a length).
+            mixInto(full, override->adjustment);
+            mixInto(stable, override->adjustment);
             continue;
         }
         if (!window.enabled || !item.guest) continue;
@@ -3560,11 +3686,36 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
             continue;
         }
         VkDescriptorBufferInfo info{};
-        if (!addressSnapshot(recorder, item.address - item.adjustment, item.size + item.adjustment, info)) continue;
+        bool transient = false;
+        if (!addressSnapshot(recorder, item.address - item.adjustment, item.size + item.adjustment, info, transient)) continue;
         selected.push_back(index);
         infos.push_back(info);
+        mixBinding(index, info, transient);
     }
     if (selected.empty()) return {};
+    // An identical draw of this batch (the same bindings, hence the same bytes: the batch keeps
+    // every buffer, and a set made for it is not written again) binds that draw's set. One of
+    // another batch would need a set that outlives its batch; counted, with the draws that
+    // differ from a recent one by their arena copies alone (see AddressSnapshotStats).
+    const auto batch = recorder.OpenBatchId();
+    bool repeatedAcross = false;
+    bool repeatedButArena = false;
+    for (const auto& memo : drawSetMemos) {
+        if (memo.set == VK_NULL_HANDLE) continue;
+        if (memo.full == full) {
+            if (memo.batch == batch) {
+                ++addressSnapshotStats.setsReused;
+                result.allocation.set = memo.set;
+                return std::shared_ptr<DrawBindings>(std::shared_ptr<void>(), &result);
+            }
+            repeatedAcross = true;
+        } else if (memo.stable == stable) {
+            repeatedButArena = true;
+        }
+    }
+    ++addressSnapshotStats.setsBuilt;
+    if (repeatedAcross) ++addressSnapshotStats.setsRepeatedAcrossBatches;
+    else if (repeatedButArena) ++addressSnapshotStats.setsRepeatedButArena;
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     if (drawBindingSizes.empty()) {
         std::map<VkDescriptorType, std::uint32_t> counts;
@@ -3610,6 +3761,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
     update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
     update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    drawSetMemos[drawSetNext++ % drawSetMemos.size()] = {full, stable, allocation.set, batch};
     // The set only: `cache` stays null, so the scratch frees nothing.
     result.allocation.set = allocation.set;
     return std::shared_ptr<DrawBindings>(std::shared_ptr<void>(), &result);
@@ -3625,11 +3777,20 @@ bool ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shade
     moved.clear();
     // An address-based build that is not shared serves no second use.
     if (_set == VK_NULL_HANDLE || (usesBda && !guestMemory.Shared())) return true;
+    // The build made one binding per stage binding, in this order: the template's is found by
+    // position, and searched for only if the stages are not the build's layout after all.
+    std::size_t position = 0;
+    const auto keptBinding = [&](const ShaderRecompiler::DescriptorBinding& binding) {
+        const auto at = position - 1;
+        if (at < bindings.size() && bindings[at].layout.binding == binding.binding) return bindings.begin() + static_cast<std::ptrdiff_t>(at);
+        return std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+    };
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return false;
         for (const auto& binding : shader.program->bindings) {
+            ++position;
             if (DataRole(binding.role)) {
-                const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+                const auto kept = keptBinding(binding);
                 if (kept == bindings.end() || kept->allocations.size() != 1) return false;
                 const auto index = kept->allocations.front();
                 const auto& item = allocations[index];
@@ -3642,7 +3803,7 @@ bool ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shade
                 continue;
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
-            const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+            const auto kept = keptBinding(binding);
             if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return false;
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;

@@ -769,14 +769,17 @@ void reportAddressDraws() {
         if (snapshots.inPlace[i] != seen.inPlace[i]) left += " " + std::string(refusals[i]) + " " + std::to_string(snapshots.inPlace[i] - seen.inPlace[i]);
     }
     std::fprintf(stderr, "[addrdraw] read-only elements (10 s): %llu bound to a snapshot (%llu in video memory): %llu by the collect epoch without a check (%llu of them after asking the range again), %llu reused after their checks, %llu copied (%.1f MiB), %llu small ones copied without a collect (%.1f MiB); left in place:%s\n", delta(snapshots.bound, seen.bound), delta(snapshots.video, seen.video), delta(snapshots.epochSkips, seen.epochSkips), delta(snapshots.epochRechecks, seen.epochRechecks), delta(snapshots.reused, seen.reused), delta(snapshots.copied, seen.copied), static_cast<double>(snapshots.copiedBytes - seen.copiedBytes) / 1048576.0, delta(snapshots.small, seen.small), static_cast<double>(snapshots.smallBytes - seen.smallBytes) / 1048576.0, left.empty() ? " none" : left.c_str());
+    const auto before = seen;
     seen = snapshots;
     // What the hits no longer pay per draw: the batch arena (small snapshots and the draws' own
-    // data buffers), the template proofs answered by the epoch, the templates the sweep dropped.
+    // data buffers), the template proofs answered by the epoch, the templates the sweep dropped,
+    // the window collects (a collect answered by a window walk is a walk saved, less the one
+    // walk per window the window walk stood for) and the draws' own sets.
     static Recorder::ArenaStatistics arenaSeen;
     static std::uint64_t proofsSeen = 0;
     const auto arena = Recorder::ArenaCounts();
     const auto proofs = ShaderResources::ProofsReused();
-    std::fprintf(stderr, "[addrdraw] per-draw work (10 s): batch arena %.1f MiB in %llu blocks of 1 MiB; template proofs answered by the collect epoch %llu; templates dropped for images that left their cache %llu (%.1f MiB of such images held)\n", static_cast<double>(arena.bytes - arenaSeen.bytes) / 1048576.0, delta(arena.blocks, arenaSeen.blocks), delta(proofs, proofsSeen), static_cast<unsigned long long>(stats.swept), static_cast<double>(stats.sweptBytes) / 1048576.0);
+    std::fprintf(stderr, "[addrdraw] per-draw work (10 s): batch arena %.1f MiB in %llu blocks of 1 MiB; template proofs answered by the collect epoch %llu; templates dropped for images that left their cache %llu (%.1f MiB of such images held); window collects: %llu windows walked whole, %llu collects answered by them, %llu windows refused; draw sets: %llu bound again within their batch, %llu built (%llu of them repeated a draw of another batch, %llu repeated one but for the arena copies)\n", static_cast<double>(arena.bytes - arenaSeen.bytes) / 1048576.0, delta(arena.blocks, arenaSeen.blocks), delta(proofs, proofsSeen), static_cast<unsigned long long>(stats.swept), static_cast<double>(stats.sweptBytes) / 1048576.0, delta(snapshots.windowWalks, before.windowWalks), delta(snapshots.windowServed, before.windowServed), delta(snapshots.windowRefused, before.windowRefused), delta(snapshots.setsReused, before.setsReused), delta(snapshots.setsBuilt, before.setsBuilt), delta(snapshots.setsRepeatedAcrossBatches, before.setsRepeatedAcrossBatches), delta(snapshots.setsRepeatedButArena, before.setsRepeatedButArena));
     arenaSeen = arena;
     proofsSeen = proofs;
     const auto last = stats.lastReport;
@@ -996,6 +999,36 @@ const ResourceCache::Key& DrawResourceKey(const Context& context, std::span<cons
         append64(indexBytes);
     }
     return key;
+}
+
+// What the last recorded draw left in the recorder's open render pass (APS5_REUSE_ADDRESS_DRAWS),
+// by the pass's serial (Recorder::OpenPassSerial: the pass is still the open one, so nothing but
+// draws continuing it was recorded since, by any thread). Under GuestMemory::GpuMutex.
+// - The pipeline and the dynamic state it set: a draw continuing the pass binds and sets only
+//   what differs (Pipeline::Continue).
+// - For a plan hit, the attachments its targets and depth image were proved as (the image and
+//   the ColorTarget it was proved for: the register clear and the keys go by it), with the
+//   collect epoch and the pending registry's serial of that proof: a plan hit continuing the pass
+//   with the same images for the same targets takes them without the cache lookups and the
+//   Refresh (the conditions of refreshResidentTarget's memo, which DrawWithRecipe did without:
+//   every plan hit refreshed every target). APS5_TARGET_REFRESH_EACH_DRAW=1 proves them for
+//   every draw.
+struct OpenPassMemo {
+    const Recorder* recorder = nullptr;
+    std::uint64_t pass = 0;
+    Pipeline::PassDynamics dynamics;
+    std::uint64_t epoch = 0;
+    std::uint64_t pendingSerial = 0;
+    std::array<const StorageTexture*, 8> targets{};
+    std::array<ColorTarget, 8> colors{};
+    std::size_t targetCount = 0;
+    const DepthImage* depth = nullptr;
+    bool proved = false;
+};
+
+OpenPassMemo& OpenPass() {
+    static OpenPassMemo memo;
+    return memo;
 }
 
 // The buffers a template or plan hit moved (ShaderResources::MovedReadOnlyBuffers), per thread:
@@ -2164,6 +2197,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     if (record.depth != nullptr) passAttachments.emplace_back(record.depth->Image(), true);
     const PassAccess passAccess{gpuIndirect ? GuestRangeList(indirectReads) : GuestRangeList(passReads), resources.GpuWrites(), passImages, passAttachments, addressBased, resources.BdaWrites(), resources.UsesGds()};
+    // The open pass before this draw joins or ends it (OpenPassMemo).
+    const bool passMemo = ShaderResources::ReuseAddressDraws();
+    const auto passBefore = passMemo ? recorder->OpenPassSerial() : 0;
     const auto start = recorder->StartDrawPass(passKey, forced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -2188,7 +2224,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
-    if (continued) {
+    auto& openPass = OpenPass();
+    const bool knownPass = passMemo && continued && passBefore != 0 && openPass.recorder == recorder && openPass.pass == passBefore;
+    if (continued && knownPass) {
+        record.pipeline->Continue(commands, state, openPass.dynamics);
+    } else if (continued) {
         record.pipeline->Continue(commands, state);
     } else {
         // With a depth attachment the depth tests also wait for earlier depth writes (a previous
@@ -2276,6 +2316,15 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // draw class range) before anything else is recorded. A draw that wrote memory owes the next
     // one a barrier, so its pass cannot be continued.
     recorder->LeaveRenderPassOpen(passKey, drawTiming, resources.LegacyPassBlock(), passAccess);
+    if (passMemo) {
+        // The pass this draw left open, with what it bound; its attachments' proof is the
+        // caller's to note (DrawWithRecipe), and stands only for the pass it was noted in.
+        const auto passAfter = recorder->OpenPassSerial();
+        if (!(knownPass && passAfter == passBefore)) openPass.proved = false;
+        if (!knownPass) openPass.dynamics = record.pipeline->Dynamics(state);
+        openPass.recorder = recorder;
+        openPass.pass = passAfter;
+    }
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, record.targets, std::move(record.depth), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, std::move(record.lease));
     timer.phase(PhaseKeep);
@@ -3022,9 +3071,22 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         std::vector<std::shared_ptr<StorageTexture>>& scratch;
         ~ClearTargets() { scratch.clear(); }
     } clearTargets{targetScratch};
+    // A plan hit into the pass the last draw left open, in the epoch and under the pending
+    // registry its attachments were proved in (OpenPassMemo): an image that is the pass's
+    // attachment at its place is taken as it is.
+    const auto& openPass = OpenPass();
+    const auto passEpoch = GuestMemory::ThreadCollectEpoch();
+    const bool provedPass = plan && TargetMemoEnabled() && ShaderResources::ReuseAddressDraws() && openPass.proved && passEpoch != 0 && openPass.epoch == passEpoch && openPass.recorder == recorder && openPass.pass != 0 && openPass.pass == recorder->OpenPassSerial() && openPass.pendingSerial == StorageTexture::PendingSerial() && openPass.targetCount == recipe.targets.size();
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
         timer.phase(PhaseSetup);
         auto stored = recipe.targets[index].lock();
+        if (provedPass && stored != nullptr && stored.get() == openPass.targets[index] && sameColorTarget(openPass.colors[index], state.colors[index]) && stored->Cached()) {
+            // As a proved Refresh notes it: the image is in use at this present.
+            stored->NoteProved();
+            GuestMemory::CountTrace(GuestMemory::TraceCount::TargetRefreshSkipped);
+            targets.push_back(std::move(stored));
+            continue;
+        }
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, state.colors[index].dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
             stored->Refresh();
@@ -3039,7 +3101,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     std::shared_ptr<DepthImage> depth;
     if (state.depth.attached) {
         depth = recipe.depth.lock();
-        if (depth == nullptr || !DepthImageCached(context, depth.get())) return miss(DrawRecipeMiss::TargetGone);
+        if (depth == nullptr || (!(provedPass && depth.get() == openPass.depth) && !DepthImageCached(context, depth.get()))) return miss(DrawRecipeMiss::TargetGone);
     }
     timer.phase(PhasePrepare);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
@@ -3088,7 +3150,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     const bool timed = plan && AddressDrawTimes();
     const auto provedAt = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
-    SharedResourceCache().Touch(recipe.key);
+    // (A plan's template was found by its key a moment ago, which touched it.)
+    if (!plan) SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);
     // False for every recipe of the draw cache (no completion work on a reusable template without
@@ -3119,7 +3182,28 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // A plan's push constants are its own stages' (and its moved buffers' adjustments).
     record.pushBytes = plan ? nullptr : &recipe.pushBytes;
     record.pushStages = plan ? 0 : recipe.pushStages;
+    // What the pass memo will hold if this draw leaves its attachments proved (raw: the batch
+    // keeps the images while the pass is open).
+    std::array<const StorageTexture*, 8> provedTargets{};
+    const auto provedCount = record.targets.size();
+    for (std::size_t index = 0; index < provedCount && index < provedTargets.size(); ++index) provedTargets[index] = record.targets[index].get();
+    const auto* provedDepth = record.depth.get();
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
+    if (plan && provedCount <= provedTargets.size()) {
+        // The proofs above were made in this epoch and under this registry serial (a Refresh
+        // that flushed moved it, and the next draw then proves again), and the pass this draw
+        // left open is the one recordDraw noted.
+        auto& noted = OpenPass();
+        if (noted.recorder == recorder && noted.pass != 0 && noted.pass == recorder->OpenPassSerial()) {
+            noted.targets = provedTargets;
+            for (std::size_t index = 0; index < provedCount; ++index) noted.colors[index] = state.colors[index];
+            noted.targetCount = provedCount;
+            noted.depth = provedDepth;
+            noted.epoch = passEpoch;
+            noted.pendingSerial = StorageTexture::PendingSerial();
+            noted.proved = true;
+        }
+    }
     targetScratch = std::move(record.targets);
     if (timed) {
         auto& times = PlanTimeTotals();
