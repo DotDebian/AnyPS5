@@ -14,6 +14,14 @@ namespace {
 
 enum AheadRecheck { RecheckDevice, RecheckMappings, RecheckPending, RecheckDiffers, RecheckUnreadable };
 
+// The pending-write view of the recheck in progress on this thread (recheckPreparedDraw): one
+// snapshot of the recorder's pending writes serves every page the prepared draw read, instead of
+// one loaded per page by pendingOverlap. A write published while the recheck runs is missed for
+// the pages already passed either way; with the shared view it is missed for the remaining ones
+// too, the same window as a write published right after the recheck returns.
+// APS5_RECHECK_VIEW_PER_PAGE=1 loads a view per page as before.
+thread_local const PendingView* recheckView = nullptr;
+
 }
 
 bool Driver::drawAheadEnabled() {
@@ -125,6 +133,7 @@ std::shared_ptr<PreparedDraw> Driver::prepareDrawAhead(const QueueState& queue, 
 }
 
 ShaderMemory::PendingWrite Driver::pendingOverlap(std::uint64_t address, std::size_t bytes, std::span<std::byte>) {
+    if (recheckView != nullptr) return recheckView->Overlaps(address, bytes) ? ShaderMemory::PendingWrite::Sync : ShaderMemory::PendingWrite::None;
     PendingView pending;
     pending.Load();
     return pending.Overlaps(address, bytes) ? ShaderMemory::PendingWrite::Sync : ShaderMemory::PendingWrite::None;
@@ -138,6 +147,18 @@ bool Driver::recheckPreparedDraw(const PreparedDraw& prepared, std::uint64_t dev
     };
     if (prepared.deviceSerial != deviceSerial) return fail(RecheckDevice);
     if (GuestMemory::ForgetSerial() != prepared.forgetSerial) return fail(RecheckMappings);
+    static const bool viewPerPage = std::getenv("APS5_RECHECK_VIEW_PER_PAGE") != nullptr;
+    PendingView view;
+    struct ViewScope {
+        explicit ViewScope(const PendingView* shared) { recheckView = shared; }
+        ~ViewScope() { recheckView = nullptr; }
+    };
+    std::optional<ViewScope> viewScope;
+    if (!viewPerPage) {
+        view.Load();
+        viewScope.emplace(&view);
+        GuestMemory::CountTrace(GuestMemory::TraceCount::RecheckViewShared);
+    }
     switch (prepared.shaderMemory->RecheckReads(&pendingOverlap)) {
         case ShaderMemory::Recheck::Same: break;
         case ShaderMemory::Recheck::Pending: return fail(RecheckPending);
