@@ -467,12 +467,38 @@ struct AddressDrawStats {
     double buildUs = 0;
     std::array<std::uint64_t, ProofFailureCount> proofFailures{};
     std::array<std::uint64_t, static_cast<std::size_t>(AddressDrawFate::Count)> fates{};
+    // Templates dropped because an image they held left its cache (ResourceCache::SweepDeparted).
+    std::uint64_t swept = 0;
+    std::uint64_t sweptBytes = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
 AddressDrawStats& AddressDraws() {
     static AddressDrawStats stats;
     return stats;
+}
+
+// APS5_TRACE_ADDRDRAW_TIMES=1: a plan hit's time split into its proof (the address space, the
+// template's proof, the moved buffers), its bindings (PrepareDrawBindings: the snapshots, the
+// draw's set) and the rest of its record, for the [drawplan] line; five clock reads a plan hit,
+// none without the switch.
+bool AddressDrawTimes() {
+    static const bool enabled = std::getenv("APS5_TRACE_ADDRDRAW_TIMES") != nullptr;
+    return enabled;
+}
+
+struct PlanTimes {
+    double proofUs = 0;
+    double bindingsUs = 0;
+    double recordUs = 0;
+    std::uint64_t hits = 0;
+    // The bindings' share of the record in progress (recordDraw adds it).
+    double currentBindingsUs = 0;
+};
+
+PlanTimes& PlanTimeTotals() {
+    static PlanTimes times;
+    return times;
 }
 
 // APS5_DRAW_PLANS: the draws that came with a state key, printed as [drawplan] every 10 s whenever
@@ -507,6 +533,12 @@ void reportDrawPlans() {
         if (stats.misses[i] != 0) misses += " " + std::string(DrawRecipeMissName(static_cast<DrawRecipeMiss>(i))) + " " + std::to_string(stats.misses[i]);
     }
     std::fprintf(stderr, "[drawplan] draws with a state key (10 s): %llu plan hits avg %.1f us; no plan tried: %llu not eligible, %llu no template, %llu template without a plan for the state; plans that missed:%s; %llu plans attached\n", static_cast<unsigned long long>(stats.hits), stats.hits != 0 ? stats.hitUs / static_cast<double>(stats.hits) : 0.0, static_cast<unsigned long long>(stats.ineligible), static_cast<unsigned long long>(stats.noTemplate), static_cast<unsigned long long>(stats.noPlan), misses.empty() ? " none" : misses.c_str(), static_cast<unsigned long long>(stats.attached));
+    if (AddressDrawTimes()) {
+        auto& times = PlanTimeTotals();
+        const auto average = [&](double total) { return times.hits != 0 ? total / static_cast<double>(times.hits) : 0.0; };
+        std::fprintf(stderr, "[drawplan] times of %llu plan hits (10 s), avg us: proof %.1f (address space, template proof, moved buffers), bindings %.1f (snapshots, data buffers, the draw's set), record %.1f (inputs, targets, pass, commands, keep)\n", static_cast<unsigned long long>(times.hits), average(times.proofUs), average(times.bindingsUs), average(times.recordUs));
+        times = {};
+    }
     const auto last = stats.lastReport;
     stats = {};
     stats.lastReport = last;
@@ -539,8 +571,17 @@ void reportAddressDraws() {
     for (std::size_t i = 0; i < refusals.size(); ++i) {
         if (snapshots.inPlace[i] != seen.inPlace[i]) left += " " + std::string(refusals[i]) + " " + std::to_string(snapshots.inPlace[i] - seen.inPlace[i]);
     }
-    std::fprintf(stderr, "[addrdraw] read-only elements (10 s): %llu bound to a snapshot (%llu in video memory): %llu by the collect epoch without a check (%llu of them after asking the range again), %llu reused after their checks, %llu copied (%.1f MiB); left in place:%s\n", delta(snapshots.bound, seen.bound), delta(snapshots.video, seen.video), delta(snapshots.epochSkips, seen.epochSkips), delta(snapshots.epochRechecks, seen.epochRechecks), delta(snapshots.reused, seen.reused), delta(snapshots.copied, seen.copied), static_cast<double>(snapshots.copiedBytes - seen.copiedBytes) / 1048576.0, left.empty() ? " none" : left.c_str());
+    std::fprintf(stderr, "[addrdraw] read-only elements (10 s): %llu bound to a snapshot (%llu in video memory): %llu by the collect epoch without a check (%llu of them after asking the range again), %llu reused after their checks, %llu copied (%.1f MiB), %llu small ones copied without a collect (%.1f MiB); left in place:%s\n", delta(snapshots.bound, seen.bound), delta(snapshots.video, seen.video), delta(snapshots.epochSkips, seen.epochSkips), delta(snapshots.epochRechecks, seen.epochRechecks), delta(snapshots.reused, seen.reused), delta(snapshots.copied, seen.copied), static_cast<double>(snapshots.copiedBytes - seen.copiedBytes) / 1048576.0, delta(snapshots.small, seen.small), static_cast<double>(snapshots.smallBytes - seen.smallBytes) / 1048576.0, left.empty() ? " none" : left.c_str());
     seen = snapshots;
+    // What the hits no longer pay per draw: the batch arena (small snapshots and the draws' own
+    // data buffers), the template proofs answered by the epoch, the templates the sweep dropped.
+    static Recorder::ArenaStatistics arenaSeen;
+    static std::uint64_t proofsSeen = 0;
+    const auto arena = Recorder::ArenaCounts();
+    const auto proofs = ShaderResources::ProofsReused();
+    std::fprintf(stderr, "[addrdraw] per-draw work (10 s): batch arena %.1f MiB in %llu blocks of 1 MiB; template proofs answered by the collect epoch %llu; templates dropped for images that left their cache %llu (%.1f MiB of such images held)\n", static_cast<double>(arena.bytes - arenaSeen.bytes) / 1048576.0, delta(arena.blocks, arenaSeen.blocks), delta(proofs, proofsSeen), static_cast<unsigned long long>(stats.swept), static_cast<double>(stats.sweptBytes) / 1048576.0);
+    arenaSeen = arena;
+    proofsSeen = proofs;
     const auto last = stats.lastReport;
     stats = {};
     stats.lastReport = last;
@@ -729,8 +770,13 @@ bool MovableBuffers() {
     return enabled;
 }
 
-ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
-    ResourceCache::Key key{0xffffffffu};
+// Built into the calling thread's vector, which the result refers to until the thread's next key
+// (a draw builds one or two and is done with each before the next; the cache and a recipe copy
+// what they keep).
+const ResourceCache::Key& DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
+    thread_local ResourceCache::Key key;
+    key.clear();
+    key.push_back(0xffffffffu);
     const auto append64 = [&](std::uint64_t value) {
         key.push_back(static_cast<std::uint32_t>(value));
         key.push_back(static_cast<std::uint32_t>(value >> 32u));
@@ -738,9 +784,11 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     append64(reinterpret_cast<std::uint64_t>(context.device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
     for (const auto& shader : shaders) {
-        const auto part = ShaderResources::ContentKey(shader, true, MovableBuffers());
-        key.push_back(static_cast<std::uint32_t>(part.size()));
-        key.insert(key.end(), part.begin(), part.end());
+        // The stage's words behind their count.
+        const auto countAt = key.size();
+        key.push_back(0);
+        ShaderResources::AppendContentKey(key, shader, true, MovableBuffers());
+        key[countAt] = static_cast<std::uint32_t>(key.size() - countAt - 1);
     }
     if (ranges) {
         append64(target.address);
@@ -750,6 +798,14 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     }
     return key;
 }
+
+// The buffers a template or plan hit moved (ShaderResources::MovedReadOnlyBuffers), per thread:
+// one draw's at a time.
+std::vector<ShaderResources::MovedBuffer>& MovedScratch() {
+    thread_local std::vector<ShaderResources::MovedBuffer> moved;
+    return moved;
+}
+
 
 // The alias checks the build makes for every guest buffer descriptor (ShaderResources::
 // addGuestBuffer), repeated for a cached build whose own checks compared the buffers against
@@ -998,7 +1054,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (state.rectList) Require(draw.indexCount % 3 == 0, "incomplete rect-list primitive");
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders");
     if (recipe != nullptr) {
-        inputs.fragmentOutputs = recipe->fragmentOutputs;
+        // (The fragment outputs are the recipe's too, and nothing of a recipe draw reads them:
+        // the masked state they decide is in its pipeline.)
         inputs.shaderStages = recipe->shaderStages;
     } else {
         inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
@@ -1213,8 +1270,9 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
 // stages repeat, or a fresh build.
 struct ResolvedResources {
     std::shared_ptr<ShaderResources> resources;
-    std::vector<ShaderResources::MovedBuffer> moved;
-    ResourceCache::Key contentKey;
+    // The thread's scratch (MovedScratch) and key (DrawResourceKey).
+    std::span<const ShaderResources::MovedBuffer> moved;
+    const ResourceCache::Key* contentKey = nullptr;
     bool cacheable = false;
     const ShaderResources::BuildTiming* built = nullptr;
     // A shared address-based template's use: its hold on the address space, which the draw's
@@ -1249,8 +1307,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->variantId != 0; }) && (keyAddressDraws || reuseAddress || !addressStages);
     if (resolved.cacheable) {
         addressBuild = AddressDrawBuild::NoEntry;
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        resolved.contentKey = &DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
+        if (auto cached = SharedResourceCache().Find(*resolved.contentKey)) {
             // A shared address-based template is used under a hold on its address space, taken
             // before anything else of it is (the space's identity, this draw's captured regions,
             // the mirrors); a captured region outside the space leaves the template to other draws.
@@ -1273,12 +1331,11 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 }
             }
             auto* recorder = Recorder::Active();
-            std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
-            if (valid && serves && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
-            if (moved.has_value()) {
+            auto& moved = MovedScratch();
+            if (valid && serves && recorder != nullptr && cached->MovedReadOnlyBuffers(shaders, *recorder, moved)) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
-                resolved.moved = std::move(*moved);
+                resolved.moved = moved;
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
@@ -1287,7 +1344,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 countCache(&DrawProfile::cacheMisses);
             } else {
                 resolved.lease.reset();
-                SharedResourceCache().Remove(resolved.contentKey);
+                SharedResourceCache().Remove(*resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
             }
         }
@@ -1486,29 +1543,51 @@ struct Kept {
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::shared_ptr<DepthImage> depth, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, ShaderResources::SharedLease lease = nullptr) {
-    auto kept = std::make_shared<Kept>();
-    kept->resources = resources;
-    kept->pipeline = std::move(pipeline);
-    kept->framebuffer = std::move(framebuffer);
-    kept->indices = std::move(inputs.indices);
-    kept->vertexBuffers = std::move(inputs.vertexBuffers);
-    kept->scratch = std::move(scratch);
-    kept->targets = std::move(targets);
-    kept->depth = std::move(depth);
-    const auto& residents = kept->targets;
-    recorder.Keep(kept);
+void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>>& targets, std::shared_ptr<DepthImage> depth, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, ShaderResources::SharedLease lease = nullptr) {
+    // APS5_REUSE_ADDRESS_DRAWS: the batch keeps each object once (a pass's draws share their
+    // pipeline, framebuffer, targets and templates) instead of one holder per draw.
+    const bool keepOnce = ShaderResources::ReuseAddressDraws() && scratch == nullptr;
+    const std::vector<std::shared_ptr<StorageTexture>>* residents = &targets;
+    if (keepOnce) {
+        recorder.KeepOnce(resources);
+        recorder.KeepOnce(pipeline);
+        recorder.KeepOnce(framebuffer);
+        recorder.KeepOnce(inputs.indices);
+        for (const auto& buffer : inputs.vertexBuffers) recorder.KeepOnce(buffer);
+        for (const auto& target : targets) recorder.KeepOnce(target);
+        recorder.KeepOnce(depth);
+    } else {
+        auto kept = std::make_shared<Kept>();
+        kept->resources = resources;
+        kept->pipeline = std::move(pipeline);
+        kept->framebuffer = std::move(framebuffer);
+        kept->indices = std::move(inputs.indices);
+        kept->vertexBuffers = std::move(inputs.vertexBuffers);
+        kept->scratch = std::move(scratch);
+        kept->targets = std::move(targets);
+        kept->depth = std::move(depth);
+        residents = &kept->targets;
+        recorder.Keep(kept);
+    }
     if (checkRecords) recorder.OnComplete(std::move(checkRecords));
+    // A shared address-based build's later use in a batch: the batch already holds its lease, its
+    // completion and its write notes (ShaderResources::UsedInBatch).
+    const bool shared = resources->SharesLease();
+    const auto batch = shared && keepOnce ? recorder.OpenBatchId() : 0;
+    const bool repeated = shared && resources->UsedInBatch(batch);
     // Counted for the [address-sync] line: a lease released by the completion (the pin waiter
     // finishes the recorder up to the open batch, which holds the kept resources and gets the
     // next serial), or waited for by the caller (any wait releases it at once).
-    if (resources->HoldsLease()) CountLeaseOutcome(outcome.waited, outcome.waited ? 0 : recorder.Submissions() + 1);
+    if (resources->HoldsLease() && !repeated) CountLeaseOutcome(outcome.waited, outcome.waited ? 0 : recorder.Submissions() + 1);
     // Every use of a (possibly shared) resources object registers its GPU writes anew.
-    resources->MarkGpuWrites(recorder);
+    resources->MarkGpuWrites(recorder, repeated);
     CountDrawStaging(*resources, true);
     // The write-back (fault check, copied buffers) runs when the batch completed; a fault is
     // reported by the recorder ("deferred write-back failed") instead of thrown out of the draw.
-    if (resources->SharesLease()) {
+    if (repeated) {
+        // This use's hold goes now: the batch's first use of the object keeps the same space.
+        lease.reset();
+    } else if (shared) {
         // A use of a shared address-based build: its fault check and write marks, then its hold on
         // the address space, released here (whether or not the check throws) as a single-use
         // build's write-back releases its lease: the registry's pin waiter finishes this batch to
@@ -1518,6 +1597,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
             const auto held = std::move(lease);
             resources->CompleteSharedUse();
         });
+        resources->NoteBatchUse(batch);
     } else if (listed) {
         // As VulkanDevice::dispatch lists its copied writers: delisted before the write-back
         // (one that fails must not keep indirect dispatches on the CPU), listed after the
@@ -1531,7 +1611,11 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     } else if (completion) {
         recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
     }
-    for (const auto& resident : residents) {
+    // A draw that continued the previous draw's pass renders into the targets that draw marked,
+    // with nothing recorded between the two (a flush of a target, or any other work, ends the
+    // pass): they are pending already.
+    if (keepOnce && outcome.passContinued) return;
+    for (const auto& resident : *residents) {
         if (resident != nullptr) resident->MarkDirty();
     }
 }
@@ -1698,7 +1782,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    const bool timeBindings = AddressDrawTimes();
+    const auto bindingsStart = timeBindings ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    if (timeBindings) PlanTimeTotals().currentBindingsUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - bindingsStart).count();
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const auto forced = capture ? PassBreak::Capture : readsTarget ? PassBreak::ReadsTarget : gpuIndirect ? PassBreak::GpuIndirect : meshIndirect ? PassBreak::MeshIndirect : depthClear ? PassBreak::DepthClear : PassBreak::None;
@@ -1710,9 +1797,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         indirectReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) indirectReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
-    const auto passImages = resources.StorageImages();
-    std::vector<std::pair<VkImage, bool>> passAttachments;
-    passAttachments.reserve(record.targets.size() + 1);
+    const auto& passImages = resources.StorageImageList();
+    thread_local std::vector<std::pair<VkImage, bool>> passAttachments;
+    passAttachments.clear();
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
@@ -1831,7 +1918,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // one a barrier, so its pass cannot be continued.
     recorder->LeaveRenderPassOpen(passKey, drawTiming, resources.LegacyPassBlock(), passAccess);
     timer.phase(PhaseRecord);
-    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.depth), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, std::move(record.lease));
+    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, record.targets, std::move(record.depth), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, std::move(record.lease));
     timer.phase(PhaseKeep);
     if (record.waited) {
         // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -1920,7 +2007,7 @@ bool drawFromPlan(const Context& context, const State& state, const Pm4::DrawPar
     }
     const auto start = std::chrono::steady_clock::now();
     // The trimmed key (DrawPlans requires it): the target and index ranges are not part of it.
-    const auto key = DrawResourceKey(context, shaders, state.color, 0, 0, false);
+    const auto& key = DrawResourceKey(context, shaders, state.color, 0, 0, false);
     auto cached = SharedResourceCache().Find(key, true);
     if (cached == nullptr) {
         ++stats.noTemplate;
@@ -1945,6 +2032,8 @@ bool drawFromPlan(const Context& context, const State& state, const Pm4::DrawPar
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, std::uint64_t stateKey) {
     // APS5_DRAW_PLANS: a draw whose template holds a plan for its state is recorded from it.
+    // APS5_REUSE_ADDRESS_DRAWS: templates whose images left the texture caches go, once a frame.
+    if (ShaderResources::ReuseAddressDraws()) AddressDraws().swept += SharedResourceCache().SweepDeparted(&AddressDraws().sweptBytes);
     const bool planned = stateKey != 0 && DrawPlans();
     const auto planKey = planned && planEligible(draw, shaders) ? planKeyFor(stateKey, shaders) : 0;
     if (planned) {
@@ -2074,7 +2163,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr; });
     auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
     auto& resources = resolved.resources;
-    const auto& contentKey = resolved.contentKey;
+    // The thread's key (DrawResourceKey): good until the next one is built, which nothing below does.
+    static const ResourceCache::Key noKey;
+    const auto& contentKey = resolved.contentKey != nullptr ? *resolved.contentKey : noKey;
     const bool cacheable = resolved.cacheable;
     built = resolved.built;
     // The memory-state decision of an indirect draw, made here after the resource build (which may
@@ -2206,7 +2297,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // (the copy-in the staged one recorded is left without a copy-back, which stores nothing).
     if (!lean && (!resolved.moved.empty() || resources->StagesBuffers())) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
-        resolved.moved.clear();
+        resolved.moved = {};
         resolved.lease.reset();
     }
     if (!recorded) CountDrawStaging(*resources, false);
@@ -2520,6 +2611,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, std::shared_ptr<ShaderResources> planTemplate) {
     const bool plan = planTemplate != nullptr;
+    const auto planStart = plan && AddressDrawTimes() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     PerformanceTimer timing("Graphics.DrawWithRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
@@ -2555,8 +2647,15 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // what the lookup would return, and Refresh brings it up to date exactly as the lookup's does
     // (FlushPending, the whole-surface collect and UnchangedSince, the key scan). An image gone
     // from the cache is a miss: the ordinary path looks up anew.
-    std::vector<std::shared_ptr<StorageTexture>> targets;
-    targets.reserve(recipe.targets.size());
+    // The thread's vector: lent to the record and taken back after it, and left empty on every
+    // way out (it must hold no image once the draw is done).
+    thread_local std::vector<std::shared_ptr<StorageTexture>> targetScratch;
+    auto& targets = targetScratch;
+    targets.clear();
+    struct ClearTargets {
+        std::vector<std::shared_ptr<StorageTexture>>& scratch;
+        ~ClearTargets() { scratch.clear(); }
+    } clearTargets{targetScratch};
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
         timer.phase(PhaseSetup);
         auto stored = recipe.targets[index].lock();
@@ -2614,15 +2713,14 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }
     // A plan's stages are this draw's own, not the ones the template was built from: what they
     // moved is rebound as on a template hit, and a buffer that cannot be leaves the draw to a build.
-    std::vector<ShaderResources::MovedBuffer> moved;
-    if (plan) {
-        auto found = resources->MovedReadOnlyBuffers(shaders, *recorder);
-        if (!found.has_value()) {
-            timer.phase(PhaseLookup);
-            return miss(DrawRecipeMiss::Proof);
-        }
-        moved = std::move(*found);
+    auto& moved = MovedScratch();
+    moved.clear();
+    if (plan && !resources->MovedReadOnlyBuffers(shaders, *recorder, moved)) {
+        timer.phase(PhaseLookup);
+        return miss(DrawRecipeMiss::Proof);
     }
+    const bool timed = plan && AddressDrawTimes();
+    const auto provedAt = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     SharedResourceCache().Touch(recipe.key);
     countCache(&DrawProfile::cacheHits);
@@ -2656,6 +2754,15 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.pushBytes = plan ? nullptr : &recipe.pushBytes;
     record.pushStages = plan ? 0 : recipe.pushStages;
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs);
+    targetScratch = std::move(record.targets);
+    if (timed) {
+        auto& times = PlanTimeTotals();
+        const auto recordedAt = std::chrono::steady_clock::now();
+        ++times.hits;
+        times.proofUs += std::chrono::duration<double, std::micro>(provedAt - planStart).count();
+        times.bindingsUs += times.currentBindingsUs;
+        times.recordUs += std::chrono::duration<double, std::micro>(recordedAt - provedAt).count() - times.currentBindingsUs;
+    }
     if (profile) {
         result.recordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();
         auto& stats = Profile();

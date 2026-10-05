@@ -89,6 +89,11 @@ public:
         if (residencyUse.load(std::memory_order_relaxed) != tick) residencyUse.store(tick, std::memory_order_relaxed);
     }
     std::uint64_t ResidencyUse() const { return residencyUse.load(std::memory_order_relaxed); }
+    // Set when the sampled texture cache drops its entry of this object (an eviction under its
+    // budget, a replacement): the cache counts the memory as freed from then on, so whoever
+    // still holds the object keeps video memory nobody accounts for (ResourceCache::SweepDeparted).
+    void NoteDeparted() const { departed.store(true, std::memory_order_release); }
+    bool Departed() const { return departed.load(std::memory_order_acquire); }
 
 private:
     void release() noexcept;
@@ -109,6 +114,7 @@ private:
     std::uint32_t imageLayers = 0;
     std::atomic<bool> residentDepth{false};
     mutable std::atomic<std::uint64_t> residencyUse{0};
+    mutable std::atomic<bool> departed{false};
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;
     std::unique_ptr<CommandBatch> upload;

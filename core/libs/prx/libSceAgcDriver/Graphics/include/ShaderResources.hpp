@@ -137,12 +137,18 @@ public:
         std::size_t allocation;
         std::uint64_t address;
         std::size_t size;
-        std::vector<std::uint32_t> words;
+        // A data buffer's words: the draw's own stage's (or this object's), alive for the draw.
+        std::span<const std::uint32_t> words;
         // A read-only V# of a shared address-based build's later use: bound in place through the
-        // address space, like the build's own elements, at `adjustment` (see PrepareDrawBindings).
+        // address space, like the build's own elements, at `adjustment` and by `info` (see
+        // PrepareDrawBindings), unless it takes a snapshot.
         bool inPlace = false;
         std::uint32_t adjustment = 0;
+        VkDescriptorBufferInfo info{};
     };
+    // For an address-based build under APS5_REUSE_ADDRESS_DRAWS the result is the calling
+    // thread's scratch, valid until its next call (the set and everything it binds are kept by
+    // the recorder's open batch; see addressDrawBindings).
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
     // APS5_DISPATCH_SNAPSHOTS (local experiment, see ShaderResources.cpp): the set one use of a
     // compute build binds instead of its own, with its read-only guest buffer elements that are
@@ -158,11 +164,34 @@ public:
     // device memory and how many are not, by reason, then the first elements one by one.
     std::string DescribePlacements() const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    // The same into the caller's vector (cleared first; a draw path keeps one per thread): false
+    // when a buffer cannot be moved.
+    bool MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, std::vector<MovedBuffer>& moved) const;
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
     // once the work completed.
-    void MarkGpuWrites(Recorder& recorder);
+    // `repeated`: a shared address-based build's later use in a batch that already holds its
+    // write notes and marks (UsedInBatch): its written ranges are the same for every use, they
+    // stay pending until the batch completed and are marked again by its completion.
+    void MarkGpuWrites(Recorder& recorder, bool repeated = false);
+    // Whether NoteBatchUse was called with this batch (Recorder::OpenBatchId) last: a shared
+    // build's uses in one batch register one completion (the fault check, the write marks and
+    // the hold on the address space are the batch's, not each draw's). Under GuestMemory::GpuMutex.
+    bool UsedInBatch(std::uint64_t batch) const { return batch != 0 && lastUseBatch == batch; }
+    void NoteBatchUse(std::uint64_t batch) { lastUseBatch = batch; }
+    // Revalidate calls a shared build answered from its proof of the same collect epoch
+    // (cumulative, the [addrdraw] line).
+    static std::uint64_t ProofsReused();
+    // StorageImages, computed once (the images are fixed with the build).
+    const std::vector<std::pair<VkImage, bool>>& StorageImageList() const;
+    // Whether a texture or storage image this object holds has left its cache (Texture::Departed,
+    // StorageTexture::Cached): the object then pins video memory the caches no longer count, and
+    // could not be proved current again anyway.
+    bool PinsDeparted() const;
+    // The device bytes of those images (a departed snapshot texture's allocation, an uncached
+    // storage image's surface), for the sweep's count.
+    std::uint64_t DepartedBytes() const;
     void WriteBackBuffers();
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return bda != nullptr || guestMemory.HasCopiedWrites(); }
@@ -209,6 +238,8 @@ public:
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
+    // The same words appended to `key` (a draw's key is built in one vector the thread keeps).
+    static void AppendContentKey(std::vector<std::uint32_t>& key, const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
@@ -262,7 +293,9 @@ public:
     // The read-only buffer elements of address-based draws under APS5_REUSE_ADDRESS_DRAWS with
     // APS5_SNAPSHOT_ADDRESS_DRAWS (PrepareDrawBindings: a build's own elements and the ones a
     // template or plan hit moved), cumulative, for the [addrdraw] line: elements bound to a
-    // snapshot (`video`: one whose buffer is in video memory), of them the binds that skipped
+    // snapshot (`video`: one whose buffer is in video memory; `small`: an element of at most
+    // APS5_SNAPSHOT_ADDRESS_DRAWS_SMALL_BYTES copied into the batch arena with no collect and no
+    // cache entry), of them the binds that skipped
     // the checks by the collect epoch (Recorder::EpochSnapshot; `epochRechecks`: after asking
     // the range again because a driver stamp or a write note had moved), reused a cached
     // snapshot after its checks, or copied one; and the elements left bound in place through the import, by
@@ -280,6 +313,8 @@ public:
         std::uint64_t reused = 0;
         std::uint64_t copied = 0;
         std::uint64_t copiedBytes = 0;
+        std::uint64_t small = 0;
+        std::uint64_t smallBytes = 0;
         std::array<std::uint64_t, static_cast<std::size_t>(SnapshotRefusal::Count)> inPlace{};
     };
     static const AddressSnapshotStats& AddressSnapshotCounters();
@@ -455,9 +490,15 @@ private:
     void noteReusable();
     AddressRefusal sharingRefusal() const;
     // The snapshot an address-based draw binds for the read-only range [begin, begin + bytes) of
-    // one of its elements instead of the import (see AddressSnapshotStats), or null to leave the
-    // element in place. Under the stamp PrepareDrawBindings took for the call.
-    std::shared_ptr<Buffer> addressSnapshot(Recorder& recorder, std::uint64_t begin, std::size_t bytes) const;
+    // one of its elements instead of the import (see AddressSnapshotStats): `info` receives it,
+    // kept by the recorder's open batch; false leaves the element in place. Under the stamp
+    // addressDrawBindings took for the call.
+    bool addressSnapshot(Recorder& recorder, std::uint64_t begin, std::size_t bytes, VkDescriptorBufferInfo& info) const;
+    // PrepareDrawBindings for an address-based build under APS5_REUSE_ADDRESS_DRAWS: the draw's
+    // own data buffers (from the batch arena), its moved elements and, under
+    // APS5_SNAPSHOT_ADDRESS_DRAWS, the snapshots of its read-only elements, in a set the batch
+    // frees; nothing is allocated per draw but the set.
+    std::shared_ptr<DrawBindings> addressDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
     // The descriptor counts of a draw's own set (PrepareDrawBindings), computed once.
     mutable std::vector<VkDescriptorPoolSize> drawBindingSizes;
     void reportDescriptorCaches() const;
@@ -554,6 +595,22 @@ private:
     // A use of this shared build reported a fault (set under GuestMemory::GpuMutex by a completion,
     // atomic for the reader's sake): it serves no further use.
     std::atomic<bool> faulted{false};
+    std::uint64_t lastUseBatch = 0;
+    mutable std::vector<std::pair<VkImage, bool>> storageImageList;
+    mutable bool storageImagesListed = false;
+    // A shared build's image proof within a collect epoch (APS5_REUSE_ADDRESS_DRAWS; see
+    // Revalidate): what the last successful proof stood on.
+    struct ProofStamp {
+        std::uint64_t epoch = 0;
+        std::uint64_t driverStores = 0;
+        std::uint64_t writeNotes = 0;
+        std::uint64_t registry = 0;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t departures = 0;
+        std::uint64_t depthHolding = 0;
+        bool operator==(const ProofStamp&) const = default;
+    };
+    ProofStamp provedStamp;
     std::vector<std::pair<std::uint64_t, std::shared_ptr<const DrawRecipe>>> plans;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
@@ -616,6 +673,16 @@ public:
     // `probe`: a lookup the caller repeats on a miss (a draw plan's, before the draw's own), left
     // out of the miss churn accounting so one draw's miss is charged once.
     std::shared_ptr<ShaderResources> Find(const Key& key, bool probe = false);
+    // Drops the entries whose object holds a texture or storage image that left its cache
+    // (ShaderResources::PinsDeparted): the texture caches evict under a video memory budget and
+    // count an evicted image as freed, while an entry here kept it alive, so a full cache of
+    // idle templates held gigabytes past the budget (4096 entries exhausted a 16 GiB card).
+    // Called by the draw path; walks the entries once per residency frame, and only when a cache
+    // dropped something since the last walk. Returns how many it dropped (they are destroyed
+    // after the cache's lock is released) and adds the bytes of the departed images they held
+    // to `bytes` (an image several entries held is counted for each).
+    // APS5_NO_RESOURCE_CACHE_SWEEP=1 never walks.
+    std::size_t SweepDeparted(std::uint64_t* bytes = nullptr);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).

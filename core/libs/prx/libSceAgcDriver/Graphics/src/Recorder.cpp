@@ -3020,34 +3020,47 @@ Recorder::SnapshotStamp Recorder::CurrentSnapshotStamp(std::uint64_t space) cons
     // walks for every collect) there is no epoch to stand on. APS5_NO_SNAPSHOT_EPOCH_REUSE=1
     // proves every bind anew, as before.
     static const bool enabled = std::getenv("APS5_NO_COLLECT_MEMO") == nullptr && std::getenv("APS5_NO_SNAPSHOT_EPOCH_REUSE") == nullptr;
-    return {enabled ? GuestMemory::ThreadCollectEpoch() : 0, GuestMemory::DriverStoreSerial(), writeNoteCount, StorageTexture::PendingSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), space};
+    return {enabled ? GuestMemory::ThreadCollectEpoch() : 0, GuestMemory::DriverStoreSerial(), writeNoteCount, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), space};
 }
 
-std::shared_ptr<Buffer> Recorder::EpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& now, bool* rechecked) {
+Recorder::EpochSnapshotHit Recorder::EpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& now) {
     if (now.epoch == 0 || now.space == 0 || epochSnapshots.empty()) return {};
     const auto bucket = epochSnapshotBucket(address, bytes);
     for (std::size_t way = 0; way < 2; ++way) {
         auto& slot = epochSnapshots[bucket + way];
         if (slot.address != address || slot.bytes != bytes) continue;
-        if (slot.stamp.epoch != now.epoch || slot.stamp.registry != now.registry || slot.stamp.pendingSerial != now.pendingSerial || slot.stamp.space != now.space) return {};
+        if (slot.stamp.epoch != now.epoch || slot.stamp.registry != now.registry || slot.stamp.space != now.space) return {};
+        EpochSnapshotHit hit;
         // A driver stamp or a write note since the proof: of this range, or of another?
         if (slot.stamp.driverStores != now.driverStores) {
-            if (!GuestMemory::UnchangedSince(address, bytes, slot.generation)) return {};
+            if (slot.generation == 0 || !GuestMemory::UnchangedSince(address, bytes, slot.generation)) return {};
             slot.stamp.driverStores = now.driverStores;
-            if (rechecked != nullptr) *rechecked = true;
+            hit.rechecked = true;
         }
         if (slot.stamp.writeNotes != now.writeNotes) {
-            if (PendingWriteOverlaps(address, bytes)) return {};
+            if (PendingWriteHits(address, bytes)) return {};
             slot.stamp.writeNotes = now.writeNotes;
-            if (rechecked != nullptr) *rechecked = true;
+            hit.rechecked = true;
         }
-        return slot.buffer.lock();
+        const auto batch = OpenBatchId();
+        if (slot.keptBatch != batch) {
+            const auto held = slot.buffer.lock();
+            if (held == nullptr) return {};
+            KeepOnce(held);
+            slot.keptBatch = batch;
+        }
+        hit.buffer = slot.handle;
+        hit.offset = slot.offset;
+        hit.video = slot.video;
+        return hit;
     }
     return {};
 }
 
-void Recorder::NoteEpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& stamp, std::uint64_t generation, const std::shared_ptr<Buffer>& buffer) {
-    if (stamp.epoch == 0 || stamp.space == 0 || buffer == nullptr) return;
+void Recorder::NoteEpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& stamp, std::uint64_t generation, const std::shared_ptr<Buffer>& buffer, VkDeviceSize offset) {
+    if (buffer == nullptr) return;
+    KeepOnce(buffer);
+    if (stamp.epoch == 0 || stamp.space == 0) return;
     if (epochSnapshots.empty()) epochSnapshots.resize(EpochSnapshotSlots);
     const auto bucket = epochSnapshotBucket(address, bytes);
     // The range's own slot, else one of another epoch (dead by now), else the first.
@@ -3065,6 +3078,72 @@ void Recorder::NoteEpochSnapshot(std::uint64_t address, std::size_t bytes, const
     slot->stamp = stamp;
     slot->generation = generation;
     slot->buffer = buffer;
+    slot->handle = buffer->Handle();
+    slot->offset = offset;
+    slot->keptBatch = OpenBatchId();
+    slot->video = buffer->InVideoMemory();
+}
+
+bool Recorder::PendingWriteHits(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    // The published union is the active recorder's, and is behind while a note waits to be
+    // published (never between two calls of the note functions).
+    const auto current = activeRecorder == this && unpublished.empty() ? pendingWrites.load(std::memory_order_acquire) : nullptr;
+    if (current == nullptr) return PendingWriteOverlaps(address, bytes);
+    const auto end = address + bytes;
+    // Sorted and disjoint: the first range ending after the address is the only candidate.
+    const auto found = std::partition_point(current->begin(), current->end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return range.second <= address; });
+    return found != current->end() && found->first < end;
+}
+
+namespace {
+std::atomic<std::uint64_t> batchIds{0};
+std::atomic<std::uint64_t> arenaBlocks{0}, arenaBytes{0};
+}
+
+std::uint64_t Recorder::OpenBatchId() {
+    ensureOpen();
+    if (open->id == 0) open->id = batchIds.fetch_add(1, std::memory_order_relaxed) + 1;
+    return open->id;
+}
+
+const void*& Recorder::keptOnceSlot(const void* object) {
+    ensureOpen();
+    const auto mixed = reinterpret_cast<std::uintptr_t>(object) * 0x9e3779b97f4a7c15ull;
+    return open->keptOnce[static_cast<std::size_t>(mixed >> 40u) % open->keptOnce.size()];
+}
+
+std::shared_ptr<void>& Recorder::BatchScratch() {
+    ensureOpen();
+    return open->scratch;
+}
+
+Recorder::ArenaBytes Recorder::ArenaAllocate(std::size_t bytes) {
+    if (bytes == 0 || bytes > ArenaMaxBytes) return {};
+    ensureOpen();
+    const auto alignment = std::max<std::size_t>(static_cast<std::size_t>(context.limits.minStorageBufferOffsetAlignment), 16);
+    auto offset = (open->arenaUsed + alignment - 1) / alignment * alignment;
+    if (open->arenaBlock == nullptr || offset + bytes > ArenaBlockBytes) {
+        try {
+            open->arenaBlock = std::make_shared<Buffer>(context, ArenaBlockBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, GpuReadProperties(GpuReadKind::StorageCopy));
+        } catch (const std::exception&) {
+            open->arenaBlock.reset();
+            return {};
+        }
+        // The batch owns the block; a later batch that binds from it keeps it too (the epoch
+        // table's KeepOnce).
+        open->kept.push_back(open->arenaBlock);
+        open->arenaUsed = 0;
+        offset = 0;
+        arenaBlocks.fetch_add(1, std::memory_order_relaxed);
+    }
+    open->arenaUsed = offset + bytes;
+    arenaBytes.fetch_add(bytes, std::memory_order_relaxed);
+    return {open->arenaBlock, offset, open->arenaBlock->Bytes().data() + offset};
+}
+
+Recorder::ArenaStatistics Recorder::ArenaCounts() {
+    return {arenaBlocks.load(std::memory_order_relaxed), arenaBytes.load(std::memory_order_relaxed)};
 }
 
 void Recorder::OnComplete(std::function<void()> action) {
