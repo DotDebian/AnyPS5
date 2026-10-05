@@ -440,6 +440,61 @@ void countCache(std::uint64_t DrawProfile::*counter) {
     ++(stats.*counter);
 }
 
+// APS5_REUSE_ADDRESS_DRAWS: what became of the draws whose stages map guest memory by address,
+// printed as [addrdraw] every 10 s whenever the switch is on (no profile switch needed: one run
+// must tell whether the templates serve). Per draw exactly one outcome: a hit, or the reason its
+// resources were built; for a build, whether it went into the cache or why not. Plain counters:
+// every caller holds GuestMemory::GpuMutex.
+enum class AddressDrawBuild : std::size_t { NotCacheable, NoEntry, Faulted, Space, Snapshot, Proof, Moved, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(AddressDrawBuild::Count)> AddressDrawBuildNames{"not cacheable", "no template", "template faulted", "address space replaced", "captured region outside the space", "template proof failed", "moved buffer refused"};
+// A build's fate: shared (inserted), not recorded (a synchronous or waited-for draw is never
+// shared), no lease (a fault buffer without tables: the rect-list stages), or ShaderResources'
+// refusal.
+enum class AddressDrawFate : std::size_t { Shared, NotRecorded, NoLease, StoresByAddress, NoSpace, OwnRegions, MirrorWrites, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(AddressDrawFate::Count)> AddressDrawFateNames{"shared", "not recorded", "no lease", "stores by address", "no cached space", "regions of its own", "written mirror"};
+constexpr std::size_t ProofFailureCount = static_cast<std::size_t>(ShaderResources::ProofFailure::Count);
+constexpr std::array<const char*, ProofFailureCount> ProofFailureNames{"none", "imports", "evicted image", "pending image", "memory changed", "keys", "other"};
+
+struct AddressDrawStats {
+    std::uint64_t hits = 0;
+    double hitUs = 0;
+    // Hits that bound the template's own set, and those that needed a set of their own for the
+    // data buffers they rebuilt and the V#s they bound in place.
+    std::uint64_t ownSets = 0;
+    std::uint64_t dataBuffers = 0;
+    std::uint64_t reboundBuffers = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(AddressDrawBuild::Count)> builds{};
+    double buildUs = 0;
+    std::array<std::uint64_t, ProofFailureCount> proofFailures{};
+    std::array<std::uint64_t, static_cast<std::size_t>(AddressDrawFate::Count)> fates{};
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+AddressDrawStats& AddressDraws() {
+    static AddressDrawStats stats;
+    return stats;
+}
+
+void reportAddressDraws() {
+    auto& stats = AddressDraws();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - stats.lastReport < std::chrono::seconds(10)) return;
+    stats.lastReport = now;
+    std::uint64_t builds = 0;
+    for (const auto count : stats.builds) builds += count;
+    const auto list = [](const auto& counts, const auto& names, std::size_t first) {
+        std::string text;
+        for (std::size_t i = first; i < names.size(); ++i) {
+            if (counts[i] != 0) text += " " + std::string(names[i]) + " " + std::to_string(counts[i]);
+        }
+        return text.empty() ? std::string(" none") : text;
+    };
+    std::fprintf(stderr, "[addrdraw] address-based draws (10 s): %llu template hits avg %.1f us (%llu with a set of their own: %llu data buffers rebuilt, %llu buffers rebound in place), %llu builds avg %.1f us; built because:%s; proof failures by reason:%s; builds then:%s; %zu templates and dispatch entries cached\n", static_cast<unsigned long long>(stats.hits), stats.hits != 0 ? stats.hitUs / static_cast<double>(stats.hits) : 0.0, static_cast<unsigned long long>(stats.ownSets), static_cast<unsigned long long>(stats.dataBuffers), static_cast<unsigned long long>(stats.reboundBuffers), static_cast<unsigned long long>(builds), builds != 0 ? stats.buildUs / static_cast<double>(builds) : 0.0, list(stats.builds, AddressDrawBuildNames, 0).c_str(), list(stats.proofFailures, ProofFailureNames, 1).c_str(), list(stats.fates, AddressDrawFateNames, 0).c_str(), SharedResourceCache().Size());
+    const auto last = stats.lastReport;
+    stats = {};
+    stats.lastReport = last;
+}
+
 // ValidateShaders decodes every SPIR-V instruction of every stage on every draw. Its outcome depends
 // only on the stages' compiled variants (a variant id names identical SPIR-V and binding layout),
 // their push constant placement and vertex attribute shapes, and the state fields it checks, so the
@@ -988,6 +1043,11 @@ struct ResolvedResources {
     ResourceCache::Key contentKey;
     bool cacheable = false;
     const ShaderResources::BuildTiming* built = nullptr;
+    // A shared address-based template's use: its hold on the address space, which the draw's
+    // completion releases (see ShaderResources::ReuseAddressDraws), and whether the stages map
+    // memory by address with the switch on (the [addrdraw] accounting).
+    ShaderResources::SharedLease lease;
+    bool addressCounted = false;
 };
 
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
@@ -1005,14 +1065,42 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     static const bool keyAddressDraws = std::getenv("APS5_KEY_ADDRESS_DRAWS") != nullptr;
-    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->variantId != 0; }) && (keyAddressDraws || !ShaderResources::NeverReusable(shaders));
+    // APS5_REUSE_ADDRESS_DRAWS=1: stages that map guest memory by address take part too; their
+    // builds are shared between draws when ShaderResources allows it (ReuseAddressDraws).
+    const bool addressStages = ShaderResources::NeverReusable(shaders);
+    const bool reuseAddress = addressStages && ShaderResources::ReuseAddressDraws();
+    resolved.addressCounted = reuseAddress;
+    const auto resolveStart = reuseAddress ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto addressBuild = AddressDrawBuild::NotCacheable;
+    resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->variantId != 0; }) && (keyAddressDraws || reuseAddress || !addressStages);
     if (resolved.cacheable) {
+        addressBuild = AddressDrawBuild::NoEntry;
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
         if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
-            const bool valid = cached->Revalidate(shaders);
+            // A shared address-based template is used under a hold on its address space, taken
+            // before anything else of it is (the space's identity, this draw's captured regions,
+            // the mirrors); a captured region outside the space leaves the template to other draws.
+            bool valid = !cached->HoldsLease() || cached->SharesLease();
+            bool serves = true;
+            if (valid && cached->SharesLease()) {
+                auto miss = ShaderResources::SharedMiss::None;
+                resolved.lease = cached->AcquireSharedLease(snapshots, miss);
+                if (resolved.lease == nullptr) {
+                    (miss == ShaderResources::SharedMiss::Snapshot ? serves : valid) = false;
+                    addressBuild = miss == ShaderResources::SharedMiss::Snapshot ? AddressDrawBuild::Snapshot : miss == ShaderResources::SharedMiss::Faulted ? AddressDrawBuild::Faulted : AddressDrawBuild::Space;
+                }
+            }
+            if (valid && serves) {
+                ShaderResources::ProofReport proof;
+                valid = cached->Revalidate(shaders, &proof);
+                if (!valid) {
+                    addressBuild = AddressDrawBuild::Proof;
+                    if (reuseAddress) ++AddressDraws().proofFailures[static_cast<std::size_t>(proof.failure)];
+                }
+            }
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            if (valid && serves && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 resolved.resources = std::move(cached);
@@ -1020,8 +1108,11 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
+                if (serves) addressBuild = AddressDrawBuild::Moved;
+                resolved.lease.reset();
                 countCache(&DrawProfile::cacheMisses);
             } else {
+                resolved.lease.reset();
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
             }
@@ -1030,12 +1121,26 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         countCache(&DrawProfile::uncacheable);
     }
     timer.phase(PhaseLookup);
+    if (reuseAddress && resolved.resources != nullptr) {
+        auto& stats = AddressDraws();
+        ++stats.hits;
+        stats.hitUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - resolveStart).count();
+        if (!resolved.moved.empty()) {
+            ++stats.ownSets;
+            for (const auto& entry : resolved.moved) ++(entry.inPlace ? stats.reboundBuffers : stats.dataBuffers);
+        }
+    }
     if (resolved.resources == nullptr) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
+        if (reuseAddress) {
+            auto& stats = AddressDraws();
+            ++stats.builds[static_cast<std::size_t>(addressBuild)];
+            stats.buildUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - resolveStart).count();
+        }
     }
     timer.phase(PhaseResources);
     APS5_LOG_CHARS_OUT_DEBUG("ShaderResources created");
@@ -1205,7 +1310,7 @@ struct Kept {
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::shared_ptr<DepthImage> depth, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::shared_ptr<DepthImage> depth, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, ShaderResources::SharedLease lease = nullptr) {
     auto kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
@@ -1226,7 +1331,17 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     resources->MarkGpuWrites(recorder);
     // The write-back (fault check, copied buffers) runs when the batch completed; a fault is
     // reported by the recorder ("deferred write-back failed") instead of thrown out of the draw.
-    if (listed) {
+    if (resources->SharesLease()) {
+        // A use of a shared address-based build: its fault check and write marks, then its hold on
+        // the address space, released here (whether or not the check throws) as a single-use
+        // build's write-back releases its lease: the registry's pin waiter finishes this batch to
+        // free a guest allocation, and must find the lease gone once the completions ran.
+        Require(lease != nullptr, "a shared address-based build is used without a hold on its address space");
+        recorder.OnComplete([resources, lease = std::move(lease)]() mutable {
+            const auto held = std::move(lease);
+            resources->CompleteSharedUse();
+        });
+    } else if (listed) {
         // As VulkanDevice::dispatch lists its copied writers: delisted before the write-back
         // (one that fails must not keep indirect dispatches on the CPU), listed after the
         // registration (a throw there leaves nothing behind).
@@ -1259,6 +1374,8 @@ struct RecordedDraw {
     std::shared_ptr<DepthImage> depth;
     const IndirectRecord* indirect = nullptr;
     std::span<const ShaderResources::MovedBuffer> moved;
+    // A shared address-based template's use: the hold its completion releases (keepRecordedDraw).
+    ShaderResources::SharedLease lease;
     bool listed = false;
     bool completion = false;
     bool waited = false;
@@ -1266,10 +1383,17 @@ struct RecordedDraw {
     VkShaderStageFlags pushStages = 0;
 };
 
-void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0) {
+void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, const ShaderResources::DrawBindings* bindings = nullptr) {
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
     if (bytes == nullptr) {
+        // The elements this use bound in place at another adjustment than the template's
+        // (DrawBindings::pushPatches) take theirs; zero is the byte the stages assembled.
+        const bool repatched = bindings != nullptr && !bindings->pushPatches.empty();
+        const auto assembled = repatched ? block : std::array<std::byte, PipelinePushConstantBytes>{};
         resources.PatchPushConstants(block);
+        if (repatched) {
+            for (const auto& [position, adjustment] : bindings->pushPatches) block[position] = adjustment != 0 ? static_cast<std::byte>(adjustment) : assembled[position];
+        }
         stages = PushConstantStages(shaders);
     }
     if (!state.stages.mesh) {
@@ -1476,7 +1600,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0);
+    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, drawBindings.get());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     // APS5_PROFILE_GPU_DRAWS=1 (local, not for upstream): each recorded draw's own [gputime] range
     // inside its pass, keyed by its last stage's variant (0xd... on the "by program" list); a
@@ -1530,7 +1654,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // one a barrier, so its pass cannot be continued.
     recorder->LeaveRenderPassOpen(passKey, drawTiming, resources.LegacyPassBlock(), passAccess);
     timer.phase(PhaseRecord);
-    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.depth), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
+    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.depth), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, std::move(record.lease));
     timer.phase(PhaseKeep);
     if (record.waited) {
         // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -1808,7 +1932,26 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
-    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    if (cacheable && built != nullptr && recorded && resources->Reusable()) {
+        // An address-based build goes in shared (APS5_REUSE_ADDRESS_DRAWS): the cached object
+        // holds no lease, and the one the build took is this draw's, released by its completion.
+        if (resources->HoldsLease()) resolved.lease = resources->ShareLease();
+        SharedResourceCache().Insert(contentKey, resources);
+    }
+    if (resolved.addressCounted) {
+        if (built != nullptr) {
+            const auto fate = resources->SharesLease() ? AddressDrawFate::Shared : !recorded || !cacheable ? AddressDrawFate::NotRecorded : !resources->HoldsLease() ? AddressDrawFate::NoLease : [&] {
+                switch (resources->SharingRefusal()) {
+                    case ShaderResources::AddressRefusal::StoresByAddress: return AddressDrawFate::StoresByAddress;
+                    case ShaderResources::AddressRefusal::OwnRegions: return AddressDrawFate::OwnRegions;
+                    case ShaderResources::AddressRefusal::MirrorWrites: return AddressDrawFate::MirrorWrites;
+                    default: return AddressDrawFate::NoSpace;
+                }
+            }();
+            ++AddressDraws().fates[static_cast<std::size_t>(fate)];
+        }
+        reportAddressDraws();
+    }
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.
@@ -1817,6 +1960,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (!lean && !resolved.moved.empty()) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
+        resolved.lease.reset();
     }
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
@@ -1836,6 +1980,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         record.recorder = recorder;
         record.resources = resources;
         record.moved = resolved.moved;
+        record.lease = std::move(resolved.lease);
         record.pipeline = pipeline;
         record.framebuffer = framebuffer;
         record.targetViews = targetViews;
@@ -1850,7 +1995,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && resolved.moved.empty()) {
+        // (An address-based template is left out: a recipe hit would have to hold its address
+        // space and run its completion, which DrawWithRecipe does not.)
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->HoldsLease() && resolved.moved.empty()) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -2029,7 +2176,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);
     if (recorded) {
-        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, depthImage, std::move(scratch), std::move(checkRecords), listed, completion, outcome);
+        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, depthImage, std::move(scratch), std::move(checkRecords), listed, completion, outcome, std::move(resolved.lease));
         timer.phase(PhaseKeep);
         if (outcome.waited) {
             // The wait the dispatch path makes for such work (source 3, "address-based"): the

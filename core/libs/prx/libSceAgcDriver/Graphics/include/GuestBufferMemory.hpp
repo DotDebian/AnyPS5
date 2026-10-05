@@ -246,8 +246,48 @@ public:
     // never calls it (a synchronous draw) stores the staging bytes from the CPU in WriteBack.
     void RecordCopyBacks(Recorder& recorder);
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
-    // build's own lease, or by the cached address space it holds.
-    bool HoldsLease() const { return !lease.empty() || space != nullptr; }
+    // build's own lease, or by the cached address space it holds (or, once shared, maps by identity:
+    // each use then holds the space, see Share).
+    bool HoldsLease() const { return !lease.empty() || space != nullptr || sharedSpace != nullptr; }
+    // Sharing an address-based upload between draws (APS5_REUSE_ADDRESS_DRAWS, see
+    // ShaderResources::ShareLease). An upload served by the cached address space alone (no region of
+    // its own: nothing copied per build, no V# or snapshot outside the space) whose written
+    // descriptor ranges all lie in imports bound in place has no state of its own to bring up to
+    // date and nothing to store back but the write marks, so a later draw mapping the same space can
+    // bind what it bound. Shareable says whether that holds, or why not.
+    enum class ShareRefusal : std::uint8_t { None, NoSpace, OwnRegions, MirrorWrites, Count };
+    ShareRefusal Shareable() const;
+    // A use's hold on the space (and through it on the registry lease), released by the use's
+    // completion: what WriteBack releases for an upload that is not shared.
+    using SpaceLease = std::shared_ptr<const void>;
+    // Turns a shareable upload into a shared one and returns the space as the first use's hold. From
+    // here the upload names its space by identity only, so that a cached object pins no guest
+    // allocation while no recorded work uses it (the registry's pin waiter then needs nothing new:
+    // it drops the cached space and finishes the lease batches, as for single-use builds). Every
+    // member that reads the space's regions may be called only while a use holds the space
+    // (AcquireShared's result, or this one), and WriteBack never: a use completes by CompleteShared.
+    SpaceLease Share();
+    bool Shared() const { return sharedSpace != nullptr; }
+    // Another use of a shared upload, under GuestMemory::GpuMutex: the space must still be the
+    // cached one and pass AcquireRegistered's hit test (the registry generation, the imports' epoch,
+    // the device), every captured region of the new use must lie in a live region of the space
+    // (compared as AddSnapshot compares it; one outside it would need a region of its own, which a
+    // shared upload cannot have), and the space's writable and heap mirrors are refreshed as a
+    // build's AcquireRegistered refreshes them. Null with the reason, else the use's hold.
+    enum class SharedFailure : std::uint8_t { None, Space, Snapshot, Imports, Count };
+    SpaceLease AcquireShared(std::span<const GuestMemorySnapshot> snapshots, SharedFailure& failure);
+    // UploadFinish's check for an upload served by the space, repeated for a use once everything
+    // that can reconcile the imports (the mirror refreshes, the image lookups and their flushes)
+    // ran: the imports are reconciled with the registry and none was retired since the space was
+    // built, so the buffers the descriptor set and the BDA table name still back their ranges.
+    bool SharedImportsStand() const;
+    // The write-back of one use of a shared upload: the written descriptor ranges (all bound in
+    // place, see Shareable) are marked written, as WriteBack marks a direct region's.
+    void CompleteShared() const;
+    // The descriptor of [address, address + bytes) when a region of the space serves it whole (a
+    // moved read-only V# of a later use, bound in place like the build's own), with its alignment
+    // adjustment as Descriptor computes it; nothing when no region does.
+    std::optional<VkDescriptorBufferInfo> SharedDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     // Every uploaded region as [begin, end) when all of them are served by host imports, in place or
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
@@ -357,6 +397,17 @@ private:
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).
     std::shared_ptr<const AddressSpace> space;
+    // A shared upload (see Share): its space by address and serial, valid while a use holds it
+    // (the serial alone is compared when none does), the space's mirrored regions (the ones a use
+    // refreshes) and the written ranges merged, both fixed with the space.
+    const AddressSpace* sharedSpace = nullptr;
+    std::uint64_t sharedSerial = 0;
+    std::vector<const Region*> sharedMirrors;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> sharedWrites;
+    // The space whose regions serve this upload: its own hold, or a shared upload's identity.
+    const AddressSpace* mappedSpace() const { return space != nullptr ? space.get() : sharedSpace; }
+    // AddSnapshot's consistency compare of a captured region against the region serving it.
+    static void compareSnapshot(const Region& owner, const GuestMemorySnapshot& snapshot);
     // Import registry epoch when `direct` pointers were taken at acquire time; they are reused while
     // no import was destroyed since.
     std::uint64_t importsEpoch = 0;
