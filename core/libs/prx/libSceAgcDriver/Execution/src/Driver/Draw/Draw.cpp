@@ -115,6 +115,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
+    // The key of the decoded state without the user words (APS5_DRAW_PLANS, else 0): Graphics::Draw
+    // finds a draw plan by it.
+    std::uint64_t stateKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
     if (prepared != nullptr && (lockedPrepare || (drawParameters.indirect && !AdoptableIndirect(*prepared, localDevice->DrawIndirectSupport(), IndirectDrawAheadEnabled())))) prepared = nullptr;
@@ -123,11 +126,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool adopted = prepared != nullptr && !lookupFirst;
     if (adopted) {
         drawKey = prepared->drawKey;
+        stateKey = prepared->stateKey;
         decode = prepared->decode;
         drawParameters = prepared->drawParameters;
     } else if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
+        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &stateKey);
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -217,6 +221,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             aheadKnownKeys[2].fetch_add(1, std::memory_order_relaxed);
             adopted = true;
             drawKey = prepared->drawKey;
+            stateKey = prepared->stateKey;
             drawParameters = prepared->drawParameters;
             programs = std::move(prepared->programs);
             memory = std::move(prepared->memory);
@@ -443,7 +448,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, stateKey);
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");

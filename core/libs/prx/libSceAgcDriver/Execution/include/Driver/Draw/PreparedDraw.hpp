@@ -19,6 +19,8 @@ struct PreparedDraw {
     std::uint64_t deviceSerial = 0;
     std::uint64_t forgetSerial = 0;
     std::uint64_t drawKey = 0;
+    // Driver::drawRegisterKey's state key (0 without APS5_DRAW_PLANS).
+    std::uint64_t stateKey = 0;
     bool keyKnown = false;
     std::shared_ptr<const DrawDecode> decode;
     std::vector<DrawProgram> programs;

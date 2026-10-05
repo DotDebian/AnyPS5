@@ -1,14 +1,23 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include <bit>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* stateKey) {
     std::uint64_t key = 0xcbf29ce484222325ull;
+    // The state key runs beside the key over the same words, less the user-word registers; it
+    // starts from another basis so the two never name the same thing.
+    const bool stated = stateKey != nullptr && Graphics::DrawPlans();
+    std::uint64_t state = 0x84222325cbf29ce4ull;
+    bool user = false;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
         key *= 0x100000001b3ull;
+        if (!stated || user) return;
+        state ^= value;
+        state *= 0x100000001b3ull;
     };
     mix(deviceSerial);
     for (const auto& range : Graphics::DrawKeyRegisters) {
@@ -16,9 +25,11 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         mix((static_cast<std::uint64_t>(range.bank) << 32u) | range.first);
         const auto end = range.first + range.count;
         for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
+            user = range.bank == Graphics::RegisterBank::Shader && Graphics::DrawUserWordRegister(it->first);
             mix(it->first);
             mix(it->second);
         }
+        user = false;
     }
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
         const auto low = queue.shader.find(base);
@@ -37,6 +48,8 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         mix(reinterpret_cast<std::uintptr_t>(it->second.get()));
         mix(address - it->second->codeAddress);
     }
+    // Zero means no state key (Graphics::Draw).
+    if (stateKey != nullptr) *stateKey = !stated ? 0 : state != 0 ? state : 1;
     return key;
 }
 

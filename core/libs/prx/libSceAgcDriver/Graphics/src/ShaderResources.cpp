@@ -1657,6 +1657,22 @@ ShaderResources::AddressRefusal ShaderResources::sharingRefusal() const {
     }
 }
 
+std::shared_ptr<const DrawRecipe> ShaderResources::FindPlan(std::uint64_t planKey) const {
+    for (const auto& [key, plan] : plans) {
+        if (key == planKey) return plan;
+    }
+    return nullptr;
+}
+
+void ShaderResources::AttachPlan(std::uint64_t planKey, std::shared_ptr<const DrawRecipe> plan) {
+    // One template serves a material's draws into a handful of passes (the state keys differ by
+    // target, viewport or blend); eight covers them without the list becoming a search.
+    constexpr std::size_t MaxPlans = 8;
+    plans.erase(std::remove_if(plans.begin(), plans.end(), [&](const auto& entry) { return entry.first == planKey; }), plans.end());
+    plans.insert(plans.begin(), {planKey, std::move(plan)});
+    if (plans.size() > MaxPlans) plans.pop_back();
+}
+
 ShaderResources::SharedLease ShaderResources::ShareLease() {
     Require(reusable && guestMemory.HoldsLease() && !guestMemory.Shared(), "only a reusable address-based build shares its lease");
     return guestMemory.Share();
@@ -2487,12 +2503,12 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
 
 }
 
-std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
+std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key, bool probe) {
     resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(mutex);
     const auto found = index.find(key);
     if (found == index.end()) {
-        noteMiss(key);
+        if (!probe) noteMiss(key);
         return nullptr;
     }
     entries.splice(entries.begin(), entries, found->second);

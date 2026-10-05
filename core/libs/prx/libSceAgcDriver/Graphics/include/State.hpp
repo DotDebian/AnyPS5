@@ -222,6 +222,14 @@ inline constexpr std::array<DrawKeyRange, 47> DrawKeyRegisters{{
 }};
 // Whether DrawKeyRegisters holds the read.
 bool DrawKeyCovers(RegisterRead read);
+// Whether a shader-bank register of the table only feeds a program's user data: the 32 user words
+// of the pixel, vertex/geometry-front and hull banks and the geometry-back and hull user pointers
+// (Driver::decodeDraw's prepare and initializeMerged read nothing else of them). The decoded state
+// and pixel stage are a pure function of the table's other registers, which is what the draw state
+// key hashes (Driver::drawRegisterKey, APS5_DRAW_PLANS).
+inline constexpr bool DrawUserWordRegister(std::uint32_t offset) {
+    return (offset >= 0x00c && offset < 0x02c) || (offset >= 0x08c && offset < 0x0ac) || (offset >= 0x10c && offset < 0x12c) || offset == 0x082 || offset == 0x083 || offset == 0x102 || offset == 0x103;
+}
 
 }
 

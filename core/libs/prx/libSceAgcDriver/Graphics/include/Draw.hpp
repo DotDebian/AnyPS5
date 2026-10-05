@@ -15,7 +15,9 @@ namespace AgcDriver::Graphics {
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+// `stateKey` (nonzero under APS5_DRAW_PLANS=1, Driver::drawRegisterKey) names the decoded state
+// without the stages' user words: see DrawPlans.
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, std::uint64_t stateKey = 0);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 
 struct DrawInputCopy {
@@ -81,9 +83,27 @@ struct DrawRecipeOutcome {
 // the template's proof (ProveCurrent) with the alias checks repeated, the pipeline and framebuffer
 // from the recipe, then the record as Draw's (pass continued or begun, Kept, MarkGpuWrites). A
 // miss records nothing.
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe);
+// With `planTemplate` the recipe is a draw plan of that resource-cache template (DrawPlans): the
+// template is the caller's (found by this draw's content key), it may be a shared address-based
+// one (the draw then holds its address space and completes like any use of it), the buffers this
+// draw's stages moved are rebound (MovedReadOnlyBuffers) and the push constants are assembled
+// from the stages; a state the plan does not fit is a miss, not an error.
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, std::shared_ptr<ShaderResources> planTemplate = nullptr);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
+// Draw plans (APS5_DRAW_PLANS=1, default off). A draw recipe is found by the draw's register key
+// and its stages' variants, and the key hashes the stages' user words: a draw whose SRT moves every
+// frame never repeats its key or its variants, so it never has a recipe. A plan is the same recipe
+// found another way: by the state key (the register key without the user words, which names the
+// decoded state, the pixel stage and the programs' code) on the resource-cache template the draw's
+// content key finds. What the user words select is not hashed but proved by content, as a
+// template hit proves it: the content key (the stages' variants, images, samplers and written
+// buffers), the template's proof, and the data buffers and read-only V#s of this draw rebound.
+// What a plan skips is what a recipe skips: the shader validation, the target, depth, pipeline and
+// framebuffer lookups. Only direct draws without vertex attributes (the mesh path) take part: a
+// vertex input layout comes from V# words no key names. Ignored under APS5_SYNC_COMPLETION_DRAWS
+// and APS5_NO_DRAW_KEY_TRIM.
+bool DrawPlans();
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is
 // vkCmdDrawIndirect from the host import; every other value names why the CPU read them instead,
