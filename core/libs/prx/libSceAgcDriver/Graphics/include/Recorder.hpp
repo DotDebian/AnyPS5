@@ -153,6 +153,44 @@ public:
     // `registryGeneration`: GuestAllocationsGeneration read before the copy, like `generation`.
     // `derived`: a value computed from the copied bytes, returned with the snapshot on reuse.
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0, std::vector<std::byte> shadow = {});
+    // Storage snapshots proved once per collect epoch (APS5_REUSE_ADDRESS_DRAWS with
+    // APS5_SNAPSHOT_ADDRESS_DRAWS: a frame's draws bind the same few thousand read-only buffers
+    // tens of thousands of times, and each bind looked the snapshot up, collected its range and
+    // asked the tracker). A snapshot's proof is what its reuse checks say: no pending GPU write
+    // or image result over the range, the registry unchanged, the range collected and unstamped
+    // since the snapshot's generation. Within one collect epoch of the proving thread a second
+    // collect of the range is a memo hit by contract (GuestMemory.hpp: a CPU store landing after
+    // the first is seen by the next epoch), so the proof can only change through what the stamp
+    // below names, each read BEFORE the checks it stands for: the driver's own stamps anywhere
+    // (GuestMemory::DriverStoreSerial), a pending write noted on this recorder, the pending image
+    // registry (StorageTexture::PendingSerial, which a unit shadow's fresh results move too) and
+    // the allocation registry. `space` names what the range was found bound in place by (the
+    // cached address space's serial). While a snapshot's stamp is the current one, EpochSnapshot
+    // returns it with no lookup, collect or tracker query; when only the driver's stamps or the
+    // write notes moved (a draw that writes a buffer moves both), the range alone is asked again
+    // (UnchangedSince from the proof's generation, PendingWriteOverlaps: `rechecked`) and the
+    // slot takes the new counts; anything else is a miss and the caller proves the range anew.
+    // What this gives up against the reuse check: a CPU store made after the range's collect
+    // that ANOTHER thread's walk stamped within the epoch, while no driver stamp moved (the
+    // reuse check saw that stamp by accident of timing; this path sees it at the next epoch, as
+    // the contract promises and no sooner). Held weakly: the snapshot cache's budget stays what
+    // keeps a buffer alive.
+    struct SnapshotStamp {
+        std::uint64_t epoch = 0;
+        std::uint64_t driverStores = 0;
+        std::uint64_t writeNotes = 0;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t registry = 0;
+        std::uint64_t space = 0;
+        bool operator==(const SnapshotStamp&) const = default;
+    };
+    // The stamp in force now; `epoch` is 0 on a thread without a collect epoch (nothing is noted
+    // or returned for it).
+    SnapshotStamp CurrentSnapshotStamp(std::uint64_t space) const;
+    std::shared_ptr<Buffer> EpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& now, bool* rechecked = nullptr);
+    // `generation`: the collect of the range the proof was made under (every stamp up to it was
+    // accounted for).
+    void NoteEpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& stamp, std::uint64_t generation, const std::shared_ptr<Buffer>& buffer);
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
@@ -907,6 +945,20 @@ private:
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
+    // See EpochSnapshot: two-way buckets by a hash of the range, made at the first note.
+    struct EpochSnapshotSlot {
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        SnapshotStamp stamp;
+        std::uint64_t generation = 0;
+        std::weak_ptr<Buffer> buffer;
+    };
+    static constexpr std::size_t EpochSnapshotSlots = 16384;
+    std::vector<EpochSnapshotSlot> epochSnapshots;
+    static std::size_t epochSnapshotBucket(std::uint64_t address, std::size_t bytes) {
+        const auto mixed = (address ^ (static_cast<std::uint64_t>(bytes) * 0x9e3779b97f4a7c15ull)) * 0xbf58476d1ce4e5b9ull;
+        return static_cast<std::size_t>(mixed >> 40u) & (EpochSnapshotSlots - 2);
+    }
     std::shared_ptr<Buffer> reuseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator found, std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation);
 };
 

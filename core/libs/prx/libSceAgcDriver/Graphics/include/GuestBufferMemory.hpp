@@ -323,6 +323,10 @@ public:
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    // Whether [address, address + bytes) lies whole in one region bound in place through a host
+    // import: InPlaceReads' ranges asked for one range, by the owner search instead of a scan of
+    // the ~1200 of an address-based build.
+    bool BoundInPlace(std::uint64_t address, std::size_t bytes) const;
     // A name for the set InPlaceReads returns when it is the cached address space's alone (the
     // space's serial; the set is then fixed with the space), else 0: see Recorder::ReadSetNoted.
     std::uint64_t ReadSetToken() const;

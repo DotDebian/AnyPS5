@@ -3015,6 +3015,58 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     pool.bytes += bytes;
 }
 
+Recorder::SnapshotStamp Recorder::CurrentSnapshotStamp(std::uint64_t space) const {
+    // The reuse stands on the collect memo's contract: without the memo (APS5_NO_COLLECT_MEMO=1
+    // walks for every collect) there is no epoch to stand on. APS5_NO_SNAPSHOT_EPOCH_REUSE=1
+    // proves every bind anew, as before.
+    static const bool enabled = std::getenv("APS5_NO_COLLECT_MEMO") == nullptr && std::getenv("APS5_NO_SNAPSHOT_EPOCH_REUSE") == nullptr;
+    return {enabled ? GuestMemory::ThreadCollectEpoch() : 0, GuestMemory::DriverStoreSerial(), writeNoteCount, StorageTexture::PendingSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), space};
+}
+
+std::shared_ptr<Buffer> Recorder::EpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& now, bool* rechecked) {
+    if (now.epoch == 0 || now.space == 0 || epochSnapshots.empty()) return {};
+    const auto bucket = epochSnapshotBucket(address, bytes);
+    for (std::size_t way = 0; way < 2; ++way) {
+        auto& slot = epochSnapshots[bucket + way];
+        if (slot.address != address || slot.bytes != bytes) continue;
+        if (slot.stamp.epoch != now.epoch || slot.stamp.registry != now.registry || slot.stamp.pendingSerial != now.pendingSerial || slot.stamp.space != now.space) return {};
+        // A driver stamp or a write note since the proof: of this range, or of another?
+        if (slot.stamp.driverStores != now.driverStores) {
+            if (!GuestMemory::UnchangedSince(address, bytes, slot.generation)) return {};
+            slot.stamp.driverStores = now.driverStores;
+            if (rechecked != nullptr) *rechecked = true;
+        }
+        if (slot.stamp.writeNotes != now.writeNotes) {
+            if (PendingWriteOverlaps(address, bytes)) return {};
+            slot.stamp.writeNotes = now.writeNotes;
+            if (rechecked != nullptr) *rechecked = true;
+        }
+        return slot.buffer.lock();
+    }
+    return {};
+}
+
+void Recorder::NoteEpochSnapshot(std::uint64_t address, std::size_t bytes, const SnapshotStamp& stamp, std::uint64_t generation, const std::shared_ptr<Buffer>& buffer) {
+    if (stamp.epoch == 0 || stamp.space == 0 || buffer == nullptr) return;
+    if (epochSnapshots.empty()) epochSnapshots.resize(EpochSnapshotSlots);
+    const auto bucket = epochSnapshotBucket(address, bytes);
+    // The range's own slot, else one of another epoch (dead by now), else the first.
+    auto* slot = &epochSnapshots[bucket];
+    for (std::size_t way = 0; way < 2; ++way) {
+        auto& candidate = epochSnapshots[bucket + way];
+        if (candidate.address == address && candidate.bytes == bytes) {
+            slot = &candidate;
+            break;
+        }
+        if (candidate.stamp.epoch != stamp.epoch && slot->stamp.epoch == stamp.epoch) slot = &candidate;
+    }
+    slot->address = address;
+    slot->bytes = bytes;
+    slot->stamp = stamp;
+    slot->generation = generation;
+    slot->buffer = buffer;
+}
+
 void Recorder::OnComplete(std::function<void()> action) {
     ensureOpen();
     open->completions.push_back(std::move(action));
