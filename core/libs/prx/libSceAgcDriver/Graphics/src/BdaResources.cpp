@@ -264,13 +264,16 @@ void BdaResources::CheckFault() const {
         const auto bytes = table->Bytes();
         ShaderRecompiler::BdaAbi::Header header{};
         std::memcpy(&header, bytes.data(), sizeof(header));
+        // The entry the shader's lookup took: the last one beginning at or below the address (the
+        // entries of a range with sub-range mirrors overlap, see GuestBufferMemory.cpp).
+        ShaderRecompiler::BdaAbi::Range hit{};
         for (std::uint32_t index = 0; index < header.count; ++index) {
             ShaderRecompiler::BdaAbi::Range range{};
             std::memcpy(&range, bytes.data() + sizeof(header) + index * sizeof(range), sizeof(range));
-            if (report.address < range.begin || report.address >= range.end) continue;
-            message << std::hex << "; the store hit 0x" << range.begin << "+0x" << range.end - range.begin << ", read-only in the BDA table: stores through GPU-selected descriptors reach only writable ranges imported in place, not ones served by a mirror or a copy (past APS5_HOST_IMPORT_MIB, or refused by the driver)";
-            break;
+            if (range.begin > report.address) break;
+            hit = range;
         }
+        if (report.address < hit.end) message << std::hex << "; the store hit 0x" << hit.begin << "+0x" << hit.end - hit.begin << ", read-only in the BDA table: stores through GPU-selected descriptors reach only writable ranges imported in place, not ones served by a mirror or a copy (past APS5_HOST_IMPORT_MIB, or refused by the driver)";
     }
     throw std::runtime_error(message.str());
 }
