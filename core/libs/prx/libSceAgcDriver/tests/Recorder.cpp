@@ -3853,6 +3853,56 @@ void unimportableRangeTests(const Device& device) {
 #endif
 }
 
+void releaseLaterTests() {
+    struct Destroyed {
+        std::mutex mutex;
+        std::vector<std::thread::id> threads;
+        std::size_t Count() {
+            std::lock_guard lock(mutex);
+            return threads.size();
+        }
+    };
+    struct Probe {
+        explicit Probe(std::shared_ptr<Destroyed> destroyed) : destroyed(std::move(destroyed)) {}
+        Probe(const Probe&) = delete;
+        Probe& operator=(const Probe&) = delete;
+        std::shared_ptr<Destroyed> destroyed;
+        ~Probe() {
+            std::lock_guard lock(destroyed->mutex);
+            destroyed->threads.push_back(std::this_thread::get_id());
+        }
+    };
+    auto destroyed = std::make_shared<Destroyed>();
+    const auto waitFor = [&](std::size_t count) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (destroyed->Count() < count && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Require(destroyed->Count() == count, "objects handed to ReleaseLater were not destroyed");
+    };
+    const auto offThread = [&] {
+        std::lock_guard lock(destroyed->mutex);
+        return std::none_of(destroyed->threads.begin(), destroyed->threads.end(), [](std::thread::id id) { return id == std::this_thread::get_id(); });
+    };
+    const bool inlineRelease = std::getenv("APS5_NO_RELEASE_LATER") != nullptr || std::getenv("APS5_RELEASE_UNDER_LOCK") != nullptr || std::getenv("APS5_RELEASE_ON_UNLOCK") != nullptr;
+    constexpr auto group = Recorder::ReleaseLaterGroup;
+    Recorder::ReleaseLater(nullptr);
+    {
+        std::unique_lock gpu(GpuMutex());
+        for (std::size_t i = 0; i + 1 < group; ++i) Recorder::ReleaseLater(std::make_shared<Probe>(destroyed));
+        if (inlineRelease) {
+            Require(destroyed->Count() == group - 1, "ReleaseLater kept objects with its kill switch set");
+            return;
+        }
+        Require(destroyed->Count() == 0, "an object handed to ReleaseLater was destroyed before its group was full");
+        Recorder::ReleaseLater(std::make_shared<Probe>(destroyed));
+        Require(destroyed->Count() == 0, "a full ReleaseLater group was destroyed under the GPU mutex");
+    }
+    waitFor(group);
+    Require(offThread(), "a ReleaseLater group was destroyed on the thread that handed it over");
+    for (std::size_t i = 0; i < group; ++i) Recorder::ReleaseLater(std::make_shared<Probe>(destroyed));
+    waitFor(2 * group);
+    Require(offThread(), "a ReleaseLater group handed over without the GPU mutex was destroyed on the handing thread");
+}
+
 int main() {
     try {
         Device device;
@@ -3905,6 +3955,7 @@ int main() {
             gpuTimestampTests(device, recorder);
         }
         drawSnapshotPatchTests(device);
+        releaseLaterTests();
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {

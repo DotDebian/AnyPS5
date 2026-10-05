@@ -9,6 +9,20 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+struct AdoptedDrawLeftovers {
+    std::shared_ptr<PreparedDraw> prepared;
+    std::vector<DrawProgram> programs;
+    std::vector<ShaderRecompiler::MemoryRegion> memory;
+    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
+    std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
+    std::vector<ShaderRecompiler::RecompileResult> results;
+    std::vector<StageCapture> stageCaptures;
+};
+
+}
+
 void Driver::setMeshIndexWords(DrawProgram& front, const Graphics::State& graphics, const Pm4::DrawParameters& parameters) {
     if (!graphics.stages.mesh) return;
     auto& words = front.userData;
@@ -174,6 +188,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     std::vector<StageCapture> stageCaptures(programs.size());
     if (adopted) stageCaptures = std::move(prepared->stageCaptures);
+    const auto releaseAdopted = [&] {
+        if (!adopted) return;
+        auto leftovers = std::make_shared<AdoptedDrawLeftovers>();
+        leftovers->prepared = std::move(prepared);
+        leftovers->programs = std::move(programs);
+        leftovers->memory = std::move(memory);
+        leftovers->vertexInfos = std::move(vertexInfos);
+        leftovers->decodeReads = std::move(decodeReads);
+        leftovers->results = std::move(results);
+        leftovers->stageCaptures = std::move(stageCaptures);
+        Graphics::Recorder::ReleaseLater(std::move(leftovers));
+    };
     std::vector<std::shared_ptr<DispatchVariant>> matched(programs.size());
     std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions(programs.size());
 
@@ -382,6 +408,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             phaseTiming.Phase(DrawRowGraphics);
         }
         timing.Mark("draw_and_resource_release");
+        releaseAdopted();
         return drawn();
     }
 
@@ -409,6 +436,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) {
             phaseTiming.Phase(DrawRowGraphics);
             timing.Mark("draw_and_resource_release");
+            releaseAdopted();
             return drawn();
         }
 
@@ -419,6 +447,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
+    releaseAdopted();
     return drawn();
 }
 

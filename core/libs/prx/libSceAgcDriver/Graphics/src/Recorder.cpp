@@ -503,6 +503,14 @@ void ReleaseDeferredKeeps() {
     }
     queue.wake.notify_one();
 }
+
+bool ReleaseLaterEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_RELEASE_LATER") == nullptr && !ReleaseUnderLock() && !ReleaseOnUnlock();
+    return enabled;
+}
+
+struct ReleaseLaterTag {};
+auto& ReleaseLaterObjects() { return HostThreadLocal<std::vector<std::shared_ptr<void>>, ReleaseLaterTag>(); }
 // Lock-free state of the active recorder's open batch, read by the queue workers between packets
 // and inside WAIT_REG_MEM polls (see the static readers in Recorder.hpp). Written under the mutex.
 constexpr std::int64_t NoPendingLabel = std::numeric_limits<std::int64_t>::min();
@@ -2724,6 +2732,23 @@ std::size_t Recorder::UnsignaledBatches() const {
 void Recorder::Keep(std::shared_ptr<void> object) {
     ensureOpen();
     open->kept.push_back(std::move(object));
+}
+
+void Recorder::ReleaseLater(std::shared_ptr<void> object) {
+    if (object == nullptr) return;
+    if (!ReleaseLaterEnabled()) {
+        object.reset();
+        return;
+    }
+    auto& objects = ReleaseLaterObjects();
+    objects.push_back(std::move(object));
+    if (objects.size() < ReleaseLaterGroup) return;
+    DeferredBatch batch;
+    batch.kept.reserve(ReleaseLaterGroup);
+    batch.kept.swap(objects);
+    DeferredBatches().push_back(std::move(batch));
+    deferredPending.fetch_add(1, std::memory_order_acq_rel);
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) ReleaseDeferredKeeps();
 }
 
 namespace {

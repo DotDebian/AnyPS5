@@ -107,6 +107,8 @@ public:
     // neither the mutex nor the recorder nor a particular thread. ~Recorder joins the release
     // thread and waits for every release in progress before the device goes.
     void Keep(std::shared_ptr<void> object);
+    static void ReleaseLater(std::shared_ptr<void> object);
+    static constexpr std::size_t ReleaseLaterGroup = 64;
     // Draw input snapshots (ShaderResources::PrepareDrawBindings) kept across draws: a recorded
     // draw reads a copy of its read-only in-place inputs, taken when it is recorded, and the draws
     // of a frame bind the same multi-MiB buffers (light lists a compute pass wrote) hundreds of
