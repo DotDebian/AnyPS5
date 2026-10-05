@@ -3221,6 +3221,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const char* value = std::getenv("APS5_SNAPSHOT_ADDRESS_DRAWS_MAX_KIB");
         return static_cast<std::size_t>(value != nullptr ? std::strtoull(value, nullptr, 10) : 8192ull) << 10u;
     }();
+    // Elements under APS5_SNAPSHOT_ADDRESS_DRAWS_MIN_KIB (0) stay in place: the GPU caches small
+    // windows of imported memory, and each snapshot costs the CPU a write-watch check per draw.
+    static const std::size_t addressDrawFloor = [] {
+        const char* value = std::getenv("APS5_SNAPSHOT_ADDRESS_DRAWS_MIN_KIB");
+        return static_cast<std::size_t>(value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull) << 10u;
+    }();
     // A shared address-based build's use (`moved` not empty) binds its own data buffers and its
     // moved elements in place; the build's other elements stay as the set has them.
     if (_set == VK_NULL_HANDLE || (usesBda && !addressDraws && moved.empty())) return {};
@@ -3273,7 +3279,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         const auto begin = address - item.adjustment;
         const auto bytes = size + item.adjustment;
-        if (usesBda && bytes > addressDrawLimit) continue;
+        if (usesBda && (bytes > addressDrawLimit || bytes < addressDrawFloor)) continue;
         // The range's CPU stores so far are stamped first, so the reuse check sees them; a store
         // made after the collect (during the copy) is stamped newer by the next one and drops the
         // snapshot then.
