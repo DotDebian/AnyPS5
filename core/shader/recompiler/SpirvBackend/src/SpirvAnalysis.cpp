@@ -194,7 +194,7 @@ std::uint32_t SharedAccessDwords(IrOpcode opcode) {
     case IrOpcode::DataConsume:
         return 0u;
     default:
-        return SharedAccessOf(opcode) != SharedAccess::None ? 1u : 0u;
+        return SharedComponentCount(opcode);
     }
 }
 

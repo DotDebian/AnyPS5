@@ -1195,6 +1195,12 @@ void verifyFunctionLdsBound() {
         emit(IrOpcode::WriteSharedU32, IrType::Void, {&phi, &constant(1u), &active}, 0u);
     }).first;
     require(joined == 256u, "function LDS: a phi of bounded addresses must take its largest");
+
+    const auto atomic64 = build([](IrProgram& program, IrBlock&, auto& emit, auto& constant, IrValue& active) {
+        auto& data = program.CreateValue(IrOpcode::Void, IrType::U64);
+        emit(IrOpcode::SharedAtomicIAdd64, IrType::U64, {&constant(0xfcu), &data, &active}, 0u);
+    }).first;
+    require(atomic64 == 128u, "function LDS: a 64-bit atomic at byte 0xfc reaches dword 64 and must take 128 dwords");
 }
 
 void verifyGpuSelectedBuffer(bool enabled) {
