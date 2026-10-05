@@ -84,10 +84,23 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         ++outcomes.heldAtSubmit;
         return;
     }
-    if (storedSince(packet, awaited, awaitedBytes, received)) {
+    // A wait a store of this queue's own packets satisfies is no ordering point for the CPU's
+    // writes, like a label of its own found in the recorder's table (takeLabel below): on the
+    // hardware the queue's earlier packet wrote the value and the wait never held, so nothing the
+    // CPU does is ordered before the packets that follow, and the collect epoch stays. Another
+    // queue's store keeps the bump. APS5_STORED_WAIT_EPOCH_BUMP=1 bumps for every such wait as before.
+    static const bool storedWaitBump = std::getenv("APS5_STORED_WAIT_EPOCH_BUMP") != nullptr;
+    const auto storedSinceSubmit = [&] {
+        std::uint32_t storingQueue = ~0u;
+        if (!storedSince(packet, awaited, awaitedBytes, received, &storingQueue)) return false;
         ++outcomes.storedSinceSubmit;
-        return;
-    }
+        if (storingQueue == queue && !storedWaitBump) {
+            epochPoint.bump = false;
+            GuestMemory::CountTrace(GuestMemory::TraceCount::StoredWaitBumpSkipped);
+        }
+        return true;
+    };
+    if (storedSinceSubmit()) return;
 
     static const bool labelShortcut = std::getenv("APS5_NO_LABEL_SHORTCUT") == nullptr;
     static const bool overlapSubmit = std::getenv("APS5_NO_WAIT_OVERLAP_SUBMIT") == nullptr;
@@ -273,10 +286,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
-        if (storedSince(packet, awaited, awaitedBytes, received)) {
-            ++outcomes.storedSinceSubmit;
-            return;
-        }
+        if (storedSinceSubmit()) return;
         ++polls;
         if (spinning) {
             _mm_pause();
