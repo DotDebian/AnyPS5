@@ -2713,8 +2713,13 @@ bool GuestBufferMemory::InPlaceReadsOverlap(std::uint64_t address, std::size_t b
     if (!uploaded || committed) return false;
     const auto end = address + bytes;
     const auto overlaps = [&](const auto& region) { return region.direct != nullptr && address < region.end && region.begin < end; };
-    if (space != nullptr && std::any_of(space->base.begin(), space->base.end(), overlaps)) return true;
+    if (const auto* mapped = mappedSpace(); mapped != nullptr && std::any_of(mapped->base.begin(), mapped->base.end(), overlaps)) return true;
     return std::any_of(regions.begin(), regions.end(), overlaps);
+}
+
+std::uint64_t GuestBufferMemory::ReadSetToken() const {
+    const auto* mapped = mappedSpace();
+    return uploaded && !committed && mapped != nullptr && regions.empty() ? mapped->serial : 0;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {

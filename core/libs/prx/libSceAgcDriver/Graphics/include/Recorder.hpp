@@ -178,6 +178,12 @@ public:
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
+    // A set of ranges noted once per batch (APS5_REUSE_ADDRESS_DRAWS: every address-based draw
+    // reads the same ~1200 leased heaps of the cached address space, and a batch of a thousand
+    // draws noted them a thousand times). `token` names the set (nonzero); a batch that noted it
+    // holds every one of its ranges until it dies, so a caller that finds it noted skips the note.
+    bool ReadSetNoted(std::uint64_t token) const { return token != 0 && open != nullptr && open->readSet == token; }
+    void NoteReadSet(std::uint64_t token) { if (open != nullptr) open->readSet = token; }
     // Whether an unexecuted batch (open, or in flight with its fence unsignaled) reads the range in
     // place. A hit in an in-flight batch whose fence signaled meanwhile is a miss (one status
     // query per hit). `ignoreSignaled` false: every in-flight batch counts, whatever its fence.
@@ -587,6 +593,8 @@ private:
             ReadKind kind;
         };
         std::vector<Read> reads;
+        // The set of ranges last noted whole into `reads` (see ReadSetNoted); 0: none.
+        std::uint64_t readSet = 0;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         // The programs whose work was recorded (APS5_TRACE_RECORD=1), printed at submit.

@@ -3533,7 +3533,14 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
-    recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    // APS5_REUSE_ADDRESS_DRAWS: an address-based use served by the cached address space alone
+    // notes that space's heaps once per batch (the set is the same for every such use, and the
+    // batch keeps it), unless the capture trace wants every note.
+    const auto readSet = ReuseAddressDraws() && Recorder::ReadTracking() && !CaptureTrace::Enabled() ? guestMemory.ReadSetToken() : 0;
+    if (readSet == 0 || !recorder.ReadSetNoted(readSet)) {
+        recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+        if (readSet != 0) recorder.NoteReadSet(readSet);
+    }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageWritten[index]) storageTextures[index]->MarkDirty();
