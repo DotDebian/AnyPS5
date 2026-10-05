@@ -30,7 +30,7 @@ void Driver::reapCompletionLabels() {
 
     if (!completionsPending()) return;
 
-    bumpEpoch(&EpochBumps::reaps);
+    bumpEpoch(&EpochBumps::reaps, GuestMemory::EpochReason::Reap);
     if (const auto localDevice = device.Load()) localDevice->ReapRecorded();
 }
 

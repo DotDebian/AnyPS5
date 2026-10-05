@@ -72,7 +72,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     struct EpochPoint {
         bool bump = true;
         ~EpochPoint() {
-            if (bump) bumpEpoch(&EpochBumps::waits);
+            if (bump) bumpEpoch(&EpochBumps::waits, GuestMemory::EpochReason::Wait);
         }
     } epochPoint;
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);

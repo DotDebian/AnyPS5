@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -208,7 +209,7 @@ private:
     static WaitOutcomes& waitOutcomes();
     static Graphics::Recorder::LateStatistics& lateCountsSeen();
     static EpochBumps& epochBumps();
-    static void bumpEpoch(std::uint64_t EpochBumps::*counter);
+    static void bumpEpoch(std::uint64_t EpochBumps::*counter, GuestMemory::EpochReason reason);
     static bool packetEpoch();
     static bool labelTryEachPacket();
     static std::chrono::microseconds labelFlushDeadline();
