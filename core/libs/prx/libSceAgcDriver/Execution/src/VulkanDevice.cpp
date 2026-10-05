@@ -195,6 +195,7 @@ struct VulkanDevice::State {
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
     bool maintenance8 = false;
+    bool storageImageWithoutFormat = false;
     // The GDS shaders bind and the CP's DMA_DATA reaches (Pm4::InstallGdsBacking), when this device
     // installed the backing.
     std::unique_ptr<Graphics::Buffer> gds;
@@ -894,6 +895,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     if (enabled.shaderResourceMinLod) state->capabilities.push_back(spv::CapabilityMinLod);
     if (enabled.shaderStorageImageWriteWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageWriteWithoutFormat);
     if (enabled.shaderStorageImageReadWithoutFormat) state->capabilities.push_back(spv::CapabilityStorageImageReadWithoutFormat);
+    state->storageImageWithoutFormat = enabled.shaderStorageImageWriteWithoutFormat == VK_TRUE && enabled.shaderStorageImageReadWithoutFormat == VK_TRUE;
     // Bindless image tables index an image array with a wave-uniform runtime slot.
     enabled.shaderSampledImageArrayDynamicIndexing = available.shaderSampledImageArrayDynamicIndexing;
     enabled.shaderStorageImageArrayDynamicIndexing = available.shaderStorageImageArrayDynamicIndexing;
@@ -2559,6 +2561,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.memoryProperties2 = state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
     context.maintenance8 = state->maintenance8;
+    static const bool singlePassStorage = std::getenv("APS5_NO_SINGLE_PASS_STORAGE") == nullptr;
+    context.singlePassStorage = state->storageImageWithoutFormat && singlePassStorage;
     return context;
 }
 

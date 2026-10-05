@@ -156,6 +156,10 @@ struct Context {
     bool pipelineExecutableInfo = false;
     // VK_KHR_maintenance8 enabled: vkCmdCopyImage copies between depth/stencil and color formats.
     bool maintenance8 = false;
+    // Storage images are read and written without a format: storage write-backs retile straight
+    // from the image and uploads detile straight into it (TextureDetiler::DispatchImage), with no
+    // linear buffer and copy between. APS5_NO_SINGLE_PASS_STORAGE=1 keeps the copies.
+    bool singlePassStorage = false;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

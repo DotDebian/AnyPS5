@@ -45,6 +45,18 @@ add_custom_command(
         DEPENDS "${agcTextureDetileShaderSource}" glslang-standalone
         VERBATIM
 )
+# The same shader with the linear side an image (single-pass storage write-backs and uploads).
+set(agcTextureDetileImageShaderSpv ${agcTextureDetileGeneratedDir}/TextureDetileImage.spv)
+set(agcTextureDetileImageShaderHeader ${agcTextureDetileGeneratedDir}/TextureDetileImage_spv.h)
+add_custom_command(
+        OUTPUT "${agcTextureDetileImageShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -DLINEAR_IMAGE=1 -o "${agcTextureDetileImageShaderSpv}" "${agcTextureDetileShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcTextureDetileImageShaderSpv} -DOUTPUT=${agcTextureDetileImageShaderHeader}
+        -DSYMBOL=TEXTURE_DETILE_IMAGE_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcTextureDetileShaderSource}" glslang-standalone
+        VERBATIM
+)
 
 set(agcSampleCounterShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/SampleCounter.comp)
 set(agcSampleCounterShaderSpv ${agcTextureDetileGeneratedDir}/SampleCounter.spv)
@@ -209,6 +221,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
+        ${agcTextureDetileImageShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}
         ${agcMeshArgumentsShaderHeader}
@@ -530,6 +543,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/UnitShadow.cpp
         Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
+        ${agcTextureDetileImageShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}
         ${agcMeshArgumentsShaderHeader}
@@ -717,6 +731,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/UnitShadow.cpp
             Graphics/src/Sampler.cpp
             ${agcTextureDetileShaderHeader}
+            ${agcTextureDetileImageShaderHeader}
             ${visualShaders}
     )
 

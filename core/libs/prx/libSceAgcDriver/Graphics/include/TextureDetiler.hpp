@@ -43,13 +43,23 @@ namespace AgcDriver::Graphics {
         // restricts the move to part of the mip (a partial upload or write-back, StorageTexture),
         // leaving the other elements of both buffers alone.
         void Dispatch(VkCommandBuffer commands, TextureTileMode tileMode, std::uint32_t elementBytes, VkBuffer source, std::uint64_t sourceOffset, VkBuffer destination, std::uint64_t destinationOffset, const TileMipLayout& layout, bool retile = false, std::uint32_t slice = 0, bool thick = false, const DetileWindow& window = {});
+        // The same move with the linear side an image: detiles `tiled` straight into the texels of
+        // `view`, or with `retile` writes them straight into `tiled`. The view is a 2D storage view
+        // (layout GENERAL) of one mip and layer in the unsigned integer format of the element size
+        // (ImageElementFormat), so each texel is the element's bytes; the window's linear base and
+        // byte count do not apply. Needs storage image reads and writes without a format.
+        void DispatchImage(VkCommandBuffer commands, TextureTileMode tileMode, std::uint32_t elementBytes, VkBuffer tiled, std::uint64_t tiledOffset, VkImageView view, const TileMipLayout& layout, bool retile = false, std::uint32_t slice = 0, const DetileWindow& window = {});
+        // The view format DispatchImage moves elements of `elementBytes` through (R8, R16, R32,
+        // R32G32 or R32G32B32A32 UINT), VK_FORMAT_UNDEFINED for other sizes.
+        static VkFormat ImageElementFormat(std::uint32_t elementBytes);
         // Recycles the descriptor sets of the previous batch; call before recording a new command batch.
         void BeginBatch();
 
     private:
-        VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick);
+        VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image = false);
         void release() noexcept;
-        VkDescriptorSet allocateSet();
+        VkDescriptorSet allocateSet(bool image = false);
+        void checkWindow(const TileMipLayout& layout, const DetileWindow& window, std::uint32_t& columnEnd, std::uint32_t& rowEnd) const;
 
         const Context context;
         VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
@@ -58,6 +68,12 @@ namespace AgcDriver::Graphics {
         std::vector<std::pair<std::uint32_t, VkPipeline>> pipelines;
         std::vector<VkDescriptorPool> descriptorPools;
         std::size_t allocatedSets = 0;
+        // DispatchImage's: binding 0 the tiled buffer, binding 1 the storage image.
+        VkDescriptorSetLayout imageDescriptorLayout = VK_NULL_HANDLE;
+        VkPipelineLayout imagePipelineLayout = VK_NULL_HANDLE;
+        VkShaderModule imageModule = VK_NULL_HANDLE;
+        std::vector<VkDescriptorPool> imageDescriptorPools;
+        std::size_t allocatedImageSets = 0;
     };
 
 }

@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
@@ -139,6 +140,9 @@ public:
             enabled.shaderInt64 = VK_TRUE;
             enabled.occlusionQueryPrecise = supported.occlusionQueryPrecise;
             context.occlusionQueryPrecise = supported.occlusionQueryPrecise == VK_TRUE;
+            enabled.shaderStorageImageReadWithoutFormat = supported.shaderStorageImageReadWithoutFormat;
+            enabled.shaderStorageImageWriteWithoutFormat = supported.shaderStorageImageWriteWithoutFormat;
+            context.singlePassStorage = supported.shaderStorageImageReadWithoutFormat == VK_TRUE && supported.shaderStorageImageWriteWithoutFormat == VK_TRUE && std::getenv("APS5_NO_SINGLE_PASS_STORAGE") == nullptr;
             address.pNext = &bytes;
             std::vector<const char*> extensionsEnabled{VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_8BIT_STORAGE_EXTENSION_NAME};
             if (hasExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
@@ -2577,6 +2581,205 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
     std::cout << "write-back padding" << (watched ? " (watched)" : "") << ": ok\n";
 }
 
+// Single-pass storage moves (Context::singlePassStorage) against the copies through a linear
+// buffer, on the same guest bytes: a surface's first upload (whole, from the import), a write-back
+// of new texels in every mip (windows into the unit shadows), and a second image over the memory
+// uploaded from those shadows (windows). The images and guest memory must match byte for byte,
+// and the second image must hold the texels written.
+void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0 || !base.singlePassStorage) {
+        std::cout << "host imports or storage access without a format unavailable: single-pass storage moves not tested\n";
+        return;
+    }
+    struct Case {
+        const char* name;
+        std::uint32_t format;
+        TextureTileMode tileMode;
+        std::uint32_t width;
+        std::uint32_t height;
+        std::uint32_t mipCount;
+    };
+    constexpr Case cases[] = {
+        {"R8 64 KiB R_X 200x150", 1, TextureTileMode::kR64KBX, 200, 150, 1},
+        {"R16 64 KiB R_X 200x150, 3 mips", 7, TextureTileMode::kR64KBX, 200, 150, 3},
+        {"RGBA8 64 KiB R_X 520x260, 6 mips", 56, TextureTileMode::kR64KBX, 520, 260, 6},
+        {"RGBA16F 64 KiB R_X 384x256", 71, TextureTileMode::kR64KBX, 384, 256, 1},
+        {"RGBA16F 64 KiB R_X 256x200, 4 mips", 71, TextureTileMode::kR64KBX, 256, 200, 4},
+        {"RGBA32F 64 KiB R_X 136x72, 2 mips", 77, TextureTileMode::kR64KBX, 136, 72, 2},
+        {"RGBA8 64 KiB S 300x170", 56, TextureTileMode::kStandard64KB, 300, 170, 1},
+        {"RGBA16F 4 KiB S 100x70, 2 mips", 71, TextureTileMode::kStandard4KB, 100, 70, 2},
+        {"R8 256 B S 90x40", 1, TextureTileMode::kStandard256B, 90, 40, 1},
+    };
+    std::string failures;
+    std::size_t tested = 0;
+    for (const auto& test : cases) {
+        if (!StorageFormatAvailable(base, test.format)) continue;
+        const std::string what = std::string(watched ? "(watched) " : "") + test.name;
+        GuestTextureResource resource{};
+        resource.width = test.width;
+        resource.height = test.height;
+        resource.mipCount = test.mipCount;
+        resource.tileMode = test.tileMode;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = test.format;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        const auto geometry = DescribeSurface(resource);
+        const auto elementBytes = BytesPerElement(test.format);
+        // The surface, then a 64 KiB unit past it that no store may reach.
+        const auto bytes = (static_cast<std::size_t>(geometry.guestBytes) + 65535) / 65536 * 65536 + 65536;
+        struct Result {
+            std::vector<std::uint8_t> uploaded, memory, reuploaded;
+            std::uint64_t moves = 0;
+        };
+        std::array<Result, 2> results;
+        bool skipped = false;
+        for (int mode = 0; mode < 2 && !skipped; ++mode) {
+            auto context = base;
+            context.singlePassStorage = mode == 1;
+            void* block = nullptr;
+            if (watched) {
+                block = AllocateWatched(bytes, 65536);
+            } else {
+#ifdef _WIN32
+                block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+                block = std::aligned_alloc(65536, bytes);
+#endif
+            }
+            if (block == nullptr) {
+                std::cout << "no write watching: single-pass storage moves in watched memory not tested\n";
+                return;
+            }
+            auto* memory = static_cast<std::uint8_t*>(block);
+            std::uint32_t seed = 0x13579bdfu;
+            const auto random = [&] {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                return static_cast<std::uint8_t>(seed >> 9);
+            };
+            for (std::size_t i = 0; i < bytes; ++i) memory[i] = random();
+            const auto address = reinterpret_cast<std::uint64_t>(block);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Add(block, bytes, true, true);
+            }
+            struct Unregister {
+                const Context& context;
+                void* block;
+                std::uint64_t address;
+                std::size_t bytes;
+                bool watched;
+                ~Unregister() {
+                    {
+                        GuestAllocations::Mutation mutation;
+                        mutation.Remove(block);
+                    }
+                    HostImportFor(context, address, bytes);
+                    if (watched) ReleaseWatched(block, bytes);
+#ifdef _WIN32
+                    else VirtualFree(block, 0, MEM_RELEASE);
+#else
+                    else std::free(block);
+#endif
+                }
+            } unregister{base, block, address, bytes, watched};
+            if (HostImportFor(base, address, bytes) == nullptr) {
+                std::cout << "host import refused: single-pass storage moves not tested\n";
+                return;
+            }
+            TextureDetiler detiler(base);
+            context.detiler = &detiler;
+            resource.baseAddress = address;
+            std::size_t linearBytes = 0;
+            for (const auto& mip : geometry.mips) linearBytes += static_cast<std::size_t>(mip.width) * mip.height * elementBytes;
+            const auto readImage = [&](const StorageTexture& image) {
+                Buffer readback(context, linearBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                const auto commands = recorder.Commands();
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                std::vector<VkBufferImageCopy> copies;
+                std::size_t at = 0;
+                for (std::uint32_t level = 0; level < geometry.mips.size(); ++level) {
+                    VkBufferImageCopy copy{};
+                    copy.bufferOffset = at;
+                    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+                    copy.imageExtent = {geometry.mips[level].width, geometry.mips[level].height, 1};
+                    copies.push_back(copy);
+                    at += static_cast<std::size_t>(geometry.mips[level].width) * geometry.mips[level].height * elementBytes;
+                }
+                context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image.Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                recorder.Submit();
+                device.WaitQueue();
+                recorder.Sync();
+                const auto read = readback.Bytes();
+                return std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(read.data()), reinterpret_cast<const std::uint8_t*>(read.data()) + linearBytes);
+            };
+            std::vector<std::uint8_t> texels(linearBytes);
+            for (auto& value : texels) value = random();
+            const auto movesBefore = StorageTexture::SinglePassMoves();
+            {
+                auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+                recorder.Keep(image);
+                results[mode].uploaded = readImage(*image);
+                Buffer staging(context, linearBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                std::memcpy(staging.Bytes().data(), texels.data(), linearBytes);
+                const auto commands = recorder.Commands();
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                std::vector<VkBufferImageCopy> copies;
+                std::size_t at = 0;
+                for (std::uint32_t level = 0; level < geometry.mips.size(); ++level) {
+                    VkBufferImageCopy copy{};
+                    copy.bufferOffset = at;
+                    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+                    copy.imageExtent = {geometry.mips[level].width, geometry.mips[level].height, 1};
+                    copies.push_back(copy);
+                    at += static_cast<std::size_t>(geometry.mips[level].width) * geometry.mips[level].height * elementBytes;
+                }
+                context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging.Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(copies.size()), copies.data());
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                image->MarkDirty();
+                image->WriteBack();
+                recorder.Submit();
+                device.WaitQueue();
+                recorder.Sync();
+                // The second image over the memory reads what the write-back stored (from the unit
+                // shadows while they hold it).
+                auto again = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+                recorder.Keep(again);
+                results[mode].reuploaded = readImage(*again);
+                std::vector<std::byte> read(bytes);
+                if (watched) AgcDriver::GuestMemory::Read(address, read);
+                else {
+                    StorageTexture::FlushPending(address, bytes, nullptr, "test", PublishScope::Whole);
+                    recorder.Submit();
+                    device.WaitQueue();
+                    recorder.Sync();
+                    std::memcpy(read.data(), memory, bytes);
+                }
+                results[mode].memory.assign(reinterpret_cast<const std::uint8_t*>(read.data()), reinterpret_cast<const std::uint8_t*>(read.data()) + bytes);
+            }
+            recorder.Sync();
+            results[mode].moves = StorageTexture::SinglePassMoves() - movesBefore;
+            if (results[mode].reuploaded != texels) failures += what + (mode == 1 ? " (single pass)" : " (copies)") + ": the second image does not hold the texels written back\n";
+        }
+        if (results[0].moves != 0 || results[1].moves < 3) failures += what + ": single-pass moves " + std::to_string(results[0].moves) + " with the copies and " + std::to_string(results[1].moves) + " in single pass (want 0 and at least 3)\n";
+        if (results[0].uploaded != results[1].uploaded) failures += what + ": the first upload differs between the copies and single pass\n";
+        if (results[0].memory != results[1].memory) {
+            std::size_t differ = 0;
+            for (std::size_t i = 0; i < results[0].memory.size(); ++i) differ += results[0].memory[i] != results[1].memory[i];
+            failures += what + ": guest memory after the write-back differs in " + std::to_string(differ) + " bytes between the copies and single pass\n";
+        }
+        ++tested;
+    }
+    if (!failures.empty()) throw std::runtime_error("single-pass storage moves:\n" + failures);
+    std::cout << "single-pass storage moves" << (watched ? " (watched)" : "") << ": ok (" << tested << " surfaces)\n";
+}
+
 void importWindowTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& base = device.GetContext();
@@ -4497,6 +4700,8 @@ int main() {
             storageRefreshTests(device, recorder, true);
             writeBackPaddingTests(device, recorder, false);
             writeBackPaddingTests(device, recorder, true);
+            singlePassTests(device, recorder, false);
+            singlePassTests(device, recorder, true);
             targetKeyProofTests(device, recorder);
             refreshProofTests(device, recorder);
             importWatchTests(device);

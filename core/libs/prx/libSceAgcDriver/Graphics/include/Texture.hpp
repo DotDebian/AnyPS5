@@ -290,6 +290,9 @@ public:
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
     bool Refresh();
     static std::uint64_t RefreshesProved();
+    // Uploads and write-backs that moved texels straight between the tiled bytes and the image
+    // (Context::singlePassStorage), since the start.
+    static std::uint64_t SinglePassMoves();
     std::uint64_t GuestBytes() const;
 
 private:
@@ -432,6 +435,15 @@ private:
     bool overlaps(std::uint64_t address, std::size_t bytes) const;
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
     VkImageView createView(std::uint32_t mip, bool firstLayer = false) const;
+    // Whether the windows of an upload or write-back move the texels straight between the tiled
+    // bytes and the image (TextureDetiler::DispatchImage; Context::singlePassStorage, a 2D image
+    // whose element size has an unsigned integer storage format), and the view of one mip and
+    // layer they go through (made once, kept with the image).
+    bool singlePass();
+    VkImageView elementView(std::uint32_t level, std::uint32_t layer);
+    // A single-pass upload's barriers: before the detiles (`discard`: no texel is kept) and after.
+    void recordDirectUploadBarrier(VkCommandBuffer commands, bool discard);
+    void recordDirectUploadDone(VkCommandBuffer commands);
     void release() noexcept;
 
     Context context;
@@ -490,6 +502,8 @@ private:
     std::uint32_t defaultMip = 0;
     std::map<std::uint32_t, VkImageView> extraViews;
     std::map<std::uint32_t, VkImageView> firstLayerViews;
+    std::map<std::uint32_t, VkImageView> elementViews;
+    std::int8_t singlePassState = -1;
     bool attachable = false;
     std::map<std::tuple<VkFormat, std::uint32_t, std::uint32_t>, VkImageView> attachmentViews;
     VkFormat storageFormat = VK_FORMAT_UNDEFINED;
