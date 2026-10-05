@@ -2136,13 +2136,28 @@ std::uint32_t Recorder::BeginGpuTimingInPass(std::uint64_t key) {
     return beginTiming(key);
 }
 
+namespace {
+// Under APS5_PROFILE_GPU every batch made a timestamp query pool of 1024 queries and destroyed it
+// when it completed, about a thousand pools a second, where the two-query pools of the other mode
+// were kept for reuse: over a long run the Vulkan driver's video memory use grew by about
+// 2 KiB per batch with no allocation of ours behind it (the [vram] line's gap between the ledger
+// and the heap usage). The pools are now kept for reuse in both modes: one is only ever returned
+// by a batch whose results were read (readGpuTiming, before release), every pool of a run has the
+// same query count (the mode is fixed at start), and the first use in a batch resets it.
+// APS5_GPU_TIMING_POOL_PER_BATCH=1 makes and destroys one per batch as before.
+bool RecycleTimingPools() {
+    static const bool perBatch = std::getenv("APS5_GPU_TIMING_POOL_PER_BATCH") != nullptr;
+    return !perBatch;
+}
+}
+
 std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && DrawProfiled())) return NoTiming;
     const auto commands = open->commands;
     const std::uint32_t queryCount = full ? MaxTimedRanges * 2 : 2;
     if (open->queries == VK_NULL_HANDLE) {
-        if (!full && !sparePools.empty()) {
+        if ((!full || RecycleTimingPools()) && !sparePools.empty()) {
             open->queries = sparePools.back();
             sparePools.pop_back();
         } else {
@@ -4302,7 +4317,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
 
 void Recorder::release(Batch& batch) noexcept {
     if (batch.queries != VK_NULL_HANDLE) {
-        if (!GpuTimingEnabled() && sparePools.size() < 64) {
+        if ((!GpuTimingEnabled() || RecycleTimingPools()) && sparePools.size() < 64) {
             try {
                 sparePools.push_back(batch.queries);
                 batch.queries = VK_NULL_HANDLE;
