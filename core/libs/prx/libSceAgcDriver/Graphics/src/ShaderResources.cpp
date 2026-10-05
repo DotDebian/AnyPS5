@@ -2618,7 +2618,7 @@ std::size_t ShaderResources::addDataBuffer(std::span<const std::uint32_t> words)
     const auto size = words.size() * sizeof(std::uint32_t);
     Require(size <= context.limits.maxStorageBufferRange, "shader data buffer exceeds descriptor range limit");
     const bool refreshable = TemplateDataRefresh() && size <= MaxRefreshBytes;
-    auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u));
+    auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u), GpuReadProperties(GpuReadKind::StorageCopy));
     std::memcpy(buffer->Bytes().data(), words.data(), size);
     Allocation allocation{0, size, false, std::move(buffer)};
     if (refreshable && keepsTemplateRecords()) allocation.dataWords.assign(words.begin(), words.end());
@@ -3129,7 +3129,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, GpuReadProperties(GpuReadKind::StorageCopy));
             std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
                 if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
@@ -3159,9 +3159,17 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (buffer != nullptr) {
             CountDrawSnapshot(true, bytes);
         } else {
-            buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
-            recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+            buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, GpuReadProperties(GpuReadKind::StorageCopy));
+            // A snapshot in video memory is compared with the guest's bytes through a copy in
+            // system memory, made first so that both hold the same bytes.
+            std::vector<std::byte> shadow;
+            if ((GpuReadProperties(GpuReadKind::StorageCopy) & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+                shadow.assign(reinterpret_cast<const std::byte*>(begin), reinterpret_cast<const std::byte*>(begin) + bytes);
+                std::memcpy(buffer->Bytes().data(), shadow.data(), bytes);
+            } else {
+                std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+            }
+            recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer, Recorder::SnapshotUse::Storage, 0, std::move(shadow));
             CountDrawSnapshot(false, bytes);
         }
         selected.push_back(index);

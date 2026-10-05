@@ -66,9 +66,17 @@ constexpr std::size_t NoSyncSite = static_cast<std::size_t>(-1);
 constexpr std::size_t SyncSiteLimit = 48;
 thread_local std::size_t activeSyncSite = NoSyncSite;
 
+// APS5_TRACE_SYNC=1 (local, not for upstream): the GPU waits alone, per presented frame, without
+// the per-draw timing of APS5_PROFILE_DRAW that slows the frame down. Off under APS5_PROFILE_DRAW,
+// whose [recorder] line owns the same tables.
+bool SyncTraced() {
+    static const bool traced = std::getenv("APS5_TRACE_SYNC") != nullptr && std::getenv("APS5_PROFILE_DRAW") == nullptr;
+    return traced;
+}
+
 bool SyncSitesProfiled() {
     // APS5_NO_SYNC_SITES=1 leaves only the per-source and per-thread counts.
-    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_SYNC_SITES") == nullptr;
+    static const bool profiled = (std::getenv("APS5_PROFILE_DRAW") != nullptr || SyncTraced()) && std::getenv("APS5_NO_SYNC_SITES") == nullptr;
     return profiled;
 }
 
@@ -158,6 +166,95 @@ std::string ThreadSyncReport() {
 }
 // Unlocked timeline waits (WaitSerial): count and time, for the [recorder] line.
 std::atomic<std::uint64_t> unlockedWaits{0}, unlockedWaitedUs{0};
+
+// APS5_TRACE_SYNC: the waits of one 10 s interval by length (a GPU that is the limit shows few long
+// waits, round-trip latency many short ones), the submissions and the presents, printed as one
+// [synctrace] line with the per-source, per-thread and per-site tables, which are cleared with it.
+// Touched under the GpuMutex (finish, the hook's relock, Submit) but for the atomics.
+struct SyncTrace {
+    enum Kind { Fence, Timeline, Kinds };
+    static constexpr std::array<double, 6> LimitsMs{0.05, 0.2, 1, 5, 20, 1e12};
+    struct Bucket {
+        std::uint64_t count = 0;
+        double ms = 0;
+    };
+    std::array<std::array<Bucket, 6>, Kinds> waits{};
+    std::array<Bucket, static_cast<std::size_t>(GuestMemory::ReadSite::Count)> timelineByReadSite{};
+    std::uint64_t submits = 0;
+    std::uint64_t presentsAtReport = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+SyncTrace syncTrace;
+std::atomic<std::uint64_t> tracedPresents{0};
+
+void ReportSyncTrace(std::chrono::steady_clock::time_point now) {
+    static const char* const kinds[SyncTrace::Kinds] = {"fence", "timeline"};
+    static const char* const limits[6] = {"<50us", "<200us", "<1ms", "<5ms", "<20ms", ">=20ms"};
+    static const char* const names[5] = {"idle", "pending-write", "recorded-store", "address-based", "other"};
+    auto& trace = syncTrace;
+    const auto seconds = std::chrono::duration<double>(now - trace.lastReport).count();
+    const auto presents = tracedPresents.load(std::memory_order_relaxed);
+    const auto frames = presents - trace.presentsAtReport;
+    const auto serialWaits = unlockedWaits.exchange(0, std::memory_order_relaxed);
+    const auto serialUs = unlockedWaitedUs.exchange(0, std::memory_order_relaxed);
+    std::string report;
+    char text[160];
+    double waitedMs = 0;
+    for (int kind = 0; kind < SyncTrace::Kinds; ++kind) {
+        report += std::string("; ") + kinds[kind] + " waits (count/ms)";
+        for (std::size_t bucket = 0; bucket < trace.waits[kind].size(); ++bucket) {
+            const auto& entry = trace.waits[kind][bucket];
+            waitedMs += entry.ms;
+            if (entry.count == 0) continue;
+            std::snprintf(text, sizeof(text), " %s %llu/%.0f", limits[bucket], static_cast<unsigned long long>(entry.count), entry.ms);
+            report += text;
+        }
+    }
+    report += "; timeline waits by read site:";
+    for (std::size_t site = 0; site < trace.timelineByReadSite.size(); ++site) {
+        const auto& entry = trace.timelineByReadSite[site];
+        if (entry.count == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %llu/%.0f", GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(site)), static_cast<unsigned long long>(entry.count), entry.ms);
+        report += text;
+    }
+    report += "; syncs by source (announced/waited ms):";
+    for (int source = 0; source < 5; ++source) {
+        std::snprintf(text, sizeof(text), " %s %llu/%.0f", names[source], static_cast<unsigned long long>(syncCounts[source]), syncWaitedMs[source]);
+        report += text;
+        syncCounts[source] = 0;
+        syncWaitedMs[source] = 0;
+    }
+    std::fprintf(stderr, "[synctrace] %.1f s: %llu frames, %llu submits, %.0f ms waited for the GPU under the mutex or in the hook, %llu unlocked serial waits %.0f ms%s; by thread (count/wait):%s; top sites (source@caller syncs/batches/wait):%s\n", seconds, static_cast<unsigned long long>(frames), static_cast<unsigned long long>(trace.submits), waitedMs, static_cast<unsigned long long>(serialWaits), serialUs / 1000.0, report.c_str(), ThreadSyncReport().c_str(), SyncSiteReport().c_str());
+    {
+        std::lock_guard lock(threadSyncsMutex);
+        threadSyncs.clear();
+    }
+    for (auto& entry : syncSites) {
+        entry.syncs = 0;
+        entry.batches = 0;
+        entry.waitedMs = 0;
+    }
+    trace.waits = {};
+    trace.timelineByReadSite = {};
+    trace.submits = 0;
+    trace.presentsAtReport = presents;
+    trace.lastReport = now;
+}
+
+// One traced wait, charged like the profile's: to the bucket of its length, its source, its thread
+// and the sync site in progress.
+void NoteTracedWait(SyncTrace::Kind kind, int source, double ms, std::chrono::steady_clock::time_point now) {
+    std::size_t bucket = 0;
+    while (ms >= SyncTrace::LimitsMs[bucket]) ++bucket;
+    ++syncTrace.waits[kind][bucket].count;
+    syncTrace.waits[kind][bucket].ms += ms;
+    if (source >= 0 && source < 5) {
+        syncWaitedMs[source] += ms;
+        CountThreadSync(source, ms);
+    }
+    CountSiteWait(ms);
+    if (now - syncTrace.lastReport > std::chrono::seconds(10)) ReportSyncTrace(now);
+}
 // vkQueueSubmit calls and their time (APS5_PROFILE_DRAW; Submit runs under the GpuMutex).
 std::uint64_t submitCount = 0;
 double submitUs = 0, submitMaxUs = 0;
@@ -1373,6 +1470,10 @@ void Recorder::AnnounceSyncSite(const void* site) {
     announcedSite = site;
 }
 
+void Recorder::NotePresent() {
+    tracedPresents.fetch_add(1, std::memory_order_relaxed);
+}
+
 double Recorder::ThreadWaitedMs() {
     return threadWaitedMs;
 }
@@ -2017,6 +2118,13 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     if (!GpuTimingEnabled()) return NoTiming;
     Commands();
+    return beginTiming(key);
+}
+
+std::uint32_t Recorder::BeginGpuTimingInPass(std::uint64_t key) {
+    // No Commands(): that would end the open pass. The pool exists (the pass's class range made it),
+    // so nothing is reset inside the pass.
+    if (!GpuTimingEnabled() || open == nullptr || open->queries == VK_NULL_HANDLE) return NoTiming;
     return beginTiming(key);
 }
 
@@ -2692,7 +2800,8 @@ void Recorder::readGpuTiming(Batch& batch) {
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
     std::fprintf(stderr, "[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
-    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) std::fprintf(stderr, " 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
+    static const std::size_t listed = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr ? 40 : 12;
+    for (std::size_t i = 0; i < hot.size() && i < listed; ++i) std::fprintf(stderr, " 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     std::fprintf(stderr, "; by class:%s\n", classes.c_str());
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
@@ -2826,7 +2935,8 @@ std::shared_ptr<Buffer> Recorder::reuseDrawSnapshot(std::map<DrawSnapshotKey, Dr
 
 bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes) {
     const auto held = entry.buffer->Bytes();
-    if (held.size() != bytes || bytes == 0) return false;
+    if (held.size() != bytes || bytes == 0 || (!entry.shadow.empty() && entry.shadow.size() != bytes)) return false;
+    const std::byte* compared = entry.shadow.empty() ? held.data() : entry.shadow.data();
     constexpr std::uint64_t block = 65536;
     const auto aligned = address / block * block;
     const auto end = address + bytes;
@@ -2847,13 +2957,13 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         const auto from = std::max(address, aligned + k * block);
         const auto to = std::min(end, aligned + (k + 1) * block);
         const auto offset = static_cast<std::size_t>(from - address);
-        spans.push_back({held.data() + offset, reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from)});
+        spans.push_back({compared + offset, reinterpret_cast<const void*>(from), static_cast<std::size_t>(to - from)});
     }
     equal.assign(spans.size(), 0);
     CompareSpans(spans, equal);
     for (std::size_t k = 0; k < spans.size(); ++k) {
         if (equal[k] != 0) continue;
-        const auto offset = static_cast<std::size_t>(static_cast<const std::byte*>(spans[k].first) - held.data());
+        const auto offset = static_cast<std::size_t>(static_cast<const std::byte*>(spans[k].first) - compared);
         const auto length = spans[k].bytes;
         if (!sole) return false;
         if (!differing.empty() && differing.back().first + differing.back().second == offset) differing.back().second += length;
@@ -2863,12 +2973,19 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
         if (DrawProfiled()) drawSnapshotRevalidated.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    for (const auto& [offset, length] : differing) std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
+    for (const auto& [offset, length] : differing) {
+        if (entry.shadow.empty()) {
+            std::memcpy(held.data() + offset, reinterpret_cast<const void*>(address + offset), length);
+        } else {
+            std::memcpy(entry.shadow.data() + offset, reinterpret_cast<const void*>(address + offset), length);
+            std::memcpy(held.data() + offset, entry.shadow.data() + offset, length);
+        }
+    }
     if (DrawProfiled()) drawSnapshotPatched.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
-void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
+void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, std::vector<std::byte> shadow) {
     const auto maxEntries = DrawSnapshotEntries(use);
     const auto budget = DrawSnapshotBudget(use);
     auto& pool = drawSnapshotPools[SnapshotPool(use)];
@@ -2885,7 +3002,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     const DrawSnapshotKey key{address, use, bytes};
     pool.recency.push_back(key);
     try {
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
+        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived, std::move(shadow)});
     } catch (...) {
         pool.recency.pop_back();
         throw;
@@ -3470,6 +3587,7 @@ void Recorder::Submit() {
     Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
+    if (SyncTraced()) ++syncTrace.submits;
     ResidencyClock::NoteSubmission();
     if (TraceRecord()) {
         std::string line;
@@ -3544,7 +3662,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
 
 void Recorder::WaitSerial(std::uint64_t serial) {
     if (timeline == VK_NULL_HANDLE || serial == 0) return;
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || SyncTraced();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
     const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial);
@@ -3775,7 +3893,8 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
             }
         }
     }
-    const auto start = profile || trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool traced = SyncTraced();
+    const auto start = profile || trace || traced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto waited = start;
     auto& mutex = GuestMemory::GpuMutex();
     VkResult result = VK_SUCCESS;
@@ -3785,11 +3904,17 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         mutex.unlock();
         result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
-        if (profile || trace) waited = std::chrono::steady_clock::now();
+        if (profile || trace || traced) waited = std::chrono::steady_clock::now();
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
     mutex.lock();
     const auto ms = std::chrono::duration<double, std::milli>(waited - start).count();
+    if (traced) {
+        auto& bySite = syncTrace.timelineByReadSite[static_cast<std::size_t>(readSite)];
+        ++bySite.count;
+        bySite.ms += ms;
+        NoteTracedWait(SyncTrace::Timeline, source, ms, waited);
+    }
     if (profile) {
         // The GPU wait is charged like a locked wait, so the per-source, per-thread and per-site
         // totals of the [recorder] line keep their meaning; the unlocked count says how many were
@@ -3927,6 +4052,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s (the waiting thread last recorded program 0x%llx)\n", waited, static_cast<unsigned long long>(notedProgram));
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+        }
+        if (SyncTraced()) {
+            const auto now = std::chrono::steady_clock::now();
+            NoteTracedWait(SyncTrace::Fence, source, std::chrono::duration<double, std::milli>(now - waitStart).count(), now);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);

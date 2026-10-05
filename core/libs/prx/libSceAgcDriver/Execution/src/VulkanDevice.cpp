@@ -2114,6 +2114,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         if (dumpFrame) --dumps.dumped;
         return false;
     }
+    Graphics::Recorder::NotePresent();
     return true;
 }
 

@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 
 namespace AgcDriver::Graphics {
@@ -33,6 +34,11 @@ bool KeysServeSurface(std::uint64_t followedDcc, DccKeys uploaded, DccKeys fille
 DccKeys ReadDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
 bool IsDccClear(DccKeys keys);
 DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
+// Local experiment (APS5_REGISTER_CLEAR_KNOWN_KEYS): the keys a key store still pending on the GPU
+// leaves in the range, when that store is the newest recorded writer of it (the memo CurrentDccKeys
+// answers from); nullopt when nothing is pending or the pending writer is not such a store. Under
+// GuestMemory::GpuMutex; never waits.
+std::optional<DccKeys> KnownPendingDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
 // Stores "uncompressed" keys over the surface's metadata on the CPU (a guest memory write: it waits
 // for recorded GPU work that writes the keys first).
 void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes);
