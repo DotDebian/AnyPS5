@@ -868,7 +868,20 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     ValidateDepthBounds(context, state.depth);
     timer.phase(PhaseValidate);
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
-    if (draw.indexed) {
+    // A mesh draw never binds the index buffer (recordDrawCommands issues vkCmdDrawMeshTasks*: the
+    // mesh stage reads the indices through its hidden user words, MeshIndexBufferDescriptor), so its
+    // snapshot served only the two checks below on the highest index: the indexed-draw limit, which
+    // no mesh draw is subject to, and the restart index of a triangle fan. Without vertex
+    // attributes (whose copies are sized by the highest index) and outside the fan-with-restart
+    // case the snapshot is skipped: no collect of the index pages, no snapshot lookup, no buffer
+    // kept per draw. The flush of pending GPU writes over the range stays, as CopyDrawInput made
+    // it. Debug aid: APS5_MESH_INDEX_SNAPSHOT=1 takes the snapshot for every indexed draw as before.
+    static const bool meshIndexSnapshot = std::getenv("APS5_MESH_INDEX_SNAPSHOT") != nullptr;
+    const bool skipIndexSnapshot = draw.indexed && state.stages.mesh.has_value() && !meshIndexSnapshot && !(state.stages.mesh->inputPrimitive == 5 && state.primitiveRestart) && shaders.front().program->vertexAttributes.empty();
+    if (skipIndexSnapshot) {
+        if (indexBytes != 0) GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+        GuestMemory::CountTrace(GuestMemory::TraceCount::MeshIndexSnapshotSkipped);
+    } else if (draw.indexed) {
         const auto use = draw.indexSize == 2 ? Recorder::SnapshotUse::Index16 : Recorder::SnapshotUse::Index32;
         auto copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         std::uint32_t highest = copy.derived;
