@@ -39,6 +39,8 @@ public:
     void RequireVersion(std::uint32_t version);
     [[nodiscard]] std::uint32_t Import(const std::string& name);
     [[nodiscard]] std::uint32_t DefineGlobalVariable(std::uint32_t pointerType, std::uint32_t storageClass);
+    // With an initializer: a constant declared before this call.
+    [[nodiscard]] std::uint32_t DefineInitializedGlobalVariable(std::uint32_t pointerType, std::uint32_t storageClass, std::uint32_t initializer);
     void DefineGlobalVariable(std::uint32_t id, std::uint32_t pointerType, std::uint32_t storageClass);
     void AddMemoryModel(std::uint32_t addressingModel, std::uint32_t memoryModel);
     void AddName(std::uint32_t target, const std::string& name);

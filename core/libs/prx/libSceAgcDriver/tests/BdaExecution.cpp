@@ -124,6 +124,11 @@ void RunBdaExecutionTests(const Context& context) {
     run(guest, 8, 0x11, static_cast<Abi::FaultReason>(0));
     run(guest + 1, 16, 0x3322, static_cast<Abi::FaultReason>(0));
     run(guest + 1, 32, 0x55443322, static_cast<Abi::FaultReason>(0));
+    // The lookups' last-range cache (DefineBdaLookup): a byte in the first range fills it, the next
+    // byte lies in the second range and must not be served from the first one's device address;
+    // and a byte past the table after a cached one still faults as unmapped.
+    run(guest + 2, 16, 0x4433, static_cast<Abi::FaultReason>(0));
+    run(guest + 4, 16, 0, Abi::FaultReason::Unmapped);
     run(guest + 5, 8, 0, Abi::FaultReason::Unmapped, 2, 64);
     run(guest - 1, 8, 0, Abi::FaultReason::Unmapped);
     run(std::numeric_limits<std::uint64_t>::max() - 1, 32, 0, Abi::FaultReason::Overflow);
