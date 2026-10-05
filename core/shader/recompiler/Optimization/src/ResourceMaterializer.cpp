@@ -45,6 +45,7 @@ struct DecodedImage {
     bool fmask = false;
     bool depthBits = false;
     bool depthUnorm16 = false;
+    IrBufferFormat packedFormat = IrBufferFormat::Invalid;
 };
 
 ShaderBufferResource decodeBufferDescriptor(const DescriptorValue& value) {
@@ -157,6 +158,12 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
     decoded.fmask = IsFmaskTextureFormat(format);
     if (decoded.fmask && (storage || base.depthCompare || base.indirectRoot != ImageResource::NoIndirectImage)) {
         throw std::runtime_error("FMASK requires a direct sampled image load");
+    }
+    if (base.packed) {
+        if (base.indirectRoot != ImageResource::NoIndirectImage || (!storage && descriptorImageSwizzle(descriptor) != ShaderImageIdentitySwizzle)) {
+            throw std::runtime_error("packed image access requires a direct image, with identity swizzle when sampled");
+        }
+        decoded.packedFormat = format;
     }
     decoded.conversionFormat = RemapTextureFormat(format) != format ? format : IrBufferFormat::Invalid;
     if (storage || decoded.conversionFormat != IrBufferFormat::Invalid) {
@@ -290,6 +297,9 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     }
     if (image.resourceClass != ImageResourceClass::Sampled) {
         rejectTable(BindlessRejection::Storage, "bindless storage image tables are unsupported");
+    }
+    if (image.packed) {
+        throw std::runtime_error("bindless packed image tables are unsupported");
     }
     const auto slots = ResourceMaterializer::BindlessSlots();
     DescriptorValue heapValue;
@@ -534,6 +544,7 @@ void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& s
         entry.fmask = decoded.fmask;
         entry.depthBits = decoded.depthBits;
         entry.depthUnorm16 = decoded.depthUnorm16;
+        entry.packedFormat = decoded.packedFormat;
         result.images.push_back(entry);
     }
 
@@ -620,6 +631,7 @@ void ResourceMaterializer::Apply(IrProgram& program, const ResourceSpecializatio
         image.cube = source.cube;
         image.depthBits = source.depthBits;
         image.depthUnorm16 = source.depthUnorm16;
+        image.packedFormat = source.packedFormat;
         image.indirectResources.clear();
     }
     for (std::uint32_t index = 0; index < images.size(); index++) {
@@ -948,7 +960,7 @@ bool ResourceSpecialization::Buffer::operator==(const Buffer& other) const {
 }
 
 bool ResourceSpecialization::Image::operator==(const Image& other) const {
-    return numericClass == other.numericClass && dimension == other.dimension && mipCount == other.mipCount && conversionFormat == other.conversionFormat && shaderSwizzle == other.shaderSwizzle && indirectRoot == other.indirectRoot && indirectMappingOffset == other.indirectMappingOffset && indirectSearchIterations == other.indirectSearchIterations && cube == other.cube && fmask == other.fmask && depthBits == other.depthBits && depthUnorm16 == other.depthUnorm16;
+    return numericClass == other.numericClass && dimension == other.dimension && mipCount == other.mipCount && conversionFormat == other.conversionFormat && shaderSwizzle == other.shaderSwizzle && indirectRoot == other.indirectRoot && indirectMappingOffset == other.indirectMappingOffset && indirectSearchIterations == other.indirectSearchIterations && cube == other.cube && fmask == other.fmask && depthBits == other.depthBits && depthUnorm16 == other.depthUnorm16 && packedFormat == other.packedFormat;
 }
 
 bool ResourceSpecialization::operator==(const ResourceSpecialization& other) const {

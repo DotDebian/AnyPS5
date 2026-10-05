@@ -22,9 +22,11 @@ struct SpirvRequirements {
     // With functionLds: when not empty, every LDS access's byte address with the lane term taken
     // out (see FunctionLdsLaneAddresses); the array is indexed by these constant addresses.
     std::unordered_map<const IrValue*, std::uint32_t> functionLdsAddresses;
+    bool ldsLock = false;
     bool functionScratch = false;
     bool pixelValidMask = false;
     bool bufferInt64Atomics = false;
+    bool sharedInt64Atomics = false;
     bool float64 = false;
     bool coherentBuffers = false;
     std::vector<std::uint32_t> capabilities;
@@ -48,6 +50,7 @@ inline constexpr std::uint32_t FunctionLdsDwordLimit = 8192u;
 // and keeps which accesses alias; the per-invocation array then sees only constant indices.
 [[nodiscard]] std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const IrProgram& program);
 [[nodiscard]] std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program);
+[[nodiscard]] bool IsWaveMaskBranch(BranchCondition condition);
 
 }
 

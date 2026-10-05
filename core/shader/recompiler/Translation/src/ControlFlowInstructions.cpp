@@ -339,8 +339,9 @@ void TranslationContext::vPermlane16B32(const RdnaInstruction& inst, bool x16) {
     const IrU32 value = readU32(sourceAt(inst, 0u));
     const IrU32 selectLow = readU32(sourceAt(inst, 1u));
     const IrU32 selectHigh = readU32(sourceAt(inst, 2u));
+    const IrU32 previous = readRawU32(plainOperand(inst.destination));
     const PermlaneFlags flags{x16, inst.destination.opSel, inst.destination.opSelHi};
-    const IrU32 result(ir.Emit(IrOpcode::Permlane16U32, IrType::U32, {&value.Value(), &selectLow.Value(), &selectHigh.Value(), &ir.GetExec()}, flags));
+    const IrU32 result(ir.Emit(IrOpcode::Permlane16U32, IrType::U32, {&value.Value(), &selectLow.Value(), &selectHigh.Value(), &ir.GetExec(), &previous.Value()}, flags));
     writeRawU32(inst.destination, result);
 }
 

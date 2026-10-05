@@ -2,6 +2,7 @@
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/KernelErrors.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -23,6 +24,8 @@
 #include <time.h>
 #include <sys/time.h>
 #endif
+
+extern "C" int* APS5_VABI __error_nid_postfix();
 
 static std::uint64_t RawMonotonicNanos() {
 #ifdef _WIN32
@@ -222,15 +225,15 @@ int APS5_VABI sceKernelUsleep_nid_postfix(KernelUseconds microseconds) {
     return 0;
 }
 
-int APS5_VABI sceKernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
-    if (rqtp == nullptr) {
-        return -1;
+static int SleepForRequest(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+    constexpr int guestFault = 14;
+    constexpr int guestInvalid = 22;
+    if (rqtp == nullptr) return guestFault;
+    if (rqtp->tv_nsec < 0 || rqtp->tv_nsec >= 1000000000LL) return guestInvalid;
+    if (rqtp->tv_sec >= 0) {
+        TimedWait::SleepNanos(static_cast<std::uint64_t>(rqtp->tv_sec) * 1000000000ULL +
+                              static_cast<std::uint64_t>(rqtp->tv_nsec));
     }
-    if (rqtp->tv_sec < 0 || rqtp->tv_nsec < 0 || rqtp->tv_nsec >= 1000000000LL) {
-        return -1;
-    }
-    TimedWait::SleepNanos(static_cast<std::uint64_t>(rqtp->tv_sec) * 1000000000ULL +
-                          static_cast<std::uint64_t>(rqtp->tv_nsec));
     if (rmtp != nullptr) {
         rmtp->tv_sec = 0;
         rmtp->tv_nsec = 0;
@@ -238,12 +241,20 @@ int APS5_VABI sceKernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmt
     return 0;
 }
 
+int APS5_VABI sceKernelNanosleep(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
+    const int error = SleepForRequest(rqtp, rmtp);
+    return error == 0 ? 0 : SceKernelError(error);
+}
+
 int APS5_VABI nanosleep_nid_postfix(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
-    return sceKernelNanosleep(rqtp, rmtp);
+    const int error = SleepForRequest(rqtp, rmtp);
+    if (error == 0) return 0;
+    *__error_nid_postfix() = error;
+    return -1;
 }
 
 int APS5_VABI _nanosleep_nid_postfix(const KernelTimespec* rqtp, KernelTimespec* rmtp) {
-    return sceKernelNanosleep(rqtp, rmtp);
+    return nanosleep_nid_postfix(rqtp, rmtp);
 }
 
 int APS5_VABI usleep_nid_postfix(KernelUseconds microseconds) {

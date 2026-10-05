@@ -78,7 +78,7 @@ void EmitMeshEntryPoint(SpirvEmitterState& state);
 void EmitMeshAllocate(SpirvValueEmitContext& ctx, const IrValue& inst);
 std::uint32_t MeshOutputPointer(SpirvEmitterState& state, StageOutputKind kind, std::uint32_t index = 0);
 std::uint32_t MeshPrimitivePointer(SpirvEmitterState& state);
-DppTargetLane EmitDppQuadPermTargetLane(SpirvEmitterState& state, std::uint32_t subid, std::uint32_t control);
+DppTargetLane EmitDppGroupPermTargetLane(SpirvEmitterState& state, std::uint32_t subid, std::uint32_t control, std::uint32_t laneBits);
 DppTargetLane EmitDppRowShiftTargetLane(SpirvEmitterState& state, std::uint32_t subid, std::uint32_t amount, bool left);
 DppTargetLane EmitDppRowRotateRightTargetLane(SpirvEmitterState& state, std::uint32_t subid, std::uint32_t amount);
 DppTargetLane EmitDppMirrorTargetLane(SpirvEmitterState& state, std::uint32_t subid, bool halfRow);
@@ -96,6 +96,7 @@ std::uint32_t StorageBufferPackedStride(const SpirvEmitterState& state, const Me
 IrBufferFormat StorageBufferFormat(const SpirvEmitterState& state, const MemoryInfo& mem);
 void EmitMemoryOffsets(SpirvEmitterState& state);
 std::uint32_t LdsDwordCount(const SpirvEmitterState& state);
+std::uint32_t EmitLdsLockPointer(SpirvEmitterState& state);
 MemoryResourceAccess PrepareMemoryResourceAccess(SpirvEmitterState& state, const MemoryInfo& mem);
 MemoryResourceAccess PrepareStorageBufferResourceAccess(SpirvEmitterState& state, const MemoryInfo& mem, std::uint32_t variable, std::uint32_t pointerType);
 std::uint32_t EmitMemoryElementIndex(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t rawIndex);
@@ -134,6 +135,8 @@ std::uint32_t Binary(SpirvEmitterState& state, std::uint32_t opcode, std::uint32
 std::uint32_t Select(SpirvEmitterState& state, std::uint32_t type, std::uint32_t condition, std::uint32_t trueValue, std::uint32_t falseValue);
 std::uint32_t AtomicIncrement(SpirvEmitterState& state, std::uint32_t old, std::uint32_t limit);
 std::uint32_t AtomicDecrement(SpirvEmitterState& state, std::uint32_t old, std::uint32_t limit);
+std::uint32_t AtomicFloatMinMax(SpirvEmitterState& state, std::uint32_t old, std::uint32_t source, bool maxValue);
+std::uint32_t AtomicFloatCompareSwap(SpirvEmitterState& state, std::uint32_t old, std::uint32_t desired, std::uint32_t comparator);
 
 template<std::uint32_t TOpcode, IrType TValueType, typename... TArguments>
 std::uint32_t EmitNative(SpirvEmitterState& state, TArguments... arguments) {

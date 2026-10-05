@@ -145,17 +145,16 @@ void TranslationContext::vCvtOffF32I4(const RdnaInstruction& inst) {
 }
 
 void TranslationContext::vCvtPkrtzF16F32(const RdnaInstruction& inst) {
-    const IrF32 lhs = applyF32ResultModifiers(inst.destination, IrF32(*readOperand(sourceAt(inst, 0u), IrType::F32)));
-    const IrF32 rhs = applyF32ResultModifiers(inst.destination, IrF32(*readOperand(sourceAt(inst, 1u), IrType::F32)));
+    const IrF32 lhs(*readOperand(sourceAt(inst, 0u), IrType::F32));
+    const IrF32 rhs(*readOperand(sourceAt(inst, 1u), IrType::F32));
     const IrU32 result(ir.Emit(IrOpcode::PackFloat2x16Rtz, IrType::U32, {&lhs.Value(), &rhs.Value()}));
     writeOperand(inst.destination, &result.Value());
 }
 
-void TranslationContext::vCvtPknormF32(const RdnaInstruction& inst, IrOpcode opcode) {
-    IrValue* lhs = readOperand(sourceAt(inst, 0u), IrType::F32);
-    IrValue* rhs = readOperand(sourceAt(inst, 1u), IrType::F32);
-    IrValue& pair = ir.Emit(IrOpcode::CompositeConstructF32x2, IrType::F32x2, {lhs, rhs});
-    const IrU32 result(ir.Emit(opcode, IrType::U32, {&pair}));
+void TranslationContext::vCvtPknormF32(const RdnaInstruction& inst, bool signedValue) {
+    const IrU32 low = normF32(readU32(sourceAt(inst, 0u)), signedValue);
+    const IrU32 high = normF32(readU32(sourceAt(inst, 1u)), signedValue);
+    const IrU32 result(ir.BitwiseOr(low.Value(), ir.ShiftLeftLogical(high.Value(), ir.Constant(16u))));
     writeOperand(inst.destination, &result.Value());
 }
 
@@ -171,8 +170,8 @@ void TranslationContext::vCvtPkU8F32(const RdnaInstruction& inst) {
 }
 
 void TranslationContext::vPackB32F16(const RdnaInstruction& inst) {
-    const IrU32 low = readF16LaneBits(sourceAt(inst, 0u), false);
-    const IrU32 high(ir.ShiftLeftLogical(readF16LaneBits(sourceAt(inst, 1u), false).Value(), ir.Constant(16u)));
+    const IrU32 low = readF16Bits(sourceAt(inst, 0u));
+    const IrU32 high(ir.ShiftLeftLogical(readF16Bits(sourceAt(inst, 1u)).Value(), ir.Constant(16u)));
     const IrU32 result(ir.BitwiseOr(low.Value(), high.Value()));
     writeOperand(inst.destination, &result.Value());
 }

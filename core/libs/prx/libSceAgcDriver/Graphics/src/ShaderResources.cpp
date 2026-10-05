@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -372,14 +373,19 @@ struct LookupRecord {
     const StorageTexture* source;
 };
 
-thread_local std::vector<LookupRecord> lookupLog;
+thread_local std::vector<LookupRecord>* lookupLogSlot = nullptr;
+
+std::vector<LookupRecord>& lookupLog() {
+    return ShaderRecompiler::ThreadOwned(lookupLogSlot);
+}
 
 void logLookup(const LookupRecord& record) {
     // The bound drops the oldest half, never everything: one build's lookups (a few dozen at most)
     // are the newest records, and a capture must find them even when the bound trips mid-build.
     constexpr std::size_t bound = 1024;
-    if (lookupLog.size() >= bound) lookupLog.erase(lookupLog.begin(), lookupLog.begin() + bound / 2);
-    lookupLog.push_back(record);
+    auto& log = lookupLog();
+    if (log.size() >= bound) log.erase(log.begin(), log.begin() + bound / 2);
+    log.push_back(record);
 }
 
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0);
@@ -1141,7 +1147,8 @@ struct ThreadBuildProfile {
 };
 
 ThreadBuildProfile& ThreadBuilds() {
-    thread_local ThreadBuildProfile profile;
+    thread_local ThreadBuildProfile* profileSlot = nullptr;
+    auto& profile = ShaderRecompiler::ThreadOwned(profileSlot);
     return profile;
 }
 
@@ -1706,11 +1713,12 @@ bool EpochRevalidate() {
 void ShaderResources::captureValidation() {
     if (!keepsTemplateRecords()) {
         validatedTextures.clear();
-        lookupLog.clear();
+        lookupLog().clear();
         return;
     }
     const auto record = [](const void* object) -> const LookupRecord* {
-        for (auto it = lookupLog.rbegin(); it != lookupLog.rend(); ++it) {
+        const auto& log = lookupLog();
+        for (auto it = log.rbegin(); it != log.rend(); ++it) {
             if (it->object == object) return &*it;
         }
         return nullptr;
@@ -1720,7 +1728,7 @@ void ShaderResources::captureValidation() {
     for (std::size_t i = 0; i < textures.size(); ++i) {
         if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, true};
     }
-    lookupLog.clear();
+    lookupLog().clear();
 }
 
 // Proves every texture and storage image still current without repeating its lookup: exactly the
@@ -1752,12 +1760,17 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     if (!textures.empty() && depthHoldingSeen != DepthHoldingGeneration()) return fail(FastFail::Changed);
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
-    thread_local std::vector<GuestMemory::UnchangedQuery> queries;
-    thread_local std::vector<StorageTexture::PendingQuery> pending;
+    thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
+    auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
+    thread_local std::vector<StorageTexture::PendingQuery>* pendingSlot = nullptr;
+    auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
     // The element each pending query stands for, in query order.
-    thread_local std::vector<PendingOverlap> owners;
-    thread_local std::vector<const StorageTexture*> images;
-    thread_local std::vector<DccKeys> scannedKeys;
+    thread_local std::vector<PendingOverlap>* ownersSlot = nullptr;
+    auto& owners = ShaderRecompiler::ThreadOwned(ownersSlot);
+    thread_local std::vector<const StorageTexture*>* imagesSlot = nullptr;
+    auto& images = ShaderRecompiler::ThreadOwned(imagesSlot);
+    thread_local std::vector<DccKeys>* scannedKeysSlot = nullptr;
+    auto& scannedKeys = ShaderRecompiler::ThreadOwned(scannedKeysSlot);
     queries.clear();
     pending.clear();
     owners.clear();
@@ -2031,7 +2044,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // they must hand back the very objects the set's views belong to. The build appended them stage
     // by stage, binding by binding, so the walk repeats that order.
     const auto fullWalk = [&] {
-        lookupLog.clear();
+        lookupLog().clear();
         std::size_t textureIndex = 0;
         std::size_t storageIndex = 0;
         for (const auto& shader : shaders) {
@@ -2067,8 +2080,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         captureValidation();
         return true;
     };
-    thread_local std::vector<PendingOverlap> overlapping;
-    thread_local std::vector<PendingOverlap> refreshed;
+    thread_local std::vector<PendingOverlap>* overlappingSlot = nullptr;
+    auto& overlapping = ShaderRecompiler::ThreadOwned(overlappingSlot);
+    thread_local std::vector<PendingOverlap>* refreshedSlot = nullptr;
+    auto& refreshed = ShaderRecompiler::ThreadOwned(refreshedSlot);
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
@@ -2120,7 +2135,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             // The walk after the refresh, or beside a proof that accepted a foreign overlap, must
             // find every object in place and current: another object, or an upload (a moved
             // content version), is a decision the proof got wrong.
-            thread_local std::vector<std::pair<const StorageTexture*, std::uint64_t>> versions;
+            thread_local std::vector<std::pair<const StorageTexture*, std::uint64_t>>* versionsSlot = nullptr;
+            auto& versions = ShaderRecompiler::ThreadOwned(versionsSlot);
             versions.clear();
             for (const auto& surface : validatedTextures) {
                 if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
@@ -2153,7 +2169,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     };
     if (EpochRevalidate()) {
         if (!directRegions.empty() && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
-            thread_local std::vector<StorageTexture::PendingQuery> regions;
+            thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;
+            auto& regions = ShaderRecompiler::ThreadOwned(regionsSlot);
             regions.clear();
             for (const auto& region : directRegions) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
             StorageTexture::ScanPending(regions);

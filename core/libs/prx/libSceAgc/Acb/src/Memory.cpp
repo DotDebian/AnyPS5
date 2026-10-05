@@ -31,8 +31,7 @@ std::uint32_t* APS5_VABI sceAgcAcbDmaData(CommandBuffer* buf, std::uint8_t dst, 
 }
 
 std::uint32_t APS5_VABI sceAgcAcbDmaDataGetSize() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return 28;
 }
 
 std::uint32_t* APS5_VABI sceAgcAcbAtomicMem(CommandBuffer* buf, std::uint8_t atomicOp, std::uint8_t command, std::uint8_t cachePolicy, const volatile void* address, std::uint64_t srcData, std::uint64_t compareData, std::uint16_t loopInterval) {

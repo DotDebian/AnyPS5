@@ -57,8 +57,6 @@ bool isLaneLocal(IrOpcode opcode) {
         case IrOpcode::CompositeExtractU32x3:
         case IrOpcode::CompositeExtractU32x4:
         case IrOpcode::PackHalf2x16:
-        case IrOpcode::PackSnorm2x16:
-        case IrOpcode::PackUnorm2x16:
         case IrOpcode::PackFloat2x16Rtz:
         case IrOpcode::BitFieldInsert:
         case IrOpcode::BitFieldUExtract:
@@ -151,7 +149,6 @@ bool isLaneLocal(IrOpcode opcode) {
         case IrOpcode::FPCos:
         case IrOpcode::FPExp2:
         case IrOpcode::FPLog2:
-        case IrOpcode::FPLdexp:
         case IrOpcode::FPRoundEven32:
         case IrOpcode::FPFloor32:
         case IrOpcode::FPCeil32:

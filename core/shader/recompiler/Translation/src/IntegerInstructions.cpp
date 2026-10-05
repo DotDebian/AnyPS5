@@ -84,11 +84,19 @@ bool TranslationContext::packedInteger16Shift(const RdnaInstruction& inst, IrOpc
     return true;
 }
 
-bool TranslationContext::packedInteger16Binary(const RdnaInstruction& inst, IrOpcode opcode) {
+IrU32 TranslationContext::saturateInteger16(const RdnaOperand& destination, IrU32 value, bool sign) {
+    if (!destination.clamp) {
+        return value;
+    }
+    IrValue& lower = ir.Emit(IrOpcode::SMax32, IrType::U32, {&value.Value(), &ir.Constant(sign ? 0xffff8000u : 0u)});
+    return IrU32(ir.Emit(IrOpcode::SMin32, IrType::U32, {&lower, &ir.Constant(sign ? 0x7fffu : 0xffffu)}));
+}
+
+bool TranslationContext::packedInteger16Binary(const RdnaInstruction& inst, IrOpcode opcode, bool sign) {
     const auto translateLane = [&](bool highLane) {
-        const IrU32 lhs = readU16LaneAsU32(sourceAt(inst, 0u), highLane, false);
-        const IrU32 rhs = readU16LaneAsU32(sourceAt(inst, 1u), highLane, false);
-        return IrU32(ir.Emit(opcode, IrType::U32, {&lhs.Value(), &rhs.Value()}));
+        const IrU32 lhs = readU16LaneAsU32(sourceAt(inst, 0u), highLane, sign);
+        const IrU32 rhs = readU16LaneAsU32(sourceAt(inst, 1u), highLane, sign);
+        return saturateInteger16(inst.destination, IrU32(ir.Emit(opcode, IrType::U32, {&lhs.Value(), &rhs.Value()})), sign);
     };
     const IrU32 low = translateLane(false);
     const IrU32 high = translateLane(true);
@@ -99,11 +107,14 @@ bool TranslationContext::packedInteger16Binary(const RdnaInstruction& inst, IrOp
 
 bool TranslationContext::packedInteger16Mad(const RdnaInstruction& inst, bool sign) {
     const auto translateLane = [&](bool highLane) {
-        const IrU32 lhs = readU16LaneAsU32(sourceAt(inst, 0u), highLane, false);
-        const IrU32 rhs = readU16LaneAsU32(sourceAt(inst, 1u), highLane, false);
-        const IrU32 product(ir.IMul(lhs.Value(), rhs.Value()));
+        const IrU32 lhs = readU16LaneAsU32(sourceAt(inst, 0u), highLane, sign);
+        const IrU32 rhs = readU16LaneAsU32(sourceAt(inst, 1u), highLane, sign);
+        IrU32 product(ir.IMul(lhs.Value(), rhs.Value()));
+        if (inst.destination.clamp && !sign) {
+            product = IrU32(ir.Emit(IrOpcode::UMin32, IrType::U32, {&product.Value(), &ir.Constant(0xffffu)}));
+        }
         const IrU32 addend = readU16LaneAsU32(sourceAt(inst, 2u), highLane, sign);
-        return IrU32(ir.IAdd(product.Value(), addend.Value()));
+        return saturateInteger16(inst.destination, IrU32(ir.IAdd(product.Value(), addend.Value())), sign);
     };
     const IrU32 low = translateLane(false);
     const IrU32 high = translateLane(true);
@@ -325,10 +336,24 @@ bool TranslationContext::vMad64x32(const RdnaInstruction& inst, bool sign) {
     const IrU32 carryLowU32(ir.Select(carryLow.Value(), ir.Constant(1u), ir.Constant(0u)));
     const IrU32 high(ir.IAdd(high0.Value(), carryLowU32.Value()));
     const IrU1 carry1(ir.ULessThan(high.Value(), high0.Value()));
-    const IrU64 result(ir.ConstructU64(low.Value(), high.Value()));
+    const IrU1 carry(ir.LogicalOr(carry0.Value(), carry1.Value()));
+    IrU32 resultLow = low;
+    IrU32 resultHigh = high;
+    if (inst.destination.clamp) {
+        if (sign) {
+            IrValue& flipped = ir.BitwiseAnd(ir.BitwiseXor(mulHigh.Value(), high.Value()), ir.BitwiseXor(add[1].Value(), high.Value()));
+            const IrU1 overflow(ir.INotEqual(ir.ShiftRightLogical(flipped, ir.Constant(31u)), ir.Constant(0u)));
+            IrValue& addSign = ir.ShiftRightArithmetic(add[1].Value(), ir.Constant(31u));
+            resultLow = IrU32(ir.Select(overflow.Value(), ir.BitwiseXor(addSign, ir.Constant(0xffffffffu)), low.Value()));
+            resultHigh = IrU32(ir.Select(overflow.Value(), ir.BitwiseXor(addSign, ir.Constant(0x7fffffffu)), high.Value()));
+        } else {
+            resultLow = IrU32(ir.Select(carry.Value(), ir.Constant(0xffffffffu), low.Value()));
+            resultHigh = IrU32(ir.Select(carry.Value(), ir.Constant(0xffffffffu), high.Value()));
+        }
+    }
+    const IrU64 result(ir.ConstructU64(resultLow.Value(), resultHigh.Value()));
     writeOperand(inst.destination, &result.Value());
     if (inst.destination2.kind != RdnaOperandKind::Null && inst.destination2.kind != RdnaOperandKind::Unknown) {
-        const IrU1 carry(ir.LogicalOr(carry0.Value(), carry1.Value()));
         if (!sign) {
             writeMask(inst.destination2, carry);
             return true;
@@ -791,17 +816,9 @@ bool TranslationContext::vCndmaskB32(const RdnaInstruction& inst) {
     const IrU1 condition = readMask(maskOperand);
     const RdnaOperand& falseOperand = sourceAt(inst, 0u);
     const RdnaOperand& trueOperand = sourceAt(inst, 1u);
-    IrValue* result = nullptr;
-    if (falseOperand.negate || falseOperand.absolute || trueOperand.negate || trueOperand.absolute) {
-        IrValue* falseValue = readOperand(falseOperand, IrType::F32);
-        IrValue* trueValue = readOperand(trueOperand, IrType::F32);
-        result = &ir.Emit(IrOpcode::SelectF32, IrType::F32, {&condition.Value(), trueValue, falseValue});
-    } else {
-        const IrU32 falseValue = readU32(falseOperand);
-        const IrU32 trueValue = readU32(trueOperand);
-        result = &ir.Select(condition.Value(), trueValue.Value(), falseValue.Value());
-    }
-    writeOperand(inst.destination, result);
+    const IrU32 falseValue = readU32(falseOperand);
+    const IrU32 trueValue = readU32(trueOperand);
+    writeOperand(inst.destination, &ir.Select(condition.Value(), trueValue.Value(), falseValue.Value()));
     return true;
 }
 

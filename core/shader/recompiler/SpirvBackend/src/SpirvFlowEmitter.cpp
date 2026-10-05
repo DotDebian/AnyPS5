@@ -3,6 +3,7 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvWaveExchange.hpp"
 #include <array>
+#include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -154,12 +155,41 @@ bool IsContinueTarget(const IrProgram& program, std::uint32_t block) {
     return false;
 }
 
-std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& info) {
+std::uint32_t EmitWaveAny(SpirvEmitterState& state, std::uint32_t predicate) {
+    const auto ballot = state.module.AllocateId();
+    state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4u), ballot, ConstantU32(state, spv::ScopeSubgroup), predicate);
+    const auto wave = EmitWaveBallot(state, ballot);
+    const auto low = state.module.AllocateId();
+    const auto high = state.module.AllocateId();
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, wave, 0u);
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, wave, 1u);
+    state.module.AddFunction(spv::OpINotEqual, TypeBool(state), result, EmitBinaryU32(state, spv::OpBitwiseOr, low, high), ConstantU32(state, 0u));
+    return result;
+}
+
+std::uint32_t EmitWaveMaskBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& info) {
+    auto& state = ctx.state;
     const auto kind = info.terminator.condition;
-    if (ctx.state.splitWave && (kind == BranchCondition::ExecZero || kind == BranchCondition::ExecNonZero || kind == BranchCondition::VccZero || kind == BranchCondition::VccNonZero)) {
+    if (kind == BranchCondition::ExecNonZero || kind == BranchCondition::VccNonZero) {
+        return EmitWaveAny(state, ctx.Def(info.condition));
+    }
+    const auto clear = state.module.AllocateId();
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLogicalNot, TypeBool(state), clear, ctx.Def(info.condition));
+    state.module.AddFunction(spv::OpLogicalNot, TypeBool(state), result, EmitWaveAny(state, clear));
+    return result;
+}
+
+std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& info) {
+    const auto condition = info.terminator.condition;
+    if (ctx.state.splitWave && IsWaveMaskBranch(condition)) {
         return EmitSplitWaveBranchCondition(ctx, info);
     }
-    if (ctx.otherHalf == nullptr || info.terminator.condition == BranchCondition::ScalarInstruction || info.terminator.condition == BranchCondition::GotoVariable || info.terminator.condition == BranchCondition::IndirectTarget) {
+    if (ctx.otherHalf == nullptr && IsWaveMaskBranch(condition)) {
+        return EmitWaveMaskBranchCondition(ctx, info);
+    }
+    if (ctx.otherHalf == nullptr || condition == BranchCondition::ScalarInstruction || condition == BranchCondition::GotoVariable || condition == BranchCondition::IndirectTarget) {
         return ctx.Def(info.condition);
     }
     auto& state = ctx.state;
@@ -169,6 +199,7 @@ std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& i
     const auto result = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0u);
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1u);
+    const auto kind = info.terminator.condition;
     const bool zero = kind == BranchCondition::ExecZero || kind == BranchCondition::VccZero || kind == BranchCondition::SccZero;
     const auto combined = EmitBinaryU32(state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
     state.module.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result, combined, ConstantU32(state, zero ? ~0u : 0u));
@@ -351,8 +382,6 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::CompositeExtractU32x3: return Invoke(EmitCompositeExtractU32x3, ctx, inst);
         case IrOpcode::CompositeExtractU32x4: return Invoke(EmitCompositeExtractU32x4, ctx, inst);
         case IrOpcode::PackHalf2x16: return Invoke(EmitPackHalf2x16, ctx, inst);
-        case IrOpcode::PackSnorm2x16: return Invoke(EmitPackSnorm2x16, ctx, inst);
-        case IrOpcode::PackUnorm2x16: return Invoke(EmitPackUnorm2x16, ctx, inst);
         case IrOpcode::PackFloat2x16Rtz: return Invoke(EmitPackFloat2x16Rtz, ctx, inst);
         case IrOpcode::FPAbs32: return Invoke(EmitFPAbs32, ctx, inst);
         case IrOpcode::FPNeg32: return Invoke(EmitFPNeg32, ctx, inst);
@@ -451,7 +480,6 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPCos: return Invoke(EmitFPCos, ctx, inst);
         case IrOpcode::FPExp2: return Invoke(EmitFPExp2, ctx, inst);
         case IrOpcode::FPLog2: return Invoke(EmitFPLog2, ctx, inst);
-        case IrOpcode::FPLdexp: return Invoke(EmitFPLdexp, ctx, inst);
         case IrOpcode::FPRoundEven32: return Invoke(EmitFPRoundEven32, ctx, inst);
         case IrOpcode::FPFloor32: return Invoke(EmitFPFloor32, ctx, inst);
         case IrOpcode::FPCeil32: return Invoke(EmitFPCeil32, ctx, inst);
@@ -460,6 +488,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPAdd64: return Invoke(EmitFPAdd64, ctx, inst);
         case IrOpcode::FPMul64: return Invoke(EmitFPMul64, ctx, inst);
         case IrOpcode::FPFma64: return Invoke(EmitFPFma64, ctx, inst);
+        case IrOpcode::FPFmaScale64: return Invoke(EmitFPFmaScale64, ctx, inst);
         case IrOpcode::FPMin64: return Invoke(EmitFPMin64, ctx, inst);
         case IrOpcode::FPMax64: return Invoke(EmitFPMax64, ctx, inst);
         case IrOpcode::FPSaturate64: return Invoke(EmitFPSaturate64, ctx, inst);
@@ -471,6 +500,10 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::FPFract64: return Invoke(EmitFPFract64, ctx, inst);
         case IrOpcode::FPFrexpMant64: return Invoke(EmitFPFrexpMant64, ctx, inst);
         case IrOpcode::FPFrexpExp64: return Invoke(EmitFPFrexpExp64, ctx, inst);
+        case IrOpcode::FPRcp64: return Invoke(EmitFPRcp64, ctx, inst);
+        case IrOpcode::FPRsq64: return Invoke(EmitFPRsq64, ctx, inst);
+        case IrOpcode::FPSqrt64: return Invoke(EmitFPSqrt64, ctx, inst);
+        case IrOpcode::FPTrigPreop64: return Invoke(EmitFPTrigPreop64, ctx, inst);
         case IrOpcode::ConvertF32F64: return Invoke(EmitConvertF32F64, ctx, inst);
         case IrOpcode::ConvertF64F32: return Invoke(EmitConvertF64F32, ctx, inst);
         case IrOpcode::ConvertF64S32: return Invoke(EmitConvertF64S32, ctx, inst);
@@ -500,6 +533,38 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::StoreAddressU8: return Invoke(EmitStoreAddressU8, ctx, inst);
         case IrOpcode::StoreAddressU16: return Invoke(EmitStoreAddressU16, ctx, inst);
         case IrOpcode::StoreAddressU32: return Invoke(EmitStoreAddressU32, ctx, inst);
+        case IrOpcode::AddressAtomicSwap32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicCmpSwap32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicIAdd32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicISub32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicSMin32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicUMin32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicSMax32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicUMax32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicAnd32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicOr32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicXor32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicInc32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicDec32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicSwap64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicCmpSwap64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicIAdd64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicISub64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicSMin64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicUMin64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicSMax64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicUMax64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicAnd64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicOr64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicXor64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFCmpSwap32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFMin32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFMax32: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFCmpSwap64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFMin64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicFMax64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicInc64: return Invoke(EmitAddressAtomic, ctx, inst);
+        case IrOpcode::AddressAtomicDec64: return Invoke(EmitAddressAtomic, ctx, inst);
         case IrOpcode::LoadBufferU8: return Invoke(EmitLoadBufferU8, ctx, inst);
         case IrOpcode::LoadBufferU16: return Invoke(EmitLoadBufferU16, ctx, inst);
         case IrOpcode::LoadBufferU32: return Invoke(EmitLoadBufferU32, ctx, inst);
@@ -526,6 +591,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::BufferAtomicOr64: return Invoke(EmitBufferAtomicOr64, ctx, inst);
         case IrOpcode::BufferAtomicInc32: return Invoke(EmitBufferAtomicInc32, ctx, inst);
         case IrOpcode::BufferAtomicDec32: return Invoke(EmitBufferAtomicDec32, ctx, inst);
+        case IrOpcode::BufferAtomicUSubSat32: return Invoke(EmitBufferAtomicUSubSat32, ctx, inst);
         case IrOpcode::BufferAtomicIAdd64: return Invoke(EmitBufferAtomicIAdd64, ctx, inst);
         case IrOpcode::BufferAtomicISub64: return Invoke(EmitBufferAtomicISub64, ctx, inst);
         case IrOpcode::BufferAtomicSMin64: return Invoke(EmitBufferAtomicSMin64, ctx, inst);
@@ -576,6 +642,24 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::SharedAtomicCmpstF32: return Invoke(EmitSharedAtomicCmpstF32, ctx, inst);
         case IrOpcode::SharedAtomicMskor32: return Invoke(EmitSharedAtomicMskor32, ctx, inst);
         case IrOpcode::SharedAtomicWrap32: return Invoke(EmitSharedAtomicWrap32, ctx, inst);
+        case IrOpcode::SharedAtomicSwap64: return Invoke(EmitSharedAtomicSwap64, ctx, inst);
+        case IrOpcode::SharedAtomicIAdd64: return Invoke(EmitSharedAtomicIAdd64, ctx, inst);
+        case IrOpcode::SharedAtomicISub64: return Invoke(EmitSharedAtomicISub64, ctx, inst);
+        case IrOpcode::SharedAtomicRsub64: return Invoke(EmitSharedAtomicRsub64, ctx, inst);
+        case IrOpcode::SharedAtomicInc64: return Invoke(EmitSharedAtomicInc64, ctx, inst);
+        case IrOpcode::SharedAtomicDec64: return Invoke(EmitSharedAtomicDec64, ctx, inst);
+        case IrOpcode::SharedAtomicSMin64: return Invoke(EmitSharedAtomicSMin64, ctx, inst);
+        case IrOpcode::SharedAtomicUMin64: return Invoke(EmitSharedAtomicUMin64, ctx, inst);
+        case IrOpcode::SharedAtomicSMax64: return Invoke(EmitSharedAtomicSMax64, ctx, inst);
+        case IrOpcode::SharedAtomicUMax64: return Invoke(EmitSharedAtomicUMax64, ctx, inst);
+        case IrOpcode::SharedAtomicAnd64: return Invoke(EmitSharedAtomicAnd64, ctx, inst);
+        case IrOpcode::SharedAtomicOr64: return Invoke(EmitSharedAtomicOr64, ctx, inst);
+        case IrOpcode::SharedAtomicXor64: return Invoke(EmitSharedAtomicXor64, ctx, inst);
+        case IrOpcode::SharedAtomicFMin64: return Invoke(EmitSharedAtomicFMin64, ctx, inst);
+        case IrOpcode::SharedAtomicFMax64: return Invoke(EmitSharedAtomicFMax64, ctx, inst);
+        case IrOpcode::SharedAtomicCmpst64: return Invoke(EmitSharedAtomicCmpst64, ctx, inst);
+        case IrOpcode::SharedAtomicCmpstF64: return Invoke(EmitSharedAtomicCmpstF64, ctx, inst);
+        case IrOpcode::SharedAtomicMskor64: return Invoke(EmitSharedAtomicMskor64, ctx, inst);
         case IrOpcode::DataAppend: return Invoke(EmitDataAppend, ctx, inst);
         case IrOpcode::DataConsume: return Invoke(EmitDataConsume, ctx, inst);
         case IrOpcode::SwizzleU32: return Invoke(EmitSwizzleU32, ctx, inst);
@@ -599,6 +683,9 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::ImageAtomicSMax32: return Invoke(EmitImageAtomicSMax32, ctx, inst);
         case IrOpcode::ImageAtomicInc32: return Invoke(EmitImageAtomicInc32, ctx, inst);
         case IrOpcode::ImageAtomicDec32: return Invoke(EmitImageAtomicDec32, ctx, inst);
+        case IrOpcode::ImageAtomicFCmpSwap32: return Invoke(EmitImageAtomicFCmpSwap32, ctx, inst);
+        case IrOpcode::ImageAtomicFMin32: return Invoke(EmitImageAtomicFMin32, ctx, inst);
+        case IrOpcode::ImageAtomicFMax32: return Invoke(EmitImageAtomicFMax32, ctx, inst);
         case IrOpcode::GetAttribute: return Invoke(EmitGetAttribute, ctx, inst);
         case IrOpcode::GetInterpolationParameter: return Invoke(EmitGetInterpolationParameter, ctx, inst);
         case IrOpcode::SetAttribute: return Invoke(EmitSetAttribute, ctx, inst);

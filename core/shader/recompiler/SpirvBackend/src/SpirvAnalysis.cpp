@@ -289,13 +289,13 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
     SpirvRequirements requirements {};
     for (const IrBlock* block : program.BlockOrder()) {
         for (const IrValue* inst : block->Instructions()) {
-            if (BufferAccessOf(inst->Opcode()) == BufferAccess::Atomic && inst->Type() == IrType::U64) {
+            const auto addressAccess = AddressOpcodeInfoOf(inst->Opcode()).access;
+            if ((BufferAccessOf(inst->Opcode()) == BufferAccess::Atomic || addressAccess == AddressAccess::Atomic) && inst->Type() == IrType::U64) {
                 requirements.bufferInt64Atomics = true;
             }
             if (IsFloat64Opcode(inst->Opcode())) {
                 requirements.float64 = true;
             }
-            const auto addressAccess = AddressOpcodeInfoOf(inst->Opcode()).access;
             if (addressAccess != AddressAccess::None) {
                 const auto memoryIndex = inst->Flags<MemoryFlags>().index;
                 if (memoryIndex >= program.Resources().memoryInfo.size()) {
@@ -306,8 +306,6 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                         throw std::runtime_error("scratch operation has no per-thread storage");
                     }
                     requirements.functionScratch = true;
-                } else if (addressAccess == AddressAccess::Write) {
-                    throw std::runtime_error("writable FLAT/GLOBAL addresses require GPU ownership tracking");
                 }
             }
             if (BufferAccessOf(inst->Opcode()) != BufferAccess::None) {
@@ -335,6 +333,9 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                 }
             }
             const auto sharedAccess = SharedAccessOf(inst->Opcode());
+            if (sharedAccess == SharedAccess::Atomic && inst->Type() == IrType::U64) {
+                requirements.sharedInt64Atomics = true;
+            }
             if (sharedAccess != SharedAccess::None) {
                 const auto index = inst->Flags<MemoryFlags>().index;
                 if (index >= program.Resources().memoryInfo.size()) {
@@ -346,6 +347,8 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
                 }
                 if (program.Resources().stage != IrShaderStage::Compute && program.Resources().stage != IrShaderStage::Mesh && kind == ResourceKind::Lds) {
                     requirements.functionLds = true;
+                } else if (sharedAccess == SharedAccess::Atomic && inst->Type() == IrType::U64 && kind == ResourceKind::Lds) {
+                    requirements.ldsLock = true;
                 }
                 if (sharedAccess == SharedAccess::Append || sharedAccess == SharedAccess::Consume) {
                     requirements.subgroupBallot = true;
@@ -420,7 +423,16 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
             requirements.functionLdsDwords = static_cast<std::uint32_t>(std::max<std::uint64_t>((needed + 63u) & ~63ull, 64u));
         }
     }
+    for (const auto& info : program.Metadata().blockInfo) {
+        if (info.terminator.kind == TerminatorKind::ConditionalBranch && IsWaveMaskBranch(info.terminator.condition)) {
+            requirements.subgroupBallot = true;
+        }
+    }
     return requirements;
+}
+
+bool IsWaveMaskBranch(BranchCondition condition) {
+    return condition == BranchCondition::ExecZero || condition == BranchCondition::ExecNonZero || condition == BranchCondition::VccZero || condition == BranchCondition::VccNonZero;
 }
 
 std::unordered_set<const IrValue*> WaveUniformValues(const IrProgram& program) {

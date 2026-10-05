@@ -153,6 +153,7 @@ struct Context {
     VkBuffer gdsBuffer = VK_NULL_HANDLE;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     bool memoryBudget = false;
+    bool pipelineExecutableInfo = false;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

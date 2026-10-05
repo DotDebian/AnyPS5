@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureResidency.hpp"
+#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -109,7 +110,8 @@ void Driver::execute(const Submission& submission) {
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
-    thread_local PacketProfile packetProfile;
+    thread_local PacketProfile* packetProfileSlot = nullptr;
+    auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
     ++packetProfile.submissions;
 
     bumpEpoch(&EpochBumps::submissions);

@@ -5,6 +5,7 @@
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
 #include "SpirvBackend/SpirvWaveExchange.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvModuleSetup.hpp"
+#include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -134,7 +135,7 @@ std::uint32_t SpirvValueEmitContext::Ballot(const IrValue* predicate) {
     const auto low = state.module.AllocateId();
     state.module.AddFunction(spv::OpGroupNonUniformBallot, ballotType, low, scope, otherHalf == nullptr || half == 0u ? Def(predicate) : otherHalf->Def(predicate));
     if (otherHalf == nullptr) {
-        return low;
+        return EmitWaveBallot(state, low);
     }
     const auto high = state.module.AllocateId();
     const auto lowWord = state.module.AllocateId();
@@ -179,7 +180,7 @@ std::uint32_t SpirvValueEmitContext::Shuffle(const IrValue& inst, std::size_t in
     if (otherHalf == nullptr) {
         // SingleLane: `lane` is in this invocation's half (the callers' lanes stay within 32).
         const auto physical = state.splitWave ? EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31u)) : lane;
-        state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index), physical);
+        state.module.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index), EmitHostSubgroupLane(state, physical));
         return low;
     }
     const auto physicalLane = EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31u));
@@ -268,6 +269,8 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.supportedCapabilities = target.supportedCapabilities;
     state.supportedExtensions = target.supportedExtensions;
     state.nonConstantImageOffsets = target.nonConstantImageOffsets;
+    state.splitSubgroup = program.WaveSize() == 32u && target.subgroupSize > 32u;
+    if (state.splitSubgroup && (state.requirements.subgroupBallot || state.requirements.subgroupShuffle)) state.requirements.subgroupLocalInvocationId = true;
     const auto* workgroup = ShaderWorkgroupInputFor(state);
     const bool splitHost = workgroup != nullptr && program.WaveSize() == 64u && workgroup->hostSubgroupSize == 32u;
     state.laneCount = splitHost && !workgroup->singleLane ? 2u : 1u;

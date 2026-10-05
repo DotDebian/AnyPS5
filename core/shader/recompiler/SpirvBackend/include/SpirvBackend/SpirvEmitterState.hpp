@@ -82,6 +82,7 @@ struct SpirvEmitterState {
 
     SpirvRequirements requirements;
     std::uint32_t laneCount = 1;
+    bool splitSubgroup = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     // WaveLayout::SingleLane (see SpirvWaveExchange.hpp): each guest wave64 spans two host

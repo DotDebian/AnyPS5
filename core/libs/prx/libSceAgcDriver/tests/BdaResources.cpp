@@ -336,7 +336,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         {
             ShaderResources resources(context, compiled, snapshots);
             faultWords()[Abi::WrittenOverflowWord] = 1;
-            reject([&] { resources.WriteBack(); }, "pages stored to through GPU-selected buffer descriptors");
+            reject([&] { resources.WriteBack(); }, "pages stored to through the BDA table");
             faultWords()[Abi::WrittenOverflowWord] = 0;
             resources.WriteBack();
         }
