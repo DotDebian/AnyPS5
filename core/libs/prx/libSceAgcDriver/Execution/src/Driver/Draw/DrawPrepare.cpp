@@ -140,6 +140,7 @@ ShaderMemory::PendingWrite Driver::pendingOverlap(std::uint64_t address, std::si
 }
 
 bool Driver::recheckPreparedDraw(const PreparedDraw& prepared, std::uint64_t deviceSerial) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::Recheck);
     aheadRechecks.fetch_add(1, std::memory_order_relaxed);
     const auto fail = [&](AheadRecheck reason) {
         aheadRecheckFailures[reason].fetch_add(1, std::memory_order_relaxed);

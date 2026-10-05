@@ -135,6 +135,32 @@ void CheckCollectMemo() {
     CollectWrites(base, 4096);
     Require(!UnchangedSince(base, 4096, first), "a collect of an earlier epoch answered after the ordering point");
 }
+
+// Gap walks: a memoized collect over pages the epoch walked in part walks the others alone.
+void CheckGapWalks() {
+    void* memory = AllocateWatched(4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 4 * Block);
+    BumpCollectEpoch();
+    const auto first = CollectWrites(base, Block);
+    Require(first != 0, "the gap block is not collected");
+    static_cast<volatile std::uint8_t*>(memory)[8] = 0x5a;
+    static_cast<volatile std::uint8_t*>(memory)[Block + 8] = 0x5a;
+    static_cast<volatile std::uint8_t*>(memory)[3 * Block + 8] = 0x5a;
+    CollectWrites(base + 3 * Block, Block);
+    Require(CollectWrites(base, 4 * Block) != 0, "a collect over a partly walked range failed");
+    Require(UnchangedSince(base, Block, first), "pages walked earlier in the epoch were walked again");
+    Require(!UnchangedSince(base + Block, Block, first), "the pages between two walked ranges were not walked");
+    Require(!UnchangedSince(base + 3 * Block, Block, first), "a write before the range's first walk of the epoch was not seen");
+    static_cast<volatile std::uint8_t*>(memory)[2 * Block + 8] = 0x5a;
+    const auto whole = CollectWrites(base, 4 * Block);
+    Require(UnchangedSince(base + 2 * Block, Block, whole) && whole != 0, "a range walked whole by pieces was walked again");
+    CollectWritesUncached(base, Block);
+    Require(!UnchangedSince(base, Block, first), "an uncached collect skipped pages the epoch had walked");
+    BumpCollectEpoch();
+    const auto next = CollectWrites(base, 4 * Block);
+    Require(!UnchangedSince(base + 2 * Block, Block, whole) && next != 0, "the next epoch did not walk the range");
+}
 }
 
 int main() {
@@ -146,6 +172,7 @@ int main() {
         CheckSharedBlock();
         CheckOwnStore();
         CheckCollectMemo();
+        CheckGapWalks();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

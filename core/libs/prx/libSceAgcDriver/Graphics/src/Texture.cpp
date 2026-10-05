@@ -1214,6 +1214,7 @@ LookupOutcomes& ThreadLookupOutcomes() {
 }
 
 bool StorageTexture::Refresh() {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::StorageRefresh, false);
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (refreshProved()) {
@@ -2890,6 +2891,7 @@ bool StorageTexture::blocksKept(std::span<const std::shared_ptr<StorageTexture>>
 }
 
 void StorageTexture::ClassifyAccess(std::uint64_t address, std::size_t bytes, AccessClassification& out) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::Hook, false);
     out = {};
     const auto overlapping = overlappingPending(address, bytes);
     if (overlapping.empty()) return;
@@ -2906,6 +2908,7 @@ void StorageTexture::ClassifyAccess(std::uint64_t address, std::size_t bytes, Ac
 }
 
 bool StorageTexture::AccessKeptByCpu(std::uint64_t address, std::size_t bytes, std::size_t* images, std::size_t* evicted) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::Hook, false);
     if (evicted != nullptr) *evicted = 0;
     const auto overlapping = overlappingPending(address, bytes);
     if (images != nullptr) *images = overlapping.size();
@@ -3804,6 +3807,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
 }
 
 void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::WriteBack);
     // Block units are stored per access; an image whose units keep being asked for in pieces (a
     // consumer touching it through many small ranges, each piece re-arming the pending memos of
     // the next dispatch) stores every pending unit once more than `pieces` partial stores fall
@@ -3846,6 +3850,7 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::WriteBack);
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;

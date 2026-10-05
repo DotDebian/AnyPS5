@@ -781,6 +781,7 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
         const auto begin = mirrors[first]->base;
         const auto bytes = mirrors[last - 1]->base + mirrors[last - 1]->bytes - begin;
         prepareRange(begin, bytes);
+        const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::AddressSpace);
         const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes));
         Require(generation != 0, "a heap mirror's range is no longer write-watched");
         for (auto index = first; index < last; ++index) {
@@ -833,6 +834,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     mirror->range = range;
     if (heap) {
         prepareRefresh(*mirror, range->address, range->bytes);
+        const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::AddressSpace);
         const auto generation = GuestMemory::CollectWrites(range->address, range->bytes);
         constexpr std::uint64_t block = 65536;
         mirror->generations.assign(static_cast<std::size_t>(((range->address + range->bytes + block - 1) / block) - range->address / block), generation);
@@ -1947,6 +1949,7 @@ std::shared_ptr<Buffer> takeStagingBuffer(const Context& context, std::uint64_t 
 // Starts a use of the shadow under GuestMemory::GpuMutex, after the queued stores over its range
 // were recorded: nothing when the proof above holds (no copy-in), else why the copy-in is made.
 std::optional<ResidentCopyIn> beginResidentUse(ResidentShadow& shadow) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::Staging);
     const auto collected = GuestMemory::CollectWritesUncached(shadow.begin, static_cast<std::size_t>(shadow.end - shadow.begin));
     std::optional<ResidentCopyIn> reason;
     if (collected == 0) {

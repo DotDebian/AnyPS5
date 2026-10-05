@@ -227,6 +227,8 @@ void ReportSyncTrace(std::chrono::steady_clock::time_point now) {
     std::fprintf(stderr, "[synctrace] %.1f s: %llu frames, %llu submits, %.0f ms waited for the GPU under the mutex or in the hook, %llu unlocked serial waits %.0f ms%s; by thread (count/wait):%s; top sites (source@caller syncs/batches/wait):%s\n", seconds, static_cast<unsigned long long>(frames), static_cast<unsigned long long>(trace.submits), waitedMs, static_cast<unsigned long long>(serialWaits), serialUs / 1000.0, report.c_str(), ThreadSyncReport().c_str(), SyncSiteReport().c_str());
     // The same window's collect epochs and write-watch walks (GuestMemory::CollectTraceReport).
     std::fprintf(stderr, "[synctrace] %.1f s, %llu frames: %s\n", seconds, static_cast<unsigned long long>(frames), GuestMemory::CollectTraceReport().c_str());
+    // And who walked (GuestMemory::WalkTraceReport).
+    std::fprintf(stderr, "[synctrace] %.1f s, %llu frames: %s\n", seconds, static_cast<unsigned long long>(frames), GuestMemory::WalkTraceReport().c_str());
     {
         std::lock_guard lock(threadSyncsMutex);
         threadSyncs.clear();
@@ -2918,7 +2920,10 @@ std::shared_ptr<Buffer> Recorder::CollectedDrawSnapshot(std::uint64_t address, s
         generation = GuestMemory::WatchedGeneration(address, bytes);
         return {};
     }
-    generation = GuestMemory::CollectWrites(address, bytes);
+    {
+        const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::DrawSnapshot);
+        generation = GuestMemory::CollectWrites(address, bytes);
+    }
     return reuseDrawSnapshot(found, address, bytes, SnapshotUse::Storage, nullptr, generation);
 }
 
@@ -3716,6 +3721,7 @@ void Recorder::Submit() {
     if (FlipReadCheck()) {
         // A CPU write into a noted read after this collect (and so possibly before the GPU read
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
+        const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::BatchReads);
         for (const auto& read : open->reads) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(read.begin, read.end - read.begin));
     }
     auto batch = std::move(open);

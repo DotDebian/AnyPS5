@@ -561,6 +561,7 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
     const auto count = static_cast<std::size_t>(guestBytes / KeyBytes);
     // The collect precedes the scan: a write landing between them is stamped above `collected`, so
     // the proof it would invalidate is never taken as current.
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::DccKeys, false);
     const auto collected = count == 0 ? 0 : GuestMemory::CollectWrites(resource.dccAddress, count);
     if (proof.generation != 0 && collected != 0 && GuestMemory::UnchangedSince(resource.dccAddress, count, proof.generation)) {
         counters.proved.fetch_add(1, std::memory_order_relaxed);
@@ -601,6 +602,7 @@ DccKeys ProvedCurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceByt
     const auto count = static_cast<std::size_t>(surfaceBytes / KeyBytes);
     if (metaAddress == 0 || count == 0 || !RangeKeyProofs() || !GuestMemory::GpuMutex().HeldByThisThread()) return CurrentDccKeys(metaAddress, surfaceBytes);
     auto& counters = Proofs();
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::DccKeys, false);
     const auto collected = GuestMemory::CollectWrites(metaAddress, count);
     if (proof.generation != 0 && proof.address == metaAddress && proof.count == count && collected != 0 && GuestMemory::UnchangedSince(metaAddress, count, proof.generation)) {
         counters.rangeProved.fetch_add(1, std::memory_order_relaxed);

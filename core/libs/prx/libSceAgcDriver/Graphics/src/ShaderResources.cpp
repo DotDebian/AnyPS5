@@ -1277,6 +1277,7 @@ double ShaderResources::phase(BuildPhase which) {
 }
 
 void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::Build, false);
     const auto stageStart = std::chrono::steady_clock::now();
     phaseStart = stageStart;
     if (BuildProfiled()) {
@@ -1438,6 +1439,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
 }
 
 void ShaderResources::buildComplete() {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::Build, false);
     const auto stageStart = std::chrono::steady_clock::now();
     phaseStart = stageStart;
     try {
@@ -2230,6 +2232,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::Proof);
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3465,6 +3468,7 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
     // of this epoch, which is what lets the epoch stand for it afterwards (a store made during
     // the copy is stamped newer by the next walk and compared then). A range that is not
     // write-watched has no generation and would be copied for every draw: left in place.
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::DrawSnapshot);
     const auto generation = GuestMemory::CollectWrites(begin, bytes);
     if (generation == 0) return leave(SnapshotRefusal::Unwatched);
     auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
@@ -3950,6 +3954,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDispatchB
             // Collected before the lookup and before a copy, as addressSnapshot does: the reuse
             // check then sees every CPU store so far, and a store made during the copy is stamped
             // newer by the next walk. A range outside the write watch could never be reused.
+            const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::DrawSnapshot);
             const auto generation = GuestMemory::CollectWrites(begin, bytes);
             if (generation == 0) {
                 leave(DispatchRefusal::Unwatched);

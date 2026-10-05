@@ -1257,6 +1257,7 @@ void CountDrawInput(bool index, bool reused, std::size_t bytes) {
 }
 
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::DrawSnapshot);
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     const bool index = use != Recorder::SnapshotUse::Vertex;
     DrawInputCopy copy;
@@ -1575,6 +1576,7 @@ bool sameColorTarget(const ColorTarget& a, const ColorTarget& b) {
 }
 
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup, std::size_t memoSlot = NoTargetMemo) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::TargetRefresh);
     auto* memo = memoSlot < targetMemos.size() && TargetMemoEnabled() ? &targetMemos[memoSlot] : nullptr;
     const auto epoch = memo != nullptr ? GuestMemory::ThreadCollectEpoch() : 0;
     auto* passRecorder = memo != nullptr && epoch != 0 && GuestMemory::GpuMutex().HeldByThisThread() ? Recorder::Active() : nullptr;
