@@ -4,13 +4,13 @@ This fork's `main` mirrors `astrobot`, my integration branch for running Astro B
 
 ## Astro Bot status
 
-Linux, measured on my machine (5 October 2026: CachyOS, i9-14900KF, RTX 4090). Frame rates are the game's own, with no frame generation.
+Linux, measured on my machine (6 October 2026: CachyOS, i9-14900KF, RTX 4090). Frame rates are the game's own, with no frame generation.
 
 | Part | State | Frame rate |
 | --- | --- | --- |
 | Boot, PlayStation Studios video, logos | Renders | video at about 57 fps |
-| Title screen | Renders, including the copyright line (console fonts or the Noto substitutes) | 50 to 52 fps |
-| NEW GAME menu | Renders | about 50 fps |
+| Title screen | Renders, including the copyright line (console fonts or the Noto substitutes) | about 50 fps |
+| NEW GAME menu | Renders | about 48 fps |
 | Intro cinematic and space scene | Renders, no more GPU hangs | 40 to 47 fps |
 | Tutorial (Crash Site hub) | Playable with a DualSense | about 13 fps |
 | World map, controller ship flight | Renders | about 27 fps |
