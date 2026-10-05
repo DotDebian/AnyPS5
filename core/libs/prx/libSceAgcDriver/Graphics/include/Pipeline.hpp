@@ -98,6 +98,15 @@ void ValidateShaderPair(const ShaderRecompiler::RecompileResult& vertex, const S
 // The input locations of the pixel shader `fragment` that the stage before it (`previous`) has no
 // output for: on the GPU such a parameter reads whatever the parameter cache holds.
 std::set<std::uint32_t> UnwrittenFragmentInputs(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> fragment);
+// What a fragment module's words do besides exporting colors (APS5_DEPTH_ONLY_NO_FRAGMENT): end
+// an invocation (OpKill and its successors), or export depth, a stencil reference or a sample
+// mask (a SampleMask built-in counts whichever way it is used). Stores are not read off the
+// words: every address-based module stores to its fault buffer; the bindings say what it writes.
+struct FragmentEffects {
+    bool kills = false;
+    bool exportsCoverage = false;
+};
+FragmentEffects InspectFragmentEffects(std::span<const std::uint32_t> words);
 // The pixel shader with its inputs at `locations` made zero-initialized private variables, which
 // is how the pipeline links parameters the stage before it never exports.
 std::vector<std::uint32_t> ZeroFragmentInputs(std::span<const std::uint32_t> fragment, const std::set<std::uint32_t>& locations);

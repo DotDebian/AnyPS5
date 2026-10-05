@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <utility>
 
 namespace AgcDriver::Graphics {
@@ -1019,7 +1020,9 @@ struct DrawInputs {
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
 // instead of computed.
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
+// `validated`: the stages the driver compiled, which the shader validation takes whole when the
+// draw is made without its pixel stage (APS5_DEPTH_ONLY_NO_FRAGMENT); else `shaders`.
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const CompiledShader> validated, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe) {
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1059,7 +1062,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         // the masked state they decide is in its pipeline.)
         inputs.shaderStages = recipe->shaderStages;
     } else {
-        inputs.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
+        inputs.fragmentOutputs = CachedFragmentOutputs(context, validated, state, outcome.validateMemoized, outcome.validateHit);
         inputs.shaderStages = PipelineStages(shaders);
     }
     APS5_LOG_CHARS_OUT_DEBUG("ValidateShaders OK");
@@ -1964,6 +1967,91 @@ bool RecordDraws() {
     return recordDraws;
 }
 
+// APS5_DEPTH_ONLY_NO_FRAGMENT=1 (local experiment, not for upstream): a draw without a color target
+// whose pixel stage does nothing but export colors is drawn without that stage (Vulkan needs no
+// fragment shader to rasterize depth and stencil, and sample counting does not depend on one). The
+// stage is dropped from the draw's stage list right at the entry, so everything keyed or built
+// from the list sees the shorter one alike: the resource build (the pixel stage's textures and
+// buffers are neither bound nor snapshotted), the content key and its template, the plan key, the
+// pipeline and its key, the push constant stages and block (the dropped stage's bytes stay zero)
+// and a recipe made from the draw. Only the shader validation still takes both stages. The stage
+// stays when the draw has a color target or no depth attachment, would not be recorded, or the
+// pixel module ends invocations (kill, alpha test), exports depth, a stencil reference or a
+// sample mask, writes a buffer or an image (or is not proved not to), updates one atomically,
+// stores by address or binds the GDS. The driver has captured and compiled the stage by then:
+// that work is not saved.
+bool DepthOnlyNoFragment() {
+    static const bool enabled = std::getenv("APS5_DEPTH_ONLY_NO_FRAGMENT") != nullptr;
+    return enabled;
+}
+
+enum class FragmentKept : std::size_t { Dropped, ColorTarget, NotRecorded, Kill, DepthExport, Stores, Other, Count };
+
+// What keeps a pixel module in a depth-only draw, from its bindings and words alone.
+FragmentKept fragmentSideEffects(const ShaderRecompiler::RecompileResult& program) {
+    if (program.bdaWrites) return FragmentKept::Stores;
+    for (const auto& binding : program.bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::Gds) return FragmentKept::Stores;
+        const auto any = [](const std::vector<bool>& flags) { return std::find(flags.begin(), flags.end(), true) != flags.end(); };
+        if (any(binding.bufferWritten) || any(binding.bufferAtomic) || any(binding.imageWritten)) return FragmentKept::Stores;
+        // An element the recompiler did not classify counts as written, as the resource build
+        // counts it.
+        if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.bufferWritten.size() < binding.count) return FragmentKept::Stores;
+        if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage && binding.imageWritten.size() < binding.count) return FragmentKept::Stores;
+    }
+    const auto effects = InspectFragmentEffects(program.spirv.Words());
+    if (effects.kills) return FragmentKept::Kill;
+    if (effects.exportsCoverage) return FragmentKept::DepthExport;
+    return FragmentKept::Dropped;
+}
+
+// The [depth-nofrag] line, every 10 s. Under GuestMemory::GpuMutex (plain counters).
+void countDepthOnly(FragmentKept verdict, bool depthOnly) {
+    static std::uint64_t draws = 0, depthOnlyDraws = 0;
+    static std::array<std::uint64_t, static_cast<std::size_t>(FragmentKept::Count)> verdicts{};
+    static auto last = std::chrono::steady_clock::now();
+    ++draws;
+    if (depthOnly) ++depthOnlyDraws;
+    ++verdicts[static_cast<std::size_t>(verdict)];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    const auto seconds = std::chrono::duration<double>(now - last).count();
+    last = now;
+    const auto count = [&](FragmentKept which) { return static_cast<unsigned long long>(verdicts[static_cast<std::size_t>(which)]); };
+    std::fprintf(stderr, "[depth-nofrag] %.1f s: %llu draws with a pixel stage, %llu without a color target; drawn without the pixel stage: %llu; kept with it: %llu kill, %llu depth, stencil or sample-mask export, %llu stores, %llu color target, %llu not recorded, %llu other\n", seconds, static_cast<unsigned long long>(draws), static_cast<unsigned long long>(depthOnlyDraws), count(FragmentKept::Dropped), count(FragmentKept::Kill), count(FragmentKept::DepthExport), count(FragmentKept::Stores), count(FragmentKept::ColorTarget), count(FragmentKept::NotRecorded), count(FragmentKept::Other));
+    draws = depthOnlyDraws = 0;
+    verdicts = {};
+}
+
+// The stages a draw is made with: `shaders`, or `shaders` without its pixel stage (see
+// DepthOnlyNoFragment). The same state and stages always give the same answer, so a recipe or a
+// plan made from the shorter list is replayed with it.
+std::span<const CompiledShader> drawnStages(const State& state, std::span<const CompiledShader> shaders) {
+    if (!DepthOnlyNoFragment() || shaders.size() != 2 || shaders.back().stage != ShaderRecompiler::ShaderStage::Fragment || shaders.back().program == nullptr) return shaders;
+    const bool depthOnly = !state.hasColorTarget && state.colors.empty();
+    auto verdict = FragmentKept::Dropped;
+    if (!depthOnly) {
+        verdict = FragmentKept::ColorTarget;
+    } else if (state.rectList || state.stages.tessellation.has_value() || !state.depth.attached || shaders.back().program->variantId == 0) {
+        verdict = FragmentKept::Other;
+    } else if (!RecordDraws() || Recorder::Active() == nullptr || DumpTargetLimit() != 0) {
+        verdict = FragmentKept::NotRecorded;
+    } else {
+        // Per compiled variant: equal ids mean identical words and bindings.
+        static std::unordered_map<std::uint64_t, FragmentKept> verdicts;
+        const auto id = shaders.back().program->variantId;
+        const auto found = verdicts.find(id);
+        if (found != verdicts.end()) {
+            verdict = found->second;
+        } else {
+            verdict = fragmentSideEffects(*shaders.back().program);
+            if (verdicts.size() < 65536) verdicts.emplace(id, verdict);
+        }
+    }
+    countDepthOnly(verdict, depthOnly);
+    return verdict == FragmentKept::Dropped ? shaders.first(1) : shaders;
+}
+
 }
 
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
@@ -2033,6 +2121,10 @@ bool drawFromPlan(const Context& context, const State& state, const Pm4::DrawPar
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, std::uint64_t stateKey) {
+    // APS5_DEPTH_ONLY_NO_FRAGMENT: from here on the draw is its stages without the pixel one; only
+    // the shader validation (prepareDrawInputs) still sees the stages as compiled.
+    const auto validated = shaders;
+    shaders = drawnStages(state, shaders);
     // APS5_DRAW_PLANS: a draw whose template holds a plan for its state is recorded from it.
     // APS5_REUSE_ADDRESS_DRAWS: templates whose images left the texture caches go, once a frame.
     if (ShaderResources::ReuseAddressDraws()) AddressDraws().swept += SharedResourceCache().SweepDeparted(&AddressDraws().sweptBytes);
@@ -2062,7 +2154,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    auto inputs = prepareDrawInputs(context, state, draw, shaders, validated, outcome, timer, nullptr);
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -2614,6 +2706,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, std::shared_ptr<ShaderResources> planTemplate) {
     const bool plan = planTemplate != nullptr;
     const auto planStart = plan && AddressDrawTimes() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // APS5_DEPTH_ONLY_NO_FRAGMENT: the stages the recipe was made with (a plan's caller has
+    // dropped the pixel stage already, and a list of one stage is returned as it is).
+    shaders = drawnStages(state, shaders);
     PerformanceTimer timing("Graphics.DrawWithRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
@@ -2638,7 +2733,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // another device's) is a miss, where a recipe of the draw cache would be a bug.
     if (plan && (recipe.device != context.device || recipe.targets.size() != state.colors.size() || recipe.targetViews.size() != state.colors.size())) return miss(DrawRecipeMiss::ObjectsGone);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == state.colors.size(), "draw recipe targets do not match the state");
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);
+    auto inputs = prepareDrawInputs(context, state, draw, shaders, shaders, outcome, timer, &recipe);
     if (inputs.nothing) {
         result.recorded = true;
         return result;

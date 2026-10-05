@@ -691,6 +691,32 @@ std::vector<std::uint32_t> ZeroFragmentInputs(std::span<const std::uint32_t> wor
     return result;
 }
 
+FragmentEffects InspectFragmentEffects(std::span<const std::uint32_t> words) {
+    FragmentEffects effects;
+    Require(words.size() >= 5 && words[0] == spv::MagicNumber, "invalid fragment SPIR-V header");
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> spv::WordCountShift;
+        Require(count != 0 && count <= words.size() - cursor, "truncated SPIR-V instruction");
+        switch (words[cursor] & spv::OpCodeMask) {
+            case spv::OpKill:
+            case spv::OpTerminateInvocation:
+            case spv::OpDemoteToHelperInvocation:
+                effects.kills = true;
+                break;
+            case spv::OpExecutionMode:
+                if (count >= 3 && (words[cursor + 2] == spv::ExecutionModeDepthReplacing || words[cursor + 2] == spv::ExecutionModeStencilRefReplacingEXT)) effects.exportsCoverage = true;
+                break;
+            case spv::OpDecorate:
+                if (count >= 4 && words[cursor + 2] == spv::DecorationBuiltIn && (words[cursor + 3] == spv::BuiltInFragDepth || words[cursor + 3] == spv::BuiltInSampleMask || words[cursor + 3] == spv::BuiltInFragStencilRefEXT)) effects.exportsCoverage = true;
+                break;
+            default:
+                break;
+        }
+        cursor += count;
+    }
+    return effects;
+}
+
 std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders, const State& state, const VkPhysicalDeviceSubgroupProperties& subgroup, bool fragmentShaderBarycentric, bool descriptorIndexing) {
     using Stage = ShaderRecompiler::ShaderStage;
     const bool tessellation = state.stages.path == ShaderPath::Tessellation;
