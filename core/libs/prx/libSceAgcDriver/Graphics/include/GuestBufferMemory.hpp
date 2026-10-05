@@ -330,6 +330,11 @@ public:
     // import: InPlaceReads' ranges asked for one range, by the owner search instead of a scan of
     // the ~1200 of an address-based build.
     bool BoundInPlace(std::uint64_t address, std::size_t bytes) const;
+    // How the uploaded [address, address + bytes) of a descriptor element is served, for the
+    // [dispatch-res] trace: staged in device memory, or why not (`addressable`: the build maps
+    // guest memory by address, which never stages).
+    enum class Placement : std::uint8_t { Staged, InPlaceReadOnly, InPlaceAddressBased, InPlaceSizeWindow, InPlaceOther, GpuCopy, Mirror, CpuCopy, Unbound, Count };
+    Placement PlacementOf(std::uint64_t address, std::size_t bytes, bool addressable) const;
     // A name for the set InPlaceReads returns when it is the cached address space's alone (the
     // space's serial; the set is then fixed with the space), else 0: see Recorder::ReadSetNoted.
     std::uint64_t ReadSetToken() const;

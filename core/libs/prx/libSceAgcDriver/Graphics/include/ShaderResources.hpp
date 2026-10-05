@@ -144,6 +144,19 @@ public:
         std::uint32_t adjustment = 0;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    // APS5_DISPATCH_SNAPSHOTS (local experiment, see ShaderResources.cpp): the set one use of a
+    // compute build binds instead of its own, with its read-only guest buffer elements that are
+    // bound in place inside an import served by copies in video memory, or null when no element
+    // qualifies (the build's own set is then bound). `commands` is the open batch's command
+    // buffer: with APS5_DISPATCH_SNAPSHOTS=2 the copies of ranges recorded work still writes are
+    // recorded into it, and `copiedOnGpu` tells the caller its leading barrier must be recorded
+    // (it makes those copies visible to the dispatch). Kept by the recorder; per use, so a
+    // cached template or a recipe hit proves its snapshots anew like any other use.
+    std::shared_ptr<DrawBindings> PrepareDispatchBindings(Recorder& recorder, VkCommandBuffer commands, bool& copiedOnGpu) const;
+    static bool DispatchSnapshotsEnabled();
+    // The [dispatch-res] trace's account of the guest buffer elements: how many are staged in
+    // device memory and how many are not, by reason, then the first elements one by one.
+    std::string DescribePlacements() const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
