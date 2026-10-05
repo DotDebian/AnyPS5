@@ -78,6 +78,18 @@ std::atomic<std::uint64_t> driverStoreSerial{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(EpochReason::Count)> tracedEpochs{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TraceCount::Count)> tracedCounts{};
 std::atomic<std::uint64_t> tracedWalks{0}, tracedWalkBytes{0}, tracedWalkNanoseconds{0}, tracedMemoHitsReported{0};
+// APS5_TRACE_SYNC (see WalkTraceReport): the walks by collect site and by size, the walks over
+// pages the epoch had walked already by why the memo missed them, and the reductions' savings.
+struct WalkSiteCounters {
+    std::atomic<std::uint64_t> walks{0}, bytes{0}, nanoseconds{0}, uncached{0};
+};
+std::array<WalkSiteCounters, static_cast<std::size_t>(CollectSite::Count)> walkSites{};
+constexpr std::array<std::uint64_t, 4> WalkSizeLimits{65536, 1u << 20u, 16u << 20u, 256u << 20u};
+std::array<WalkSiteCounters, WalkSizeLimits.size() + 1> walkSizes{};
+enum class WalkRepeat : std::size_t { Uncached, Partial, OtherThread, ListCleared, NoEpoch, Count };
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(WalkRepeat::Count)> walkRepeats{}, walkRepeatBytes{};
+std::atomic<std::uint64_t> gapCollects{0}, gapBytesSkipped{0}, sharedCollects{0}, sharedWholeCollects{0}, sharedBytesSkipped{0};
+thread_local CollectSite threadCollectSite = CollectSite::Other;
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
 // tracker mutex acquisitions that had to wait (APS5_PROFILE_DRAW; see lockTracker).
@@ -838,6 +850,10 @@ struct WriteTracker {
     // records in the same block (the title's per-job slots are 0x20 apart) must not count.
     std::vector<std::uint32_t> cpuBlocks;
     std::vector<std::uint32_t> writtenBlocks;
+    // Per 64 KiB block: the generation of the last walk that covered every page of it (0: none).
+    // A thread whose epoch began at an older generation may take the block as walked for its
+    // epoch (shared walks, see GuestMemory.hpp); also names the walks another thread repeated.
+    std::vector<std::uint32_t> walkedBlocks;
 #else
     static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
     static constexpr std::size_t LeafCount = std::size_t{1} << 15;
@@ -881,6 +897,7 @@ struct WriteTracker {
         blocks.assign(size / WriteBlockBytes + 1, 0);
         cpuBlocks.assign(size / WriteBlockBytes + 1, 0);
         writtenBlocks.assign(size / WriteBlockBytes + 1, 0);
+        walkedBlocks.assign(size / WriteBlockBytes + 1, 0);
         pages.resize(1u << 16);
 #else
         watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
@@ -1052,7 +1069,22 @@ thread_local ThreadCollectMemo threadCollectMemo;
 struct ThreadWalkedRanges {
     std::uint64_t epoch = 0;
     std::uint64_t unwatched = 0;
+    // The list was emptied at its cap during this epoch: later walks may repeat earlier ones.
+    bool cleared = false;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;
+
+    // The parts of [first, stop) no interval covers, in order.
+    void Uncovered(std::uintptr_t first, std::uintptr_t stop, std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const {
+        auto it = std::upper_bound(ranges.begin(), ranges.end(), first, [](std::uintptr_t address, const std::pair<std::uintptr_t, std::uintptr_t>& range) { return address < range.first; });
+        if (it != ranges.begin()) --it;
+        auto cursor = first;
+        for (; it != ranges.end() && it->first < stop && cursor < stop; ++it) {
+            if (it->second <= cursor) continue;
+            if (it->first > cursor) out.emplace_back(cursor, it->first);
+            cursor = std::max(cursor, it->second);
+        }
+        if (cursor < stop) out.emplace_back(cursor, stop);
+    }
 
     bool Covers(std::uintptr_t first, std::uintptr_t stop) const {
         auto next = std::upper_bound(ranges.begin(), ranges.end(), first, [](std::uintptr_t address, const std::pair<std::uintptr_t, std::uintptr_t>& range) { return address < range.first; });
@@ -1063,7 +1095,10 @@ struct ThreadWalkedRanges {
 
     void Add(std::uintptr_t first, std::uintptr_t stop) {
         // Bounded: a list this long means the epoch is not ending; starting over only costs walks.
-        if (ranges.size() >= 4096) ranges.clear();
+        if (ranges.size() >= 4096) {
+            ranges.clear();
+            cleared = true;
+        }
         auto at = std::lower_bound(ranges.begin(), ranges.end(), first, [](const std::pair<std::uintptr_t, std::uintptr_t>& range, std::uintptr_t address) { return range.first < address; });
         if (at != ranges.begin() && std::prev(at)->second >= first) --at;
         else at = ranges.insert(at, {first, first});
@@ -1154,6 +1189,91 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #endif
 }
 
+bool gapWalksEnabled() {
+    static const bool whole = std::getenv("APS5_WHOLE_RANGE_WALKS") != nullptr;
+    return !whole;
+}
+
+bool sharedWalksEnabled() {
+#ifdef _WIN32
+    static const bool shared = std::getenv("APS5_SHARED_WALKS") != nullptr;
+    return shared;
+#else
+    return false;
+#endif
+}
+
+// The tracker generation when the calling thread's epoch began (BumpCollectEpoch): a walk with a
+// newer generation started after that ordering point.
+thread_local std::uint32_t threadEpochGeneration = 0;
+
+// One walk with its accounting: the totals of the [synctrace] line, the calling thread's collect
+// site, the size class, and the blocks it covered whole (walkedBlocks). Under the tracker mutex.
+bool tracedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool uncached, CollectSite fallback = CollectSite::Other) {
+    const bool traced = collectTraced();
+    const auto walkStart = traced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool walked = walkWrites(tracker, first, stop, kind);
+    const auto nanoseconds = traced ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()) : 0;
+    const auto bytes = stop - first;
+    tracedWalks.fetch_add(1, std::memory_order_relaxed);
+    tracedWalkBytes.fetch_add(bytes, std::memory_order_relaxed);
+    tracedWalkNanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
+    const auto site = threadCollectSite != CollectSite::Other ? threadCollectSite : fallback;
+    const auto count = [&](WalkSiteCounters& counters) {
+        counters.walks.fetch_add(1, std::memory_order_relaxed);
+        counters.bytes.fetch_add(bytes, std::memory_order_relaxed);
+        counters.nanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
+        if (uncached) counters.uncached.fetch_add(1, std::memory_order_relaxed);
+    };
+    count(walkSites[static_cast<std::size_t>(site)]);
+    std::size_t size = 0;
+    while (size < WalkSizeLimits.size() && bytes >= WalkSizeLimits[size]) ++size;
+    count(walkSizes[size]);
+#ifdef _WIN32
+    if (walked && !tracker.walkedBlocks.empty() && first >= tracker.base) {
+        const auto generation = tracker.generation.load(std::memory_order_relaxed);
+        const auto firstBlock = (first - tracker.base + WriteBlockBytes - 1) / WriteBlockBytes;
+        const auto endBlock = (stop - tracker.base) / WriteBlockBytes;
+        for (auto block = firstBlock; block < endBlock && block < tracker.walkedBlocks.size(); ++block) tracker.walkedBlocks[block] = generation;
+    }
+#endif
+    return walked;
+}
+
+// Of `pieces` (page ranges inside the arena), the 64 KiB blocks a walk newer than `since` covered
+// whole are removed; returns the bytes removed. Under the tracker mutex.
+std::uint64_t dropWalkedBlocks(const WriteTracker& tracker, std::uint32_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& pieces) {
+    std::uint64_t dropped = 0;
+#ifdef _WIN32
+    if (tracker.walkedBlocks.empty()) return 0;
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> kept;
+    kept.clear();
+    for (const auto& [begin, end] : pieces) {
+        if (begin < tracker.base) {
+            kept.emplace_back(begin, end);
+            continue;
+        }
+        auto cursor = begin;
+        const auto firstBlock = (begin - tracker.base + WriteBlockBytes - 1) / WriteBlockBytes;
+        const auto endBlock = (end - tracker.base) / WriteBlockBytes;
+        for (auto block = firstBlock; block < endBlock && block < tracker.walkedBlocks.size(); ++block) {
+            if (tracker.walkedBlocks[block] <= since) continue;
+            const auto blockBegin = tracker.base + block * WriteBlockBytes;
+            if (cursor < blockBegin) kept.emplace_back(cursor, blockBegin);
+            cursor = blockBegin + WriteBlockBytes;
+            dropped += WriteBlockBytes;
+        }
+        if (cursor < end) kept.emplace_back(cursor, end);
+    }
+    if (dropped != 0) pieces = kept;
+#else
+    static_cast<void>(tracker);
+    static_cast<void>(since);
+    static_cast<void>(pieces);
+#endif
+    return dropped;
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -1201,14 +1321,56 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
-    // APS5_TRACE_SYNC: the walk alone (the wait for the tracker mutex is not in it), failed ones too.
-    const bool traced = collectTraced();
-    const auto walkStart = traced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const bool walked = walkWrites(tracker, first, stop, StampKind::Cpu);
-    tracedWalks.fetch_add(1, std::memory_order_relaxed);
-    tracedWalkBytes.fetch_add(stop - first, std::memory_order_relaxed);
-    if (traced) tracedWalkNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
-    if (!walked) return 0;
+    // What is walked: the whole range, less (for a memoized collect of a thread with an epoch) the
+    // pages this thread's list holds for the epoch (gap walks) and the blocks another thread walked
+    // since the epoch began (shared walks); see GuestMemory.hpp. The walks of pages the epoch had
+    // seen already are counted by why the memo did not serve them.
+    const auto repeat = [](WalkRepeat why, std::uint64_t repeated) {
+        walkRepeats[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+        walkRepeatBytes[static_cast<std::size_t>(why)].fetch_add(repeated, std::memory_order_relaxed);
+    };
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
+    pieces.clear();
+    const bool hasEpoch = threadCollectEpoch != 0;
+    const auto& walkedList = threadWalkedRanges;
+    const bool listCurrent = hasEpoch && collectMemoEnabled() && !sharedCollectMemo() && !collectMemoRing() && walkedList.epoch == epoch && walkedList.unwatched == unwatchSerial.load(std::memory_order_relaxed);
+    if (listCurrent) walkedList.Uncovered(first, stop, pieces);
+    else pieces.emplace_back(first, stop);
+    std::uint64_t uncovered = 0;
+    for (const auto& [begin, end] : pieces) uncovered += end - begin;
+    const auto covered = (stop - first) - uncovered;
+    if (!hasEpoch) {
+        repeat(WalkRepeat::NoEpoch, stop - first);
+    } else if (covered != 0) {
+        repeat(useMemo ? WalkRepeat::Partial : WalkRepeat::Uncached, covered);
+    } else if (listCurrent && walkedList.cleared) {
+        repeat(WalkRepeat::ListCleared, stop - first);
+    }
+    if (covered != 0 && useMemo && gapWalksEnabled()) {
+        gapCollects.fetch_add(1, std::memory_order_relaxed);
+        gapBytesSkipped.fetch_add(covered, std::memory_order_relaxed);
+    } else if (covered != 0) {
+        pieces.assign(1, {first, stop});
+    }
+    if (hasEpoch) {
+        // Blocks a walk of another thread (or an uncached one of this thread's, already counted)
+        // covered since this thread's epoch began: skipped by a memoized collect under shared
+        // walks, counted as repeated otherwise.
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> remaining;
+        remaining = pieces;
+        const auto elsewhere = dropWalkedBlocks(tracker, threadEpochGeneration, remaining);
+        if (elsewhere != 0 && useMemo && sharedWalksEnabled()) {
+            sharedCollects.fetch_add(1, std::memory_order_relaxed);
+            if (remaining.empty()) sharedWholeCollects.fetch_add(1, std::memory_order_relaxed);
+            sharedBytesSkipped.fetch_add(elsewhere, std::memory_order_relaxed);
+            pieces = remaining;
+        } else if (elsewhere != 0 && covered == 0) {
+            repeat(WalkRepeat::OtherThread, elsewhere);
+        }
+    }
+    for (const auto& [begin, end] : pieces) {
+        if (!tracedWalk(tracker, begin, end, StampKind::Cpu, !memoized)) return 0;
+    }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
@@ -1222,6 +1384,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 list.ranges.clear();
                 list.epoch = epoch;
                 list.unwatched = serial;
+                list.cleared = false;
             }
             list.Add(first, stop);
         }
@@ -1245,8 +1408,58 @@ void BumpCollectEpoch() {
 
 void BumpCollectEpoch(EpochReason reason) {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    // A walk bumps the generation before it reads its first page, under the tracker mutex: one with
+    // a generation above this value started after this ordering point (shared walks).
+    threadEpochGeneration = Tracker().generation.load(std::memory_order_acquire);
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
     tracedEpochs[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+CollectSite SetCollectSite(CollectSite site) {
+    return std::exchange(threadCollectSite, site);
+}
+
+CollectSite CurrentCollectSite() {
+    return threadCollectSite;
+}
+
+std::string WalkTraceReport() {
+    static constexpr const char* sites[static_cast<std::size_t>(CollectSite::Count)] = {"other", "draw snapshot", "template or plan proof", "resource build", "storage refresh", "target refresh", "recheck", "address space or mirror", "dispatch", "label or wait", "write-back", "hook", "staging", "present", "batch reads", "dcc keys", "driver store"};
+    static constexpr const char* sizes[WalkSizeLimits.size() + 1] = {"<64K", "<1M", "<16M", "<256M", ">=256M"};
+    static constexpr const char* repeats[static_cast<std::size_t>(WalkRepeat::Count)] = {"uncached collect", "partial overlap", "walked by another thread", "list cleared at its cap", "thread without an epoch"};
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    std::string report = "walks by site (count/MiB/us, uncached):";
+    char text[160];
+    for (std::size_t site = 0; site < walkSites.size(); ++site) {
+        const auto walks = take(walkSites[site].walks);
+        const auto bytes = take(walkSites[site].bytes);
+        const auto nanoseconds = take(walkSites[site].nanoseconds);
+        const auto uncached = take(walkSites[site].uncached);
+        if (walks == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %llu/%.0f/%llu (%llu)", sites[site], static_cast<unsigned long long>(walks), bytes / 1048576.0, static_cast<unsigned long long>(nanoseconds / 1000), static_cast<unsigned long long>(uncached));
+        report += text;
+    }
+    report += "; by walked size (count/MiB/us):";
+    for (std::size_t size = 0; size < walkSizes.size(); ++size) {
+        const auto walks = take(walkSizes[size].walks);
+        const auto bytes = take(walkSizes[size].bytes);
+        const auto nanoseconds = take(walkSizes[size].nanoseconds);
+        take(walkSizes[size].uncached);
+        std::snprintf(text, sizeof(text), " %s %llu/%.0f/%llu", sizes[size], static_cast<unsigned long long>(walks), bytes / 1048576.0, static_cast<unsigned long long>(nanoseconds / 1000));
+        report += text;
+    }
+    report += "; collects over pages already walked in the epoch, by why the memo did not serve them (count/MiB):";
+    for (std::size_t why = 0; why < walkRepeats.size(); ++why) {
+        std::snprintf(text, sizeof(text), " %s %llu/%.0f", repeats[why], static_cast<unsigned long long>(take(walkRepeats[why])), take(walkRepeatBytes[why]) / 1048576.0);
+        report += text;
+    }
+    const auto gaps = take(gapCollects);
+    const auto gapBytes = take(gapBytesSkipped);
+    const auto shared = take(sharedCollects);
+    const auto sharedWhole = take(sharedWholeCollects);
+    const auto sharedBytes = take(sharedBytesSkipped);
+    std::snprintf(text, sizeof(text), "; gap walks %s: %llu collects, %.0f MiB not walked; shared walks %s: %llu collects (%llu without a walk), %.0f MiB not walked", gapWalksEnabled() ? "on" : "off", static_cast<unsigned long long>(gaps), gapBytes / 1048576.0, sharedWalksEnabled() ? "on" : "off", static_cast<unsigned long long>(shared), static_cast<unsigned long long>(sharedWhole), sharedBytes / 1048576.0);
+    return report + text;
 }
 
 std::uint64_t ThreadCollectEpoch() {
@@ -1325,9 +1538,9 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     const auto first = address & ~(page - 1);
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
     const bool covered = tracker.covers(first, static_cast<std::size_t>(stop - first));
-    const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu);
+    const bool before = covered && tracedWalk(tracker, first, stop, StampKind::Cpu, true, CollectSite::AddressSpace);
     if (!import()) return false;
-    if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+    if (!before || !tracedWalk(tracker, first, stop, StampKind::ImportWindow, true, CollectSite::AddressSpace)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
     return true;
 }
 
@@ -1405,11 +1618,11 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
 #ifdef _WIN32
     if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(first, static_cast<std::size_t>(stop - first))) return stampStored(tracker, store());
 #endif
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return stampStored(tracker, store());
+    if (!tracedWalk(tracker, first, stop, StampKind::Cpu, true, CollectSite::DriverStore)) return stampStored(tracker, store());
     const auto stored = store();
     // The walk stamps as the driver's whatever it finds dirty, stored or not.
     driverStoreSerial.fetch_add(1, std::memory_order_release);
-    walkWrites(tracker, first, stop, StampKind::Driver);
+    tracedWalk(tracker, first, stop, StampKind::Driver, true, CollectSite::DriverStore);
     return stampStored(tracker, stored);
 }
 

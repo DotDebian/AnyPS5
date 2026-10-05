@@ -135,6 +135,7 @@ void Driver::observePendingWrite(std::uint64_t address, bool unchanged) {
 }
 
 bool Driver::knownValueCurrent(const WrittenBuffer& writer) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::Dispatch, false);
     const auto bytes = static_cast<std::size_t>(writer.end - writer.begin);
     GuestMemory::CollectWrites(writer.begin, bytes);
     return GuestMemory::UnchangedSince(writer.begin, bytes, writer.generation);

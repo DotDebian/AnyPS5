@@ -114,6 +114,38 @@ void CountTrace(TraceCount which);
 std::string CollectTraceReport();
 // The calling thread's collect epoch: 0 until its first bump (such a thread reuses no walk).
 std::uint64_t ThreadCollectEpoch();
+// APS5_TRACE_SYNC: who walks. A walk (a memo miss, or an uncached collect) is charged to the
+// calling thread's collect site, set by a scope at the caller like a ReadSiteScope; `overrideOuter`
+// false keeps an outer scope's site (a storage refresh inside a target lookup stays the target's).
+// WalkTraceReport returns the window's walks by site (count, MiB, microseconds), by size of the
+// walked range, the walks of pages the same epoch had already walked with why they missed the
+// memo, and what the two reductions below saved; it clears the counters.
+//
+// Gap walks (default, APS5_WHOLE_RANGE_WALKS=1 restores): a memoized collect whose range the
+// thread's epoch list covers only in part walks the uncovered pages alone, where it walked the
+// whole range again. Exact under the epoch contract above: the covered pages were walked in this
+// epoch, and a write to them since belongs to the next one.
+// Shared walks (APS5_SHARED_WALKS=1, off by default): a memoized collect also skips the 64 KiB
+// blocks any thread walked after the calling thread's epoch began. Every CPU write made before
+// that thread's ordering point is then stamped, which is all the contract asks of the collect;
+// but it lets one worker's walk answer another's check, which the rule above forbids as written,
+// hence the switch. Windows only.
+enum class CollectSite : std::uint8_t { Other, DrawSnapshot, Proof, Build, StorageRefresh, TargetRefresh, Recheck, AddressSpace, Dispatch, LabelWait, WriteBack, Hook, Staging, Present, BatchReads, DccKeys, DriverStore, Count };
+CollectSite SetCollectSite(CollectSite site);
+CollectSite CurrentCollectSite();
+class CollectSiteScope {
+public:
+    explicit CollectSiteScope(CollectSite site, bool overrideOuter = true) : previous(CurrentCollectSite()) {
+        if (overrideOuter || previous == CollectSite::Other) SetCollectSite(site);
+    }
+    ~CollectSiteScope() { SetCollectSite(previous); }
+    CollectSiteScope(const CollectSiteScope&) = delete;
+    CollectSiteScope& operator=(const CollectSiteScope&) = delete;
+
+private:
+    CollectSite previous;
+};
+std::string WalkTraceReport();
 // Counts the driver's own stamps (MarkWritten, the stores of Write, WriteChanged and
 // StoreOwnBytes): while it stands, no block anywhere took a driver stamp, so a proof that
 // UnchangedSince held for a range needs only the CPU's stores looked at again (a collect, or

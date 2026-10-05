@@ -462,6 +462,7 @@ ShadowSlabPin::~ShadowSlabPin() {
 }
 
 std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::WriteBack, false);
     if (!UnitShadowEnabled() || scope == PublishScope::None || bytes == 0) return 0;
     if (Recorder::InCompletion() && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Store) {
         // The store's own stamp makes the unit stale; a publish recorded now would land over the
@@ -521,6 +522,7 @@ VkDeviceSize SlabOffset(const HostImport& import, const ShadowSlab& slab, std::u
 }
 
 std::optional<ShadowDestination> ShadowDestinationFor(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::WriteBack, false);
     if (!UnitShadowEnabled() || end <= begin || begin < import.base || end > import.base + import.bytes) return std::nullopt;
     if (!GuestMemory::Watched(begin, static_cast<std::size_t>(end - begin))) return std::nullopt;
     auto& registry = Registry();

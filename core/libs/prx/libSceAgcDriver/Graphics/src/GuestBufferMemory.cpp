@@ -1001,6 +1001,7 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
             continue;
         }
         const bool synced = prepareRange(begin, bytes, !(selected && vramMirrorNoFlush()));
+        const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::AddressSpace);
         const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes));
         if (selected && generation == 0) {
             giveUp("no longer write-watched");
@@ -1097,6 +1098,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     mirror->padding = subPadding;
     if (heap) {
         prepareRefresh(*mirror, base, bytes);
+        const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::AddressSpace);
         const auto generation = GuestMemory::CollectWrites(base, static_cast<std::size_t>(bytes));
         constexpr std::uint64_t block = 65536;
         mirror->generations.assign(static_cast<std::size_t>(((base + bytes + block - 1) / block) - base / block), generation);
@@ -2350,6 +2352,7 @@ std::shared_ptr<Buffer> takeStagingBuffer(const Context& context, std::uint64_t 
 // Starts a use of the shadow under GuestMemory::GpuMutex, after the queued stores over its range
 // were recorded: nothing when the proof above holds (no copy-in), else why the copy-in is made.
 std::optional<ResidentCopyIn> beginResidentUse(ResidentShadow& shadow) {
+    const GuestMemory::CollectSiteScope collectSite(GuestMemory::CollectSite::Staging);
     const auto collected = GuestMemory::CollectWritesUncached(shadow.begin, static_cast<std::size_t>(shadow.end - shadow.begin));
     std::optional<ResidentCopyIn> reason;
     if (collected == 0) {
