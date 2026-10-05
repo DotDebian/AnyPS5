@@ -21,6 +21,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <vector>
 #include <atomic>
@@ -87,6 +88,26 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
 std::atomic<std::uint64_t> refreshesProved{0}, refreshesFull{0};
+std::atomic<std::uint64_t> aliasUnitsLent{0}, aliasUnitsRemapped{0}, aliasEdgeUnits{0};
+constexpr std::array<const char*, 8> aliasRefusalNames{"element size", "tile mode", "layout", "keys", "uncached", "target", "untracked", "state"};
+std::array<std::atomic<std::uint64_t>, aliasRefusalNames.size()> aliasRefusals{};
+
+void noteAliasRefusal(const char* reason) {
+    for (std::size_t i = 0; i < aliasRefusalNames.size(); ++i) {
+        if (std::string_view(aliasRefusalNames[i]) == reason) aliasRefusals[i].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+std::string aliasReport() {
+    char text[96];
+    std::snprintf(text, sizeof(text), "; hand-overs: units lent %llu (remapped %llu), edge units stored %llu, refused", static_cast<unsigned long long>(aliasUnitsLent.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(aliasUnitsRemapped.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(aliasEdgeUnits.exchange(0, std::memory_order_relaxed)));
+    std::string line = text;
+    for (std::size_t i = 0; i < aliasRefusalNames.size(); ++i) {
+        std::snprintf(text, sizeof(text), " %s %llu", aliasRefusalNames[i], static_cast<unsigned long long>(aliasRefusals[i].exchange(0, std::memory_order_relaxed)));
+        line += text;
+    }
+    return line;
+}
 
 struct StorageTraffic {
     std::mutex mutex;
@@ -127,7 +148,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu; refreshes in total: %llu proved, %llu in full\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), static_cast<unsigned long long>(refreshesProved.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refreshesFull.load(std::memory_order_relaxed)));
+    std::fprintf(stderr, "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu; refreshes in total: %llu proved, %llu in full%s\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted), static_cast<unsigned long long>(refreshesProved.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refreshesFull.load(std::memory_order_relaxed)), aliasReport().c_str());
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -1051,21 +1072,66 @@ bool StorageTexture::Refresh() {
     // generation, no results of this image's own there) or dead to its own write-back (tracked and
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
-    auto alias = pendingAlias();
-    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
-    if (alias != nullptr) {
-        std::vector<std::uint8_t> aliasStamped(trackedLayers);
-        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
-        for (std::uint32_t unit = 0; alias != nullptr && unit < trackedLayers; ++unit) {
-            if (!alias->layerPending[unit]) continue;
-            if (alias->layerGeneration[unit] == 0 || aliasStamped[unit] == GuestMemory::BlockMaybeWritten || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
-                alias = nullptr;
+    const char* aliasRefusal = nullptr;
+    auto alias = pendingAlias(profile ? &aliasRefusal : nullptr);
+    if (alias.source != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) {
+        alias = {};
+        aliasRefusal = "target";
+    }
+    std::uint32_t overlapFirst = 0, overlapEnd = 0;
+    std::vector<bool> lendable, storeFirst;
+    const auto aliasStamps = [&](std::vector<std::uint8_t>& stamped) {
+        const auto& source = *alias.source;
+        overlapFirst = static_cast<std::uint32_t>(std::max<std::int64_t>(0, -alias.unitShift));
+        overlapEnd = static_cast<std::uint32_t>(std::clamp<std::int64_t>(static_cast<std::int64_t>(source.trackedLayers) - alias.unitShift, 0, trackedLayers));
+        if (overlapFirst >= overlapEnd) return false;
+        stamped.assign(overlapEnd - overlapFirst, 0);
+        const auto begin = layerBegin(overlapFirst);
+        const auto bytes = layerBegin(overlapEnd - 1) + layerBytes(overlapEnd - 1) - begin;
+        const auto generations = std::span<const std::uint64_t>(source.layerGeneration).subspan(static_cast<std::size_t>(overlapFirst + alias.unitShift), overlapEnd - overlapFirst);
+        return GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(bytes), generations, stamped);
+    };
+    if (alias.source != nullptr) {
+        const auto held = alias.source;
+        const auto& source = *held;
+        std::vector<std::uint8_t> aliasStamped;
+        if (!aliasStamps(aliasStamped)) {
+            alias = {};
+            aliasRefusal = "untracked";
+        }
+        const AliasPlan* plan = nullptr;
+        if (alias.remapped) {
+            const auto theirs = source.aliasSurface();
+            if (theirs) plan = &aliasPlanFrom(*theirs);
+        }
+        lendable.assign(trackedLayers, false);
+        storeFirst.assign(trackedLayers, false);
+        for (std::uint32_t unit = overlapFirst; alias.source != nullptr && unit < overlapEnd; ++unit) {
+            const auto theirUnit = static_cast<std::size_t>(unit + alias.unitShift);
+            if (!source.layerPending[theirUnit]) continue;
+            const auto stamp = aliasStamped[unit - overlapFirst];
+            if (source.layerGeneration[theirUnit] == 0 || stamp == GuestMemory::BlockMaybeWritten || (stamp == GuestMemory::BlockUnchanged && layerPending[unit])) {
+                alias = {};
+                aliasRefusal = "state";
                 break;
             }
+            if (stamp != GuestMemory::BlockUnchanged) continue;
+            if (!alias.remapped || (plan != nullptr && plan->Handed(unit))) lendable[unit] = true;
+            else storeFirst[unit] = true;
         }
+        if (alias.source == nullptr) storeFirst.clear();
     }
     // No publish: the upload below reads the stored units from the unit shadow itself.
-    const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
+    bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.source.get(), "storage refresh", PublishScope::None);
+    if (!storeFirst.empty()) {
+        std::size_t edgeUnits = 0;
+        for (const auto& [begin, end] : unitRuns(storeFirst)) {
+            edgeUnits += static_cast<std::size_t>((end - begin + AliasBlockBytes - 1) / AliasBlockBytes);
+            if (FlushPending(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin), nullptr, "storage refresh", PublishScope::None)) flushed = true;
+        }
+        aliasEdgeUnits.fetch_add(edgeUnits, std::memory_order_relaxed);
+    }
+    if (profile && alias.source == nullptr && aliasRefusal != nullptr) noteAliasRefusal(aliasRefusal);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
@@ -1150,17 +1216,19 @@ bool StorageTexture::Refresh() {
         // Only the direct path uploads the selected layers alone (see upload); the others replace
         // the whole image, so every pending layer's results are stored first.
         direct = keys == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
-        if (alias != nullptr && direct) {
+        if (alias.source != nullptr && direct) {
             // The alias's pending units that nothing stamped since its generation (a CPU store or a
             // driver store there wins over its results, as at its own write-back) are taken from
             // its image: every one of them, since its write-back would have stamped them all. Units
             // already holding them at the same alias version stay as they are.
-            const bool sameBorrow = borrowedFrom.lock() == alias && borrowedVersion == alias->version && borrowedUnits.size() == trackedLayers;
-            std::vector<std::uint8_t> aliasStamped(trackedLayers);
-            const bool aliasTracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped);
+            const auto& source = *alias.source;
+            const bool sameBorrow = borrowedFrom.lock() == alias.source && borrowedVersion == source.version && borrowedShift == alias.unitShift && borrowedUnits.size() == trackedLayers;
+            std::vector<std::uint8_t> aliasStamped;
+            const bool aliasTracked = aliasStamps(aliasStamped);
             borrowed.assign(trackedLayers, false);
-            for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
-                if (!aliasTracked || !alias->layerPending[unit] || aliasStamped[unit] != 0 || alias->layerGeneration[unit] == 0 || layerPending[unit]) continue;
+            for (std::uint32_t unit = overlapFirst; aliasTracked && unit < overlapEnd; ++unit) {
+                const auto theirUnit = static_cast<std::size_t>(unit + alias.unitShift);
+                if (!lendable[unit] || !source.layerPending[theirUnit] || aliasStamped[unit - overlapFirst] != 0 || source.layerGeneration[theirUnit] == 0 || layerPending[unit]) continue;
                 if (sameBorrow && borrowedUnits[unit]) continue;
                 borrowed[unit] = true;
                 anyBorrowed = true;
@@ -1177,7 +1245,7 @@ bool StorageTexture::Refresh() {
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
-        takeRefreshProof(alias != nullptr);
+        takeRefreshProof(alias.source != nullptr);
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
@@ -1269,7 +1337,7 @@ bool StorageTexture::Refresh() {
     }
     if (anyBorrowed) {
         uploadReason = "alias";
-        borrowUnits(*alias, borrowed);
+        borrowUnits(*alias.source, borrowed, alias.unitShift, alias.remapped);
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
             if (borrowed[unit]) layerGeneration[unit] = current;
         }
@@ -2037,8 +2105,10 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         for (std::uint32_t unit = first; unit < first + count; ++unit) {
             if (!borrowedUnits[unit]) continue;
             borrowedUnits[unit] = false;
-            if (source->version != borrowedVersion || !source->layerPending[unit]) continue;
-            source->layerPending[unit] = false;
+            const auto theirUnit = static_cast<std::int64_t>(unit) + borrowedShift;
+            if (theirUnit < 0 || theirUnit >= static_cast<std::int64_t>(source->trackedLayers)) continue;
+            if (source->version != borrowedVersion || !source->layerPending[static_cast<std::size_t>(theirUnit)]) continue;
+            source->layerPending[static_cast<std::size_t>(theirUnit)] = false;
             unitsSuperseded.fetch_add(1, std::memory_order_relaxed);
             superseded = true;
         }
@@ -3017,27 +3087,97 @@ void StorageTexture::blockGenerations(std::vector<std::uint64_t>& generations) c
     }
 }
 
-std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
+StorageTexture::Alias StorageTexture::pendingAlias(const char** refusal) const {
     static const bool disabled = std::getenv("APS5_NO_ALIAS_BORROW") != nullptr;
-    if (disabled || !blockUnits) return nullptr;
+    static const bool remapDisabled = std::getenv("APS5_NO_ALIAS_REMAP") != nullptr;
+    if (disabled || !blockUnits) return {};
     std::vector<std::shared_ptr<StorageTexture>> candidates;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         for (auto* texture : pending.textures) {
-            if (texture == this || texture->descriptor.baseAddress != descriptor.baseAddress || texture->guestBytes != guestBytes || !texture->blockUnits) continue;
+            if (texture == this || !texture->blockUnits || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
             if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
         }
     }
     for (const auto& candidate : candidates) {
         const auto& mine = descriptor;
         const auto& theirs = candidate->descriptor;
+        if (theirs.baseAddress != mine.baseAddress || candidate->guestBytes != guestBytes) continue;
         // The same texels under another format of the same size: the device copy moves them bit
         // for bit, as the guest bytes would.
         const bool sameShape = mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && geometry.imageLayers == candidate->geometry.imageLayers && geometry.imageDepth == candidate->geometry.imageDepth && trackedLayers == candidate->trackedLayers;
-        if (sameShape && candidate->Cached() && candidate->uploadedKeys == DccKeys::Uncompressed) return candidate;
+        if (sameShape && candidate->Cached() && candidate->uploadedKeys == DccKeys::Uncompressed) return {candidate, 0, false};
     }
-    return nullptr;
+    const char* reason = nullptr;
+    const auto refuse = [&](const char* why) {
+        if (reason == nullptr) reason = why;
+    };
+    const auto mine = remapDisabled ? std::nullopt : aliasSurface();
+    for (const auto& candidate : candidates) {
+        const auto theirs = remapDisabled ? std::nullopt : candidate->aliasSurface();
+        if (!mine || !theirs || candidate->descriptor.dimension != descriptor.dimension) {
+            refuse("layout");
+            continue;
+        }
+        if (theirs->tileMode != mine->tileMode) {
+            refuse("tile mode");
+            continue;
+        }
+        if (theirs->elementBytes != mine->elementBytes) {
+            refuse("element size");
+            continue;
+        }
+        if (!AliasBlocksCompatible(*theirs, *mine)) {
+            refuse("layout");
+            continue;
+        }
+        if (!candidate->Cached()) {
+            refuse("uncached");
+            continue;
+        }
+        if (candidate->uploadedKeys != DccKeys::Uncompressed) {
+            refuse("keys");
+            continue;
+        }
+        const auto difference = static_cast<std::int64_t>(descriptor.baseAddress) - static_cast<std::int64_t>(candidate->descriptor.baseAddress);
+        if (difference % static_cast<std::int64_t>(AliasBlockBytes) != 0) {
+            refuse("layout");
+            continue;
+        }
+        return {candidate, difference / static_cast<std::int64_t>(AliasBlockBytes), true};
+    }
+    if (refusal != nullptr) *refusal = reason;
+    return {};
+}
+
+const StorageTexture::AliasPlan& StorageTexture::aliasPlanFrom(const AliasSurface& source) {
+    ++aliasPlanUses;
+    for (auto& plan : aliasPlans) {
+        if (plan.lastUse != 0 && plan.source == source && plan.unitCopies.size() == static_cast<std::size_t>(trackedLayers) + 1) {
+            plan.lastUse = aliasPlanUses;
+            return plan;
+        }
+    }
+    auto& plan = *std::min_element(aliasPlans.begin(), aliasPlans.end(), [](const AliasPlan& a, const AliasPlan& b) { return a.lastUse < b.lastUse; });
+    plan.source = source;
+    plan.lastUse = aliasPlanUses;
+    plan.copies.clear();
+    plan.unitCopies.assign(static_cast<std::size_t>(trackedLayers) + 1, 0);
+    const auto mine = aliasSurface();
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        plan.unitCopies[unit] = static_cast<std::uint32_t>(plan.copies.size());
+        if (mine) AliasBlockCopies(source, *mine, layerBegin(unit), plan.copies);
+    }
+    plan.unitCopies[trackedLayers] = static_cast<std::uint32_t>(plan.copies.size());
+    return plan;
+}
+
+std::optional<AliasSurface> StorageTexture::aliasSurface() const {
+    if (!blockUnits || descriptor.dimension != TextureDimension::k2D || descriptor.mipCount != 1 || mips.size() != 1 || mips[0].tail || arrayLayers != 1) return std::nullopt;
+    if (geometry.thick || geometry.imageLayers != 1 || geometry.imageDepth != 1 || IsBlockCompressed(descriptor.format) || trackedLayerBytes != AliasBlockBytes) return std::nullopt;
+    if (mips[0].tiledSize % AliasBlockBytes != 0 || descriptor.baseAddress % AliasBlockBytes != 0) return std::nullopt;
+    return AliasSurface{descriptor.tileMode, BytesPerElement(descriptor.format), mips[0].width, mips[0].height, mips[0].blocksPerRow, descriptor.baseAddress + mips[0].tiledOffset, mips[0].tiledSize / AliasBlockBytes};
 }
 
 void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
@@ -3049,14 +3189,30 @@ void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
     }
 }
 
-std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vector<bool>& units) {
+std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vector<bool>& units, std::int64_t unitShift, bool remapped) {
     const auto runs = unitRuns(units);
-    const auto windows = sliceWindows(runs);
-    Require(!windows.empty(), "storage image borrows no unit");
     std::vector<VkImageCopy> regions;
-    for (const auto& window : windows) {
-        for (const auto& region : window.regions) regions.push_back({region.imageSubresource, region.imageOffset, region.imageSubresource, region.imageOffset, region.imageExtent});
+    if (remapped) {
+        const auto theirs = source.aliasSurface();
+        Require(theirs.has_value(), "storage image borrows from an alias without a block layout");
+        const auto& plan = aliasPlanFrom(*theirs);
+        std::vector<AliasCopy> copies;
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            if (!units[unit]) continue;
+            Require(plan.Handed(unit), "storage image borrows a block its alias does not hand over");
+            copies.insert(copies.end(), plan.copies.begin() + plan.unitCopies[unit], plan.copies.begin() + plan.unitCopies[unit + 1]);
+        }
+        const VkImageSubresourceLayers layer{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        for (const auto& copy : copies) regions.push_back({layer, {static_cast<std::int32_t>(copy.sourceX), static_cast<std::int32_t>(copy.sourceY), 0}, layer, {static_cast<std::int32_t>(copy.destinationX), static_cast<std::int32_t>(copy.destinationY), 0}, {copy.width, copy.height, 1u}});
+        aliasUnitsRemapped.fetch_add(static_cast<std::uint64_t>(std::count(units.begin(), units.end(), true)), std::memory_order_relaxed);
+    } else {
+        Require(unitShift == 0, "storage image borrows a shifted alias block for block");
+        for (const auto& window : sliceWindows(runs)) {
+            for (const auto& region : window.regions) regions.push_back({region.imageSubresource, region.imageOffset, region.imageSubresource, region.imageOffset, region.imageExtent});
+        }
     }
+    Require(!regions.empty(), "storage image borrows no unit");
+    aliasUnitsLent.fetch_add(static_cast<std::uint64_t>(std::count(units.begin(), units.end(), true)), std::memory_order_relaxed);
     std::uint64_t bytes = 0;
     for (const auto& [begin, end] : runs) bytes += end - begin;
     auto* recorder = Recorder::Active();
@@ -3101,10 +3257,12 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     if (batch) batch->SubmitAndWait();
     else recorder->EndGpuTiming(timing, bytes);
     countStorageUpload(3, bytes);
-    if (borrowedFrom.lock() != source.weak_from_this().lock() || borrowedUnits.size() != trackedLayers) {
+    if (borrowedFrom.lock() != source.weak_from_this().lock() || borrowedShift != unitShift || borrowedUnits.size() != trackedLayers) {
         borrowedUnits.assign(trackedLayers, false);
         borrowedFrom = source.weak_from_this();
+        borrowedShift = unitShift;
     }
+    originalValid = false;
     borrowedVersion = source.version;
     source.lent = true;
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {

@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -32,6 +33,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <atomic>
 #include <cmath>
@@ -3487,6 +3489,170 @@ void depthSurfaceSamplingTests(const Device& device, Recorder& recorder) {
     ClearDepthImages(base.device);
 }
 
+void aliasHandOverTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0 || !StorageFormatAvailable(base, 62)) {
+        std::cout << "host imports or 8-byte storage images unavailable: remapped hand-overs not tested\n";
+        return;
+    }
+    constexpr std::uint32_t wideWidth = 384, wideHeight = 256, narrowWidth = 256, narrowHeight = 200;
+    constexpr std::uint32_t elementBytes = 8, blockWidth = 128, blockHeight = 64;
+    constexpr std::size_t bytes = 12 * 65536;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: remapped hand-overs not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* memory = static_cast<std::uint8_t*>(block);
+    std::uint32_t seed = 0x2468ace1u;
+    const auto random = [&] {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        return static_cast<std::uint8_t>(seed >> 7);
+    };
+    for (std::size_t i = 0; i < bytes; ++i) memory[i] = random();
+    std::vector<std::uint8_t> expected(memory, memory + bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host imports refused or compared: remapped hand-overs not tested\n";
+        return;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    const auto resourceOf = [&](std::uint32_t width, std::uint32_t height) {
+        GuestTextureResource resource{};
+        resource.baseAddress = address;
+        resource.width = width;
+        resource.height = height;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kR64KBX;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 62;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        return resource;
+    };
+    const auto wideResource = resourceOf(wideWidth, wideHeight);
+    const auto narrowResource = resourceOf(narrowWidth, narrowHeight);
+    Require(DescribeSurface(wideResource).guestBytes == bytes && DescribeSurface(narrowResource).guestBytes == 8 * 65536, "the hand-over surfaces have unexpected sizes");
+    const auto* equation = FindTextureSwizzleEquation(27u, elementBytes);
+    Require(equation != nullptr, "no 8-byte SW_64KB_R_X equation");
+    const auto tiledOffset = [&](std::uint32_t width, std::uint32_t x, std::uint32_t y) {
+        std::uint32_t offset = 0;
+        for (std::uint32_t bit = 0; bit < 16; ++bit) {
+            const auto mask = equation->bits[bit];
+            offset |= static_cast<std::uint32_t>(std::popcount((x & (mask & 0xfffu)) ^ ((y << 12) & (mask & 0xfff000u))) & 1) << bit;
+        }
+        const auto blocksPerRow = (width + blockWidth - 1) / blockWidth;
+        return static_cast<std::size_t>((y / blockHeight) * blocksPerRow + x / blockWidth) * 65536 + offset;
+    };
+    const auto upload = [&](const StorageTexture& image, std::uint32_t width, std::uint32_t height, const std::vector<std::uint8_t>& pixels) {
+        Buffer staging(context, pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memcpy(staging.Bytes().data(), pixels.data(), pixels.size());
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {width, height, 1};
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging.Handle(), image.Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    const auto readImage = [&](const StorageTexture& image, std::uint32_t width, std::uint32_t height) {
+        Buffer readback(context, static_cast<std::size_t>(width) * height * elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {width, height, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image.Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        const auto read = readback.Bytes();
+        return std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(read.data()), reinterpret_cast<const std::uint8_t*>(read.data()) + read.size());
+    };
+    std::vector<std::uint8_t> narrowElement(bytes, 0);
+    const auto storedPadding = [&](std::size_t at) { return at >= 6 * 65536 && at < 8 * 65536 && narrowElement[at] == 0; };
+    const auto holdsMemory = [&](const std::vector<std::uint8_t>& pixels, std::uint32_t width, std::uint32_t height, const std::vector<std::uint8_t>& guest, bool skipStoredPadding = false) {
+        for (std::uint32_t y = 0; y < height; ++y) {
+            for (std::uint32_t x = 0; x < width; ++x) {
+                const auto at = tiledOffset(width, x, y);
+                if (skipStoredPadding && storedPadding(at)) continue;
+                if (std::memcmp(pixels.data() + (static_cast<std::size_t>(y) * width + x) * elementBytes, guest.data() + at, elementBytes) != 0) return false;
+            }
+        }
+        return true;
+    };
+    const auto tile = [&](const std::vector<std::uint8_t>& pixels, std::uint32_t width, std::uint32_t height, std::vector<std::uint8_t>& guest) {
+        for (std::uint32_t y = 0; y < height; ++y) {
+            for (std::uint32_t x = 0; x < width; ++x) std::memcpy(guest.data() + tiledOffset(width, x, y), pixels.data() + (static_cast<std::size_t>(y) * width + x) * elementBytes, elementBytes);
+        }
+    };
+    {
+        auto wide = std::make_shared<StorageTexture>(context, detiler, wideResource, 0);
+        auto narrow = std::make_shared<StorageTexture>(context, detiler, narrowResource, 0);
+        recorder.Keep(wide);
+        recorder.Keep(narrow);
+        wide->SetCached(true);
+        narrow->SetCached(true);
+        Require(holdsMemory(readImage(*wide, wideWidth, wideHeight), wideWidth, wideHeight, expected), "the wide surface was not uploaded from guest memory");
+        std::vector<std::uint8_t> narrowPixels(static_cast<std::size_t>(narrowWidth) * narrowHeight * elementBytes);
+        for (auto& value : narrowPixels) value = random();
+        upload(*narrow, narrowWidth, narrowHeight, narrowPixels);
+        narrow->MarkDirty();
+        tile(narrowPixels, narrowWidth, narrowHeight, expected);
+        for (std::uint32_t y = 0; y < narrowHeight; ++y) {
+            for (std::uint32_t x = 0; x < narrowWidth; ++x) std::memset(narrowElement.data() + tiledOffset(narrowWidth, x, y), 1, elementBytes);
+        }
+        wide->Refresh();
+        Require(StorageTexture::FindPending(address, 8 * 65536) == narrow, "the narrow surface's results were stored instead of handed over on the device");
+        Require(holdsMemory(readImage(*wide, wideWidth, wideHeight), wideWidth, wideHeight, expected, true), "the wide surface does not hold the narrow surface's results at the same guest bytes");
+        std::vector<std::uint8_t> widePixels(static_cast<std::size_t>(wideWidth) * wideHeight * elementBytes);
+        for (auto& value : widePixels) value = random();
+        upload(*wide, wideWidth, wideHeight, widePixels);
+        wide->MarkDirty();
+        tile(widePixels, wideWidth, wideHeight, expected);
+        Require(StorageTexture::FindPending(address, 8 * 65536) != narrow, "results handed over and then rewritten stayed pending in their first image");
+        narrow->Refresh();
+        Require(StorageTexture::FindPending(address, bytes) == wide, "the wide surface's results were stored instead of handed back on the device");
+        Require(holdsMemory(readImage(*narrow, narrowWidth, narrowHeight), narrowWidth, narrowHeight, expected), "the narrow surface does not hold the wide surface's results at the same guest bytes");
+        std::vector<std::byte> read(bytes);
+        AgcDriver::GuestMemory::Read(address, read);
+        for (std::size_t i = 0; i < bytes; ++i) Require(std::to_integer<std::uint8_t>(read[i]) == expected[i], "guest memory differs from the surfaces' results in the order they were written at byte " + std::to_string(i));
+        wide->SetCached(false);
+        narrow->SetCached(false);
+    }
+    recorder.Sync();
+}
+
 void keysFillTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -3733,6 +3899,7 @@ int main() {
             pendingKeyStoreTests(device, recorder);
             movedMetadataTests(device, recorder);
             keysFillTests(device, recorder);
+            aliasHandOverTests(device, recorder);
             unimportableRangeTests(device);
             sampleDumpTests(device, recorder);
             gpuTimestampTests(device, recorder);

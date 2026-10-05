@@ -200,6 +200,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureFormat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DccMetadata.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureTiling.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/StorageAlias.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureResidency.cpp
@@ -495,6 +496,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/LiveStack.cpp
         tests/TextureFormat.cpp
         tests/TextureTiling.cpp
+        tests/StorageAlias.cpp
         tests/GuestTextureResource.cpp
         tests/GuestSamplerResource.cpp
         tests/TextureDetiler.cpp
@@ -519,6 +521,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/TextureFormat.cpp
         Graphics/src/DccMetadata.cpp
         Graphics/src/TextureTiling.cpp
+        Graphics/src/StorageAlias.cpp
         Graphics/src/TextureDetiler.cpp
         Graphics/src/Texture.cpp
         Graphics/src/TextureResidency.cpp
@@ -706,6 +709,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/TextureFormat.cpp
             Graphics/src/DccMetadata.cpp
             Graphics/src/TextureTiling.cpp
+            Graphics/src/StorageAlias.cpp
             Graphics/src/TextureDetiler.cpp
             Graphics/src/Texture.cpp
             Graphics/src/TextureResidency.cpp

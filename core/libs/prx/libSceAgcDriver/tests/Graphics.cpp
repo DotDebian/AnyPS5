@@ -2814,6 +2814,7 @@ int main() {
         RunLiveStackAccessTests();
         RunTextureFormatTests();
         RunTextureTilingTests();
+        RunStorageAliasTests();
         RunGuestTextureResourceTests();
         RunGuestSamplerResourceTests();
         mock = MockVulkan{};
