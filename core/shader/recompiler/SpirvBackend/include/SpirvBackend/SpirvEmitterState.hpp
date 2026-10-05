@@ -127,6 +127,13 @@ struct SpirvEmitterState {
     std::uint32_t bdaProbeFunction = 0;
     std::uint32_t bdaWritePointerFunction = 0;
     std::uint32_t bdaNoteWriteFunction = 0;
+    // The last table range a lookup of this invocation resolved (see DefineBdaLookup): its guest
+    // begin and end, device address and permissions, as private variables; 0 when the lookups are
+    // emitted without the cache (APS5_NO_BDA_LOOKUP_CACHE=1).
+    std::uint32_t bdaCacheBegin = 0;
+    std::uint32_t bdaCacheEnd = 0;
+    std::uint32_t bdaCacheBase = 0;
+    std::uint32_t bdaCachePermissions = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
