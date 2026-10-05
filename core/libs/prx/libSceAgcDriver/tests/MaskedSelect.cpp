@@ -326,5 +326,43 @@ int main() {
         return sample(IrShaderStage::Pixel, RdnaImageSampleFlagLevelZero) && sample(IrShaderStage::Mesh, 0u);
     });
 
+    const auto guarded = [](IrOpcode opcode, bool sameExec, bool asActive) {
+        Builder b;
+        auto& wide = b.mask(48u);
+        auto& exec = b.logicalAnd(wide, b.mask(16u));
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        IrValue& active = asActive ? b.emit(IrOpcode::INotEqual32, IrType::Bool, {&written, &b.constant(0u)}) : sameExec ? exec : wide;
+        switch (opcode) {
+            case IrOpcode::WriteSharedU32:
+                b.emit(opcode, IrType::Void, {&old, &written, &active});
+                break;
+            case IrOpcode::LoadBufferU32:
+                b.keep(b.select(exec, b.emit(opcode, IrType::U32, {&b.emit(IrOpcode::GetBufferResource, IrType::BufferResource, {}), &written, &b.constant(0u), &b.constant(0u), &active}), old));
+                break;
+            default:
+                b.emit(opcode, IrType::Void, {&b.emit(IrOpcode::CompositeConstructU32x4, IrType::U32x4, {&written, &old, &old, &old}), &active});
+                break;
+        }
+        b.eliminate();
+        return removed(written);
+    };
+
+    passed &= run("a store, load or export whose exec implies the write's exec drops the select", [&] {
+        return guarded(IrOpcode::WriteSharedU32, true, false) && guarded(IrOpcode::LoadBufferU32, true, false) && guarded(IrOpcode::SetAttribute, true, false);
+    });
+
+    passed &= run("a store, load or export under a wider exec keeps the select", [&] {
+        return !guarded(IrOpcode::WriteSharedU32, false, false) && !guarded(IrOpcode::LoadBufferU32, false, false) && !guarded(IrOpcode::SetAttribute, false, false);
+    });
+
+    passed &= run("a value used as a store's exec keeps the select", [&] {
+        return !guarded(IrOpcode::WriteSharedU32, true, true);
+    });
+
+    passed &= run("an atomic keeps the select", [&] {
+        return !guarded(IrOpcode::SharedAtomicIAdd32, true, false);
+    });
+
     return passed ? 0 : 1;
 }

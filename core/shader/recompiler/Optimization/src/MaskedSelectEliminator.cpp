@@ -178,6 +178,39 @@ bool isLaneLocal(IrOpcode opcode) {
     }
 }
 
+bool readsOnlyWhereActive(IrOpcode opcode) {
+    switch (opcode) {
+        case IrOpcode::LoadBufferU8:
+        case IrOpcode::LoadBufferU16:
+        case IrOpcode::LoadBufferU32:
+        case IrOpcode::LoadBufferU32x2:
+        case IrOpcode::LoadBufferU32x3:
+        case IrOpcode::LoadBufferU32x4:
+        case IrOpcode::StoreBufferU8:
+        case IrOpcode::StoreBufferU16:
+        case IrOpcode::StoreBufferU32:
+        case IrOpcode::StoreBufferU32x2:
+        case IrOpcode::StoreBufferU32x3:
+        case IrOpcode::StoreBufferU32x4:
+        case IrOpcode::LoadSharedU8:
+        case IrOpcode::LoadSharedU16:
+        case IrOpcode::LoadSharedU32:
+        case IrOpcode::LoadSharedU32x2:
+        case IrOpcode::LoadSharedU32x3:
+        case IrOpcode::LoadSharedU32x4:
+        case IrOpcode::WriteSharedU8:
+        case IrOpcode::WriteSharedU16:
+        case IrOpcode::WriteSharedU32:
+        case IrOpcode::WriteSharedU32x2:
+        case IrOpcode::WriteSharedU32x3:
+        case IrOpcode::WriteSharedU32x4:
+        case IrOpcode::SetAttribute:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool isExplicitLodSample(const IrProgram& program, const IrValue& value) {
     if (value.Opcode() != IrOpcode::ImageSampleRaw) return false;
     if (program.Resources().stage != IrShaderStage::Pixel) return true;
@@ -319,6 +352,7 @@ bool unobservedWhereMasked(const IrProgram& program, const std::unordered_set<co
             if (user->Parent() == nullptr || !once.contains(user->Parent())) return false;
             if (isSelect(user->Opcode()) && use.operand == 1u && implies(user->Argument(0), mask, waveSize)) continue;
             if (user->Opcode() == IrOpcode::LogicalAnd && use.operand < 2u && implies(user->Argument(1u - use.operand), mask, waveSize)) continue;
+            if (readsOnlyWhereActive(user->Opcode()) && use.operand + 1u < user->ArgumentCount() && implies(user->Argument(user->ArgumentCount() - 1u), mask, waveSize)) continue;
             if (!user->IsPhi() && !isLaneLocal(user->Opcode()) && !isExplicitLodSample(program, *user)) return false;
             if (visited.insert(user).second) {
                 if (visited.size() > VisitLimit) return false;
