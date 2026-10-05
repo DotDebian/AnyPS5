@@ -57,7 +57,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         const auto label = Pm4::DecodeLabelWrite(packet);
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
         if (label.has_value() || storesNothing) {
-            bumpEpoch(&EpochBumps::drains);
+            bumpEpoch(&EpochBumps::drains, GuestMemory::EpochReason::EopInterrupt);
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             const auto localDevice = device.Load();
@@ -232,7 +232,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
         static const bool unlockedDrain = std::getenv("APS5_NO_UNLOCKED_DRAIN") == nullptr && !drainAll;
 
-        bumpEpoch(&EpochBumps::drains);
+        bumpEpoch(&EpochBumps::drains, GuestMemory::EpochReason::Drain);
         std::shared_ptr<VulkanDevice> draining;
         std::uint64_t epoch = 0;
         {

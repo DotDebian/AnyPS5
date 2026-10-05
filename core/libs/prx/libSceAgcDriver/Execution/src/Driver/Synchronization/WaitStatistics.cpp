@@ -24,8 +24,8 @@ EpochBumps& Driver::epochBumps() {
     return bumps;
 }
 
-void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter) {
-    GuestMemory::BumpCollectEpoch();
+void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter, GuestMemory::EpochReason reason) {
+    GuestMemory::BumpCollectEpoch(reason);
     ++(epochBumps().*counter);
 }
 

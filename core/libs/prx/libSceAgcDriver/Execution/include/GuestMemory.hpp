@@ -7,6 +7,7 @@
 #include <functional>
 #include <mutex>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -96,6 +97,19 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
 std::uint64_t CollectEpochBumps();
+// APS5_TRACE_SYNC=1 (local, not for upstream): the collect figures of one [synctrace] window,
+// measurable without APS5_PROFILE_DRAW. The workers name why they bump (BumpCollectEpoch with a
+// reason), the walks (memo misses) are counted and timed, and a few fast paths count their uses
+// (CountTrace). CollectTraceReport returns the window's text and clears the counters; the
+// [synctrace] report in Recorder.cpp prints it as a line of its own. Everything but the two clock
+// reads around a walk is a relaxed atomic add, made whether or not the trace is on.
+enum class EpochReason : std::uint8_t { Submission, Wait, Drain, EopInterrupt, Reap, Packet, Other, Count };
+void BumpCollectEpoch(EpochReason reason);
+enum class TraceCount : std::uint8_t { StoredWaitBumpSkipped, EopBumpSkipped, MeshIndexSnapshotSkipped, TargetRefreshSkipped, TargetRefreshMade, RecheckViewShared, Count };
+void CountTrace(TraceCount which);
+std::string CollectTraceReport();
+// The calling thread's collect epoch: 0 until its first bump (such a thread reuses no walk).
+std::uint64_t ThreadCollectEpoch();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the

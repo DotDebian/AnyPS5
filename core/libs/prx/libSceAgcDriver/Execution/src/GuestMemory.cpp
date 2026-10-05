@@ -71,6 +71,12 @@ std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
+// APS5_TRACE_SYNC (see CollectTraceReport): the window's bumps by reason, the walks with their
+// bytes and time, and the fast paths' uses. The memo hits are the cumulative counter above, read
+// as a difference.
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(EpochReason::Count)> tracedEpochs{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TraceCount::Count)> tracedCounts{};
+std::atomic<std::uint64_t> tracedWalks{0}, tracedWalkBytes{0}, tracedWalkNanoseconds{0}, tracedMemoHitsReported{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
 // tracker mutex acquisitions that had to wait (APS5_PROFILE_DRAW; see lockTracker).
@@ -1016,6 +1022,12 @@ bool collectMemoEnabled() {
     return !disabled;
 }
 
+// As Recorder.cpp's SyncTraced: APS5_PROFILE_DRAW owns the same figures in its [guestmem] line.
+bool collectTraced() {
+    static const bool traced = std::getenv("APS5_TRACE_SYNC") != nullptr && std::getenv("APS5_PROFILE_DRAW") == nullptr;
+    return traced;
+}
+
 // The per-thread memo ring (see WriteTracker::Memo): sized to a packet's working set (a dispatch
 // collects each of its few dozen image surfaces in stage A and again in stage B). Entries of a
 // thread that never bumps its epoch never match (each collect gets a fresh epoch), as intended.
@@ -1137,7 +1149,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    // APS5_TRACE_SYNC: the walk alone (the wait for the tracker mutex is not in it), failed ones too.
+    const bool traced = collectTraced();
+    const auto walkStart = traced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool walked = walkWrites(tracker, first, stop, StampKind::Cpu);
+    tracedWalks.fetch_add(1, std::memory_order_relaxed);
+    tracedWalkBytes.fetch_add(stop - first, std::memory_order_relaxed);
+    if (traced) tracedWalkNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
+    if (!walked) return 0;
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
@@ -1158,8 +1177,46 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 }
 
 void BumpCollectEpoch() {
+    BumpCollectEpoch(EpochReason::Other);
+}
+
+void BumpCollectEpoch(EpochReason reason) {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+    tracedEpochs[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t ThreadCollectEpoch() {
+    return threadCollectEpoch;
+}
+
+void CountTrace(TraceCount which) {
+    tracedCounts[static_cast<std::size_t>(which)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string CollectTraceReport() {
+    static const char* const reasons[static_cast<std::size_t>(EpochReason::Count)] = {"submission", "wait", "drain", "eop-interrupt", "reap", "packet", "other"};
+    const auto count = [](TraceCount which) { return static_cast<unsigned long long>(tracedCounts[static_cast<std::size_t>(which)].exchange(0, std::memory_order_relaxed)); };
+    std::string byReason;
+    std::uint64_t epochs = 0;
+    char text[640];
+    for (std::size_t reason = 0; reason < tracedEpochs.size(); ++reason) {
+        const auto bumps = tracedEpochs[reason].exchange(0, std::memory_order_relaxed);
+        epochs += bumps;
+        if (bumps == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %llu", reasons[reason], static_cast<unsigned long long>(bumps));
+        byReason += text;
+    }
+    const auto hits = collectMemoHits.load(std::memory_order_relaxed);
+    const auto hitsBefore = tracedMemoHitsReported.exchange(hits, std::memory_order_relaxed);
+    const auto walks = tracedWalks.exchange(0, std::memory_order_relaxed);
+    const auto walkBytes = tracedWalkBytes.exchange(0, std::memory_order_relaxed);
+    const auto walkNanoseconds = tracedWalkNanoseconds.exchange(0, std::memory_order_relaxed);
+    std::snprintf(text, sizeof(text), "collect epochs %llu by reason:%s; bumps skipped: stored-wait %llu, eop-interrupt %llu; write-watch walks %llu in %llu us (%.0f MiB), memo hits %llu", static_cast<unsigned long long>(epochs), byReason.c_str(), count(TraceCount::StoredWaitBumpSkipped), count(TraceCount::EopBumpSkipped), static_cast<unsigned long long>(walks), static_cast<unsigned long long>(walkNanoseconds / 1000), static_cast<double>(walkBytes) / 1048576.0, static_cast<unsigned long long>(hits - hitsBefore));
+    std::string report = text;
+    const auto refreshesSkipped = count(TraceCount::TargetRefreshSkipped);
+    std::snprintf(text, sizeof(text), "; mesh index snapshots skipped %llu; target refreshes %llu made, %llu skipped; rechecks sharing one pending view %llu", count(TraceCount::MeshIndexSnapshotSkipped), count(TraceCount::TargetRefreshMade), refreshesSkipped, count(TraceCount::RecheckViewShared));
+    return report + text;
 }
 
 std::uint64_t CollectEpochBumps() {

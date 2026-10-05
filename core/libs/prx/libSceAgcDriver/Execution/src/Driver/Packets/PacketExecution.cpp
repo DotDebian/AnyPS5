@@ -114,7 +114,7 @@ void Driver::execute(const Submission& submission) {
     auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
     ++packetProfile.submissions;
 
-    bumpEpoch(&EpochBumps::submissions);
+    bumpEpoch(&EpochBumps::submissions, GuestMemory::EpochReason::Submission);
     struct AheadScope {
         DrawAhead* ahead = nullptr;
         ~AheadScope() {
@@ -127,7 +127,7 @@ void Driver::execute(const Submission& submission) {
         reportDrawAhead();
     }
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
-        if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
+        if (packetEpoch()) bumpEpoch(&EpochBumps::packets, GuestMemory::EpochReason::Packet);
         CheckFailure();
         const auto header = submission.commands[cursor];
         if (Pm4::FillerPacket(header)) { ++cursor; continue; }
