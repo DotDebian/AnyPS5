@@ -313,7 +313,7 @@ void Driver::execute(const Submission& submission) {
             } else if (!wroteOnGpu) {
                 Pm4::Execute(packet, queue);
                 if (opcode == 0x49 || opcode == 0x37) {
-                    if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial);
+                    if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial, submission.queue);
                 }
             }
             if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);

@@ -6,18 +6,22 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp) {
+void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
     if (bytes.empty() || bytes.size() > 64 || bytes.size() % 4 != 0 || address % 4 != 0) return;
     std::lock_guard lock(labelStoresMutex);
     for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
         auto& history = labelStores[address + offset];
         std::shift_right(history.begin(), history.end(), 1);
         history[0].stamp = stamp;
+        history[0].queue = queue;
         std::memcpy(&history[0].value, bytes.data() + offset, 4);
     }
 }
 
-bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received) {
+// `storingQueue` receives the queue of the store that satisfies the wait: one this queue's own
+// packet made orders no CPU write (see GuestMemory::BumpCollectEpoch), so waitMemory then leaves
+// its collect epoch alone, as it does for a label of its own found in the recorder's table.
+bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* storingQueue) {
     std::lock_guard lock(labelStoresMutex);
     const auto low = labelStores.find(address);
     if (low == labelStores.end()) return false;
@@ -31,7 +35,9 @@ bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t ad
             if (upper == high->second.end()) continue;
             value |= static_cast<std::uint64_t>(upper->value) << 32u;
         }
-        if (Pm4::WaitComparesValue(packet, value)) return true;
+        if (!Pm4::WaitComparesValue(packet, value)) continue;
+        if (storingQueue != nullptr) *storingQueue = store.queue;
+        return true;
     }
     return false;
 }
