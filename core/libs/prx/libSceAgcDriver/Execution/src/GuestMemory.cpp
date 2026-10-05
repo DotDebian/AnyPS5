@@ -71,6 +71,8 @@ std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
+// See DriverStoreSerial: bumped under the tracker mutex with every driver stamp.
+std::atomic<std::uint64_t> driverStoreSerial{0};
 // APS5_TRACE_SYNC (see CollectTraceReport): the window's bumps by reason, the walks with their
 // bytes and time, and the fast paths' uses. The memo hits are the cumulative counter above, read
 // as a difference.
@@ -1379,6 +1381,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first || !tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) return 0;
         ++tracker.generation;
+        driverStoreSerial.fetch_add(1, std::memory_order_release);
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
             tracker.stamp(block, tracker.generation, StampKind::Driver);
             tracker.noteDriverStore(block, stored.first, stored.second, tracker.generation);
@@ -1401,6 +1404,8 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
 #endif
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return stampStored(tracker, store());
     const auto stored = store();
+    // The walk stamps as the driver's whatever it finds dirty, stored or not.
+    driverStoreSerial.fetch_add(1, std::memory_order_release);
     walkWrites(tracker, first, stop, StampKind::Driver);
     return stampStored(tracker, stored);
 }
@@ -1420,11 +1425,16 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
     ++tracker.generation;
+    driverStoreSerial.fetch_add(1, std::memory_order_release);
     for (auto block = first; block <= last; ++block) {
         tracker.stamp(block, tracker.generation, StampKind::Driver);
         tracker.noteDriverStore(block, address, address + bytes, tracker.generation);
     }
     return tracker.generation;
+}
+
+std::uint64_t DriverStoreSerial() {
+    return driverStoreSerial.load(std::memory_order_acquire);
 }
 
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {

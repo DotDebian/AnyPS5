@@ -249,6 +249,30 @@ public:
     // One use's completion work (WriteBackBuffers runs it for a shared build): the fault check and
     // the write marks. The caller releases the use's hold afterwards.
     void CompleteSharedUse();
+    // The read-only buffer elements of address-based draws under APS5_REUSE_ADDRESS_DRAWS with
+    // APS5_SNAPSHOT_ADDRESS_DRAWS (PrepareDrawBindings: a build's own elements and the ones a
+    // template or plan hit moved), cumulative, for the [addrdraw] line: elements bound to a
+    // snapshot (`video`: one whose buffer is in video memory), of them the binds that skipped
+    // the checks by the collect epoch (Recorder::EpochSnapshot; `epochRechecks`: after asking
+    // the range again because a driver stamp or a write note had moved), reused a cached
+    // snapshot after its checks, or copied one; and the elements left bound in place through the import, by
+    // reason: under or over the size window (APS5_SNAPSHOT_ADDRESS_DRAWS_MIN_KIB / _MAX_KIB),
+    // written by the build, a GPU write or image result pending over the range, not in an import
+    // bound in place (a mirror, a region of the build's own, an inaccessible page), not
+    // write-watched (a snapshot of it could never be reused). Read and written under
+    // GuestMemory::GpuMutex.
+    enum class SnapshotRefusal : std::size_t { UnderWindow, OverWindow, Written, Pending, OutsideImport, Unwatched, Count };
+    struct AddressSnapshotStats {
+        std::uint64_t bound = 0;
+        std::uint64_t video = 0;
+        std::uint64_t epochSkips = 0;
+        std::uint64_t epochRechecks = 0;
+        std::uint64_t reused = 0;
+        std::uint64_t copied = 0;
+        std::uint64_t copiedBytes = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(SnapshotRefusal::Count)> inPlace{};
+    };
+    static const AddressSnapshotStats& AddressSnapshotCounters();
     // Draw plans (APS5_DRAW_PLANS, see Draw.hpp): the recipes of the draws this cached object
     // served, by the draws' plan key (their state key and push constant placement), most recently
     // attached first and bounded; an attach under a key replaces that key's plan. Under
@@ -420,6 +444,12 @@ private:
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
     AddressRefusal sharingRefusal() const;
+    // The snapshot an address-based draw binds for the read-only range [begin, begin + bytes) of
+    // one of its elements instead of the import (see AddressSnapshotStats), or null to leave the
+    // element in place. Under the stamp PrepareDrawBindings took for the call.
+    std::shared_ptr<Buffer> addressSnapshot(Recorder& recorder, std::uint64_t begin, std::size_t bytes) const;
+    // The descriptor counts of a draw's own set (PrepareDrawBindings), computed once.
+    mutable std::vector<VkDescriptorPoolSize> drawBindingSizes;
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys

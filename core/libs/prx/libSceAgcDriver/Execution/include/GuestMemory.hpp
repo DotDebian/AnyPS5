@@ -110,6 +110,12 @@ void CountTrace(TraceCount which);
 std::string CollectTraceReport();
 // The calling thread's collect epoch: 0 until its first bump (such a thread reuses no walk).
 std::uint64_t ThreadCollectEpoch();
+// Counts the driver's own stamps (MarkWritten, the stores of Write, WriteChanged and
+// StoreOwnBytes): while it stands, no block anywhere took a driver stamp, so a proof that
+// UnchangedSince held for a range needs only the CPU's stores looked at again (a collect, or
+// nothing within the collect epoch that already looked). The draw snapshots' epoch reuse reads it
+// (Recorder::EpochSnapshot).
+std::uint64_t DriverStoreSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the

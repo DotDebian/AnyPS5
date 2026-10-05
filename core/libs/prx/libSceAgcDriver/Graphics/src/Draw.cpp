@@ -724,6 +724,20 @@ void reportAddressDraws() {
         return text.empty() ? std::string(" none") : text;
     };
     std::fprintf(stderr, "[addrdraw] address-based draws (10 s): %llu template hits avg %.1f us (%llu with a set of their own: %llu data buffers rebuilt, %llu buffers rebound in place), %llu builds avg %.1f us; built because:%s; proof failures by reason:%s; builds then:%s; %zu templates and dispatch entries cached\n", static_cast<unsigned long long>(stats.hits), stats.hits != 0 ? stats.hitUs / static_cast<double>(stats.hits) : 0.0, static_cast<unsigned long long>(stats.ownSets), static_cast<unsigned long long>(stats.dataBuffers), static_cast<unsigned long long>(stats.reboundBuffers), static_cast<unsigned long long>(builds), builds != 0 ? stats.buildUs / static_cast<double>(builds) : 0.0, list(stats.builds, AddressDrawBuildNames, 0).c_str(), list(stats.proofFailures, ProofFailureNames, 1).c_str(), list(stats.fates, AddressDrawFateNames, 0).c_str(), SharedResourceCache().Size());
+    // The read-only elements of those draws under APS5_SNAPSHOT_ADDRESS_DRAWS (a build's own and
+    // the ones a hit moved; a plan hit's too): ShaderResources' cumulative counters, as the
+    // window's difference. "rebound in place" above counts every moved element, whichever of the
+    // two it was then bound to.
+    static ShaderResources::AddressSnapshotStats seen;
+    const auto snapshots = ShaderResources::AddressSnapshotCounters();
+    const auto delta = [](std::uint64_t value, std::uint64_t before) { return static_cast<unsigned long long>(value - before); };
+    constexpr std::array<const char*, static_cast<std::size_t>(ShaderResources::SnapshotRefusal::Count)> refusals{"under the size window", "over the size window", "written by the build", "pending GPU write or image result", "not in an import bound in place", "not write-watched"};
+    std::string left;
+    for (std::size_t i = 0; i < refusals.size(); ++i) {
+        if (snapshots.inPlace[i] != seen.inPlace[i]) left += " " + std::string(refusals[i]) + " " + std::to_string(snapshots.inPlace[i] - seen.inPlace[i]);
+    }
+    std::fprintf(stderr, "[addrdraw] read-only elements (10 s): %llu bound to a snapshot (%llu in video memory): %llu by the collect epoch without a check (%llu of them after asking the range again), %llu reused after their checks, %llu copied (%.1f MiB); left in place:%s\n", delta(snapshots.bound, seen.bound), delta(snapshots.video, seen.video), delta(snapshots.epochSkips, seen.epochSkips), delta(snapshots.epochRechecks, seen.epochRechecks), delta(snapshots.reused, seen.reused), delta(snapshots.copied, seen.copied), static_cast<double>(snapshots.copiedBytes - seen.copiedBytes) / 1048576.0, left.empty() ? " none" : left.c_str());
+    seen = snapshots;
     const auto last = stats.lastReport;
     stats = {};
     stats.lastReport = last;
