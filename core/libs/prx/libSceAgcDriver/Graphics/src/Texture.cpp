@@ -99,6 +99,35 @@ void noteAliasRefusal(const char* reason) {
     }
 }
 
+// The "storage refresh" write-backs (APS5_PROFILE_DRAW) by what the refresh made of an
+// overlapping pending image (its units lent, the refusal, or no candidate at all) and by the
+// refreshed image's own keys after the flush (uncompressed; a clear code it is filled from without
+// reading memory; other), as count and bytes: which refreshes the stored traffic serves.
+constexpr std::array<const char*, 3> refreshKeyNames{"uncompressed", "clear fill", "other keys"};
+constexpr std::size_t refreshOutcomes = aliasRefusalNames.size() + 2;
+std::array<std::pair<std::atomic<std::uint64_t>, std::atomic<std::uint64_t>>, refreshOutcomes * refreshKeyNames.size()> refreshWriteBacks{};
+// The refresh on this thread tallying its flushes' write-backs (countStorageWriteBack).
+thread_local std::pair<std::uint64_t, std::uint64_t>* refreshTally = nullptr;
+
+std::string refreshWriteBackReport() {
+    std::string line = "; refresh write-backs by outcome and keys (count/MiB):";
+    char text[96];
+    bool any = false;
+    for (std::size_t outcome = 0; outcome < refreshOutcomes; ++outcome) {
+        const char* name = outcome < aliasRefusalNames.size() ? aliasRefusalNames[outcome] : outcome == aliasRefusalNames.size() ? "lent" : "no candidate";
+        for (std::size_t keys = 0; keys < refreshKeyNames.size(); ++keys) {
+            auto& entry = refreshWriteBacks[outcome * refreshKeyNames.size() + keys];
+            const auto count = entry.first.exchange(0, std::memory_order_relaxed);
+            const auto bytes = entry.second.exchange(0, std::memory_order_relaxed);
+            if (count == 0) continue;
+            std::snprintf(text, sizeof(text), " %s/%s %llu/%.1f", name, refreshKeyNames[keys], static_cast<unsigned long long>(count), bytes / 1048576.0);
+            line += text;
+            any = true;
+        }
+    }
+    return any ? line : line + " none";
+}
+
 std::string aliasReport() {
     char text[96];
     std::snprintf(text, sizeof(text), "; hand-overs: units lent %llu (remapped %llu), edge units stored %llu, refused", static_cast<unsigned long long>(aliasUnitsLent.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(aliasUnitsRemapped.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(aliasEdgeUnits.exchange(0, std::memory_order_relaxed)));
@@ -107,7 +136,7 @@ std::string aliasReport() {
         std::snprintf(text, sizeof(text), " %s %llu", aliasRefusalNames[i], static_cast<unsigned long long>(aliasRefusals[i].exchange(0, std::memory_order_relaxed)));
         line += text;
     }
-    return line;
+    return line + refreshWriteBackReport();
 }
 
 struct StorageTraffic {
@@ -175,6 +204,10 @@ void countStorageWriteBack(std::uint64_t bytes, bool direct) {
     ++totals.first;
     totals.second += bytes;
     if (direct) ++traffic.directWriteBacks;
+    if (refreshTally != nullptr) {
+        ++refreshTally->first;
+        refreshTally->second += bytes;
+    }
     reportStorageTraffic(traffic);
 }
 
@@ -1156,6 +1189,11 @@ bool StorageTexture::Refresh() {
         }
         if (alias.source == nullptr) storeFirst.clear();
     }
+    std::pair<std::uint64_t, std::uint64_t> refreshStored{};
+    struct Tally {
+        ~Tally() { refreshTally = nullptr; }
+    } tally;
+    if (profile) refreshTally = &refreshStored;
     // No publish: the upload below reads the stored units from the unit shadow itself.
     bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.source.get(), "storage refresh", PublishScope::None);
     if (!storeFirst.empty()) {
@@ -1166,6 +1204,7 @@ bool StorageTexture::Refresh() {
         }
         aliasEdgeUnits.fetch_add(edgeUnits, std::memory_order_relaxed);
     }
+    refreshTally = nullptr;
     if (profile && alias.source == nullptr && aliasRefusal != nullptr) noteAliasRefusal(aliasRefusal);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
@@ -1275,6 +1314,17 @@ bool StorageTexture::Refresh() {
                 borrowedUnits.clear();
             }
         }
+    }
+    if (profile && refreshStored.first != 0) {
+        std::size_t outcome = aliasRefusalNames.size() + (alias.source != nullptr ? 0 : 1);
+        for (std::size_t i = 0; alias.source == nullptr && aliasRefusal != nullptr && i < aliasRefusalNames.size(); ++i) {
+            if (std::string_view(aliasRefusalNames[i]) == aliasRefusal) outcome = i;
+        }
+        VkClearColorValue clearValue{};
+        const std::size_t keyClass = keys == DccKeys::Uncompressed ? 0 : IsDccClear(keys) && ClearColorFor(storageFormat, keys, clearValue) ? 1 : 2;
+        auto& entry = refreshWriteBacks[outcome * refreshKeyNames.size() + keyClass];
+        entry.first.fetch_add(refreshStored.first, std::memory_order_relaxed);
+        entry.second.fetch_add(refreshStored.second, std::memory_order_relaxed);
     }
     if (unchanged) {
         ++Profile().storageReused;
