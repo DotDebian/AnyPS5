@@ -3098,6 +3098,12 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     return result;
 }
 
+bool GuestBufferMemory::BoundInPlace(std::uint64_t address, std::size_t bytes) const {
+    if (!uploaded || committed || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    const auto* found = owner(address);
+    return found != nullptr && found->direct != nullptr && address >= found->begin && address + bytes <= found->end;
+}
+
 std::uint64_t GuestBufferMemory::ReadSetToken() const {
     const auto* mapped = mappedSpace();
     return uploaded && !committed && mapped != nullptr && regions.empty() ? mapped->serial : 0;
