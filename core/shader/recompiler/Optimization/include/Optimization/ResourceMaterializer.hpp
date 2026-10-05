@@ -52,6 +52,10 @@ public:
     void Apply(IrProgram& program, const ResourceSpecialization& specialization) const;
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) const;
+    // The same, written straight into the two objects, whose lists keep their storage (a caller
+    // that materializes into the same objects again and again allocates nothing once they have
+    // grown). After a throw they hold nothing usable; Materialize leaves them untouched instead.
+    void MaterializeInto(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) const;
     // APS5_PROFILE_DRAW: the time Materialize spent building specializations, over every call.
     static std::uint64_t SpecializationNanoseconds();
     // The slots every bindless image table binds (APS5_BINDLESS_SLOTS, default 16, 1..48).

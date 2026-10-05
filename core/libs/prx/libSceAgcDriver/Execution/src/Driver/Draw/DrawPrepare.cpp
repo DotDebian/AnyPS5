@@ -27,7 +27,7 @@ thread_local const PendingView* recheckView = nullptr;
 // The draw front end's switches, all off unless set.
 // APS5_TRACE_DRAW_AHEAD=1: the [drawahead] line, every 10 s (and the clock reads it needs).
 // APS5_DRAW_AHEAD_THREADS=<n>: n threads prepare draws (1: the walk alone; see DrawAhead.hpp).
-// APS5_CAPTURE_MEMO=1, APS5_DRAW_AHEAD_SHARED_RESULTS=1: see AheadStage.
+// APS5_CAPTURE_SCRATCH=1, APS5_CAPTURE_MEMO=1, APS5_DRAW_AHEAD_SHARED_RESULTS=1: see AheadStage.
 bool AheadTraced() {
     static const bool traced = std::getenv("APS5_TRACE_DRAW_AHEAD") != nullptr;
     return traced;
@@ -88,6 +88,7 @@ std::shared_ptr<PreparedDraw> Driver::prepareDrawAhead(const QueueState& queue, 
     const bool timed = AheadTraced();
     const auto startedAt = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (timed) TheAheadTimes().asked.fetch_add(1, std::memory_order_relaxed);
+    static const bool captureScratch = std::getenv("APS5_CAPTURE_SCRATCH") != nullptr;
     static const bool captureMemo = std::getenv("APS5_CAPTURE_MEMO") != nullptr;
     static const bool sharedResults = std::getenv("APS5_DRAW_AHEAD_SHARED_RESULTS") != nullptr;
     const auto localDevice = device.Load();
@@ -145,6 +146,7 @@ std::shared_ptr<PreparedDraw> Driver::prepareDrawAhead(const QueueState& queue, 
     prepared->shaderMemory->TimeFetches(timed);
     AheadStage stage;
     stage.timed = timed;
+    stage.scratch = captureScratch;
     stage.memo = captureMemo;
     // An indirect draw's results are read again when it is adopted (AdoptableIndirect).
     stage.sharedResult = sharedResults && !drawParameters.indirect;

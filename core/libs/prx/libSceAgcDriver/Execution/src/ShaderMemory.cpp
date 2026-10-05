@@ -316,6 +316,13 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
     return capture;
 }
 
+void ShaderMemory::CaptureInto(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle& handle, ShaderRecompiler::ResourceCapture& capture) {
+    capturing(request, [&](const ShaderRecompiler::SrtRuntime& runtime) -> const ShaderRecompiler::ResourceCapture& {
+        ShaderRecompiler::CaptureResources(request, runtime, handle, capture);
+        return capture;
+    });
+}
+
 template <typename Call>
 void ShaderMemory::capturing(const ShaderRecompiler::RecompileRequest& request, Call&& call) {
     // The capture's word and page reads (through `read`) are attributed to it ([hooksync], [guestmem]).

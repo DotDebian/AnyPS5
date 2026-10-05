@@ -761,13 +761,18 @@ namespace {
 // traced into the capture (ResourceCapture::readTrace).
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     const auto& plan = *capture.plan;
+    // Straight into the capture: a new one, or one a driver keeps (whose trace is emptied here).
+    capture.readTrace.leaf = nullptr;
+    capture.readTrace.leafSlot = 0;
+    capture.readTrace.leaves.clear();
+    capture.readTrace.otherReads.clear();
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
-        ResourceMaterializer{}.Materialize(plan, runtime, capture.snapshot, capture.specialization);
+        ResourceMaterializer{}.MaterializeInto(plan, runtime, capture.snapshot, capture.specialization);
         return;
     }
     SrtRuntime traced = runtime;
     traced.readTrace = &capture.readTrace;
-    ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, capture.specialization);
+    ResourceMaterializer{}.MaterializeInto(plan, traced, capture.snapshot, capture.specialization);
     auto& other = capture.readTrace.otherReads;
     std::sort(other.begin(), other.end());
     other.erase(std::unique(other.begin(), other.end()), other.end());
@@ -799,16 +804,20 @@ std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& reques
 }
 
 std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime, const SourceHandle& handle) {
+    auto capture = std::make_shared<ResourceCapture>();
+    CaptureResources(request, runtime, handle, *capture);
+    return capture;
+}
+
+void CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime, const SourceHandle& handle, ResourceCapture& capture) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // The whole vertex family (Vertex, Local, TC, TE, Mesh) validates V# fields the memo key does not cover.
     if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) static_cast<void>(RequestInputInfo(request));
-    auto capture = std::make_shared<ResourceCapture>();
-    capture->source = handle.source;
-    capture->plan = handle.source->plan;
-    if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-    materializeCapture(*capture, runtime);
-    return capture;
+    capture.source = handle.source;
+    capture.plan = handle.source->plan;
+    capture.sourceNanoseconds = profile ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0;
+    materializeCapture(capture, runtime);
 }
 
 RecompileResult Recompile(const RecompileRequest& request) {

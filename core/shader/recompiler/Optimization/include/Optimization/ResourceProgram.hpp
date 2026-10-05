@@ -42,6 +42,10 @@ struct SourceHandle {
 };
 [[nodiscard]] std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& request);
 [[nodiscard]] std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime, const SourceHandle& handle);
+// The same into a capture the caller keeps between calls, whose lists keep their storage: for a
+// driver that hands the capture to Recompile(request, capture) at once and to nothing else, so a
+// capture allocates nothing once the object has grown. After a throw it holds nothing usable.
+void CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime, const SourceHandle& handle, ResourceCapture& capture);
 
 }
 
