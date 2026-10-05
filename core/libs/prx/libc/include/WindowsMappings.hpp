@@ -103,7 +103,7 @@ public:
                 }
                 split(base, runBytes);
                 commitResident(base, runBytes);
-                residentRuns.emplace(base, Run{base + runBytes, {}, static_cast<std::uint32_t>(runBytes >> 12)});
+                residentRuns.emplace(base, makeRun(base, base + runBytes));
                 Window window;
                 for (std::size_t at = 0; at < runBytes; at += pageBytes) {
                     auto& slot = slotOf(done + at);
@@ -268,7 +268,85 @@ public:
         return true;
     }
 
+    struct CollectStats {
+        std::uint64_t calls = 0, bytes = 0, residentCalls = 0, residentBytes = 0, privateCalls = 0, privateBytes = 0, viewPages = 0, dirty = 0;
+        std::uint64_t ticks = 0, watchTicks = 0, lockTicks = 0, last = 0;
+        std::uint64_t sizeCalls[6] = {}, sizeBytes[6] = {}, sizeTicks[6] = {};
+        std::uint64_t tookCalls[5] = {}, tookTicks[5] = {}, tookBytes[5] = {}, repeatTicks = 0, firstTicks = 0, repeats = 0;
+    };
+    CollectStats stats;
+    static std::uint64_t now() {
+        LARGE_INTEGER value;
+        QueryPerformanceCounter(&value);
+        return static_cast<std::uint64_t>(value.QuadPart);
+    }
+
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
+        static const bool trace = std::getenv("APS5_TRACE_COLLECT") != nullptr;
+        if (!trace) return collect(address, bytes, pages, count, clear);
+        const auto before = now();
+        std::unique_lock lock(mutex);
+        const auto locked = now();
+        lock.unlock();
+        const bool result = collect(address, bytes, pages, count, clear);
+        const auto after = now();
+        lock.lock();
+        ++stats.calls;
+        stats.bytes += bytes;
+        stats.dirty += *count;
+        stats.ticks += after - before;
+        stats.lockTicks += locked - before;
+        const int bucket = bytes <= 0x10000 ? 0 : bytes <= 0x100000 ? 1 : bytes <= 0x1000000 ? 2 : bytes <= 0x4000000 ? 3 : bytes <= 0x10000000 ? 4 : 5;
+        ++stats.sizeCalls[bucket];
+        stats.sizeBytes[bucket] += bytes;
+        stats.sizeTicks[bucket] += after - locked;
+        if (after - stats.last > 100000000ull) {
+            stats.last = after;
+            std::fprintf(stderr, "[collect] %llu calls %llu MiB in %.0f ms (lock wait %.0f ms, GetWriteWatch %.0f ms); resident %llu calls %llu MiB, private %llu calls %llu MiB, view pages %llu, dirty pages %llu, runs %zu, views %zu\n", static_cast<unsigned long long>(stats.calls), static_cast<unsigned long long>(stats.bytes >> 20), stats.ticks / 10000.0, stats.lockTicks / 10000.0, stats.watchTicks / 10000.0, static_cast<unsigned long long>(stats.residentCalls), static_cast<unsigned long long>(stats.residentBytes >> 20), static_cast<unsigned long long>(stats.privateCalls), static_cast<unsigned long long>(stats.privateBytes >> 20), static_cast<unsigned long long>(stats.viewPages), static_cast<unsigned long long>(stats.dirty), residentRuns.size(), views.size());
+            {
+                static char* const probe = [] {
+                    char* memory = static_cast<char*>(VirtualAlloc(nullptr, 0x10000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE));
+                    std::memset(memory, 1, 0x10000);
+                    ResetWriteWatch(memory, 0x10000);
+                    return memory;
+                }();
+                void* found[16];
+                const auto time = [&](DWORD flags) {
+                    const auto start = now();
+                    for (int i = 0; i < 200; ++i) {
+                        ULONG_PTR available = 16;
+                        DWORD granule = 0;
+                        GetWriteWatch(flags, probe, 0x10000, found, &available, &granule);
+                    }
+                    return (now() - start) / 2000.0;
+                };
+                const double reset = time(WRITE_WATCH_FLAG_RESET);
+                const double plain = time(0);
+                const auto start = now();
+                MEMORY_BASIC_INFORMATION information{};
+                for (int i = 0; i < 200; ++i) VirtualQuery(probe, &information, sizeof(information));
+                const double queried = (now() - start) / 2000.0;
+                const auto run = residentRuns.begin();
+                const auto startRun = now();
+                for (int i = 0; i < 200 && run != residentRuns.end(); ++i) {
+                    ULONG_PTR available = 16;
+                    DWORD granule = 0;
+                    GetWriteWatch(0, reinterpret_cast<void*>(run->first), 0x10000, found, &available, &granule);
+                }
+                std::fprintf(stderr, "[collect]   probe: GetWriteWatch on 64 KiB of a separate allocation %.2f us with reset, %.2f us without; VirtualQuery %.2f us; GetWriteWatch without reset on 64 KiB of a resident run %.2f us\n", reset, plain, queried, (now() - startRun) / 2000.0);
+            }
+            static const char* const spans[5] = {"under 1 us", "1 to 4 us", "4 to 16 us", "16 to 64 us", "over 64 us"};
+            for (int i = 0; i < 5; ++i) std::fprintf(stderr, "[collect]   GetWriteWatch %s: %llu calls, %llu MiB, %.0f ms\n", spans[i], static_cast<unsigned long long>(stats.tookCalls[i]), static_cast<unsigned long long>(stats.tookBytes[i] >> 20), stats.tookTicks[i] / 10000.0);
+            std::fprintf(stderr, "[collect]   repeat: %llu sampled calls took %.2f us each, the same range again without reset %.2f us\n", static_cast<unsigned long long>(stats.repeats), stats.repeats ? stats.firstTicks / 10.0 / stats.repeats : 0.0, stats.repeats ? stats.repeatTicks / 10.0 / stats.repeats : 0.0);            static const char* const names[6] = {"64K", "1M", "16M", "64M", "256M", "more"};
+            for (int i = 0; i < 6; ++i) std::fprintf(stderr, "[collect]   up to %s: %llu calls, %llu MiB, %.0f ms\n", names[i], static_cast<unsigned long long>(stats.sizeCalls[i]), static_cast<unsigned long long>(stats.sizeBytes[i] >> 20), stats.sizeTicks[i] / 10000.0);
+            const auto last = stats.last;
+            stats = {};
+            stats.last = last;
+        }
+        return result;
+    }
+
+    bool collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
         std::lock_guard lock(mutex);
         const auto capacity = *count;
         *count = 0;
@@ -312,7 +390,26 @@ public:
                     ULONG_PTR available = capacity - *count;
                     if (available == 0) return true;
                     DWORD granularity = 0;
+                    const auto watchStart = now();
                     if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) fail("collect resident guest writes");
+                    stats.watchTicks += now() - watchStart; ++stats.residentCalls; stats.residentBytes += stop - cursor;
+                    {
+                        const auto took = now() - watchStart;
+                        const int slot = took < 10 ? 0 : took < 40 ? 1 : took < 160 ? 2 : took < 640 ? 3 : 4;
+                        ++stats.tookCalls[slot];
+                        stats.tookTicks[slot] += took;
+                        stats.tookBytes[slot] += stop - cursor;
+                        if ((stats.residentCalls & 63) == 0) {
+                            void* again[64];
+                            ULONG_PTR some = 64;
+                            DWORD granule = 0;
+                            const auto repeatStart = now();
+                            GetWriteWatch(0, reinterpret_cast<void*>(cursor), stop - cursor, again, &some, &granule);
+                            stats.repeatTicks += now() - repeatStart;
+                            stats.firstTicks += took;
+                            ++stats.repeats;
+                        }
+                    }
                     *count += available;
                     if (*count == capacity) return true;
                 }
@@ -350,7 +447,9 @@ public:
                 ULONG_PTR available = capacity - *count;
                 if (available == 0) return true;
                 DWORD granularity = 0;
+                const auto watchStart = now();
                 if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) fail("collect private guest writes");
+                stats.watchTicks += now() - watchStart; ++stats.privateCalls; stats.privateBytes += stop - cursor;
                 *count += available;
                 if (*count == capacity) return true;
                 cursor = stop;
@@ -361,7 +460,7 @@ public:
 
 private:
     static constexpr std::size_t pageBytes = 0x4000;
-    static constexpr std::size_t chunkBytes = 0x200000;
+    static constexpr std::size_t chunkBytes = 0x4000000;
     struct SharedPage {
         std::uint64_t generation = 1;
         std::vector<std::uintptr_t> aliases;
@@ -394,9 +493,13 @@ private:
     // 4 KiB page that a clearing collect has reported, fresh counts the pages still without it.
     struct Run {
         std::uintptr_t end;
-        std::array<std::uint64_t, 8> collected;
+        std::vector<std::uint64_t> collected;
         std::uint32_t fresh;
     };
+    static Run makeRun(std::uintptr_t start, std::uintptr_t end) {
+        const auto pages = (end - start) >> 12;
+        return Run{end, std::vector<std::uint64_t>((pages + 63) / 64), static_cast<std::uint32_t>(pages)};
+    }
     struct Window {
         void* view = nullptr;
         unsigned char* bytes = nullptr;
@@ -463,8 +566,8 @@ private:
             if (protection != PAGE_READWRITE && !VirtualProtect(reinterpret_cast<void*>(page), pageBytes, protection, &previous)) fail("protect resident guest pages");
         }
         residentRuns.erase(it);
-        residentRuns.emplace(start, Run{at, {}, static_cast<std::uint32_t>((at - start) >> 12)});
-        residentRuns.emplace(at, Run{stop, {}, static_cast<std::uint32_t>((stop - at) >> 12)});
+        residentRuns.emplace(start, makeRun(start, at));
+        residentRuns.emplace(at, makeRun(at, stop));
     }
 
     // Moves a resident page into the section and maps the section in its place.
