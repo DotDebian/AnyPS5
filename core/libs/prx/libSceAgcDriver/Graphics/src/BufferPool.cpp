@@ -168,6 +168,7 @@ VkDeviceSize BufferPool::DeviceBudget() {
 }
 
 void BufferPool::destroy(const BufferAllocation& allocation) noexcept {
+    VulkanCalls::Count("vkDestroyBuffer");
     if (allocation.slab) {
         destroyBuffer(device, allocation.buffer, nullptr);
         PutSlot(allocation.memory, allocation.offset);

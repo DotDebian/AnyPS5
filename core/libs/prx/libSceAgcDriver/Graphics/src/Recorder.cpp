@@ -307,6 +307,7 @@ struct SamplePoolCache {
                 return;
             }
         }
+        VulkanCalls::Count("vkDestroyQueryPool");
         destroy(device, pool, nullptr);
     }
     VkQueryPool take() {
@@ -3205,6 +3206,9 @@ void Recorder::reportVram() {
     std::size_t kept = open != nullptr ? open->kept.size() : 0;
     for (const auto& batch : inFlight) kept += batch->kept.size();
     std::snprintf(text, sizeof(text), "; batches in flight %zu with %zu kept objects; arena blocks made so far %llu", inFlight.size(), kept, static_cast<unsigned long long>(arenaBlocks.load(std::memory_order_relaxed)));
+    line += text;
+    line += "; vulkan objects made/destroyed so far:" + VulkanCalls::Describe();
+    std::snprintf(text, sizeof(text), "; recorder spares: %zu command buffers with fences, %zu timing query pools", spare.size(), sparePools.size());
     line += text;
     AgcDriver::ReportLine("%s\n", line.c_str());
 }

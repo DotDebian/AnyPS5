@@ -6,7 +6,11 @@
 #endif
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -79,6 +83,57 @@ struct DeviceFunctions {
 };
 
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
+// APS5_TRACE_VRAM (local, not for upstream): how often the entry points that make or destroy
+// Vulkan objects were asked for (vkCreate*, vkDestroy*, vkAllocate*, vkFree*), by name, for the
+// [vram] line: nearly every such call of the driver resolves its entry point at the call
+// (Context::Function), so the lookups are the calls, and an object kind whose makes run ahead of
+// its destroys names itself. The few sites that keep the pointer (the buffer pool's and the query
+// pool caches' destroys) count their calls themselves. Nothing is recorded without the switch.
+namespace VulkanCalls {
+
+inline bool Traced() {
+    static const bool traced = std::getenv("APS5_TRACE_VRAM") != nullptr;
+    return traced;
+}
+
+struct Table {
+    std::mutex mutex;
+    std::map<std::string, std::uint64_t> counts;
+};
+
+inline Table& Counts() {
+    static Table table;
+    return table;
+}
+
+inline void Count(const char* name) {
+    if (!Traced() || name == nullptr) return;
+    if (std::strncmp(name, "vkCreate", 8) != 0 && std::strncmp(name, "vkDestroy", 9) != 0 && std::strncmp(name, "vkAllocate", 10) != 0 && std::strncmp(name, "vkFree", 6) != 0) return;
+    auto& table = Counts();
+    std::lock_guard lock(table.mutex);
+    ++table.counts[name];
+}
+
+// "<Object> made/destroyed" for every object kind seen, so far.
+inline std::string Describe() {
+    std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> objects;
+    {
+        auto& table = Counts();
+        std::lock_guard lock(table.mutex);
+        for (const auto& [name, count] : table.counts) {
+            if (name.rfind("vkCreate", 0) == 0) objects[name.substr(8)].first += count;
+            else if (name.rfind("vkAllocate", 0) == 0) objects[name.substr(10)].first += count;
+            else if (name.rfind("vkDestroy", 0) == 0) objects[name.substr(9)].second += count;
+            else objects[name.substr(6)].second += count;
+        }
+    }
+    std::string text;
+    for (const auto& [object, counts] : objects) text += " " + object + " " + std::to_string(counts.first) + "/" + std::to_string(counts.second);
+    return text;
+}
+
+}
+
 inline std::uint64_t& DeviceProcLookups() {
     thread_local std::uint64_t count = 0;
     return count;
@@ -158,6 +213,7 @@ struct Context {
     TFunction Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
         ++DeviceProcLookups();
+        VulkanCalls::Count(name);
         const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
         if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
         return function;
