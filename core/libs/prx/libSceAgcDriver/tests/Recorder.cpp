@@ -488,6 +488,38 @@ void lateLabelTests(Recorder& recorder) {
     Require(!Recorder::LookupLabel(a, 4, 5).has_value() && !Recorder::LookupLabel(b, 8, 5).has_value() && !recorder.PendingLabelIn(0x70000, 0x400), "(7) entries outlived their batch");
 }
 
+void largeLabelTests(Recorder& recorder) {
+    constexpr std::uint64_t slot = 0x71000, small = slot + 0x10, outside = slot - 4, wide = 0x72000;
+    const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    std::array<std::byte, 256> clear{};
+    std::array<std::byte, Recorder::LabelTableBytes> limit{};
+    limit.fill(std::byte{3});
+    recorder.Sync();
+    Require(recorder.PendingLabels() == 0 && !Recorder::PendingLabelSince().has_value() && !Recorder::WideLabelIn(0, ~0ull), "the table is not empty before the large label tests");
+    recorder.NoteLabel(small, one, 100, 0);
+    recorder.NoteLabel(outside, one, 100, 0);
+    Recorder::CloseLabelGroup(AgcDriver::GuestMemory::TrackerGeneration());
+    Require(recorder.PendingLabels() == 2 && Recorder::LookupLabel(small, 4, 50).has_value(), "4-byte labels did not enter the table");
+    recorder.NoteLabel(slot, clear, 101, 0);
+    Recorder::CloseLabelGroup(AgcDriver::GuestMemory::TrackerGeneration());
+    Require(recorder.PendingLabels() == 1 && Recorder::LookupLabel(outside, 4, 50).has_value(), "a label larger than the table bound entered dwords or removed one outside its range");
+    Require(!Recorder::LookupLabel(small, 4, 50).has_value() && !Recorder::LookupLabel(slot, 8, 0).has_value(), "an older label under a larger one still composes the value");
+    Require(Recorder::WideLabelIn(slot, 4) && Recorder::WideLabelIn(slot + clear.size() - 4, 4) && Recorder::WideLabelIn(slot - 0x100, 0x104) && !Recorder::WideLabelIn(slot - 0x100, 0x100) && !Recorder::WideLabelIn(slot + clear.size(), 4), "a large label's range is wrong");
+    Require(recorder.PendingLabelIn(slot + 0x20, 0x20) && recorder.PendingWriteOverlaps(slot, clear.size()), "a large label is not pending");
+    Require(Recorder::PendingLabelSince().has_value(), "a large label did not start the label flush deadline");
+    recorder.NoteLabel(small, one, 102, 0);
+    Recorder::CloseLabelGroup(AgcDriver::GuestMemory::TrackerGeneration());
+    const auto later = Recorder::LookupLabel(small, 4, 101);
+    Require(later.has_value() && later->value == 1 && later->stamp == 102, "a label after a large one is not served");
+    recorder.NoteLabel(wide, limit, 103, 0);
+    Recorder::CloseLabelGroup(AgcDriver::GuestMemory::TrackerGeneration());
+    Require(recorder.PendingLabels() == 2 + Recorder::LabelTableBytes / 4 && !Recorder::WideLabelIn(wide, limit.size()), "a label at the table bound did not enter every dword");
+    const auto bound = Recorder::LookupLabel(wide + Recorder::LabelTableBytes - 8, 8, 0);
+    Require(bound.has_value() && bound->value == 0x0303030303030303ull && bound->stamp == 103, "a label at the table bound is not served");
+    recorder.Sync();
+    Require(recorder.PendingLabels() == 0 && !Recorder::WideLabelIn(0, ~0ull) && !recorder.PendingLabelIn(slot, clear.size()) && !recorder.PendingWriteOverlaps(slot, clear.size()), "large label tests left entries, ranges or writes behind");
+}
+
 // (6) GuestMemory::UnchangedSinceCollected: false outside the watched arena, and around a
 // MarkWritten or a CPU write of the block inside it.
 void unchangedSinceTests() {
@@ -3671,6 +3703,7 @@ int main() {
             batchStampTests(recorder);
             labelTests(recorder);
             lateLabelTests(recorder);
+            largeLabelTests(recorder);
             unchangedSinceTests();
             closeRaceTests(device, recorder);
             keyProofTests(device, recorder);

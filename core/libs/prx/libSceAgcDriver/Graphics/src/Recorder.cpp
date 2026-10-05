@@ -1231,6 +1231,20 @@ std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, s
     return labelTableOwner->lookupLabel(address, bytes, afterStamp, refusal);
 }
 
+bool Recorder::WideLabelIn(std::uint64_t address, std::size_t bytes) {
+    std::lock_guard tableLock(labelTableMutex);
+    return labelTableOwner != nullptr && labelTableOwner->wideLabelInLocked(address, bytes);
+}
+
+bool Recorder::wideLabelInLocked(std::uint64_t address, std::size_t bytes) const {
+    if (wideLabels.empty() || bytes == 0) return false;
+    const auto end = address + bytes;
+    for (auto it = wideLabels.lower_bound(address >= wideLabelBytes ? address - wideLabelBytes + 1 : 0); it != wideLabels.end() && it->first < end; ++it) {
+        if (it->second > address) return true;
+    }
+    return false;
+}
+
 std::optional<std::uint64_t> Recorder::LookupLabelValue(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp) {
     const auto hit = LookupLabel(address, bytes, afterStamp);
     if (!hit.has_value()) return std::nullopt;
@@ -3157,7 +3171,16 @@ void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes
     ensureOpen();
     // The table entry before the write note: the note bumps the write generation a poller
     // watches, and a poller that sees the bump then finds the label without the GPU mutex.
-    noteLabelOn(*open, address, bytes, stamp, queue);
+    const bool tabled = bytes.size() <= LabelTableBytes;
+    if (tabled) {
+        noteLabelOn(*open, address, bytes, stamp, queue);
+    } else {
+        std::lock_guard tableLock(labelTableMutex);
+        labels.erase(labels.lower_bound(address), labels.lower_bound(address + bytes.size()));
+        recordedLabels.store(labels.size(), std::memory_order_relaxed);
+        open->wideLabels.push_back(wideLabels.emplace(address, address + bytes.size()));
+        wideLabelBytes = std::max<std::uint64_t>(wideLabelBytes, bytes.size());
+    }
     if (activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
@@ -3180,6 +3203,7 @@ bool Recorder::PendingLabelIn(std::uint64_t address, std::size_t bytes) const {
     if (bytes == 0) return false;
     const auto end = address + bytes;
     if (const auto first = labels.lower_bound(address); first != labels.end() && first->first < end) return true;
+    if (wideLabelInLocked(address, bytes)) return true;
     // A queued label of another queue is unordered against the caller on hardware (nothing that
     // queue recorded could have satisfied a wait yet); it is still reported, since the table mutex
     // is held anyway and a caller deciding a CPU store wants the conservative answer.
@@ -3927,15 +3951,17 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source) {
     }
     // The batch's label entries leave the table (a later label to the same dword already replaced
     // its entry and belongs to another batch). Correctness never depended on this removal.
-    if (!batch->labelDwords.empty()) {
+    if (!batch->labelDwords.empty() || !batch->wideLabels.empty()) {
         std::lock_guard tableLock(labelTableMutex);
         for (const auto dword : batch->labelDwords) {
             const auto found = labels.find(dword);
             if (found != labels.end() && found->second.batch == batch.get()) labels.erase(found);
         }
+        for (const auto entry : batch->wideLabels) wideLabels.erase(entry);
         recordedLabels.store(labels.size(), std::memory_order_relaxed);
     }
     batch->labelDwords.clear();
+    batch->wideLabels.clear();
     release(*batch);
 }
 
