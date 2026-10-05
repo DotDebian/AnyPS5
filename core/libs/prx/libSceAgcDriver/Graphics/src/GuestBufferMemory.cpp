@@ -1942,6 +1942,15 @@ std::uint64_t atomicStageMax() {
     return bytes;
 }
 
+// APS5_DRAW_STAGING: the largest region a recorded draw stages (APS5_DRAW_STAGING_MAX_KIB, default
+// 16384). A fragment shader that stores into a guest buffer bound in place makes one PCIe store per
+// fragment (Astro Bot's no-target pass over 8 and 12 MiB buffers: 54 ms per frame), against two
+// bulk copies of the region when staged, so the window is far wider than the dispatches' one.
+std::uint64_t drawStagingMax() {
+    static const std::uint64_t bytes = kibSetting("APS5_DRAW_STAGING_MAX_KIB", 16384);
+    return bytes;
+}
+
 VkMemoryPropertyFlags copyBufferProperties(bool deviceLocal) {
     return deviceLocal ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
@@ -2046,6 +2055,10 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
     if (!stagingAllowed || addressable || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;
     if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
+    // A recorded draw's build: an atomic element whatever its size, else no smaller than the
+    // dispatches' window starts (a draw that stages ends the render pass open before it and its
+    // own, which a few stores into a small buffer are not worth), up to the draw path's own cap.
+    if (drawStaging) return bytes <= drawStagingMax() && (region.atomic || bytes >= writtenShadowMin());
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
     return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(), readWrittenShadowMax()) : writtenShadowMax());
 }
@@ -2837,6 +2850,40 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
         result.emplace_back(region.begin, region.end);
     }
     return result;
+}
+
+bool GuestBufferMemory::HasStagedRegions() const {
+    return std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy && region.deviceLocal; });
+}
+
+GuestBufferMemory::DrawStagingTally GuestBufferMemory::DrawStaging() const {
+    DrawStagingTally tally;
+    if (!uploaded || committed) return tally;
+    const auto merged = mergeWrites(writes);
+    for (const auto& region : regions) {
+        std::uint64_t written = 0;
+        for (const auto& [begin, end] : merged) {
+            const auto from = std::max(begin, region.begin);
+            const auto to = std::min(end, region.end);
+            if (from < to) written += to - from;
+        }
+        if (written == 0) continue;
+        const auto bytes = region.end - region.begin;
+        if (region.gpuCopy && region.deviceLocal) {
+            ++tally.staged;
+            tally.inBytes += bytes;
+            tally.backBytes += written;
+            tally.elements += static_cast<std::uint64_t>(std::count_if(writes.begin(), writes.end(), [&](const auto& range) { return range.first >= region.begin && range.first < region.end; }));
+        } else if (region.direct == nullptr && !region.gpuCopy) {
+            ++tally.outsideImport;
+        } else if (bytes > drawStagingMax() || (!region.atomic && bytes < writtenShadowMin())) {
+            ++tally.pastWindow;
+            tally.pastWindowBytes += bytes;
+        } else {
+            ++tally.other;
+        }
+    }
+    return tally;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {

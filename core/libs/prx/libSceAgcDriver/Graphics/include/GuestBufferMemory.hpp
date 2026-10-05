@@ -197,6 +197,32 @@ public:
     // calls RecordCopyBacks (a dispatch), since a staged region's results reach guest memory by
     // that copy alone. Call before Upload.
     void AllowDeviceStaging() { stagingAllowed = true; }
+    // APS5_DRAW_STAGING=1 (local experiment): the same staging for the build of a draw that will be
+    // recorded (its record calls MarkGpuWrites, hence RecordCopyBacks, like a dispatch's), with the
+    // draw path's own size window (see stagingEligible). Call before Upload; a build that turns out
+    // not to be recorded must be replaced by one without it.
+    void AllowDrawStaging() {
+        stagingAllowed = true;
+        drawStaging = true;
+    }
+    // Whether a region of this upload is staged in device memory.
+    bool HasStagedRegions() const;
+    // What became of the regions a draw's stages write, for the [draw-staging] line: those staged
+    // (with their written elements, the bytes one use copies in and the written bytes it copies
+    // back) and those left as they were: past the draw staging window (inside an import), not
+    // served by an import at all (a CPU copy or a mirror), or for another reason (a sparse range, a
+    // shadow the device refused, APS5_CPU_COPIES).
+    struct DrawStagingTally {
+        std::uint64_t staged = 0;
+        std::uint64_t elements = 0;
+        std::uint64_t inBytes = 0;
+        std::uint64_t backBytes = 0;
+        std::uint64_t pastWindow = 0;
+        std::uint64_t pastWindowBytes = 0;
+        std::uint64_t outsideImport = 0;
+        std::uint64_t other = 0;
+    };
+    DrawStagingTally DrawStaging() const;
     // Records the copy-in of every staged region anew for another use of this upload (a resource
     // cache hit, from ShaderResources::Revalidate, under GuestMemory::GpuMutex, once the imports
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
@@ -353,6 +379,8 @@ private:
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;
+    // The staging is a recorded draw's (AllowDrawStaging).
+    bool drawStaging = false;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).

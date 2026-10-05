@@ -573,6 +573,51 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
 // draw), so a target or index ring that moves per frame does not miss on every draw. That guards a
 // workload with such rings; in the profiled menu stage every draw was DRAW_INDEX_AUTO (index range
 // 0) onto one fixed target, so its misses come from the stages' descriptor words themselves.
+// APS5_DRAW_STAGING=1 (local experiment, not for upstream): a recorded draw stages the guest buffer
+// regions its stages write inside host imports in device memory, as dispatches do (see
+// GuestBufferMemory::AllowDrawStaging): the copy-in is recorded by the build (or by Revalidate for
+// a reused one) and the copy-back by MarkGpuWrites right after the draw. Neither can lie inside a
+// render pass; Recorder::Commands ends the open one for both, so a staged draw never continues the
+// pass before it and the draw after it begins a new one.
+bool DrawStagingEnabled() {
+    static const bool enabled = std::getenv("APS5_DRAW_STAGING") != nullptr;
+    return enabled;
+}
+
+// The [draw-staging] line, every 10 s: the draws whose stages write guest buffers, by what became
+// of them. Under GuestMemory::GpuMutex (plain counters).
+void CountDrawStaging(const ShaderResources& resources, bool recorded) {
+    if (!DrawStagingEnabled() || resources.GpuWrites().empty()) return;
+    static std::uint64_t draws = 0, stagedDraws = 0, notRecorded = 0, addressBased = 0;
+    static GuestBufferMemory::DrawStagingTally total;
+    static auto last = std::chrono::steady_clock::now();
+    ++draws;
+    if (!recorded) {
+        ++notRecorded;
+    } else if (resources.HoldsLease()) {
+        ++addressBased;
+    } else {
+        const auto tally = resources.DrawStaging();
+        if (tally.staged != 0) ++stagedDraws;
+        total.staged += tally.staged;
+        total.elements += tally.elements;
+        total.inBytes += tally.inBytes;
+        total.backBytes += tally.backBytes;
+        total.pastWindow += tally.pastWindow;
+        total.pastWindowBytes += tally.pastWindowBytes;
+        total.outsideImport += tally.outsideImport;
+        total.other += tally.other;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    const auto seconds = std::chrono::duration<double>(now - last).count();
+    last = now;
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    std::fprintf(stderr, "[draw-staging] %.1f s: %llu draws write guest buffers; %llu staged (%llu regions, %llu elements, %.1f MiB copied in, %.1f MiB copied back); draws left in place: %llu not recorded, %llu address-based; regions left in place: %llu outside the size window (%.1f MiB), %llu outside an import, %llu other\n", seconds, count(draws), count(stagedDraws), count(total.staged), count(total.elements), total.inBytes / 1048576.0, total.backBytes / 1048576.0, count(notRecorded), count(addressBased), count(total.pastWindow), total.pastWindowBytes / 1048576.0, count(total.outsideImport), count(total.other));
+    draws = stagedDraws = notRecorded = addressBased = 0;
+    total = {};
+}
+
 bool MovableBuffers() {
     static const bool enabled = std::getenv("APS5_NO_MOVED_BUFFER_TEMPLATES") == nullptr;
     return enabled;
@@ -1031,7 +1076,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
-        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        // A recordable draw's build may stage its written buffers (APS5_DRAW_STAGING); the caller
+        // replaces it when the draw is not recorded after all.
+        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && DrawStagingEnabled());
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
@@ -1224,6 +1271,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     if (resources->HoldsLease()) CountLeaseOutcome(outcome.waited, outcome.waited ? 0 : recorder.Submissions() + 1);
     // Every use of a (possibly shared) resources object registers its GPU writes anew.
     resources->MarkGpuWrites(recorder);
+    CountDrawStaging(*resources, true);
     // The write-back (fault check, copied buffers) runs when the batch completed; a fault is
     // reported by the recorder ("deferred write-back failed") instead of thrown out of the draw.
     if (listed) {
@@ -1814,10 +1862,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // transitions of every target and one pass per draw, as before.
     static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
     const bool lean = recorded && !drawTransitions;
-    if (!lean && !resolved.moved.empty()) {
+    // A staged build (APS5_DRAW_STAGING) serves lean draws only: any other path may store its
+    // buffers from the CPU, which a device-local shadow cannot give, so it takes an in-place build
+    // (the copy-in the staged one recorded is left without a copy-back, which stores nothing).
+    if (!lean && (!resolved.moved.empty() || resources->StagesBuffers())) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
     }
+    if (!recorded) CountDrawStaging(*resources, false);
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto masked = maskedState(state, inputs.fragmentOutputs);
