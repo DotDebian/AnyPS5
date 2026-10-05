@@ -35,9 +35,20 @@ public:
         std::uint64_t loadsBehind = 0;
         std::uint64_t loadMismatches = 0;
         std::uint64_t stopped = 0;
+        // The draws a helper thread prepared (of `prepared`).
+        std::uint64_t helped = 0;
+        // What the worker found when it asked for a draw: the draws the walk had reached beyond
+        // that one (summed over `draws`), and the time it waited for a draw in preparation.
+        std::uint64_t depthSum = 0;
+        std::uint64_t waitNanoseconds = 0;
     };
 
-    DrawAhead(Prepare prepare, ReadPairs readPairs, std::function<void()> started = {});
+    // `helpers` more threads prepare draws beside the walk (APS5_DRAW_AHEAD_THREADS - 1; none:
+    // the walk prepares every draw itself, as before). The walk stays one thread: it alone
+    // interprets the state packets, in order. At a draw it hands the packet and a copy of the
+    // state to an idle helper and walks on, or prepares the draw itself when none is idle, so a
+    // draw is never queued behind another one. The worker takes the draws in order either way.
+    DrawAhead(Prepare prepare, ReadPairs readPairs, std::function<void()> started = {}, std::size_t helpers = 0);
     ~DrawAhead();
     DrawAhead(const DrawAhead&) = delete;
     DrawAhead& operator=(const DrawAhead&) = delete;
@@ -57,8 +68,20 @@ private:
         std::shared_ptr<PreparedDraw> prepared;
         std::vector<std::uint32_t> pairs;
     };
+    // A helper thread's one job, under `mutex` but for `state`, which the walk writes while the
+    // helper is Reserved (it is the only writer then) and the helper reads while it is Busy.
+    struct Helper {
+        enum class Stage : std::uint8_t { Idle, Reserved, Loaded, Busy };
+        Stage stage = Stage::Idle;
+        QueueState state;
+        std::span<const std::uint32_t> packet;
+        const Submission* submission = nullptr;
+        Event* event = nullptr;
+        std::thread thread;
+    };
     void run();
     void walk(const Submission& submission, QueueState state);
+    void help(Helper& helper);
     static Event& at(std::deque<Event>& events, std::size_t index);
 
     Prepare prepare;
@@ -77,7 +100,12 @@ private:
     std::deque<Event> loads;
     std::size_t workerDraw = 0;
     std::size_t workerLoad = 0;
+    // The draws the walk has reached in this submission.
+    std::size_t walkerDraw = 0;
     Counters counters;
+    std::vector<std::unique_ptr<Helper>> helpers;
+    // The helpers wait here for a job (the worker and the walk wait on `changed`).
+    std::condition_variable work;
     std::thread thread;
 };
 

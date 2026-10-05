@@ -72,6 +72,19 @@ struct StageCapture {
     std::uint32_t pushOffset = 0;
 };
 
+// What the draw front end asks of Driver::compileDrawStage for the stages of one draw, and what
+// the stages measure for it (DrawPrepare.cpp; the worker's own draws pass none).
+struct AheadStage {
+    // APS5_TRACE_DRAW_AHEAD=1: the times below are taken.
+    bool timed = false;
+    // Nanoseconds: the request and its source handle; the capture (the SRT evaluation and its
+    // fetches from guest memory); the regions; the compiled result's lookup
+    // (and its copy).
+    std::uint64_t handleNs = 0, captureNs = 0, regionsNs = 0, compileNs = 0;
+    std::uint64_t stages = 0, resultMemoHits = 0, resultMemoMisses = 0;
+};
+
+
 }
 
 #endif

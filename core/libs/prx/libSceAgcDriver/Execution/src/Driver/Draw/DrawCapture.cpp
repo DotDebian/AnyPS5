@@ -3,14 +3,26 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
 
-ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
+ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected, AheadStage* ahead) {
     using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
+    // The front end's times (AheadStage): each lap goes to the part that just ended.
+    const bool timed = ahead != nullptr && ahead->timed;
+    auto lapStarted = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto lap = [&](std::uint64_t AheadStage::* part) {
+        if (!timed) return;
+        const auto now = std::chrono::steady_clock::now();
+        ahead->*part += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lapStarted).count());
+        lapStarted = now;
+    };
+    if (ahead != nullptr) ++ahead->stages;
     const auto& program = programs[i];
     const auto waveSize = program.binary.stage == Stage::Fragment ? graphics.stages.fragmentWaveSize : graphics.stages.vertexWaveSize;
     ShaderRecompiler::RecompileRequest request{
@@ -30,14 +42,19 @@ ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::u
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
-    const auto capture = [&] {
+    lap(&AheadStage::handleNs);
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> ownedCapture;
+    const ShaderRecompiler::ResourceCapture* capture = nullptr;
+    {
         const SampledReadScope sampling(evidenceReads);
-        return shaderMemory.Capture(request, handle.get());
-    }();
+        ownedCapture = shaderMemory.Capture(request, handle.get());
+        capture = ownedCapture.get();
+    }
+    lap(&AheadStage::captureNs);
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     recompiled[i] = true;
-    memory = shaderMemory.Regions();
+    shaderMemory.Regions(memory);
 
     if (drawHit) {
         for (std::size_t j = 0; j < programs.size(); ++j) {
@@ -75,10 +92,16 @@ ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::u
 
     static const bool reuseCapture = std::getenv("APS5_NO_CAPTURE_REUSE") == nullptr;
     phaseTiming.Phase(DrawRowCapture);
+    lap(&AheadStage::regionsNs);
 
-    stageCapture.compiled = reuseCapture ? ShaderRecompiler::Recompile(request, *capture) : std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
+    {
+        bool resultMemoHit = false;
+        stageCapture.compiled = reuseCapture ? ShaderRecompiler::Recompile(request, *capture, &resultMemoHit) : std::make_shared<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request));
+        if (ahead != nullptr) ++(resultMemoHit ? ahead->resultMemoHits : ahead->resultMemoMisses);
+    }
     ShaderRecompiler::RecompileResult result = *stageCapture.compiled;
     phaseTiming.Phase(DrawRowRecompile);
+    lap(&AheadStage::compileNs);
     return result;
 }
 

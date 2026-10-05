@@ -14,6 +14,8 @@
 
 namespace ShaderRecompiler {
 struct SourceHandle;
+struct ResourceCapture;
+struct SrtRuntime;
 }
 
 namespace AgcDriver {
@@ -62,6 +64,8 @@ public:
     // resolution.
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle = nullptr);
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> Regions() const;
+    // The same into the caller's vector, which keeps its storage.
+    void Regions(std::vector<ShaderRecompiler::MemoryRegion>& result) const;
     // The page regions read since the previous call (or construction), a word read again
     // included, the initial regions excluded: one stage's own reads on the draw path's shared
     // ShaderMemory (Regions() stays the union). The spans point into the pages, as Regions()'s do.
@@ -70,13 +74,20 @@ public:
     static void CountHandleMemo(bool hit);
     enum class Recheck : std::uint8_t { Same, Pending, Differs, Unreadable };
     [[nodiscard]] Recheck RecheckReads(PendingWriteQuery pendingWrite) const;
+    // The time spent fetching pages and dwords from guest memory since construction, when asked
+    // for (the draw front end's [drawahead] line).
+    void TimeFetches(bool timed) { timeFetches = timed; }
+    [[nodiscard]] std::uint64_t FetchNanoseconds() const { return fetchNanoseconds; }
 
 private:
     static constexpr std::size_t PageBytes = 4096;
     static constexpr std::size_t PageWords = PageBytes / sizeof(std::uint32_t);
 
     struct Page {
-        std::array<std::uint32_t, PageWords> words{};
+        // The words are left as they come (16 KiB a page, several pages a draw): one is read only
+        // once `valid` says it was fetched.
+        Page() {}
+        std::array<std::uint32_t, PageWords> words;
         std::bitset<PageWords> valid;
         std::bitset<PageWords> read;
         std::bitset<PageWords> recent;
@@ -87,6 +98,10 @@ private:
     // SrtRuntime::isReadable: the snapshot's words and mapped guest pages.
     static bool readable(void* context, std::uint64_t address);
     Page& page(std::uint64_t base);
+    // Capture: the runtime over this memory, the read site and the [capture] accounting around
+    // `call`, which makes the capture and returns it.
+    template <typename Call>
+    void capturing(const ShaderRecompiler::RecompileRequest& request, Call&& call);
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
     // the caller keeps them alive for as long as the capture is used.
@@ -95,6 +110,8 @@ private:
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
+    bool timeFetches = false;
+    std::uint64_t fetchNanoseconds = 0;
 };
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a
