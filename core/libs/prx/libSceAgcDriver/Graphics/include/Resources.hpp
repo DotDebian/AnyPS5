@@ -42,6 +42,15 @@ private:
     std::shared_ptr<BufferPool> cache;
 };
 
+// APS5_VRAM_BUFFERS=<mask> (local experiment, not for upstream): buffers the shaders read are made in
+// video memory the CPU can still map (DEVICE_LOCAL | HOST_VISIBLE, the whole heap with a resizable
+// BAR) instead of cached system memory, which the GPU reads across PCIe. The CPU then writes them
+// through a write-combined mapping and must not read them back in bulk. One bit per kind, so a run
+// tells which kind the GPU time depends on; Everything moves every default host buffer. A kind whose
+// bit is clear, or a device without such a memory type, keeps the default.
+enum class GpuReadKind : unsigned { BdaTable = 1, DrawInput = 2, StorageCopy = 4, RegionCopy = 8, Mirror = 16, Everything = 128 };
+VkMemoryPropertyFlags GpuReadProperties(GpuReadKind kind);
+
 // Device-local scratch memory for GPU-side layout conversion. The detiler reads and writes scattered
 // elements, which crawls across PCIe, so guest bytes move between host and device buffers with DMA
 // copies and are only swizzled in video memory.

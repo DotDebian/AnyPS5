@@ -3,11 +3,52 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 
 namespace AgcDriver::Graphics {
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(usage), properties(properties) {
+namespace {
+
+constexpr VkMemoryPropertyFlags HostDefault = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+constexpr VkMemoryPropertyFlags VramHost = HostDefault | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+unsigned VramBufferMask() {
+    static const unsigned mask = [] {
+        const char* text = std::getenv("APS5_VRAM_BUFFERS");
+        return text != nullptr ? static_cast<unsigned>(std::strtoul(text, nullptr, 0)) : 0u;
+    }();
+    return mask;
+}
+
+// APS5_VRAM_BUFFERS: buffers newly made in mappable video memory (pool reuses are not counted), and
+// those that fell back to system memory, as a [vram-buffers] line at most every 10 s.
+std::atomic<std::uint64_t> vramBuffers{0}, vramBytes{0}, vramFallbacks{0};
+std::atomic<std::int64_t> vramLastReport{0};
+
+void CountVramBuffer(std::uint64_t bytes, bool fallback) {
+    if (fallback) vramFallbacks.fetch_add(1, std::memory_order_relaxed);
+    else {
+        vramBuffers.fetch_add(1, std::memory_order_relaxed);
+        vramBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = vramLastReport.load(std::memory_order_relaxed);
+    if (now - last < 10 || !vramLastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::fprintf(stderr, "[vram-buffers] mask 0x%x: %llu buffers made in mappable video memory so far (%.1f MiB), %llu fell back to system memory\n", VramBufferMask(), static_cast<unsigned long long>(vramBuffers.load()), vramBytes.load() / 1048576.0, static_cast<unsigned long long>(vramFallbacks.load()));
+}
+
+}
+
+VkMemoryPropertyFlags GpuReadProperties(GpuReadKind kind) {
+    return (VramBufferMask() & static_cast<unsigned>(kind)) != 0 ? VramHost : HostDefault;
+}
+
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags requested) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(usage), properties(requested == HostDefault ? GpuReadProperties(GpuReadKind::Everything) : requested) {
+    const auto properties = this->properties;
     Require(size != 0, "zero-sized GPU buffer");
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
@@ -38,12 +79,25 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         allocationBytes = requirements.size;
         // The CPU reads most of these buffers back (write-back, diffs), which is very slow from
         // write-combined memory, so the default host properties prefer cached host memory.
-        constexpr VkMemoryPropertyFlags hostDefault = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        if (properties == hostDefault) {
+        const auto hostType = [&] {
             try {
-                allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, hostDefault | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+                return context.MemoryType(requirements.memoryTypeBits, HostDefault | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
             } catch (const std::runtime_error&) {
-                allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, hostDefault);
+                return context.MemoryType(requirements.memoryTypeBits, HostDefault);
+            }
+        };
+        // APS5_VRAM_BUFFERS: a device without a mappable video memory type, or with that heap
+        // full, serves the buffer from system memory as before.
+        bool vram = properties == VramHost;
+        if (properties == HostDefault) {
+            allocation.memoryTypeIndex = hostType();
+        } else if (vram) {
+            try {
+                allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VramHost);
+            } catch (const std::runtime_error&) {
+                vram = false;
+                allocation.memoryTypeIndex = hostType();
+                CountVramBuffer(capacity, true);
             }
         } else {
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, properties);
@@ -58,10 +112,20 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
                 initializeAddress(usage);
                 mapping = slot->mapping;
                 ready = true;
+                if (vram) CountVramBuffer(capacity, false);
                 return;
             }
         }
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory buffer");
+        auto allocated = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+        if (allocated != VK_SUCCESS && vram) {
+            vram = false;
+            memory = VK_NULL_HANDLE;
+            allocation.memoryTypeIndex = hostType();
+            CountVramBuffer(capacity, true);
+            allocated = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory);
+        }
+        Check(allocated, "vkAllocateMemory buffer");
+        if (vram) CountVramBuffer(capacity, false);
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");

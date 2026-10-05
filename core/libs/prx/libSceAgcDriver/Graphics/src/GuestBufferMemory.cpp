@@ -843,7 +843,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         if (held + range->bytes > heapMirrorBudget()) heapMirrorFatal(*range, held, "past the budget");
     }
     try {
-        mirror->buffer = std::make_shared<Buffer>(context, range->bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        mirror->buffer = std::make_shared<Buffer>(context, range->bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, GpuReadProperties(GpuReadKind::Mirror));
     } catch (const std::runtime_error& error) {
         if (heap) heapMirrorFatal(*range, state.heapBytes, error.what());
         std::fprintf(stderr, "[gpu] image mirror of 0x%llx+0x%llx failed: %s; falling back to copies\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes), error.what());
@@ -2206,7 +2206,8 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     }
     const auto allocateStart = std::chrono::steady_clock::now();
     // A buffer made by UploadPrepare for a GPU copy that fell back here (its import went) is kept.
-    if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), usage);
+    // APS5_VRAM_BUFFERS: only a region no descriptor writes, whose bytes the CPU never reads back.
+    if (region.buffer == nullptr) region.buffer = region.writable ? std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), usage) : std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), usage, GpuReadProperties(GpuReadKind::RegionCopy));
     const auto readStart = std::chrono::steady_clock::now();
     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
     // Named for the [hooksync] attribution: the reads below go through the flush hook.

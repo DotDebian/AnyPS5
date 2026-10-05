@@ -1048,7 +1048,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             return copy;
         }
     }
-    copy.buffer = std::make_shared<Buffer>(context, bytes, index ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT : VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    copy.buffer = std::make_shared<Buffer>(context, bytes, index ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT : VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, GpuReadProperties(GpuReadKind::DrawInput));
     GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
     CountDrawInput(index, false, bytes);
     return copy;
@@ -1824,7 +1824,38 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    // APS5_PROFILE_GPU_DRAWS=1 (local, not for upstream): each recorded draw's own [gputime] range
+    // inside its pass, keyed by its last stage's variant (0xd... on the "by program" list); a
+    // [drawkey] line describes each key once.
+    static const bool timeDraws = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr && Recorder::GpuTimingEnabled();
+    std::uint32_t ownTiming = Recorder::NoTiming;
+    if (timeDraws && !shaders.empty()) {
+        const auto key = 0xd000000000000000ull | (shaders.back().program->variantId & 0x0fffffffffffffffull);
+        static std::mutex seenMutex;
+        static std::set<std::uint64_t> seen;
+        bool first = false;
+        {
+            std::lock_guard lock(seenMutex);
+            first = seen.size() < 4096 && seen.insert(key).second;
+        }
+        if (first) {
+            std::string stages;
+            for (const auto& shader : shaders) {
+                char text[48];
+                std::snprintf(text, sizeof(text), " %d:%llx", static_cast<int>(shader.stage), static_cast<unsigned long long>(shader.program->variantId));
+                stages += text;
+            }
+            std::fprintf(stderr, "[drawkey] 0x%llx: stages%s; %zu targets, first 0x%llx %ux%u format %d, render extent %ux%u, depth %d; %s%s indexCount %u instances %u indexed %d\n", static_cast<unsigned long long>(key), stages.c_str(), state.colors.size(), static_cast<unsigned long long>(state.colors.empty() ? 0 : state.colors.front().address), state.colors.empty() ? 0 : state.colors.front().extent.width, state.colors.empty() ? 0 : state.colors.front().extent.height, state.colors.empty() ? 0 : static_cast<int>(state.colors.front().format), state.renderExtent.width, state.renderExtent.height, record.depth != nullptr, state.stages.mesh ? "mesh " : "", args != nullptr ? (gpuIndirect ? "gpu-indirect" : "indirect") : "direct", draw.indexCount, draw.instanceCount, draw.indexed);
+        }
+        // 0xd8...: the draw continues a pass whose previous draw had the same key (no pipeline
+        // change between them), apart from the others, to tell a per-switch cost from a per-draw one.
+        static thread_local std::uint64_t previousKey = 0;
+        const bool repeated = continued && previousKey == key;
+        previousKey = key;
+        ownTiming = recorder->BeginGpuTimingInPass(repeated ? key | 0x0800000000000000ull : key);
+    }
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+    if (ownTiming != Recorder::NoTiming) recorder->EndGpuTiming(ownTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (writesDepth) record.depth->NoteWritten();
     if (record.depth != nullptr) CountDepthDraw(state.depth);

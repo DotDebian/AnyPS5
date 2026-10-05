@@ -147,7 +147,7 @@ public:
     static std::size_t DrawSnapshotEntries(SnapshotUse use);
     // `registryGeneration`: GuestAllocationsGeneration read before the copy, like `generation`.
     // `derived`: a value computed from the copied bytes, returned with the snapshot on reuse.
-    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0, std::vector<std::byte> shadow = {});
     std::shared_ptr<Buffer> DerivedDrawBuffer(const std::shared_ptr<Buffer>& copy, std::uint64_t key, std::uint32_t& value) const;
     void KeepDerivedDrawBuffer(const std::shared_ptr<Buffer>& copy, std::uint64_t key, std::shared_ptr<Buffer> derived, std::uint32_t value);
     void OnComplete(std::function<void()> action);
@@ -455,6 +455,8 @@ public:
     // announced, or as the drain counts it): for a wrapper (VulkanDevice::ReapRecorded) whose
     // FinishUpTo counts the drain itself, so a CountSync there would count it twice.
     static void AnnounceSyncSite(const void* site);
+    // APS5_TRACE_SYNC (local): one presented frame, for the [synctrace] line's per-frame figures.
+    static void NotePresent();
     // APS5_PROFILE_DRAW: the calling thread's fence and timeline waits so far, in milliseconds (0
     // when not profiling): a caller reads it around a span of its own work to learn how much of
     // that span waited for the GPU (a resource build's nested flush-hook waits, a draw's).
@@ -488,6 +490,8 @@ public:
     static bool GpuTimingEnabled();
     static bool BatchStampsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
+    // APS5_PROFILE_GPU_DRAWS (local): a range begun inside the open render pass.
+    std::uint32_t BeginGpuTimingInPass(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
@@ -877,6 +881,8 @@ private:
         std::list<DrawSnapshotKey>::iterator recent;
         std::shared_ptr<Buffer> buffer;
         std::uint32_t derived;
+        // The buffer's bytes for a buffer in video memory, which is too slow to read back.
+        std::vector<std::byte> shadow;
     };
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
     struct DrawSnapshotPool {
