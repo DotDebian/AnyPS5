@@ -16,7 +16,7 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
         const IrF32 lhs = readF16LaneAsF32(sourceAt(inst, 0u), high, true);
         const IrF32 rhs = readF16LaneAsF32(sourceAt(inst, 1u), high, true);
         if (accumulator) {
-            const IrF32 acc = readF16LaneAsF32(inst.destination, high, true);
+            const IrF32 acc = readF16LaneAsF32(accumulatorOperand(inst), high, true);
             return applyF32ResultModifiers(inst.destination, IrF32(ir.Emit(opcode, IrType::F32, {&lhs.Value(), &rhs.Value(), &acc.Value()})));
         }
         if (inst.sourceCount == 3u) {
@@ -25,7 +25,6 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
         }
         return applyF32ResultModifiers(inst.destination, IrF32(ir.Emit(opcode, IrType::F32, {&lhs.Value(), &rhs.Value()})));
     };
-    const RdnaOperand raw = plainOperand(inst.destination);
     IrU32 result = packHalf2x16(translateLane(false), translateLane(true));
     if (quietSnan) {
         const auto quietSnanLane = [&](const RdnaOperand& operand, bool high) {
@@ -44,7 +43,7 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
         };
         result = packU16Lanes(overrideLane(false), overrideLane(true));
     }
-    writeOperand(raw, &result.Value());
+    writeRawU32(inst.destination, result);
     return true;
 }
 
@@ -313,6 +312,25 @@ bool TranslationContext::vMulLegacyF32(const RdnaInstruction& inst, bool accumul
     return true;
 }
 
+bool TranslationContext::vMullitF32(const RdnaInstruction& inst) {
+    const IrU32 lhs = readU32(sourceAt(inst, 0u));
+    const IrU32 rhs = readU32(sourceAt(inst, 1u));
+    const IrU32 limit = readU32(sourceAt(inst, 2u));
+    const auto magnitude = [&](const IrU32& bits) { return IrU32(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu))); };
+    const auto isNan = [&](const IrU32& bits) { return IrU1(ir.UGreaterThan(magnitude(bits).Value(), ir.Constant(0x7f800000u))); };
+    const auto isZero = [&](const IrU32& bits) { return IrU1(ir.IEqual(magnitude(bits).Value(), ir.Constant(0u))); };
+    const IrU1 limitNotPositive(ir.LogicalOr(isZero(limit).Value(), ir.INotEqual(ir.BitwiseAnd(limit.Value(), ir.Constant(0x80000000u)), ir.Constant(0u))));
+    const IrU1 rhsNegativeMax(ir.UGreaterThan(rhs.Value(), ir.Constant(0xff7ffffeu)));
+    IrU1 lowest(ir.LogicalOr(rhsNegativeMax.Value(), ir.LogicalOr(isNan(limit).Value(), limitNotPositive.Value())));
+    lowest = IrU1(ir.LogicalOr(lowest.Value(), isNan(rhs).Value()));
+    const IrU32 product(ir.BitCastU32(ir.Emit(IrOpcode::FPMul32, IrType::F32, {&ir.BitCastF32(lhs.Value()), &ir.BitCastF32(rhs.Value())})));
+    IrU32 result(ir.Select(isNan(lhs).Value(), ir.BitwiseOr(lhs.Value(), ir.Constant(0x00400000u)), product.Value()));
+    result = IrU32(ir.Select(ir.LogicalOr(isZero(lhs).Value(), isZero(rhs).Value()), ir.Constant(0u), result.Value()));
+    result = IrU32(ir.Select(lowest.Value(), ir.Constant(0xff7fffffu), result.Value()));
+    writeOperand(inst.destination, &result.Value());
+    return true;
+}
+
 void TranslationContext::emitFloat16ClassCompare(const RdnaInstruction& inst, bool cmpx) {
     const IrU32 bits = readF16Bits(sourceAt(inst, 0u));
     const IrU32 mask = readU32(sourceAt(inst, 1u));
@@ -569,22 +587,34 @@ bool TranslationContext::vCubemaF32(const RdnaInstruction& inst) {
 }
 
 bool TranslationContext::floatCube(const RdnaInstruction& inst, std::uint32_t resultKind) {
-    const IrF32 x = readMixF32(sourceAt(inst, 0u));
-    const IrF32 y = readMixF32(sourceAt(inst, 1u));
-    const IrF32 z = readMixF32(sourceAt(inst, 2u));
-    const IrF32 nx(ir.Emit(IrOpcode::FPNeg32, IrType::F32, {&x.Value()}));
-    const IrF32 ny(ir.Emit(IrOpcode::FPNeg32, IrType::F32, {&y.Value()}));
-    const IrF32 nz(ir.Emit(IrOpcode::FPNeg32, IrType::F32, {&z.Value()}));
-    const IrF32 ax(ir.Emit(IrOpcode::FPAbs32, IrType::F32, {&x.Value()}));
-    const IrF32 ay(ir.Emit(IrOpcode::FPAbs32, IrType::F32, {&y.Value()}));
-    const IrF32 az(ir.Emit(IrOpcode::FPAbs32, IrType::F32, {&z.Value()}));
+    const IrF32 x(ir.BitCastF32(readU32(sourceAt(inst, 0u)).Value()));
+    const IrF32 y(ir.BitCastF32(readU32(sourceAt(inst, 1u)).Value()));
+    const IrF32 z(ir.BitCastF32(readU32(sourceAt(inst, 2u)).Value()));
+    const IrF32 nx(ir.BitCastF32(ir.BitwiseXor(ir.BitCastU32(x.Value()), ir.Constant(0x80000000u))));
+    const IrF32 ny(ir.BitCastF32(ir.BitwiseXor(ir.BitCastU32(y.Value()), ir.Constant(0x80000000u))));
+    const IrF32 nz(ir.BitCastF32(ir.BitwiseXor(ir.BitCastU32(z.Value()), ir.Constant(0x80000000u))));
+    const auto exponentZero = [&](IrF32 value) {
+        return IrU1(ir.IEqual(ir.BitwiseAnd(ir.BitCastU32(value.Value()), ir.Constant(0x7f800000u)), ir.Constant(0u)));
+    };
+    const auto flushed = [&](IrF32 value) {
+        return IrF32(ir.BitCastF32(ir.Select(exponentZero(value).Value(), ir.Constant(0u), ir.BitCastU32(value.Value()))));
+    };
+    const auto magnitude = [&](IrF32 value) {
+        return IrF32(ir.BitCastF32(ir.BitwiseAnd(ir.BitCastU32(value.Value()), ir.Constant(0x7fffffffu))));
+    };
+    const IrF32 fx = flushed(x);
+    const IrF32 fy = flushed(y);
+    const IrF32 fz = flushed(z);
+    const IrF32 ax = magnitude(fx);
+    const IrF32 ay = magnitude(fy);
+    const IrF32 az = magnitude(fz);
     const IrU1 zDominatesX(ir.Emit(IrOpcode::FPOrdGreaterThanEqual32, IrType::U1, {&az.Value(), &ax.Value()}));
     const IrU1 zDominatesY(ir.Emit(IrOpcode::FPOrdGreaterThanEqual32, IrType::U1, {&az.Value(), &ay.Value()}));
     const IrU1 zFace(ir.LogicalAnd(zDominatesX.Value(), zDominatesY.Value()));
     const IrU1 yFace(ir.Emit(IrOpcode::FPOrdGreaterThanEqual32, IrType::U1, {&ay.Value(), &ax.Value()}));
-    const IrU1 xNegative(ir.Emit(IrOpcode::FPOrdLessThan32, IrType::U1, {&x.Value(), &ir.ConstantF32(0.0f)}));
-    const IrU1 yNegative(ir.Emit(IrOpcode::FPOrdLessThan32, IrType::U1, {&y.Value(), &ir.ConstantF32(0.0f)}));
-    const IrU1 zNegative(ir.Emit(IrOpcode::FPOrdLessThan32, IrType::U1, {&z.Value(), &ir.ConstantF32(0.0f)}));
+    const IrU1 xNegative(ir.Emit(IrOpcode::FPOrdLessThan32, IrType::U1, {&fx.Value(), &ir.ConstantF32(0.0f)}));
+    const IrU1 yNegative(ir.Emit(IrOpcode::FPOrdLessThan32, IrType::U1, {&fy.Value(), &ir.ConstantF32(0.0f)}));
+    const IrU1 zNegative(ir.Emit(IrOpcode::FPOrdLessThan32, IrType::U1, {&fz.Value(), &ir.ConstantF32(0.0f)}));
     const auto selectFace = [&](IrF32 xValue, IrF32 yValue, IrF32 zValue) {
         return selectF32(zFace, zValue, selectF32(yFace, yValue, xValue));
     };
@@ -607,11 +637,10 @@ bool TranslationContext::floatCube(const RdnaInstruction& inst, std::uint32_t re
             result = selectFace(ny, selectF32(yNegative, nz, z), ny);
             break;
         case 3u: {
-            const IrF32 two(ir.ConstantF32(2.0f));
-            const IrF32 xTwo(ir.Emit(IrOpcode::FPMul32, IrType::F32, {&x.Value(), &two.Value()}));
-            const IrF32 yTwo(ir.Emit(IrOpcode::FPMul32, IrType::F32, {&y.Value(), &two.Value()}));
-            const IrF32 zTwo(ir.Emit(IrOpcode::FPMul32, IrType::F32, {&z.Value(), &two.Value()}));
-            result = selectFace(xTwo, yTwo, zTwo);
+            const IrF32 major = selectFace(x, y, z);
+            const IrF32 twice(ir.Emit(IrOpcode::FPMul32, IrType::F32, {&major.Value(), &ir.ConstantF32(2.0f)}));
+            const IrU1 nan(ir.UGreaterThan(ir.BitCastU32(magnitude(major).Value()), ir.Constant(0x7f800000u)));
+            result = selectF32(nan, major, selectF32(exponentZero(major), IrF32(ir.ConstantF32(0.0f)), twice));
             break;
         }
         default:

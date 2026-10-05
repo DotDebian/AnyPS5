@@ -182,6 +182,16 @@ int main() {
         return ok && b.eliminate() == 0u && !removed(written);
     });
 
+    passed &= run("a branch condition derived from the write keeps the select", [] {
+        Builder b;
+        auto& exec = b.mask(16u);
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        auto& taken = b.emit(IrOpcode::INotEqual32, IrType::Bool, {&written, &b.constant(0u)});
+        (void)b.emit(IrOpcode::Reference, IrType::Void, {&taken});
+        return b.eliminate() == 0u && !removed(written);
+    });
+
     passed &= run("a compare masked by the same exec must not keep the select", [] {
         Builder b;
         auto& exec = b.mask(16u);

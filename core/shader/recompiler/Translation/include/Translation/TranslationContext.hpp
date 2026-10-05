@@ -121,6 +121,7 @@ private:
     IrF32 selectF32(IrU1 condition, IrF32 trueValue, IrF32 falseValue);
     IrU32 convertF32ToU32Saturated(IrF32 value, float upperBound, float safeUpper, std::uint32_t highResult);
     IrU32 convertF32ToI32Saturated(IrF32 value, float lowerBound, float upperBound, float safeUpper, std::uint32_t lowerResult, std::uint32_t upperResult);
+    IrU32 convertFlooredF32ToI32(IrF32 source, IrF32 floored);
     IrU32 packU16Lanes(IrU32 low, IrU32 high);
     void emitCompareResult(const RdnaInstruction& inst, IrU1 value, bool scalar, bool cmpx);
     void emitCompareConstant(const RdnaInstruction& inst, bool value, bool scalar, bool cmpx);
@@ -175,6 +176,7 @@ private:
     bool vCvtPknormF16(const RdnaInstruction& inst, bool signedValue);
     bool vSatPkU8I16(const RdnaInstruction& inst);
     bool vMulLegacyF32(const RdnaInstruction& inst, bool accumulate);
+    bool vMullitF32(const RdnaInstruction& inst);
     void emitFloat16ClassCompare(const RdnaInstruction& inst, bool cmpx);
     bool float64Operation(const RdnaInstruction& inst, IrOpcode opcode);
     void writeF64Result(const RdnaOperand& operand, IrValue& value);
@@ -228,6 +230,7 @@ private:
     bool bfmB32(const RdnaInstruction& inst);
     IrU32 rightMask32(IrU32 count);
     IrU64 rightMask64(IrU32 count);
+    IrU32 extractBits32(IrU32 source, IrU32 offset, IrU32 rawCount, bool sign);
     bool sBfmB64(const RdnaInstruction& inst);
     bool sBfeU32(const RdnaInstruction& inst, bool sign);
     bool sBfeU64(const RdnaInstruction& inst);
@@ -247,10 +250,11 @@ private:
     bool vCndmaskB32(const RdnaInstruction& inst);
     bool packB16(const RdnaInstruction& inst, bool high0, bool high1);
     void sSubvectorLoop(const RdnaInstruction& inst, bool begin);
-    void sSaveexec(const RdnaInstruction& inst, IrOpcode operation, bool negateExec, bool negateSource, bool write64, bool negateResult = false, bool writeDestination = true);
+    void sSaveexec(const RdnaInstruction& inst, IrOpcode operation, bool negateExec, bool negateSource, bool write64, bool negateResult = false, bool writeResult = false);
     void addU32(const RdnaInstruction& inst, bool vector, bool useCarryIn);
     void subU32(const RdnaInstruction& inst, bool vector, bool reverse);
     void subbU32(const RdnaInstruction& inst, bool vector, bool reverse);
+    bool vAddSubNcU32(const RdnaInstruction& inst, bool subtract, bool reverse);
     void sAbsdiffI32(const RdnaInstruction& inst);
     void sAddSubI32(const RdnaInstruction& inst, bool subtract);
     void sLshlAddU32(const RdnaInstruction& inst, std::uint32_t shiftAmount);

@@ -764,6 +764,91 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+void viewPastLastMipTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: views past the last mip not tested\n";
+        return;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t bytes = 0x60000;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the past-last-mip block");
+    auto* texels = static_cast<std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr) {
+        std::cout << "host import of the past-last-mip block refused: views past the last mip not tested\n";
+        return;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    const auto view = [&](std::uint32_t level) {
+        const std::array<std::uint32_t, 8> words{
+            static_cast<std::uint32_t>(address >> 8u),
+            static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((side - 1u) & 3u) << 30u),
+            ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+            0xfacu | (level << 12u) | (level << 16u) | (0x1bu << 20u) | (9u << 28u),
+            0u,
+            2u << 4u,
+            0u,
+            0u,
+        };
+        return DecodeTextureResource(words);
+    };
+    const auto texel = [&](const StorageTexture& image, std::uint32_t level) {
+        Buffer readback(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+        copy.imageExtent = {1, 1, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image.Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        std::uint32_t value = 0;
+        std::memcpy(&value, readback.Bytes().data(), sizeof(value));
+        return value;
+    };
+    std::memset(texels, 0x55, bytes);
+    std::memset(texels + 0x8400, 0x66, 4);
+    std::memset(texels + 0x4800, 0x77, 4);
+    const auto allocatedView = view(2);
+    const auto pastView = view(3);
+    Require(allocatedView.mipCount == 3 && pastView.mipCount == 4 && DescribeSurface(pastView).guestBytes == bytes, "a 256x256 32 bpp SW_64KB_R_X surface viewed past MAX_MIP 2 decoded wrongly");
+    const auto allocated = CachedStorageSurface(context, allocatedView);
+    Require(allocated->Descriptor().mipCount == 3, "the allocated levels' storage image has an unexpected level count");
+    const auto past = CachedStorageSurface(context, pastView);
+    Require(past->Descriptor().mipCount == 4, "the storage image of a view past the last mip lacks the level it names");
+    Require(!StorageImageCached(context, allocated.get()), "the allocated levels' image is still the surface's after a view past its last mip");
+    Require(CachedStorageSurface(context, allocatedView) == past, "a view of the allocated levels took another image than the view past the last mip");
+    Require(texel(*past, 2) == 0x66666666u, "level 2 was not read from its addrlib tail slot");
+    Require(texel(*past, 3) == 0x77777777u, "the level past the last mip was not read from its addrlib tail slot");
+}
+
 void resourceReadTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -4151,6 +4236,7 @@ int main() {
             drawInputReuseTests(device, recorder);
             storeRunTests(device, recorder);
             movedMetadataTests(device, recorder);
+            viewPastLastMipTests(device, recorder);
             unitShadowTests(device, recorder);
             storageRefreshTests(device, recorder, false);
             storageRefreshTests(device, recorder, true);

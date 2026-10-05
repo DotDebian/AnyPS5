@@ -91,7 +91,7 @@ std::uint32_t ByteAddress(SpirvValueEmitContext& ctx, const IrValue& inst, const
     case ResourceKind::Gds:
         if (mem.kind == ResourceKind::Lds) {
             if (const auto found = state.requirements.functionLdsAddresses.find(&inst); found != state.requirements.functionLdsAddresses.end()) {
-                return ConstantU32(state, found->second);
+                return ConstantU32(state, found->second + mem.offset);
             }
         }
         if (mem.offset == 0u) {

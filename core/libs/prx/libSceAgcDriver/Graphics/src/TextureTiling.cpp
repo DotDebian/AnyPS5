@@ -316,6 +316,11 @@ ThickLayout ComputeThickLayout(TextureTileMode tileMode, std::uint32_t format, s
         mip.tail = level >= firstTailLevel;
         mip.tailX = 0;
         mip.tailY = 0;
+        const bool tiled = tileMode != TextureTileMode::kLinear;
+        const auto levelWidth = tiled ? std::max((width + (1u << level) - 1u) >> level, 1u) : mip.width;
+        const auto levelHeight = tiled ? std::max((height + (1u << level) - 1u) >> level, 1u) : mip.height;
+        const auto paddedWidth = AlignUp(levelWidth, block[0]);
+        mip.pitchBytes = paddedWidth * bytesPerElement;
         if (mip.tail) {
             constexpr std::uint32_t microBlock[5][2] = {{8, 4}, {4, 4}, {4, 4}, {4, 2}, {2, 2}};
             const auto element = static_cast<std::size_t>(std::countr_zero(bytesPerElement));
@@ -331,16 +336,12 @@ ThickLayout ComputeThickLayout(TextureTileMode tileMode, std::uint32_t format, s
             mip.pitchBytes = block[0] * bytesPerElement;
             mip.tiledOffset = 0;
             mip.tiledSize = blockBytes;
-        } else if (tileMode == TextureTileMode::kLinear) {
-            const auto paddedWidth = AlignUp(mip.width, block[0]);
-            mip.pitchBytes = paddedWidth * bytesPerElement;
+        } else if (!tiled) {
             mip.blocksPerRow = paddedWidth;
             mip.tiledSize = static_cast<std::uint64_t>(mip.pitchBytes) * mip.height;
         } else {
-            const auto paddedWidth = AlignUp(ShiftCeil(width, level), block[0]);
-            mip.pitchBytes = paddedWidth * bytesPerElement;
             mip.blocksPerRow = paddedWidth / block[0];
-            mip.tiledSize = static_cast<std::uint64_t>(mip.blocksPerRow) * (AlignUp(ShiftCeil(height, level), block[1]) / block[1]) * blockBytes;
+            mip.tiledSize = static_cast<std::uint64_t>(mip.blocksPerRow) * (AlignUp(levelHeight, block[1]) / block[1]) * blockBytes;
         }
         if (!mip.tail) {
             mip.tiledOffset = tiledOffset;

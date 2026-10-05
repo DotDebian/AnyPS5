@@ -47,14 +47,7 @@ std::uint32_t APS5_VABI sceAgcAcbAtomicGdsGetSize() {
 }
 
 std::uint32_t* APS5_VABI sceAgcAcbPrimeUtcl2(CommandBuffer* buf, const volatile void* address, std::uint32_t sizeInBytes) {
-    const auto guestAddress = reinterpret_cast<std::uintptr_t>(address);
-    auto* packet = Agc::Command::Allocate(buf, 5, __func__);
-    packet[0] = Agc::Command::Header(0x10u, 5);
-    packet[1] = 0;
-    packet[2] = static_cast<std::uint32_t>(guestAddress);
-    packet[3] = static_cast<std::uint32_t>(guestAddress >> 32u);
-    packet[4] = sizeInBytes;
-    return packet;
+    return Agc::Command::WritePrimeUtcl2(buf, address, sizeInBytes, __func__);
 }
 
 std::uint32_t APS5_VABI sceAgcAcbPrimeUtcl2GetSize() {

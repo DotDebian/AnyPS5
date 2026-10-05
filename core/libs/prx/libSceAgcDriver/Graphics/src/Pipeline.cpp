@@ -428,9 +428,9 @@ std::vector<std::byte> pipelineKey(const Context& context, const State& state, c
     for (const auto& blend : state.blends) append(key, blend);
     for (const auto value : state.blendConstants) append(key, value);
     append(key, state.colors.size());
-    for (const auto& color : state.colors) {
-        append(key, color.format);
-        append(key, color.exportIndex);
+    for (const auto& color : state.colors) append(key, color.format);
+    if (state.blends.size() != state.colors.size()) {
+        for (const auto& color : state.colors) append(key, color.exportIndex);
     }
     const auto& depth = state.depth;
     append(key, depth.attached);

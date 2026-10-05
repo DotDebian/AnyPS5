@@ -68,8 +68,6 @@ bool LaneSource(const IrProgram& program, const IrValue& value) {
 
 namespace {
 
-// The largest value a 32-bit LDS address can take, or nullopt when no bound is proven. Unsigned
-// throughout: an operation that could wrap past 2^32 has no bound.
 class AddressBound {
 public:
     std::optional<std::uint64_t> Of(const IrValue* value) {
@@ -78,7 +76,6 @@ public:
         if (value == nullptr) return std::nullopt;
         if (value->HasImmediate()) return static_cast<std::uint64_t>(value->ImmediateU32());
         if (const auto known = bounds.find(value); known != bounds.end()) return known->second;
-        // A value on its own operand chain (a loop phi) has no bound here.
         if (!visiting.insert(value).second || visiting.size() > MaxDepth) return std::nullopt;
         const auto result = compute(*value);
         visiting.erase(value);
@@ -103,7 +100,6 @@ private:
         const auto argument = [&](std::size_t index) { return index < value.ArgumentCount() ? Of(value.Argument(index)) : std::nullopt; };
         switch (value.Opcode()) {
         case IrOpcode::LaneId:
-            // Guest lane ids, at most wave64 (EmitLaneId: the subgroup invocation of either half).
             return 63u;
         case IrOpcode::IAdd32: {
             const auto a = argument(0), b = argument(1);
@@ -176,9 +172,35 @@ private:
     std::unordered_set<const IrValue*> visiting;
 };
 
-// The dwords an LDS access touches from its address on (0: not an addressed LDS access).
 std::uint32_t SharedAccessDwords(IrOpcode opcode) {
     switch (opcode) {
+    case IrOpcode::LoadSharedU8:
+    case IrOpcode::LoadSharedU16:
+    case IrOpcode::LoadSharedU32:
+    case IrOpcode::WriteSharedU8:
+    case IrOpcode::WriteSharedU16:
+    case IrOpcode::WriteSharedU32:
+    case IrOpcode::SharedAtomicFMin32:
+    case IrOpcode::SharedAtomicFMax32:
+    case IrOpcode::SharedAtomicSwap32:
+    case IrOpcode::SharedAtomicIAdd32:
+    case IrOpcode::SharedAtomicISub32:
+    case IrOpcode::SharedAtomicInc32:
+    case IrOpcode::SharedAtomicDec32:
+    case IrOpcode::SharedAtomicSMin32:
+    case IrOpcode::SharedAtomicUMin32:
+    case IrOpcode::SharedAtomicSMax32:
+    case IrOpcode::SharedAtomicUMax32:
+    case IrOpcode::SharedAtomicAnd32:
+    case IrOpcode::SharedAtomicOr32:
+    case IrOpcode::SharedAtomicXor32:
+    case IrOpcode::SharedAtomicRsub32:
+    case IrOpcode::SharedAtomicFAdd32:
+    case IrOpcode::SharedAtomicCmpst32:
+    case IrOpcode::SharedAtomicCmpstF32:
+    case IrOpcode::SharedAtomicMskor32:
+    case IrOpcode::SharedAtomicWrap32:
+        return 1u;
     case IrOpcode::LoadSharedU32x2:
     case IrOpcode::WriteSharedU32x2:
         return 2u;
@@ -188,13 +210,8 @@ std::uint32_t SharedAccessDwords(IrOpcode opcode) {
     case IrOpcode::LoadSharedU32x4:
     case IrOpcode::WriteSharedU32x4:
         return 4u;
-    case IrOpcode::LoadShared:
-    case IrOpcode::StoreShared:
-    case IrOpcode::DataAppend:
-    case IrOpcode::DataConsume:
-        return 0u;
     default:
-        return SharedComponentCount(opcode);
+        return 0u;
     }
 }
 
@@ -213,7 +230,6 @@ std::uint32_t FunctionLdsDwords(const IrProgram& program) {
             const auto dwords = SharedAccessDwords(inst->Opcode());
             if (dwords == 0u || inst->ArgumentCount() == 0) return FunctionLdsDwordLimit;
             const auto address = bound.Of(inst->Argument(0));
-            // The emitter adds the offset in 32 bits (ByteAddress): a sum that could wrap is unbounded.
             if (!address || *address + memory.offset > 0xffffffffull) return FunctionLdsDwordLimit;
             needed = std::max(needed, ((*address + memory.offset) >> 2u) + dwords);
             if (needed >= FunctionLdsDwordLimit) return FunctionLdsDwordLimit;
@@ -224,7 +240,6 @@ std::uint32_t FunctionLdsDwords(const IrProgram& program) {
 
 namespace {
 
-// An address as `lane * stride + constant`, in unsigned 64-bit arithmetic; nullopt for any other form.
 struct LaneAffine {
     std::uint64_t stride = 0;
     std::uint64_t constant = 0;
@@ -276,9 +291,8 @@ std::unordered_map<const IrValue*, std::uint32_t> FunctionLdsLaneAddresses(const
             const auto affine = LaneAffineOf(inst->Argument(0));
             if (!affine || affine->stride % 4u != 0u || (stride && *stride != affine->stride)) return {};
             stride = affine->stride;
-            const auto address = affine->constant + memory.offset;
-            if (address > 0xffffffffull) return {};
-            addresses.emplace(inst, static_cast<std::uint32_t>(address));
+            if (affine->constant + memory.offset > 0xffffffffull) return {};
+            addresses.emplace(inst, static_cast<std::uint32_t>(affine->constant));
         }
     }
     if (!stride || *stride == 0u) return {};
@@ -414,18 +428,21 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
             }
         }
     }
+    for (const auto& info : program.Metadata().blockInfo) {
+        if (info.terminator.kind == TerminatorKind::ConditionalBranch && IsWaveMaskBranch(info.terminator.condition)) {
+            requirements.subgroupBallot = true;
+        }
+    }
     if (requirements.functionLds) {
         requirements.functionLdsDwords = FunctionLdsDwords(program);
         requirements.functionLdsAddresses = FunctionLdsLaneAddresses(program);
         if (!requirements.functionLdsAddresses.empty()) {
             std::uint64_t needed = 0;
-            for (const auto& [inst, address] : requirements.functionLdsAddresses) needed = std::max<std::uint64_t>(needed, (address >> 2u) + SharedAccessDwords(inst->Opcode()));
+            for (const auto& [inst, address] : requirements.functionLdsAddresses) {
+                const auto offset = program.Resources().memoryInfo[inst->Flags<MemoryFlags>().index].offset;
+                needed = std::max<std::uint64_t>(needed, ((std::uint64_t{address} + offset) >> 2u) + SharedAccessDwords(inst->Opcode()));
+            }
             requirements.functionLdsDwords = static_cast<std::uint32_t>(std::max<std::uint64_t>((needed + 63u) & ~63ull, 64u));
-        }
-    }
-    for (const auto& info : program.Metadata().blockInfo) {
-        if (info.terminator.kind == TerminatorKind::ConditionalBranch && IsWaveMaskBranch(info.terminator.condition)) {
-            requirements.subgroupBallot = true;
         }
     }
     return requirements;

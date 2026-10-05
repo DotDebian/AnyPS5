@@ -135,6 +135,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         addHost(std::string(start, end));
     }
     for (const auto& image : images) for (const auto& dependency : image.Dependencies) addHost(dependency);
+    if (uniqueHosts.contains("libSceLibcInternal.prx") && uniqueHosts.insert("libc.prx").second) hostLibraries.push_back("libc.prx");
     dynamic.DynamicSegmentData.clear();
     const auto addNeeded = [&](const std::string& name) {
         Io::AppendU64(dynamic.DynamicSegmentData, 1);

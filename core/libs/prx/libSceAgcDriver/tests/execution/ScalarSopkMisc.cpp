@@ -70,7 +70,7 @@ void ExpectRefused(AgcDriver::VulkanDevice& device) {
     const std::vector<std::uint32_t> userData(8, 0u);
     bool refused = false;
     try {
-        ShaderRecompiler::Recompile(Request(device, code, userData, memory));
+        static_cast<void>(ShaderRecompiler::Recompile(Request(device, code, userData, memory)));
     } catch (const std::exception&) {
         refused = true;
     }

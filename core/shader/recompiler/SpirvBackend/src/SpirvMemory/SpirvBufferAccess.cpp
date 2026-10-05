@@ -95,7 +95,6 @@ void EmitMemoryOffsets(SpirvEmitterState& state) {
 std::uint32_t LdsDwordCount(const SpirvEmitterState& state) {
     const auto* workgroup = ShaderWorkgroupInput(state);
     if (workgroup != nullptr) return workgroup->ldsSizeDwords;
-    // Stages without workgroup memory keep LDS per invocation, sized to what their accesses reach.
     return state.requirements.functionLdsDwords != 0u ? state.requirements.functionLdsDwords : FunctionLdsDwordLimit;
 }
 

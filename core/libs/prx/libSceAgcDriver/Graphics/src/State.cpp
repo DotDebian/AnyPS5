@@ -635,24 +635,23 @@ State DecodeState(const QueueState& queue) {
     for (std::uint32_t slot = 0; slot < 8; ++slot) {
         if (((shaderMask >> (4u * slot)) & 0xfu) != 0) exportSlots.push_back(slot);
     }
-    std::size_t slotCount = 0;
-    for (std::size_t index = 0; index < exportSlots.size(); ++index) {
-        if (((targetMask >> (4u * exportSlots[index])) & 0xfu) != 0) slotCount = index + 1;
-    }
-    exportSlots.resize(slotCount);
     const auto written = [&](std::uint32_t slot) { return ((targetMask >> (4u * slot)) & 0xfu) != 0; };
-    result.hasColorTarget = slotCount != 0;
-    APS5_LOG_OUT_DEBUG("hasColorTarget=%u slots=%zu", result.hasColorTarget ? 1u : 0u, slotCount);
+    std::uint32_t exportCount = 0;
+    for (std::uint32_t index = 0; index < exportSlots.size(); ++index) {
+        if (written(exportSlots[index])) exportCount = index + 1;
+    }
+    result.hasColorTarget = exportCount != 0;
+    APS5_LOG_OUT_DEBUG("hasColorTarget=%u exports=%u", result.hasColorTarget ? 1u : 0u, exportCount);
 
     // CB_COLOR_CONTROL mode 0 disables color writes, which only matters when a target is written.
     if (const auto colorControl = read(cx, 0x202); !colorControlSupported(colorControl, result.hasColorTarget)) throw std::runtime_error(colorControlMessage(colorControl));
     if (auto reason = zExportFormatRejection(read(cx, 0x203), read(cx, 0x1c4)); !reason.empty()) throw std::runtime_error(reason);
-    const auto exportFormat = read(cx, 0x1c5);
+    const auto exportFormat = result.hasColorTarget ? read(cx, 0x1c5) : 0u;
     APS5_LOG_OUT_DEBUG("Export format=%u", exportFormat);
     // SPI_SHADER_POS_FORMAT: POS0 must be a 4-component position; later vectors carry the misc/clip
     // exports that PA_CL_VS_OUT_CNTL validation above already limits to ignored layer/viewport data.
     Require((read(cx, 0x1c3) & 0xfu) == 4, "additional position exports are unsupported");
-    for (std::uint32_t index = 0; index < slotCount; ++index) {
+    for (std::uint32_t index = 0; index < exportCount; ++index) {
         const auto slot = exportSlots[index];
         if (!written(slot)) continue;
         // Export formats only matter for the targets the draw writes.
@@ -708,7 +707,7 @@ State DecodeState(const QueueState& queue) {
     intersect(result.scissor, cx, 0x90, false);
     if ((read(cx, 0x292) & 2u) != 0) intersect(result.scissor, cx, 0x94, false);
     APS5_LOG_OUT_DEBUG("Scissor offset=(%d,%d) extent=%ux%u", result.scissor.offset.x, result.scissor.offset.y, result.scissor.extent.width, result.scissor.extent.height);
-    result.blends.assign(slotCount, VkPipelineColorBlendAttachmentState{});
+    result.blends.assign(exportCount, VkPipelineColorBlendAttachmentState{});
     for (const auto& color : result.colors) {
         const auto slot = color.slot;
         const auto blend = read(cx, 0x1e0 + slot);
@@ -742,6 +741,15 @@ State DecodeState(const QueueState& queue) {
     if (!result.colors.empty()) result.blend = result.blends[result.colors.front().exportIndex];
     APS5_LOG_OUT_DEBUG("DecodeState done colorTarget=%u render=%ux%u topology=%u", result.hasColorTarget ? 1u : 0u, result.renderExtent.width, result.renderExtent.height, static_cast<unsigned>(result.topology));
     return result;
+}
+
+std::array<std::uint8_t, 8> ExportMappings(const State& state) {
+    std::array<std::uint8_t, 8> mappings{};
+    mappings.fill(0xe4u);
+    for (const auto& color : state.colors) {
+        if (color.exportIndex < mappings.size()) mappings[color.exportIndex] = color.componentMapping;
+    }
+    return mappings;
 }
 
 // One CB_COLOR<slot> buffer: its surface, format, extent (of the viewed mip) and DCC metadata.
@@ -898,15 +906,6 @@ bool DepthMetadataBlit(const QueueState& queue) {
     return true;
 }
 
-std::array<std::uint8_t, 8> ExportMappings(const State& state) {
-    std::array<std::uint8_t, 8> mappings{};
-    mappings.fill(0xe4u);
-    for (const auto& color : state.colors) {
-        if (color.exportIndex < mappings.size()) mappings[color.exportIndex] = color.componentMapping;
-    }
-    return mappings;
-}
-
 std::string DrawRejection(const QueueState& queue, bool indexed) {
     const auto& cx = queue.context;
     // A register a rule needs that is absent gives no verdict here: DecodeState reports it.
@@ -961,6 +960,7 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (value(cx, 0x203, word) && value(cx, 0x1c4, other)) {
         if (auto reason = zExportFormatRejection(word, other); !reason.empty()) return reason;
     }
+    if (PixelProgramUnset(queue)) return NullPixelProgramRejection(queue);
     // The pixel stage decode (ShaderInputState.cpp) reads these after DecodeState and the program
     // prepare; a bank without them fails there with this message.
     for (const auto offset : {0x1b3u, 0x1b4u, 0x1c5u}) {
@@ -969,6 +969,20 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
         std::snprintf(text, sizeof(text), "AGC graphics: missing register at DWORD 0x%x", offset);
         return text;
     }
+    return {};
+}
+
+bool PixelProgramUnset(const QueueState& queue) {
+    const auto low = find(queue.shader, 0x008, RegisterBank::Shader);
+    const auto high = find(queue.shader, 0x009, RegisterBank::Shader);
+    return low != queue.shader.end() && high != queue.shader.end() && low->second == 0 && high->second == 0;
+}
+
+std::string NullPixelProgramRejection(const QueueState& queue) {
+    const auto targetMask = find(queue.context, 0x8e);
+    const auto shaderMask = find(queue.context, 0x8f);
+    if (targetMask == queue.context.end() || shaderMask == queue.context.end()) return "AGC graphics: a draw without a pixel program needs CB_TARGET_MASK and CB_SHADER_MASK";
+    if ((targetMask->second & shaderMask->second) != 0) return "AGC graphics: a draw without a pixel program writes color";
     return {};
 }
 

@@ -316,6 +316,12 @@ bool TranslationContext::integer24(const RdnaInstruction& inst, bool sign, bool 
     const IrU32 rhs(ir.Emit(extractOpcode, IrType::U32, {&rhsSource.Value(), &ir.Constant(0u), &ir.Constant(24u)}));
     const IrOpcode multiplyOpcode = high ? (sign ? IrOpcode::SMulHi : IrOpcode::UMulHi) : IrOpcode::IMul32;
     IrU32 result(ir.Emit(multiplyOpcode, IrType::U32, {&lhs.Value(), &rhs.Value()}));
+    if (inst.destination.clamp && !high && !addend) {
+        const IrU32 top(ir.Emit(sign ? IrOpcode::SMulHi : IrOpcode::UMulHi, IrType::U32, {&lhs.Value(), &rhs.Value()}));
+        IrValue& expected = sign ? ir.ShiftRightArithmetic(result.Value(), ir.Constant(31u)) : ir.Constant(0u);
+        IrValue& saturated = sign ? ir.BitwiseXor(ir.ShiftRightArithmetic(top.Value(), ir.Constant(31u)), ir.Constant(0x7fffffffu)) : ir.Constant(0xffffffffu);
+        result = IrU32(ir.Select(ir.INotEqual(top.Value(), expected), saturated, result.Value()));
+    }
     if (addend) {
         result = IrU32(ir.IAdd(result.Value(), readU32(sourceAt(inst, 2u)).Value()));
     }
@@ -614,15 +620,21 @@ bool TranslationContext::sBfmB64(const RdnaInstruction& inst) {
     return true;
 }
 
+IrU32 TranslationContext::extractBits32(IrU32 source, IrU32 offset, IrU32 rawCount, bool sign) {
+    const IrU32 count(ir.Emit(IrOpcode::UMin32, IrType::U32, {&rawCount.Value(), &ir.Constant(32u)}));
+    const IrU32 discard(ir.BitwiseAnd(ir.ISub(ir.Constant(32u), count.Value()), ir.Constant(31u)));
+    const IrU32 shifted(sign ? ir.ShiftRightArithmetic(source.Value(), offset.Value()) : ir.ShiftRightLogical(source.Value(), offset.Value()));
+    const IrU32 aligned(ir.ShiftLeftLogical(shifted.Value(), discard.Value()));
+    const IrU32 field(sign ? ir.ShiftRightArithmetic(aligned.Value(), discard.Value()) : ir.ShiftRightLogical(aligned.Value(), discard.Value()));
+    return IrU32(ir.Select(ir.INotEqual(count.Value(), ir.Constant(0u)), field.Value(), ir.Constant(0u)));
+}
+
 bool TranslationContext::sBfeU32(const RdnaInstruction& inst, bool sign) {
     const IrU32 source = readU32(sourceAt(inst, 0u));
     const IrU32 field = readU32(sourceAt(inst, 1u));
     const IrU32 offset(ir.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&field.Value(), &ir.Constant(0u), &ir.Constant(5u)}));
     const IrU32 rawCount(ir.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&field.Value(), &ir.Constant(16u), &ir.Constant(7u)}));
-    const IrU32 available(ir.ISub(ir.Constant(32u), offset.Value()));
-    const IrU32 count(ir.Emit(IrOpcode::UMin32, IrType::U32, {&rawCount.Value(), &available.Value()}));
-    const IrOpcode opcode = sign ? IrOpcode::BitFieldSExtract : IrOpcode::BitFieldUExtract;
-    const IrU32 result(ir.Emit(opcode, IrType::U32, {&source.Value(), &offset.Value(), &count.Value()}));
+    const IrU32 result = extractBits32(source, offset, rawCount, sign);
     writeOperand(inst.destination, &result.Value());
     ir.SetScc(ir.INotEqual(result.Value(), ir.Constant(0u)));
     return true;
@@ -698,15 +710,12 @@ bool TranslationContext::vAlignbitB32(const RdnaInstruction& inst) {
 bool TranslationContext::vAlignbyteB32(const RdnaInstruction& inst) {
     const IrU32 hi = readU32(sourceAt(inst, 0u));
     const IrU32 lo = readU32(sourceAt(inst, 1u));
-    const IrU32 byteOffset(ir.BitwiseAnd(readU32(sourceAt(inst, 2u)).Value(), ir.Constant(31u)));
+    const IrU32 byteOffset(ir.BitwiseAnd(readU32(sourceAt(inst, 2u)).Value(), ir.Constant(3u)));
     const IrU32 bitOffset(ir.ShiftLeftLogical(byteOffset.Value(), ir.Constant(3u)));
     const IrU64 concatenated(ir.ConstructU64(lo.Value(), hi.Value()));
-    const IrU32 maskedBitOffset(ir.BitwiseAnd(bitOffset.Value(), ir.Constant(63u)));
-    const IrU64 shifted(ir.Emit(IrOpcode::ShiftRightLogical64, IrType::U64, {&concatenated.Value(), &maskedBitOffset.Value()}));
-    const IrU1 inRange(ir.ULessThan(byteOffset.Value(), ir.Constant(8u)));
+    const IrU64 shifted(ir.Emit(IrOpcode::ShiftRightLogical64, IrType::U64, {&concatenated.Value(), &bitOffset.Value()}));
     const std::array<IrU32, 2> extracted = extractU64(shifted);
-    const IrU32 result(ir.Select(inRange.Value(), extracted[0].Value(), ir.Constant(0u)));
-    writeOperand(inst.destination, &result.Value());
+    writeOperand(inst.destination, &extracted[0].Value());
     return true;
 }
 

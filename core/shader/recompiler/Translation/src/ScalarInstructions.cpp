@@ -115,10 +115,10 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
         sSaveexec(inst, IrOpcode::LogicalXor, false, false, false, true);
         return true;
     case RdnaOpcode::SAndn1WrexecB32:
-        sSaveexec(inst, IrOpcode::LogicalAnd, false, true, false, false, false);
+        sSaveexec(inst, IrOpcode::LogicalAnd, false, true, false, false, true);
         return true;
     case RdnaOpcode::SAndn2WrexecB32:
-        sSaveexec(inst, IrOpcode::LogicalAnd, true, false, false, false, false);
+        sSaveexec(inst, IrOpcode::LogicalAnd, true, false, false, false, true);
         return true;
     case RdnaOpcode::SAndSaveexecB64:
         sSaveexec(inst, IrOpcode::LogicalAnd, false, false, true);
@@ -151,10 +151,10 @@ bool TranslationContext::emitScalar(const RdnaInstruction& inst) {
         sSaveexec(inst, IrOpcode::LogicalOr, false, true, true);
         return true;
     case RdnaOpcode::SAndn1WrexecB64:
-        sSaveexec(inst, IrOpcode::LogicalAnd, false, true, true, false, false);
+        sSaveexec(inst, IrOpcode::LogicalAnd, false, true, true, false, true);
         return true;
     case RdnaOpcode::SAndn2WrexecB64:
-        sSaveexec(inst, IrOpcode::LogicalAnd, true, false, true, false, false);
+        sSaveexec(inst, IrOpcode::LogicalAnd, true, false, true, false, true);
         return true;
     case RdnaOpcode::SAddU32:
         addU32(inst, false, false);

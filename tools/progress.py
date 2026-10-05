@@ -26,6 +26,7 @@ OPCODE_ALIASES = {
     "VMadMixhiF16": "V_FMA_MIXHI_F16",
 }
 OPCODE_VARIANTS = {
+    "SEndpgm": ("S_ENDPGM_SAVED", "S_ENDPGM_ORDERED_PS_DONE"),
     "VFmaF32": ("V_FMA_MIX_F32",),
     "SAddI32": ("S_ADDK_I32",),
     "SCmpEqI32": ("S_CMPK_EQ_I32",),

@@ -258,7 +258,10 @@ std::uint32_t EmitPackFloat2x16Rtz(SpirvEmitterState& state, std::uint32_t arg0,
 }
 
 std::uint32_t EmitFPSaturate32(SpirvEmitterState& state, std::uint32_t arg0) {
-    return EmitExt(state, TypeF32(state), GLSLstd450FClamp, {arg0, ConstantF32(state, 0u), ConstantF32(state, 0x3f800000u)});
+    const auto bits = Unary(state, spv::OpBitcast, TypeU32(state), arg0);
+    const auto positive = Binary(state, spv::OpULessThan, TypeBool(state), Binary(state, spv::OpISub, TypeU32(state), bits, ConstantU32(state, 1u)), ConstantU32(state, 0x7f800000u));
+    const auto upper = EmitExt(state, TypeU32(state), GLSLstd450UMin, {bits, ConstantU32(state, 0x3f800000u)});
+    return Unary(state, spv::OpBitcast, TypeF32(state), Select(state, TypeU32(state), positive, upper, ConstantU32(state, 0u)));
 }
 
 std::uint32_t EmitIAdd64(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {

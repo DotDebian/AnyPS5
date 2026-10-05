@@ -151,3 +151,23 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
+
+add_test_executable(agc_prime_utcl2_tests EXCLUDE_FROM_ALL
+        tests/PrimeUtcl2.cpp
+        Command/src/Packet.cpp
+        Command/src/Memory.cpp
+        Acb/src/Memory.cpp
+        DcbFlow/src/Memory.cpp
+        DcbState/src/Display.cpp
+)
+target_include_directories(agc_prime_utcl2_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_prime_utcl2_tests PRIVATE libc)
+configure_windows_unwind(agc_prime_utcl2_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_prime_utcl2_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_prime_utcl2_tests COMMAND agc_prime_utcl2_tests)
+    if(WIN32)
+        set_tests_properties(agc_prime_utcl2_tests PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

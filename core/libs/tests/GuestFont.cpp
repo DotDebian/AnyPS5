@@ -1,4 +1,4 @@
-#include "prx/libSceFont/include/FontTypes.hpp"
+#include "prx/libSceFont/include/FontDriver.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +15,7 @@ int APS5_VABI sceFontCreateLibrary(const FontMemory*, const void*, FontLibrary*)
 int APS5_VABI sceFontDestroyLibrary(FontLibrary*);
 int APS5_VABI sceFontCreateRenderer(const FontMemory*, const void*, FontRenderer*);
 int APS5_VABI sceFontDestroyRenderer(FontRenderer*);
+int APS5_VABI sceFontGetPixelResolution(FontLibrary, std::uint32_t*);
 int APS5_VABI sceFontSupportSystemFonts(FontLibrary);
 int APS5_VABI sceFontSupportExternalFonts(FontLibrary, std::uint32_t, std::uint32_t);
 int APS5_VABI sceFontOpenFontSet(FontLibrary, std::uint32_t, std::uint32_t, const FontOpenDetail*, FontHandle*);
@@ -49,6 +50,10 @@ static void* APS5_VABI Allocate(void*, std::uint32_t size) {
 static void APS5_VABI Release(void*, void* pointer) {
     if (pointer) --allocations;
     std::free(pointer);
+}
+
+static std::uint32_t APS5_VABI CoarsePixelResolution() {
+    return 16;
 }
 
 static void Put16(std::vector<unsigned char>& out, int value) {
@@ -113,6 +118,25 @@ int main() {
     FontLibrary library = nullptr;
     Require(sceFontCreateLibrary(&memory, nullptr, &library) == SCE_FONT_ERROR_INVALID_PARAMETER && library == nullptr);
     Require(sceFontCreateLibrary(&memory, sceFontSelectLibraryFt(0), &library) == SCE_FONT_OK && library != nullptr);
+
+    std::uint32_t subPixelCount = 1;
+    Require(sceFontGetPixelResolution(library, &subPixelCount) == SCE_FONT_OK && subPixelCount == 64);
+    Require(sceFontGetPixelResolution(library, nullptr) == SCE_FONT_ERROR_INVALID_PARAMETER);
+    Require(sceFontGetPixelResolution(nullptr, nullptr) == SCE_FONT_ERROR_INVALID_PARAMETER);
+    subPixelCount = 1;
+    Require(sceFontGetPixelResolution(nullptr, &subPixelCount) == SCE_FONT_ERROR_INVALID_LIBRARY && subPixelCount == 0);
+    FontHandleOpaque notALibrary{};
+    subPixelCount = 1;
+    Require(sceFontGetPixelResolution(&notALibrary, &subPixelCount) == SCE_FONT_ERROR_INVALID_LIBRARY && subPixelCount == 0);
+    Font::SysDriver coarseDriver = *static_cast<const Font::SysDriver*>(sceFontSelectLibraryFt(0));
+    coarseDriver.pixel_resolution = CoarsePixelResolution;
+    FontLibrary coarseLibrary = nullptr;
+    Require(sceFontCreateLibrary(&memory, &coarseDriver, &coarseLibrary) == SCE_FONT_OK && coarseLibrary != nullptr);
+    Require(sceFontGetPixelResolution(coarseLibrary, &subPixelCount) == SCE_FONT_OK && subPixelCount == 16);
+    Require(sceFontGetPixelResolution(library, &subPixelCount) == SCE_FONT_OK && subPixelCount == 64);
+    coarseDriver.pixel_resolution = nullptr;
+    Require(sceFontGetPixelResolution(coarseLibrary, &subPixelCount) == SCE_FONT_ERROR_INVALID_LIBRARY && subPixelCount == 0);
+    Require(sceFontDestroyLibrary(&coarseLibrary) == SCE_FONT_OK && coarseLibrary == nullptr);
 
     FontHandle font = reinterpret_cast<FontHandle>(&memory);
     Require(sceFontOpenFontSet(library, SystemFontSet, 1, nullptr, &font) == SCE_FONT_ERROR_NO_SUPPORT_FUNCTION && font == nullptr);

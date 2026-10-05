@@ -42,4 +42,14 @@ if(BUILD_TESTING)
         set_tests_properties(audio_out_mix_level_pad_spk PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAudioOut>")
     endif()
+
+    add_test_executable(audio_out_last_output_time_tests tests/AudioOutLastOutputTime.cpp)
+    target_include_directories(audio_out_last_output_time_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(audio_out_last_output_time_tests PRIVATE libSceAudioOut libkernel libc)
+    configure_windows_unwind(audio_out_last_output_time_tests)
+    add_test(NAME audio_out_last_output_time COMMAND audio_out_last_output_time_tests)
+    if(WIN32)
+        set_tests_properties(audio_out_last_output_time PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAudioOut>")
+    endif()
 endif()

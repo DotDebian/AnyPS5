@@ -89,6 +89,7 @@ struct Port {
     int volume[8] = {};
     int mixLevel = DEFAULT_VOLUME;
     std::uint64_t lastOutputTime = 0;
+    std::uint64_t lastDataOutputTime = 0;
     SDL_AudioDeviceID device = 0;
     SDL_AudioSpec spec = {};
 };
@@ -328,6 +329,7 @@ int APS5_VABI sceAudioOutOpen(int userId, int type, int index, std::uint32_t len
             port.format = format;
             port.channels = channelsForFormat(format);
             port.lastOutputTime = 0;
+            port.lastDataOutputTime = 0;
             port.mixLevel = type == PORT_TYPE_PADSPK ? DEFAULT_PADSPK_MIX_LEVEL : DEFAULT_VOLUME;
             for (int c = 0; c < port.channels; c++) {
                 port.volume[c] = DEFAULT_VOLUME;
@@ -374,6 +376,7 @@ int APS5_VABI sceAudioOutOutput(int handle, const void* ptr) {
 
     queueAudio(*port, ptr);
     port->lastOutputTime = sceKernelGetProcessTime();
+    if (ptr != nullptr) port->lastDataOutputTime = port->lastOutputTime;
     return static_cast<int>(port->samplesNum);
 }
 
@@ -425,7 +428,10 @@ int APS5_VABI sceAudioOutOutputs(AudioOutOutputParam* param, std::uint32_t num) 
 
     const std::uint64_t done = sceKernelGetProcessTime();
     for (std::uint32_t i = 0; i < num; i++) {
-        if (auto* port = getPort(param[i].handle)) port->lastOutputTime = done;
+        if (auto* port = getPort(param[i].handle)) {
+            port->lastOutputTime = done;
+            if (param[i].ptr != nullptr) port->lastDataOutputTime = done;
+        }
     }
 
     return static_cast<int>(first.samplesNum);
@@ -454,6 +460,19 @@ int APS5_VABI sceAudioOutSetVolume(int handle, std::uint32_t flag, int* vol) {
         }
         port->volume[i] = vol[srcIdx];
     }
+    return 0;
+}
+
+int APS5_VABI sceAudioOutGetLastOutputTime(int handle, std::uint64_t* outputTime) {
+    if (outputTime == nullptr) {
+        return -2144993276;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Port* port = getPort(handle);
+    if (port == nullptr) {
+        return -2144993277;
+    }
+    *outputTime = port->lastDataOutputTime;
     return 0;
 }
 
