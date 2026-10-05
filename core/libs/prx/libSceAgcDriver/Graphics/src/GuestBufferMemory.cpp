@@ -1477,8 +1477,9 @@ void GuestBufferMemory::addCopiedRange(const CopiedRange& range) {
 }
 
 GuestBufferMemory::BaseOverlap GuestBufferMemory::baseOverlap(std::uint64_t begin, std::uint64_t end, const Region** owner) const {
-    if (space == nullptr || space->base.empty()) return BaseOverlap::None;
-    const auto& base = space->base;
+    const auto* mapped = mappedSpace();
+    if (mapped == nullptr || mapped->base.empty()) return BaseOverlap::None;
+    const auto& base = mapped->base;
     const auto found = std::upper_bound(base.begin(), base.end(), begin, [](std::uint64_t value, const Region& region) { return value < region.begin; });
     if (found != base.begin()) {
         const auto& previous = *std::prev(found);
@@ -1523,7 +1524,8 @@ const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address)
         return found == list.begin() ? nullptr : &*std::prev(found);
     };
     const auto* own = candidate(regions);
-    const auto* shared = space != nullptr ? candidate(space->base) : nullptr;
+    const auto* mapped = mappedSpace();
+    const auto* shared = mapped != nullptr ? candidate(mapped->base) : nullptr;
     if (own == nullptr || (shared != nullptr && shared->begin > own->begin)) return shared;
     return own;
 }
@@ -1591,34 +1593,38 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         }
     }
     if (owner != nullptr) {
-        // A region read live (an import or mirror bound in place, a copy of live bytes) serves the
-        // GPU whatever the snapshot holds: the compare only checked that the capture (made before
-        // the device lock) still agreed with memory the guest, or a dispatch writing a descriptor
-        // range around the captured words, may since have changed, and a difference failed the
-        // whole dispatch where hardware would have run with the bytes in memory. A snapshot-backed
-        // region uploads its own snapshot, so two snapshots of one range must agree. The live
-        // compare reads the pages directly (no flush hook), so it costs no sync, only the memcmp;
-        // it stays on because it is the one check that the words the recompiler baked into
-        // descriptors and specialization still equal what the GPU reads. APS5_NO_SNAPSHOT_CHECK=1
-        // skips the compare of live-backed regions (the region serves the GPU whatever the snapshot
-        // held; only the diagnostic is lost).
-        static const bool checkLive = std::getenv("APS5_NO_SNAPSHOT_CHECK") == nullptr;
-        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        const bool live = owner->writable || owner->hostBacked || owner->mirror != nullptr;
-        // A live region over a unit shadow's fresh results reads the import's stale bytes here
-        // (the publish happens when the region is bound, under the device lock): not compared.
-        if (live && (!checkLive || AnyShadowedOverlaps(snapshot.address, snapshot.bytes.size()))) {
-            if (profile) Snapshots().skipped.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        const auto offset = static_cast<std::size_t>(snapshot.address - owner->begin);
-        const auto* source = live ? reinterpret_cast<const std::byte*>(snapshot.address) : owner->snapshot.data() + offset;
-        Require(std::memcmp(source, snapshot.bytes.data(), snapshot.bytes.size()) == 0, "guest snapshot differs from registered memory");
-        if (profile) Snapshots().checked.fetch_add(1, std::memory_order_relaxed);
+        compareSnapshot(*owner, snapshot);
         return;
     }
     regions.push_back({snapshot.address, end, false, {snapshot.bytes.begin(), snapshot.bytes.end()}, nullptr});
     regionsSorted = false;
+}
+
+void GuestBufferMemory::compareSnapshot(const Region& owner, const GuestMemorySnapshot& snapshot) {
+    // A region read live (an import or mirror bound in place, a copy of live bytes) serves the
+    // GPU whatever the snapshot holds: the compare only checked that the capture (made before
+    // the device lock) still agreed with memory the guest, or a dispatch writing a descriptor
+    // range around the captured words, may since have changed, and a difference failed the
+    // whole dispatch where hardware would have run with the bytes in memory. A snapshot-backed
+    // region uploads its own snapshot, so two snapshots of one range must agree. The live
+    // compare reads the pages directly (no flush hook), so it costs no sync, only the memcmp;
+    // it stays on because it is the one check that the words the recompiler baked into
+    // descriptors and specialization still equal what the GPU reads. APS5_NO_SNAPSHOT_CHECK=1
+    // skips the compare of live-backed regions (the region serves the GPU whatever the snapshot
+    // held; only the diagnostic is lost).
+    static const bool checkLive = std::getenv("APS5_NO_SNAPSHOT_CHECK") == nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool live = owner.writable || owner.hostBacked || owner.mirror != nullptr;
+    // A live region over a unit shadow's fresh results reads the import's stale bytes here
+    // (the publish happens when the region is bound, under the device lock): not compared.
+    if (live && (!checkLive || AnyShadowedOverlaps(snapshot.address, snapshot.bytes.size()))) {
+        if (profile) Snapshots().skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto offset = static_cast<std::size_t>(snapshot.address - owner.begin);
+    const auto* source = live ? reinterpret_cast<const std::byte*>(snapshot.address) : owner.snapshot.data() + offset;
+    Require(std::memcmp(source, snapshot.bytes.data(), snapshot.bytes.size()) == 0, "guest snapshot differs from registered memory");
+    if (profile) Snapshots().checked.fetch_add(1, std::memory_order_relaxed);
 }
 
 void GuestBufferMemory::Upload(bool addressable) {
@@ -2535,6 +2541,7 @@ void GuestBufferMemory::takeHeapReferences() {
 
 void GuestBufferMemory::WriteBack() {
     Require(uploaded && !committed, "guest memory cannot be committed twice or before upload");
+    Require(sharedSpace == nullptr, "a shared guest memory upload completes its uses by CompleteShared");
     const auto merged = mergeWrites(writes);
     // The CPU keeps running while the GPU works, so storing whole ranges would roll back its writes to
     // bytes the shader never touched. Only runs that differ from the uploaded copy are stored.
@@ -2691,8 +2698,8 @@ GuestBufferMemory::DrawStagingTally GuestBufferMemory::DrawStaging() const {
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (!uploaded || committed) return result;
-    if (space != nullptr) {
-        for (const auto& region : space->base) {
+    if (const auto* mapped = mappedSpace(); mapped != nullptr) {
+        for (const auto& region : mapped->base) {
             if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
         }
     }
@@ -2713,8 +2720,8 @@ bool GuestBufferMemory::InPlaceReadsOverlap(std::uint64_t address, std::size_t b
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (!uploaded) return result;
-    if (space != nullptr) {
-        for (const auto& region : space->base) {
+    if (const auto* mapped = mappedSpace(); mapped != nullptr) {
+        for (const auto& region : mapped->base) {
             if (region.direct != nullptr || region.mirror != nullptr) result.emplace_back(region.begin, region.end);
         }
     }
@@ -2742,6 +2749,106 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     Require(Recorder::Active() == &recorder, "staging copies recorded into a recorder that is not the device's");
     if (profile) Copies().stagedReused.fetch_add(copies.size(), std::memory_order_relaxed);
     recordGpuCopies(copies, false);
+}
+
+GuestBufferMemory::ShareRefusal GuestBufferMemory::Shareable() const {
+    if (!uploaded || committed || space == nullptr || !lease.empty()) return ShareRefusal::NoSpace;
+    // A region of its own holds bytes copied for this build (a range the space copies per build, a
+    // captured region or a V# outside the space), which a later use would read stale.
+    if (!regions.empty()) return ShareRefusal::OwnRegions;
+    // A written range in a mirror is stored back by a compare with a reference of this build's
+    // (WriteBack); one in an import was written in place and needs only its marks.
+    for (const auto& [begin, end] : writes) {
+        const auto* found = owner(begin);
+        if (found == nullptr || found->direct == nullptr || end > found->end) return ShareRefusal::MirrorWrites;
+    }
+    return ShareRefusal::None;
+}
+
+GuestBufferMemory::SpaceLease GuestBufferMemory::Share() {
+    Require(Shareable() == ShareRefusal::None, "guest memory upload cannot be shared");
+    sharedSpace = space.get();
+    sharedSerial = space->serial;
+    sharedMirrors.clear();
+    for (const auto& region : space->base) {
+        if (region.mirror != nullptr) sharedMirrors.push_back(&region);
+    }
+    sharedWrites = mergeWrites(writes);
+    heapReferences.clear();
+    return std::exchange(space, nullptr);
+}
+
+GuestBufferMemory::SpaceLease GuestBufferMemory::AcquireShared(std::span<const GuestMemorySnapshot> snapshots, SharedFailure& failure) {
+    Require(sharedSpace != nullptr && uploaded && !committed, "guest memory upload is not shared");
+    failure = SharedFailure::Space;
+    // AcquireRegistered's hit test, in its order: the generation is read before the space is
+    // taken, so a mutation ending in between leaves the space stale by its generation. The serial
+    // names the space (unique for the process); the address is not compared, since a space that
+    // is gone may have left it to another.
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto current = Spaces().current.load();
+    if (current == nullptr || current->serial != sharedSerial) return nullptr;
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (current->device != context.device || current->generation != generation || current->importsEpoch != state.epoch) return nullptr;
+    }
+    // From here `current` pins the space, so its regions may be read (sharedSpace is its address).
+    failure = SharedFailure::Snapshot;
+    for (const auto& snapshot : snapshots) {
+        if (snapshot.address == 0 || snapshot.bytes.empty() || snapshot.bytes.size() > std::numeric_limits<std::uint64_t>::max() - snapshot.address) return nullptr;
+        const Region* owner = nullptr;
+        if (baseOverlap(snapshot.address, snapshot.address + snapshot.bytes.size(), &owner) != BaseOverlap::Inside || owner == nullptr) return nullptr;
+        compareSnapshot(*owner, snapshot);
+    }
+    // The mirrors, as AcquireRegistered refreshes them for a build served by the space: writable
+    // image mirrors are compared with guest memory, heap mirrors refilled where their blocks
+    // changed (a selected one once per collect epoch). The preparation may wait for recorded work,
+    // whose completions can retire an import: SharedImportsStand re-checks the epoch afterwards.
+    if (!sharedMirrors.empty()) {
+        std::vector<RefreshBlock> blocks;
+        std::vector<ImageMirror*> heaps;
+        for (const auto* region : sharedMirrors) {
+            if (region->mirror->heap) {
+                if (heapRefreshDue(*region->mirror)) heaps.push_back(region->mirror.get());
+            }
+            else if (region->mirror->writable && prepareRefresh(*region->mirror, region->begin, region->end - region->begin)) appendBlocks(blocks, *region->mirror, region->begin, region->end - region->begin);
+        }
+        refreshHeapMirrors(heaps, blocks);
+        compareBlocks(blocks);
+    }
+    if (mirrorsEnabled()) {
+        if (!sharedMirrors.empty()) ++Mirrors().builds;
+        sweepMirrors();
+        reportMirrors();
+        reportVramMirrors();
+    }
+    failure = SharedFailure::None;
+    return current;
+}
+
+bool GuestBufferMemory::SharedImportsStand() const {
+    Require(sharedSpace != nullptr, "guest memory upload is not shared");
+    if (context.hostImportAlignment == 0) return true;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (importsStale(context, state)) refreshImports(context, state, sharedSpace->lease);
+    return state.epoch == sharedSpace->importsEpoch;
+}
+
+void GuestBufferMemory::CompleteShared() const {
+    // The GPU wrote imported guest memory directly; page write watching did not see it.
+    for (const auto& [begin, end] : sharedWrites) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+}
+
+std::optional<VkDescriptorBufferInfo> GuestBufferMemory::SharedDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const {
+    if (!uploaded || committed || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return std::nullopt;
+    const auto* found = owner(address);
+    if (found == nullptr || address < found->begin || address + bytes > found->end || (found->direct == nullptr && found->mirror == nullptr)) return std::nullopt;
+    const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+    const auto base = found->direct != nullptr ? found->direct->base : found->mirror->base;
+    if (alignment == 0 || ((address - base) % alignment) % 4 != 0 || bytes + (address - base) % alignment > context.limits.maxStorageBufferRange) return std::nullopt;
+    return Descriptor(address, bytes, adjustment);
 }
 
 std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, std::size_t bytes) {

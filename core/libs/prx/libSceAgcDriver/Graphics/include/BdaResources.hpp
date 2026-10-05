@@ -14,6 +14,10 @@ public:
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
+    // Whether CheckFault reads and clears the fault buffer's written-page slots (stores by address,
+    // or APS5_FULL_FAULT_SCAN): per-use state, which a build shared by several uses in flight at
+    // once (APS5_REUSE_ADDRESS_DRAWS) cannot have.
+    bool ScansWrittenPages() const { return scansWrittenPages; }
     // APS5_PROFILE_DRAW: page tables served from the per-device cache and built anew (cumulative),
     // and how many recent tables the cache holds right now.
     struct TableCacheStats {

@@ -1122,6 +1122,9 @@ ShaderResources::ShaderResources(const Context& context, const ShaderRecompiler:
 
 ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, bool stageWrites) : context(context), guestMemory(context), drawBuild(true) {
     if (stageWrites) guestMemory.AllowDrawStaging();
+    // Only a draw's build is shared (see ReuseAddressDraws): a dispatch's address-based build
+    // stages and refreshes nothing a template could keep, and its path never shares a lease.
+    addressReuse = ReuseAddressDraws();
     prepareAddressBindings(shaders, snapshots);
     build(shaders, &target, indexAddress, indexBytes);
 }
@@ -1558,12 +1561,20 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
-    if (NeedsCompletion()) {
-        refusal = ReuseRefusal::Completion;
+    if (HoldsLease()) {
+        // A draw's address-based build is reusable when it can be shared (see ReuseAddressDraws);
+        // it records no direct region: a use proves the address space itself instead.
+        if (!addressReuse) {
+            refusal = ReuseRefusal::Lease;
+            return;
+        }
+        addressRefusal = sharingRefusal();
+        reusable = addressRefusal == AddressRefusal::None;
+        refusal = reusable ? ReuseRefusal::None : ReuseRefusal::Lease;
         return;
     }
-    if (HoldsLease()) {
-        refusal = ReuseRefusal::Lease;
+    if (NeedsCompletion()) {
+        refusal = ReuseRefusal::Completion;
         return;
     }
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) {
@@ -1624,7 +1635,40 @@ const char* ShaderResources::RefusalName(ReuseRefusal reason) {
 
 bool ShaderResources::keepsTemplateRecords() const {
     static const bool always = std::getenv("APS5_KEEP_TEMPLATE_RECORDS") != nullptr;
-    return always || (!usesBda && !usesFaultBuffer);
+    return always || (addressReuse && usesBda) || (!usesBda && !usesFaultBuffer);
+}
+
+bool ShaderResources::ReuseAddressDraws() {
+    // A lease synced as soon as its work is recorded (APS5_SYNC_LEASE_DISPATCH) is the behaviour
+    // before deferred release, which sharing builds on.
+    static const bool enabled = std::getenv("APS5_REUSE_ADDRESS_DRAWS") != nullptr && !SyncLeaseWork();
+    return enabled;
+}
+
+ShaderResources::AddressRefusal ShaderResources::sharingRefusal() const {
+    // The written-page slots of the fault buffer are filled by the GPU and cleared by the
+    // completion that read them: two uses in flight would lose each other's pages.
+    if (bda == nullptr || bda->ScansWrittenPages()) return AddressRefusal::StoresByAddress;
+    switch (guestMemory.Shareable()) {
+        case GuestBufferMemory::ShareRefusal::None: return AddressRefusal::None;
+        case GuestBufferMemory::ShareRefusal::OwnRegions: return AddressRefusal::OwnRegions;
+        case GuestBufferMemory::ShareRefusal::MirrorWrites: return AddressRefusal::MirrorWrites;
+        default: return AddressRefusal::NoSpace;
+    }
+}
+
+ShaderResources::SharedLease ShaderResources::ShareLease() {
+    Require(reusable && guestMemory.HoldsLease() && !guestMemory.Shared(), "only a reusable address-based build shares its lease");
+    return guestMemory.Share();
+}
+
+ShaderResources::SharedLease ShaderResources::AcquireSharedLease(std::span<const GuestMemorySnapshot> snapshots, SharedMiss& miss) {
+    miss = SharedMiss::Faulted;
+    if (faulted.load(std::memory_order_relaxed)) return nullptr;
+    auto failure = GuestBufferMemory::SharedFailure::None;
+    auto lease = guestMemory.AcquireShared(snapshots, failure);
+    miss = failure == GuestBufferMemory::SharedFailure::None ? SharedMiss::None : failure == GuestBufferMemory::SharedFailure::Snapshot ? SharedMiss::Snapshot : SharedMiss::Space;
+    return lease;
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
@@ -2320,6 +2364,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
+    // A shared address-based build has no direct region of its own: its buffers are the address
+    // space's, which must have kept every import through the lookups and flushes above (the caller
+    // holds the space, see AcquireSharedLease).
+    if (guestMemory.Shared() && !guestMemory.SharedImportsStand()) return finish(fast, false, ProofFailure::Imports);
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
@@ -2802,7 +2850,9 @@ std::size_t ShaderResources::addDataBuffer(std::span<const std::uint32_t> words)
     auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u), GpuReadProperties(GpuReadKind::StorageCopy));
     std::memcpy(buffer->Bytes().data(), words.data(), size);
     Allocation allocation{0, size, false, std::move(buffer)};
-    if (refreshable && keepsTemplateRecords()) allocation.dataWords.assign(words.begin(), words.end());
+    // A draw's address-based build keeps them whatever the size: a later use compares its words
+    // with them and rebuilds the buffer from them (MovedReadOnlyBuffers), it never refreshes.
+    if ((refreshable || (addressReuse && usesBda)) && keepsTemplateRecords()) allocation.dataWords.assign(words.begin(), words.end());
     allocations.push_back(std::move(allocation));
     mixDataWords(dataWordsHash, allocations.back().dataWords);
     return allocations.size() - 1;
@@ -3255,7 +3305,8 @@ void CountDrawSnapshot(bool reused, std::size_t bytes) {
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
     std::vector<MovedBuffer> moved;
-    if (_set == VK_NULL_HANDLE || usesBda) return moved;
+    // An address-based build that is not shared serves no second use.
+    if (_set == VK_NULL_HANDLE || (usesBda && !guestMemory.Shared())) return moved;
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
@@ -3290,6 +3341,17 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 if (item.address == address && item.size == size) continue;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                 if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
+                if (guestMemory.Shared()) {
+                    // Bound in place through the address space, as the build binds its own
+                    // elements (no copy: the lease pins the range and the pass tracking treats
+                    // an address-based draw's reads as unknown). An adjustment other than the
+                    // build's needs somewhere to go, as a build's nonzero one does.
+                    std::uint32_t adjustment = 0;
+                    if (!guestMemory.SharedDescriptor(address, static_cast<std::size_t>(size), adjustment).has_value()) return std::nullopt;
+                    if (adjustment != item.adjustment && item.pushByte < 0 && item.dataAllocation < 0) return std::nullopt;
+                    moved.push_back({index, address, static_cast<std::size_t>(size), {}, true, adjustment});
+                    continue;
+                }
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(size) + item.adjustment;
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
@@ -3297,6 +3359,19 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
             }
         }
+    }
+    // An element bound in place at another adjustment whose shader reads it from its data buffer:
+    // the use needs a data buffer of its own to carry it, built from the template's words when
+    // this use's are the same.
+    for (std::size_t at = 0, count = moved.size(); at < count; ++at) {
+        if (!moved[at].inPlace) continue;
+        const auto& item = allocations[moved[at].allocation];
+        if (moved[at].adjustment == item.adjustment || item.pushByte >= 0) continue;
+        const auto data = static_cast<std::size_t>(item.dataAllocation);
+        if (std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == data && !entry.words.empty(); })) continue;
+        const auto& source = allocations[data];
+        if (source.dataWords.empty() || item.dataByte >= source.size) return std::nullopt;
+        moved.push_back({data, 0, source.size, source.dataWords});
     }
     return moved;
 }
@@ -3310,10 +3385,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const char* value = std::getenv("APS5_SNAPSHOT_ADDRESS_DRAWS_MAX_KIB");
         return static_cast<std::size_t>(value != nullptr ? std::strtoull(value, nullptr, 10) : 8192ull) << 10u;
     }();
-    if (_set == VK_NULL_HANDLE || (usesBda && !addressDraws)) return {};
-    const auto reads = guestMemory.InPlaceReads();
+    // A shared address-based build's use (`moved` not empty) binds its own data buffers and its
+    // moved elements in place; the build's other elements stay as the set has them.
+    if (_set == VK_NULL_HANDLE || (usesBda && !addressDraws && moved.empty())) return {};
+    const auto reads = usesBda && !addressDraws ? std::vector<std::pair<std::uint64_t, std::uint64_t>>{} : guestMemory.InPlaceReads();
     auto result = std::make_shared<DrawBindings>();
     std::vector<std::size_t> selected;
+    // What each selected element binds, in `selected`'s order.
+    std::vector<VkDescriptorBufferInfo> infos;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -3323,8 +3402,26 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             for (const auto& patch : dataPatches) {
                 if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
+            // The adjustments of the elements bound in place that this buffer carries, over the
+            // build's: zero leaves the byte the words hold, as the build leaves it.
+            for (const auto& entry : moved) {
+                if (!entry.inPlace) continue;
+                const auto& element = allocations[entry.allocation];
+                if (element.pushByte >= 0 || element.dataAllocation != static_cast<std::int64_t>(index) || element.dataByte >= override->size) continue;
+                buffer->Bytes()[element.dataByte] = entry.adjustment != 0 ? static_cast<std::byte>(entry.adjustment) : reinterpret_cast<const std::byte*>(override->words.data())[element.dataByte];
+            }
             selected.push_back(index);
+            infos.push_back({buffer->Handle(), 0, buffer->Bytes().size()});
             result->snapshots.push_back({0, std::move(buffer)});
+            continue;
+        }
+        if (override != moved.end() && override->inPlace) {
+            std::uint32_t adjustment = 0;
+            const auto info = guestMemory.SharedDescriptor(override->address, override->size, adjustment);
+            Require(info.has_value() && adjustment == override->adjustment, "a moved buffer of an address-based draw is no longer served in place");
+            if (adjustment != item.adjustment && item.pushByte >= 0) result->pushPatches.emplace_back(static_cast<std::uint32_t>(item.pushByte), adjustment);
+            selected.push_back(index);
+            infos.push_back(*info);
             continue;
         }
         std::uint64_t address = item.address;
@@ -3333,6 +3430,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             address = override->address;
             size = override->size;
         } else {
+            if (usesBda && !addressDraws) continue;
             if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
             if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
@@ -3363,6 +3461,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             CountDrawSnapshot(false, bytes);
         }
         selected.push_back(index);
+        infos.push_back({buffer->Handle(), 0, buffer->Bytes().size()});
         result->snapshots.push_back({begin, std::move(buffer)});
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
@@ -3387,9 +3486,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
     update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
-    std::vector<VkDescriptorBufferInfo> infos;
-    infos.reserve(selected.size());
-    for (const auto& snapshot : result->snapshots) infos.push_back({snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()});
     std::vector<VkWriteDescriptorSet> writes;
     for (const auto& binding : bindings) {
         for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
@@ -3464,9 +3560,29 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
 }
 
 void ShaderResources::WriteBackBuffers() {
+    // A shared build is never committed: each of its uses completes like this one.
+    if (guestMemory.Shared()) {
+        CompleteSharedUse();
+        return;
+    }
     if (bda) bda->CheckFault();
     if (SkipWriteBack()) return;
     guestMemory.WriteBack();
+}
+
+void ShaderResources::CompleteSharedUse() {
+    if (bda) {
+        try {
+            bda->CheckFault();
+        } catch (...) {
+            // The record stays in the buffer the uses share: this object serves no further use
+            // (AcquireSharedLease), and the ones already recorded report it as they complete.
+            faulted.store(true, std::memory_order_relaxed);
+            throw;
+        }
+    }
+    if (SkipWriteBack()) return;
+    guestMemory.CompleteShared();
 }
 
 bool ShaderResources::WritesMemory() const {
