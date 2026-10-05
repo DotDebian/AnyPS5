@@ -334,7 +334,9 @@ public:
     // Whether [address, address + bytes) lies whole in one region bound in place through a host
     // import: InPlaceReads' ranges asked for one range, by the owner search instead of a scan of
     // the ~1200 of an address-based build.
-    bool BoundInPlace(std::uint64_t address, std::size_t bytes) const;
+    // `region`, when given, receives the bounds of that region (an imported range, so every page
+    // of it is committed and write-watched alike).
+    bool BoundInPlace(std::uint64_t address, std::size_t bytes, std::pair<std::uint64_t, std::uint64_t>* region = nullptr) const;
     // How the uploaded [address, address + bytes) of a descriptor element is served, for the
     // [dispatch-res] trace: staged in device memory, or why not (`addressable`: the build maps
     // guest memory by address, which never stages).

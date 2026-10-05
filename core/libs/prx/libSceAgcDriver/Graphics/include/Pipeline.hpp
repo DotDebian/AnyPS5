@@ -53,6 +53,23 @@ public:
     // The same inside a render pass another pipeline of the same attachments began (compatible by
     // construction: the attachment formats alone decide).
     void Continue(VkCommandBuffer commands, const State& state) const;
+    // What the last draw of an open render pass left bound and set (the pipeline, the dynamic
+    // state it set): the next draw of the pass binds and sets only what differs.
+    struct PassDynamics {
+        const Pipeline* pipeline = nullptr;
+        VkViewport viewport{};
+        VkRect2D scissor{};
+        float depthBoundsMin = 0;
+        float depthBoundsMax = 0;
+        float depthBiasConstant = 0;
+        float depthBiasClamp = 0;
+        float depthBiasSlope = 0;
+    };
+    // Continue after the pass's previous draw, which left `last` (a null pipeline: unknown, as
+    // after Begin by a caller that keeps none); `last` becomes this draw's.
+    void Continue(VkCommandBuffer commands, const State& state, PassDynamics& last) const;
+    // What Begin or Continue leaves for `state`.
+    PassDynamics Dynamics(const State& state) const;
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;

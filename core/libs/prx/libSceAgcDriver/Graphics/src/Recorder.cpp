@@ -3058,6 +3058,7 @@ Recorder::EpochSnapshotHit Recorder::EpochSnapshot(std::uint64_t address, std::s
         hit.buffer = slot.handle;
         hit.offset = slot.offset;
         hit.video = slot.video;
+        hit.transient = slot.generation == 0;
         return hit;
     }
     return {};

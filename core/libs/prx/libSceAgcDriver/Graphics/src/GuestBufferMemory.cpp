@@ -3351,10 +3351,12 @@ GuestBufferMemory::Placement GuestBufferMemory::PlacementOf(std::uint64_t addres
     return Placement::InPlaceSizeWindow;
 }
 
-bool GuestBufferMemory::BoundInPlace(std::uint64_t address, std::size_t bytes) const {
+bool GuestBufferMemory::BoundInPlace(std::uint64_t address, std::size_t bytes, std::pair<std::uint64_t, std::uint64_t>* region) const {
     if (!uploaded || committed || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     const auto* found = owner(address);
-    return found != nullptr && found->direct != nullptr && address >= found->begin && address + bytes <= found->end;
+    if (found == nullptr || found->direct == nullptr || address < found->begin || address + bytes > found->end) return false;
+    if (region != nullptr) *region = {found->begin, found->end};
+    return true;
 }
 
 std::uint64_t GuestBufferMemory::ReadSetToken() const {
