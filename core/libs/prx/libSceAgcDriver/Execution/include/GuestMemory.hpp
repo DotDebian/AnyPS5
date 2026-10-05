@@ -96,6 +96,10 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
 std::uint64_t CollectEpochBumps();
+// The calling thread's epoch, 0 for a thread that never bumped. Epochs come from one counter, so a
+// greater one began later, whichever thread holds it (the selected mirrors of GuestBufferMemory.cpp
+// compare the epoch of their last refresh with it).
+std::uint64_t CollectEpoch();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the
