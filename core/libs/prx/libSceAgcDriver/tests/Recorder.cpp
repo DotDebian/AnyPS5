@@ -161,6 +161,19 @@ public:
                 minLod.pNext = address.pNext;
                 address.pNext = &minLod;
             }
+            VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+            if (hasExtension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance8};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                context.maintenance8 = maintenance8.maintenance8 == VK_TRUE;
+            }
+            maintenance8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+            maintenance8.maintenance8 = VK_TRUE;
+            if (context.maintenance8) {
+                extensionsEnabled.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+                maintenance8.pNext = address.pNext;
+                address.pNext = &maintenance8;
+            }
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
             device.queueCreateInfoCount = 1;
             device.pQueueCreateInfos = &queue;
@@ -3652,11 +3665,253 @@ std::vector<float> readDepth(const Device& device, Recorder& recorder, DepthImag
     return texels;
 }
 
-void depthSurfaceSamplingTests(const Device& device, Recorder& recorder) {
+// A two-layer 64x4 color image for the layer copy tests, kept in `layout` between the steps.
+class LayerImage {
+public:
+    LayerImage(const Context& context, VkFormat format, VkImageLayout layout) : context(context), layout(layout) {
+        VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = format;
+        info.extent = {64, 4, 1};
+        info.mipLevels = 1;
+        info.arrayLayers = 2;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &image), "vkCreateImage layer copy");
+        VkMemoryRequirements requirements{};
+        context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
+        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocation.allocationSize = requirements.size;
+        allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory layer copy");
+        Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory layer copy");
+    }
+    ~LayerImage() {
+        context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    }
+    LayerImage(const LayerImage&) = delete;
+    LayerImage& operator=(const LayerImage&) = delete;
+    VkImage Handle() const { return image; }
+    VkImageLayout Layout() const { return layout; }
+    void Transition(VkCommandBuffer commands, VkImageLayout from, VkImageLayout to) const {
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.oldLayout = from;
+        barrier.newLayout = to;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+    // Both layers from (Upload) or into (Read) a buffer of two tightly packed layers.
+    void Upload(VkCommandBuffer commands, VkBuffer buffer, bool first) const {
+        Transition(commands, first ? VK_IMAGE_LAYOUT_UNDEFINED : layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2};
+        region.imageExtent = {64, 4, 1};
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        Transition(commands, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, layout);
+    }
+    void Read(VkCommandBuffer commands, VkBuffer buffer) const {
+        Transition(commands, layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2};
+        region.imageExtent = {64, 4, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+        Transition(commands, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layout);
+    }
+
+private:
+    Context context;
+    VkImageLayout layout;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+};
+
+void directLayerCopyRuleTests(const Context& base) {
+    auto context = base;
+    for (const bool maintenance8 : {false, true}) {
+        context.maintenance8 = maintenance8;
+        const auto depth = VK_IMAGE_ASPECT_DEPTH_BIT, stencil = VK_IMAGE_ASPECT_STENCIL_BIT, color = VK_IMAGE_ASPECT_COLOR_BIT;
+        Require(DirectLayerCopy(context, VK_FORMAT_D32_SFLOAT, depth, VK_FORMAT_R32_SFLOAT, color) == maintenance8 && DirectLayerCopy(context, VK_FORMAT_R32_UINT, color, VK_FORMAT_D32_SFLOAT_S8_UINT, depth) == maintenance8, "32-bit depth and R32 copies do not follow maintenance8");
+        Require(DirectLayerCopy(context, VK_FORMAT_D16_UNORM_S8_UINT, depth, VK_FORMAT_R16_UNORM, color) == maintenance8 && DirectLayerCopy(context, VK_FORMAT_D32_SFLOAT_S8_UINT, stencil, VK_FORMAT_R8_UINT, color) == maintenance8 && DirectLayerCopy(context, VK_FORMAT_R8_UNORM, color, VK_FORMAT_S8_UINT, stencil) == maintenance8, "16-bit depth and stencil copies do not follow maintenance8");
+        Require(!DirectLayerCopy(context, VK_FORMAT_D32_SFLOAT, depth, VK_FORMAT_R16_UNORM, color) && !DirectLayerCopy(context, VK_FORMAT_D32_SFLOAT, depth, VK_FORMAT_R16G16_UNORM, color) && !DirectLayerCopy(context, VK_FORMAT_D32_SFLOAT_S8_UINT, stencil, VK_FORMAT_R32_UINT, color), "a depth or stencil aspect copies into a color format of another size or with several components");
+        Require(!DirectLayerCopy(context, VK_FORMAT_D24_UNORM_S8_UINT, depth, VK_FORMAT_R32_UINT, color) && !DirectLayerCopy(context, VK_FORMAT_X8_D24_UNORM_PACK32, depth, VK_FORMAT_R32_SFLOAT, color), "24-bit depth copies directly");
+        Require(!DirectLayerCopy(context, VK_FORMAT_D32_SFLOAT_S8_UINT, depth | stencil, VK_FORMAT_R32_SFLOAT, color), "both aspects copy into one color layer");
+        Require(DirectLayerCopy(context, VK_FORMAT_D32_SFLOAT, depth, VK_FORMAT_D32_SFLOAT, depth) && !DirectLayerCopy(context, VK_FORMAT_D32_SFLOAT_S8_UINT, depth, VK_FORMAT_D32_SFLOAT, depth) && !DirectLayerCopy(context, VK_FORMAT_D16_UNORM, depth, VK_FORMAT_D16_UNORM_S8_UINT, depth), "depth formats copy directly into other depth formats");
+        Require(DirectLayerCopy(context, VK_FORMAT_R32_SFLOAT, color, VK_FORMAT_R8G8B8A8_UNORM, color) && DirectLayerCopy(context, VK_FORMAT_R16_UNORM, color, VK_FORMAT_R16_SFLOAT, color) && !DirectLayerCopy(context, VK_FORMAT_R32_SFLOAT, color, VK_FORMAT_R16_UNORM, color) && !DirectLayerCopy(context, VK_FORMAT_R32_SFLOAT, color, VK_FORMAT_BC1_RGB_UNORM_BLOCK, color), "color layer copies do not pair formats by texel size");
+    }
+}
+
+// Every texel of a depth or stencil layer copied straight into a color layer (RecordCopyToImage) and
+// of a color layer copied straight into a depth or stencil aspect (RecordCopyFromImage), against the
+// copies through a buffer they replace; the other layer and the other aspect keep their bytes.
+void directLayerCopyTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (std::getenv("APS5_NO_DIRECT_DEPTH_COPY") != nullptr) {
+        std::cout << "APS5_NO_DIRECT_DEPTH_COPY set: direct depth layer copies not tested\n";
+        return;
+    }
+    directLayerCopyRuleTests(context);
+    if (!context.maintenance8 || !device.Graphics()) {
+        std::cout << "maintenance8 or a graphics queue unavailable: direct depth layer copies not tested\n";
+        return;
+    }
+    struct Case {
+        VkFormat depth;
+        VkImageAspectFlags aspect;
+        VkFormat color;
+        std::uint32_t bytes;
+    };
+    const Case cases[] = {
+        {VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_FORMAT_R32_SFLOAT, 4},
+        {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_FORMAT_R32_SFLOAT, 4},
+        {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT, VK_FORMAT_R8_UINT, 1},
+        {VK_FORMAT_D16_UNORM, VK_IMAGE_ASPECT_DEPTH_BIT, VK_FORMAT_R16_UNORM, 2},
+        {VK_FORMAT_D16_UNORM_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_FORMAT_R16_UNORM, 2},
+        {VK_FORMAT_D16_UNORM_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT, VK_FORMAT_R8_UNORM, 1},
+        {VK_FORMAT_S8_UINT, VK_IMAGE_ASPECT_STENCIL_BIT, VK_FORMAT_R8_UINT, 1},
+    };
+    constexpr std::size_t texels = 64 * 4;
+    std::uint32_t seed = 0x13579bdfu;
+    const auto random = [&] {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        return seed;
+    };
+    // Depth in [0, 1] (a D32_SFLOAT buffer copy takes nothing else), 0 and 1 included; any bits otherwise.
+    const auto pattern = [&](VkImageAspectFlags aspect, std::uint32_t bytes) {
+        std::vector<std::byte> values(texels * bytes);
+        for (std::size_t i = 0; i < texels; ++i) {
+            if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT && bytes == 4) {
+                const float value = i == 0 ? 0.0f : i == 1 ? 1.0f : static_cast<float>(random() >> 8) / 16777216.0f;
+                std::memcpy(values.data() + i * 4, &value, 4);
+            } else {
+                const auto bits = random();
+                std::memcpy(values.data() + i * bytes, &bits, bytes);
+            }
+        }
+        return values;
+    };
+    const auto supports = [&](VkFormat format, VkFormatFeatureFlags features) {
+        VkFormatProperties properties{};
+        context.formatProperties(context.physical, format, &properties);
+        return (properties.optimalTilingFeatures & features) == features;
+    };
+    const auto run = [&](auto&& record) {
+        record(recorder.Commands());
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    const auto bytesOf = [](Buffer& buffer, std::size_t offset, std::size_t size) {
+        const auto all = buffer.Bytes();
+        return std::vector<std::byte>(all.begin() + static_cast<std::ptrdiff_t>(offset), all.begin() + static_cast<std::ptrdiff_t>(offset + size));
+    };
+    std::uint32_t tested = 0;
+    for (const auto& item : cases) {
+        const auto other = DepthAspects(item.depth) & ~item.aspect;
+        if (!supports(item.depth, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT) || !supports(item.color, VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) continue;
+        Require(DirectLayerCopy(context, item.depth, item.aspect, item.color, VK_IMAGE_ASPECT_COLOR_BIT) && DirectLayerCopy(context, item.color, VK_IMAGE_ASPECT_COLOR_BIT, item.depth, item.aspect), "a tested depth layer copy is not direct");
+        const std::size_t layerBytes = texels * item.bytes;
+        const std::size_t otherBytes = other == 0 ? 0 : texels * (other == VK_IMAGE_ASPECT_STENCIL_BIT ? 1u : item.depth == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u);
+        DepthTarget target{};
+        target.extent = {64, 4};
+        const auto written = pattern(item.aspect, item.bytes);
+        const auto otherWritten = pattern(other, static_cast<std::uint32_t>(otherBytes / texels));
+        Buffer upload(context, layerBytes + otherBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memcpy(upload.Bytes().data(), written.data(), layerBytes);
+        std::memcpy(upload.Bytes().data() + layerBytes, otherWritten.data(), otherBytes);
+        // Out of the depth image: the buffer copy and the direct copy into layer 1 of a sampled image.
+        DepthImage source(context, target, item.depth);
+        LayerImage sampled(context, item.color, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        Buffer sentinel(context, 2 * layerBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(sentinel.Bytes().data(), 0x5a, 2 * layerBytes);
+        Buffer outBuffer(context, layerBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        Buffer outDirect(context, 2 * layerBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        run([&](VkCommandBuffer commands) {
+            source.RecordCopyFromBuffer(commands, upload.Handle(), item.aspect);
+            if (other != 0) {
+                VkBufferImageCopy region{};
+                region.bufferOffset = layerBytes;
+                region.imageSubresource = {other, 0, 0, 1};
+                region.imageExtent = {64, 4, 1};
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, upload.Handle(), source.Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            }
+            sampled.Upload(commands, sentinel.Handle(), true);
+            source.RecordCopyToBuffer(commands, outBuffer.Handle(), item.aspect);
+            source.RecordCopyToImage(commands, item.aspect, sampled.Handle(), VK_IMAGE_ASPECT_COLOR_BIT, 1, sampled.Layout());
+            sampled.Read(commands, outDirect.Handle());
+        });
+        const auto viaBuffer = bytesOf(outBuffer, 0, layerBytes);
+        Require(viaBuffer == written, "the buffer copy of a depth layer does not hold its texels");
+        Require(bytesOf(outDirect, layerBytes, layerBytes) == viaBuffer, "a direct copy of a depth or stencil layer into a color layer differs from the copy through a buffer");
+        Require(bytesOf(outDirect, 0, layerBytes) == bytesOf(sentinel, 0, layerBytes), "a direct depth layer copy changed another layer of the sampled image");
+        // Into depth images: from layer 1 of a color storage image, through a buffer and directly.
+        LayerImage storage(context, item.color, VK_IMAGE_LAYOUT_GENERAL);
+        const auto stored = pattern(item.aspect, item.bytes);
+        Buffer storageBytes(context, 2 * layerBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(storageBytes.Bytes().data(), 0x33, layerBytes);
+        std::memcpy(storageBytes.Bytes().data() + layerBytes, stored.data(), layerBytes);
+        DepthImage inBuffer(context, target, item.depth);
+        DepthImage inDirect(context, target, item.depth);
+        Buffer scratch(context, layerBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        Buffer readBuffer(context, layerBytes + otherBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        Buffer readDirect(context, layerBytes + otherBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        run([&](VkCommandBuffer commands) {
+            storage.Upload(commands, storageBytes.Handle(), true);
+            for (auto* image : {&inBuffer, &inDirect}) {
+                image->RecordCopyFromBuffer(commands, upload.Handle(), item.aspect);
+                if (other == 0) continue;
+                VkBufferImageCopy region{};
+                region.bufferOffset = layerBytes;
+                region.imageSubresource = {other, 0, 0, 1};
+                region.imageExtent = {64, 4, 1};
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, upload.Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            }
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkBufferImageCopy region{};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 1};
+            region.imageExtent = {64, 4, 1};
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, storage.Handle(), VK_IMAGE_LAYOUT_GENERAL, scratch.Handle(), 1, &region);
+            inBuffer.RecordCopyFromBuffer(commands, scratch.Handle(), item.aspect);
+            inDirect.RecordCopyFromImage(commands, storage.Handle(), 1, item.aspect);
+            for (auto [image, buffer] : {std::pair{&inBuffer, &readBuffer}, std::pair{&inDirect, &readDirect}}) {
+                image->RecordCopyToBuffer(commands, buffer->Handle(), item.aspect);
+                if (other == 0) continue;
+                VkBufferImageCopy back{};
+                back.bufferOffset = layerBytes;
+                back.imageSubresource = {other, 0, 0, 1};
+                back.imageExtent = {64, 4, 1};
+                context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, buffer->Handle(), 1, &back);
+            }
+        });
+        Require(bytesOf(readBuffer, 0, layerBytes) == stored, "the buffer copy of a color layer into a depth image does not hold its texels");
+        Require(bytesOf(readDirect, 0, layerBytes) == bytesOf(readBuffer, 0, layerBytes), "a direct copy of a color layer into a depth or stencil aspect differs from the copy through a buffer");
+        Require(bytesOf(readDirect, layerBytes, otherBytes) == bytesOf(readBuffer, layerBytes, otherBytes) && bytesOf(readDirect, layerBytes, otherBytes) == otherWritten, "a direct copy into one aspect of a depth image changed its other aspect");
+        Require(inDirect.ContentHolder() == DepthImage::Holder::Both && !inDirect.ClearPending(), "a direct copy into a depth image did not make it hold its texels");
+        ++tested;
+    }
+    std::cout << "direct depth layer copies: " << tested << " format and aspect pairs match the buffer copies\n";
+    Require(tested != 0, "no depth format took a direct layer copy");
+}
+
+// `direct`: the depth layer copies take vkCmdCopyImage where maintenance8 allows it, else a buffer.
+void depthSurfaceSamplingTests(const Device& device, Recorder& recorder, bool direct) {
     const auto& base = device.GetContext();
     TextureDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
+    context.maintenance8 = direct && base.maintenance8;
     const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
     std::vector<std::uint8_t> memory(1u << 16u, 0);
     auto* depthMemory = alignedSurface(memory, 0);
@@ -4252,7 +4507,9 @@ int main() {
             imageMemoTests(device, recorder);
             minLodTests(device, recorder);
             firstLayerViewTests(device, recorder);
-            depthSurfaceSamplingTests(device, recorder);
+            directLayerCopyTests(device, recorder);
+            depthSurfaceSamplingTests(device, recorder, true);
+            depthSurfaceSamplingTests(device, recorder, false);
             metadataPassTests(device, recorder);
             pendingKeyStoreTests(device, recorder);
             movedMetadataTests(device, recorder);

@@ -60,6 +60,11 @@ public:
     void NoteStored(const std::shared_ptr<StorageTexture>& storage, VkImageAspectFlags aspect);
     void RecordCopyToBuffer(VkCommandBuffer commands, VkBuffer buffer, VkImageAspectFlags aspect) const;
     void RecordCopyFromBuffer(VkCommandBuffer commands, VkBuffer buffer, VkImageAspectFlags aspect);
+    // The copies above straight between the image and `layer` of another image, by vkCmdCopyImage
+    // (only where DirectLayerCopy allows it): to a sampled image kept in `layout` around the copy,
+    // and from a color storage image in the GENERAL layout.
+    void RecordCopyToImage(VkCommandBuffer commands, VkImageAspectFlags aspect, VkImage destination, VkImageAspectFlags destinationAspect, std::uint32_t layer, VkImageLayout layout) const;
+    void RecordCopyFromImage(VkCommandBuffer commands, VkImage source, std::uint32_t layer, VkImageAspectFlags aspect);
     // Records the pending clear of the whole image to the state's clear values, outside a render
     // pass, between barriers that order it after earlier attachment and transfer work and before
     // later depth tests. Returns whether a clear was recorded.
@@ -69,6 +74,8 @@ public:
 
 private:
     void release() noexcept;
+    VkImageMemoryBarrier copyInBarrier() const;
+    void finishCopyIn(VkCommandBuffer commands, const VkImageMemoryBarrier& before);
     Context context;
     DepthTarget target;
     VkFormat format;
@@ -90,6 +97,11 @@ private:
 };
 
 std::uint32_t DepthTexelBytes(VkFormat format, VkImageAspectFlags aspect, VkFormat textureFormat);
+// Whether vkCmdCopyImage copies one aspect of a `source` image into one aspect of a `destination`
+// image as the bits a copy through a buffer gives: color formats of one texel size, one depth or
+// stencil format into itself, or (with VK_KHR_maintenance8) a depth or stencil aspect and a
+// single-component color format of its size. APS5_NO_DIRECT_DEPTH_COPY=1 keeps every copy on the buffer.
+bool DirectLayerCopy(const Context& context, VkFormat source, VkImageAspectFlags sourceAspect, VkFormat destination, VkImageAspectFlags destinationAspect);
 std::uint64_t DepthHoldingGeneration();
 bool WritesDepthImage(const DepthState& state);
 

@@ -154,6 +154,8 @@ struct Context {
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     bool memoryBudget = false;
     bool pipelineExecutableInfo = false;
+    // VK_KHR_maintenance8 enabled: vkCmdCopyImage copies between depth/stencil and color formats.
+    bool maintenance8 = false;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

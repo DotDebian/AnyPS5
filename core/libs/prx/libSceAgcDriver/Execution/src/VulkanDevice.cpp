@@ -2558,6 +2558,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.memoryBudget = state->memoryBudget;
     context.memoryProperties2 = state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
+    context.maintenance8 = state->maintenance8;
     return context;
 }
 
