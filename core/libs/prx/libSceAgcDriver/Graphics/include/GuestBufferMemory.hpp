@@ -173,6 +173,9 @@ struct AddressCopy {
 };
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit);
 
+// A device-local staging shadow kept between uses (APS5_RESIDENT_STAGING, GuestBufferMemory.cpp).
+struct ResidentShadow;
+
 class GuestBufferMemory {
 public:
     explicit GuestBufferMemory(const Context& context);
@@ -229,6 +232,11 @@ public:
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
+    // APS5_RESIDENT_STAGING: a use that stores through addresses (not through descriptors) was
+    // recorded. Its stores are stamped only when its batch completes (BdaResources' written-page
+    // scan), so until then no stamp tells a resident shadow that its range may have been written:
+    // every shadow completed before this call copies in at its next use. Under GuestMemory::GpuMutex.
+    static void NoteAddressStores();
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -389,6 +397,9 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        // APS5_RESIDENT_STAGING: the resident shadow `buffer` belongs to while the region is staged
+        // (see GuestBufferMemory.cpp); meaningful only while its buffer is this region's.
+        std::shared_ptr<ResidentShadow> resident {};
     };
 
     // How [begin, end) lies against the space's base regions.

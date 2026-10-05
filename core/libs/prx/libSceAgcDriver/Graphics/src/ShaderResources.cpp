@@ -3940,6 +3940,8 @@ void ShaderResources::WriteBack() {
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The CP's next read of the GDS is ordered after this work (Pm4::InstallGdsBacking).
     if (usesGds) Pm4::NoteGdsShaderUse();
+    // APS5_RESIDENT_STAGING: stores through addresses carry no stamp until the batch completes.
+    if (bdaWrites) GuestBufferMemory::NoteAddressStores();
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.

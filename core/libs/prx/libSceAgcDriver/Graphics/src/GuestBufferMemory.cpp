@@ -14,13 +14,16 @@
 #else
 #include <sys/mman.h>
 #endif
+#include <array>
 #include <atomic>
 #include <bit>
 #include <condition_variable>
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <tuple>
 #include <thread>
 #include <stop_token>
 #include <cstdlib>
@@ -1826,6 +1829,199 @@ void reportStaging() {
 
 }
 
+// APS5_RESIDENT_STAGING=1 (local experiment, off by default): a staging shadow stays resident
+// between uses and its copy-in is skipped when the write tracker proves the shadow still holds the
+// import's bytes. A staged region's shadow was refilled from the import before every use (51 MiB
+// read over PCIe per frame at Astro Bot's Crash Site), although the previous use's copy-back had
+// just made the import equal to it and nothing wrote the range since.
+//
+// The shadow of a guest range [begin, end) is shared by every build that stages exactly that
+// range (a registry by range hands the same buffer to each), so builds of different programs
+// writing one buffer in turn keep one copy current instead of invalidating each other's.
+//
+// After a use (its work recorded, RecordCopyBacks, MarkDirectWrites) the shadow equals the import
+// as the GPU leaves it: the written sub-ranges by the copy-back, the rest by the copy-in or an
+// earlier proof. The next use skips the copy-in when, after an uncached collect of the range,
+// - no store was stamped over a written sub-range after this build's own stamps of that use
+//   (`stamped`): anything stamped earlier landed before the copy-back, which overwrote it, and
+// - no store was stamped over the rest of the range after the uncached collect that started that
+//   use (`collected`): what that use's copy-in read (or its proof covered) is all there is.
+// GuestMemory::StoredOver answers both with the exact byte ranges of driver stores (a neighbour's
+// copy-back into the same 64 KiB block does not count) and 64 KiB blocks for the CPU's. Every
+// writer of an import stamps what it writes at record time (labels, fills, copies, key stores,
+// in-place V# writes, image write-backs, CPU stores through a collect), the invariant the unit
+// shadows rest on. A use that does not complete leaves the shadow `inUse`: the next one copies in.
+// Not seen, as before the copy-in was skipped: a CPU write landing between the record of a use
+// and its execution on the GPU reaches the import but not that use's shader input (the copy-in
+// used to read the import at execution time); the next use sees its stamp and copies in.
+// The copy-back is unchanged, so guest memory holds the results exactly as before.
+struct ResidentShadow {
+    std::shared_ptr<Buffer> buffer;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    // Under GuestMemory::GpuMutex: the proof state of the last completed use.
+    std::uint64_t collected = 0;
+    std::uint64_t stamped = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    std::uint64_t pendingCollected = 0;
+    // The count of uses that store by address (NoteAddressStores) when the last use completed.
+    std::uint64_t addressStores = 0;
+    bool inUse = false;
+};
+
+namespace {
+
+bool residentStagingEnabled() {
+    static const bool enabled = std::getenv("APS5_RESIDENT_STAGING") != nullptr;
+    return enabled;
+}
+
+// Defined below, with WriteBack's helpers.
+std::vector<std::pair<std::uint64_t, std::uint64_t>> mergeWrites(std::vector<std::pair<std::uint64_t, std::uint64_t>> writes);
+
+enum class ResidentCopyIn : std::size_t { First, InUse, Unwatched, WrittenStored, UnwrittenStored, AddressStores, Count };
+
+std::atomic<std::uint64_t> addressStoreUses{0};
+
+// The [resident-staging] line, every 10 s. Counters under GuestMemory::GpuMutex but for the
+// registry's (UploadPrepare runs without it), which are atomics.
+struct ResidentStats {
+    std::uint64_t uses = 0;
+    std::uint64_t skipped = 0;
+    std::uint64_t skippedBytes = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ResidentCopyIn::Count)> copied{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ResidentCopyIn::Count)> copiedBytes{};
+    std::atomic<std::uint64_t> created{0}, attached{0}, refused{0};
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+ResidentStats& Residents() {
+    static ResidentStats stats;
+    return stats;
+}
+
+struct ResidentRegistry {
+    std::mutex mutex;
+    std::map<std::tuple<VkDevice, std::uint64_t, std::uint64_t>, std::weak_ptr<ResidentShadow>> entries;
+};
+
+ResidentRegistry& ResidentShadows() {
+    static ResidentRegistry registry;
+    return registry;
+}
+
+// A staged region's shadow: the resident one of exactly this range when another build holds it,
+// else a new one (registered when the switch is on). `resident` is left empty with the switch off
+// or when the device refuses the buffer (the caller's fallback, as for stagingBuffer).
+std::shared_ptr<Buffer> takeStagingBuffer(const Context& context, std::uint64_t begin, std::uint64_t end, VkBufferUsageFlags usage, std::shared_ptr<ResidentShadow>& resident) {
+    resident.reset();
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    if (!residentStagingEnabled()) return stagingBuffer(context, bytes, usage);
+    auto& registry = ResidentShadows();
+    std::lock_guard lock(registry.mutex);
+    const std::tuple<VkDevice, std::uint64_t, std::uint64_t> key{context.device, begin, end};
+    if (const auto found = registry.entries.find(key); found != registry.entries.end()) {
+        if (auto alive = found->second.lock()) {
+            Residents().attached.fetch_add(1, std::memory_order_relaxed);
+            resident = std::move(alive);
+            return resident->buffer;
+        }
+        registry.entries.erase(found);
+    }
+    auto buffer = stagingBuffer(context, bytes, usage);
+    if (buffer == nullptr) {
+        Residents().refused.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    // Dead entries go when the map grows past a few thousand ranges.
+    if (registry.entries.size() >= 4096) std::erase_if(registry.entries, [](const auto& entry) { return entry.second.expired(); });
+    resident = std::make_shared<ResidentShadow>();
+    resident->buffer = buffer;
+    resident->begin = begin;
+    resident->end = end;
+    registry.entries[key] = resident;
+    Residents().created.fetch_add(1, std::memory_order_relaxed);
+    return buffer;
+}
+
+// Starts a use of the shadow under GuestMemory::GpuMutex, after the queued stores over its range
+// were recorded: nothing when the proof above holds (no copy-in), else why the copy-in is made.
+std::optional<ResidentCopyIn> beginResidentUse(ResidentShadow& shadow) {
+    const auto collected = GuestMemory::CollectWritesUncached(shadow.begin, static_cast<std::size_t>(shadow.end - shadow.begin));
+    std::optional<ResidentCopyIn> reason;
+    if (collected == 0) {
+        reason = ResidentCopyIn::Unwatched;
+    } else if (shadow.inUse) {
+        reason = ResidentCopyIn::InUse;
+    } else if (shadow.stamped == 0 || shadow.collected == 0) {
+        reason = ResidentCopyIn::First;
+    } else if (shadow.addressStores != addressStoreUses.load(std::memory_order_relaxed)) {
+        reason = ResidentCopyIn::AddressStores;
+    } else {
+        auto cursor = shadow.begin;
+        for (const auto& [from, to] : shadow.written) {
+            if (cursor < from && GuestMemory::StoredOver(cursor, static_cast<std::size_t>(from - cursor), shadow.collected)) {
+                reason = ResidentCopyIn::UnwrittenStored;
+                break;
+            }
+            if (GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), shadow.stamped)) {
+                reason = ResidentCopyIn::WrittenStored;
+                break;
+            }
+            cursor = to;
+        }
+        if (!reason.has_value() && cursor < shadow.end && GuestMemory::StoredOver(cursor, static_cast<std::size_t>(shadow.end - cursor), shadow.collected)) reason = ResidentCopyIn::UnwrittenStored;
+    }
+    shadow.inUse = true;
+    shadow.pendingCollected = collected;
+    auto& stats = Residents();
+    const auto bytes = shadow.end - shadow.begin;
+    ++stats.uses;
+    if (reason.has_value()) {
+        ++stats.copied[static_cast<std::size_t>(*reason)];
+        stats.copiedBytes[static_cast<std::size_t>(*reason)] += bytes;
+    } else {
+        ++stats.skipped;
+        stats.skippedBytes += bytes;
+    }
+    return reason;
+}
+
+void reportResidentStaging() {
+    auto& stats = Residents();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - stats.lastReport < std::chrono::seconds(10)) return;
+    const auto seconds = std::chrono::duration<double>(now - stats.lastReport).count();
+    stats.lastReport = now;
+    static constexpr const char* names[static_cast<std::size_t>(ResidentCopyIn::Count)] = {"first use", "previous use incomplete", "not write-watched", "stored over a written part", "stored over an unwritten part", "stores by address recorded since"};
+    std::string made;
+    std::uint64_t madeCount = 0, madeBytes = 0;
+    char text[112];
+    for (std::size_t reason = 0; reason < stats.copied.size(); ++reason) {
+        madeCount += stats.copied[reason];
+        madeBytes += stats.copiedBytes[reason];
+        std::snprintf(text, sizeof(text), " %s %llu/%.1f", names[reason], static_cast<unsigned long long>(stats.copied[reason]), stats.copiedBytes[reason] / 1048576.0);
+        made += text;
+    }
+    std::size_t live = 0;
+    std::uint64_t liveBytes = 0;
+    {
+        auto& registry = ResidentShadows();
+        std::lock_guard lock(registry.mutex);
+        for (const auto& [key, entry] : registry.entries) {
+            if (entry.expired()) continue;
+            ++live;
+            liveBytes += std::get<2>(key) - std::get<1>(key);
+        }
+    }
+    std::fprintf(stderr, "[resident-staging] %.1f s: %llu staged region uses; copy-ins avoided %llu (%.1f MiB); copy-ins made %llu (%.1f MiB) by reason (count/MiB):%s; shadows: %llu made, %llu shared with an earlier build, %llu refused by the device, %zu live (%.1f MiB)\n", seconds, static_cast<unsigned long long>(stats.uses), static_cast<unsigned long long>(stats.skipped), stats.skippedBytes / 1048576.0, static_cast<unsigned long long>(madeCount), madeBytes / 1048576.0, made.c_str(), static_cast<unsigned long long>(stats.created.exchange(0)), static_cast<unsigned long long>(stats.attached.exchange(0)), static_cast<unsigned long long>(stats.refused.exchange(0)), live, liveBytes / 1048576.0);
+    stats.uses = stats.skipped = stats.skippedBytes = 0;
+    stats.copied = {};
+    stats.copiedBytes = {};
+}
+
+}
+
 void ShutdownGuestBufferWorkers() {
     RefreshPool::Shutdown();
 }
@@ -1976,7 +2172,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             const bool misaligned = !bindableInPlace(region.begin - entry->base, addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
-                region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable));
+                region.buffer = takeStagingBuffer(context, region.begin, region.end, gpuCopyUsage(addressable), region.resident);
                 if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 if (region.buffer == nullptr) {
                     // No shadow to be had: in place when aligned, else the host copy below.
@@ -2270,17 +2466,19 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         for (const auto* region : copies) reads.emplace_back(region->begin, region->end);
         recorder->NoteAccess(Recorder::CommandClass::StagingIn, Recorder::Access{reads, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     }
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    // APS5_RESIDENT_STAGING: a shadow whose copy-in is skipped below is read by the shaders as the
+    // previous use's stores and copy-back left it, so this barrier also makes those visible to them.
+    if (residentStagingEnabled()) RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    else RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
-        copiedBytes += bytes;
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
-            if (region->deviceLocal) region->buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
+            if (region->deviceLocal) region->buffer = takeStagingBuffer(context, region->begin, region->end, gpuCopyUsage(addressable), region->resident);
             if (region->buffer == nullptr) {
                 // Or no shadow to be had: a host copy serves the region instead, aligned or not.
                 region->deviceLocal = false;
@@ -2289,6 +2487,14 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
             if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
         }
+        // APS5_RESIDENT_STAGING: no copy-in while the resident shadow provably holds the import's
+        // bytes (see ResidentShadow); the batch keeps the shadow as it keeps a refilled one.
+        if (region->deviceLocal && region->resident != nullptr && region->resident->buffer == region->buffer && !beginResidentUse(*region->resident).has_value()) {
+            recorder->Keep(region->buffer);
+            region->snapshot.clear();
+            continue;
+        }
+        copiedBytes += bytes;
         std::vector<std::byte> expected;
         const auto address = region->begin;
         const auto batch = static_cast<unsigned long long>(recorder->Submissions() + 1);
@@ -2349,6 +2555,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
     }
     if (stagedAny) reportStaging();
+    if (residentStagingEnabled()) reportResidentStaging();
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
     // tessellation shaders too (the batch's own barriers around dispatches are as wide).
@@ -2480,12 +2687,39 @@ bool GuestBufferMemory::HasCopiedWrites() const {
     return false;
 }
 
+void GuestBufferMemory::NoteAddressStores() {
+    addressStoreUses.fetch_add(1, std::memory_order_relaxed);
+}
+
 void GuestBufferMemory::MarkDirectWrites() const {
+    std::uint64_t stamped = 0;
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin);
         if (found == nullptr) continue;
         const auto& region = *found;
-        if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+        if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) stamped = std::max(stamped, GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin)));
+    }
+    // APS5_RESIDENT_STAGING: the use is complete for every staged region whose copy-back was
+    // recorded: its shadow holds what the import will (see ResidentShadow), judged from this
+    // build's last stamp for the written sub-ranges and from the collect that started the use for
+    // the rest. A region without a copy-back stays `inUse`, and an unstamped one (no write
+    // watching) keeps no proof.
+    if (!residentStagingEnabled()) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& region : regions) {
+        if (region.resident == nullptr || !region.gpuCopy || !region.deviceLocal || !region.copiedBack || region.resident->buffer != region.buffer) continue;
+        if (merged.empty()) merged = mergeWrites(writes);
+        auto& shadow = *region.resident;
+        shadow.written.clear();
+        for (const auto& [begin, end] : merged) {
+            const auto from = std::max(begin, region.begin);
+            const auto to = std::min(end, region.end);
+            if (from < to) shadow.written.emplace_back(from, to);
+        }
+        shadow.collected = shadow.pendingCollected;
+        shadow.stamped = stamped;
+        shadow.addressStores = addressStoreUses.load(std::memory_order_relaxed);
+        shadow.inUse = false;
     }
 }
 
