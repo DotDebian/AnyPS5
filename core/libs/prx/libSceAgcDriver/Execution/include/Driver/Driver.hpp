@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -135,8 +136,8 @@ private:
     static std::chrono::steady_clock::time_point& packetStartedAt();
     static PendingDrawPhases& pendingDrawPhases();
     void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures);
-    void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp);
-    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received);
+    void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
+    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* storingQueue = nullptr);
     static void traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue);
     static std::array<WriteRecord, 16384>& writeHistory();
     static std::size_t& writeCursor();
@@ -208,7 +209,7 @@ private:
     static WaitOutcomes& waitOutcomes();
     static Graphics::Recorder::LateStatistics& lateCountsSeen();
     static EpochBumps& epochBumps();
-    static void bumpEpoch(std::uint64_t EpochBumps::*counter);
+    static void bumpEpoch(std::uint64_t EpochBumps::*counter, GuestMemory::EpochReason reason);
     static bool packetEpoch();
     static bool labelTryEachPacket();
     static std::chrono::microseconds labelFlushDeadline();

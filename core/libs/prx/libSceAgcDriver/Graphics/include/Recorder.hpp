@@ -80,6 +80,11 @@ public:
     };
     DrawPassStart StartDrawPass(std::uint64_t key, PassBreak forced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, PassBlock block, const PassAccess& access);
+    // The open render pass's serial (0 when none is open): every pass a draw leaves open gets a
+    // value no other pass of this recorder had, so an equal non-zero value later means the same
+    // pass is still open, that is, nothing but draws continuing it was recorded in between
+    // (anything else recorded ends the pass, see above).
+    std::uint64_t OpenPassSerial() const { return open != nullptr && open->renderPass.open ? open->renderPass.serial : 0; }
     static bool PassHazardsEnabled();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
@@ -679,6 +684,8 @@ private:
             PassBlock block = PassBlock::None;
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
+            // See OpenPassSerial.
+            std::uint64_t serial = 0;
         } renderPass;
         PassHazards passHazards;
         bool passEnded = false;
@@ -859,6 +866,8 @@ private:
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
+    // The serials given to render passes left open (see OpenPassSerial).
+    std::uint64_t renderPassSerials = 0;
     std::uint64_t submissions = 0;
     std::uint64_t writeNoteCount = 0;
     // Command buffers and fences of completed batches, reused by later ones (hundreds of batches per

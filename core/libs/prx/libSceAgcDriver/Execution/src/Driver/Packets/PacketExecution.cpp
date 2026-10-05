@@ -112,7 +112,7 @@ void Driver::execute(const Submission& submission) {
     thread_local PacketProfile packetProfile;
     ++packetProfile.submissions;
 
-    bumpEpoch(&EpochBumps::submissions);
+    bumpEpoch(&EpochBumps::submissions, GuestMemory::EpochReason::Submission);
     struct AheadScope {
         DrawAhead* ahead = nullptr;
         ~AheadScope() {
@@ -125,7 +125,7 @@ void Driver::execute(const Submission& submission) {
         reportDrawAhead();
     }
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
-        if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
+        if (packetEpoch()) bumpEpoch(&EpochBumps::packets, GuestMemory::EpochReason::Packet);
         CheckFailure();
         const auto header = submission.commands[cursor];
         if (Pm4::FillerPacket(header)) { ++cursor; continue; }
@@ -311,7 +311,7 @@ void Driver::execute(const Submission& submission) {
             } else if (!wroteOnGpu) {
                 Pm4::Execute(packet, queue);
                 if (opcode == 0x49 || opcode == 0x37) {
-                    if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial);
+                    if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial, submission.queue);
                 }
             }
             if (endOfPipeInterrupt && !interruptDeferred) AgcDriverDeliverEopInterrupt(submission.queue);

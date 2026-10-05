@@ -225,6 +225,8 @@ void ReportSyncTrace(std::chrono::steady_clock::time_point now) {
         syncWaitedMs[source] = 0;
     }
     std::fprintf(stderr, "[synctrace] %.1f s: %llu frames, %llu submits, %.0f ms waited for the GPU under the mutex or in the hook, %llu unlocked serial waits %.0f ms%s; by thread (count/wait):%s; top sites (source@caller syncs/batches/wait):%s\n", seconds, static_cast<unsigned long long>(frames), static_cast<unsigned long long>(trace.submits), waitedMs, static_cast<unsigned long long>(serialWaits), serialUs / 1000.0, report.c_str(), ThreadSyncReport().c_str(), SyncSiteReport().c_str());
+    // The same window's collect epochs and write-watch walks (GuestMemory::CollectTraceReport).
+    std::fprintf(stderr, "[synctrace] %.1f s, %llu frames: %s\n", seconds, static_cast<unsigned long long>(frames), GuestMemory::CollectTraceReport().c_str());
     {
         std::lock_guard lock(threadSyncsMutex);
         threadSyncs.clear();
@@ -1572,7 +1574,10 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, PassBreak for
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, PassBlock block, const PassAccess& access) {
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;
-    if (!pass.open) pass.timing = timing;
+    if (!pass.open) {
+        pass.timing = timing;
+        pass.serial = ++renderPassSerials;
+    }
     pass.open = true;
     pass.key = key;
     pass.block = block;

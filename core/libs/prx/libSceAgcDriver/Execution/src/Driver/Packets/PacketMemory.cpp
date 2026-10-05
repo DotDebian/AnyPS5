@@ -57,7 +57,16 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         const auto label = Pm4::DecodeLabelWrite(packet);
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
         if (label.has_value() || storesNothing) {
-            bumpEpoch(&EpochBumps::drains);
+            // The packet no longer drains the device: its label is recorded and its interrupt
+            // delivered after the recorded work, while this worker goes on. The bump dates from
+            // the drain (which was an ordering point: the CPU saw the interrupt before the next
+            // packet ran). APS5_NO_EOP_EPOCH_BUMP=1 (off by default) drops it: a title whose
+            // interrupt handler writes memory the following packets of the same submission read,
+            // without a WAIT_REG_MEM between them, would then be served stale walks until the
+            // next ordering point. A packet that falls through to the drain below bumps there.
+            static const bool noEopBump = std::getenv("APS5_NO_EOP_EPOCH_BUMP") != nullptr;
+            if (noEopBump) GuestMemory::CountTrace(GuestMemory::TraceCount::EopBumpSkipped);
+            else bumpEpoch(&EpochBumps::drains, GuestMemory::EpochReason::EopInterrupt);
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
             const auto localDevice = device.Load();
@@ -71,7 +80,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue) : 4;
                 if (reason == 1) GuestMemory::Write(label->address, bytes, 4);
                 if (reason == 0 || reason == 1 || reason == 5 || reason == 6) {
-                    noteLabelStore(label->address, bytes, stamp);
+                    noteLabelStore(label->address, bytes, stamp, submission.queue);
                     Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                 }
                 countLabelOutcome(reason);
@@ -116,7 +125,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                     GuestMemory::Write(label->address, bytes, 4);
                     wroteOnGpu = true;
                 }
-                if (wroteOnGpu) noteLabelStore(label->address, bytes, stamp);
+                if (wroteOnGpu) noteLabelStore(label->address, bytes, stamp, submission.queue);
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                 countLabelOutcome(reason);
                 ++immediateLabels;
@@ -150,7 +159,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
-                if (reason == 0 || reason == 1 || reason == 5 || reason == 6) noteLabelStore(store->address, bytes, stamp);
+                if (reason == 0 || reason == 1 || reason == 5 || reason == 6) noteLabelStore(store->address, bytes, stamp, submission.queue);
                 if (reason == 0 || reason == 5 || reason == 6) {
                     if (reason == 0) ++storesOnGpu;
                     else ++storesBehindCompletions;
@@ -232,7 +241,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
         static const bool unlockedDrain = std::getenv("APS5_NO_UNLOCKED_DRAIN") == nullptr && !drainAll;
 
-        bumpEpoch(&EpochBumps::drains);
+        bumpEpoch(&EpochBumps::drains, GuestMemory::EpochReason::Drain);
         std::shared_ptr<VulkanDevice> draining;
         std::uint64_t epoch = 0;
         {
