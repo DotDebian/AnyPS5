@@ -15,6 +15,7 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -397,8 +398,45 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         }
         const auto after = AddressSpaceCounters();
         if (after.enabled) Require(after.hits == before.hits + 1 && after.rebuiltFirst + after.rebuiltGeneration + after.rebuiltWaiterDrop + after.rebuiltEpoch + after.rebuiltDevice == before.rebuiltFirst + before.rebuiltGeneration + before.rebuiltWaiterDrop + before.rebuiltEpoch + before.rebuiltDevice + 1, "second build did not take the cached address space");
+        // A shared upload (APS5_REUSE_ADDRESS_DRAWS): served by the cached space alone, it names
+        // the space by identity once shared, so only its uses pin the registry (the free below
+        // still goes through the cache drop alone); a later use takes the space again while it is
+        // current, binds a moved range in place and refuses a captured region outside the space.
+        std::optional<GuestBufferMemory> shared;
+        shared.emplace(context);
+        shared->AcquireRegistered();
+        shared->AddReadable(blockAddress, 32);
+        shared->Upload(true);
+        if (shared->Shareable() == GuestBufferMemory::ShareRefusal::None) {
+            auto use = shared->Share();
+            Require(use != nullptr && shared->Shared() && shared->HoldsLease() && shared->ReadSetToken() != 0, "a shared upload does not name its address space");
+            reject([&] { shared->WriteBack(); }, "CompleteShared");
+            std::uint32_t adjustment = 0;
+            const auto moved = shared->SharedDescriptor(blockAddress + 32, 32, adjustment);
+            Require(moved.has_value() && moved->range == 32 + adjustment, "a moved range of the space has no descriptor");
+            Require(!shared->SharedDescriptor(0x7fff12340000ULL, 8, adjustment).has_value(), "a range outside the space has a descriptor");
+            shared->CompleteShared();
+            use.reset();
+            std::array<std::byte, 8> captured{};
+            captured.fill(std::byte{0x5a});
+            auto failure = GuestBufferMemory::SharedFailure::None;
+            const std::array<GuestMemorySnapshot, 1> inside{{{blockAddress, captured}}};
+            use = shared->AcquireShared(inside, failure);
+            Require(use != nullptr && failure == GuestBufferMemory::SharedFailure::None && shared->SharedImportsStand(), "a shared upload refused another use of its current space");
+            const std::array<GuestMemorySnapshot, 1> outside{{{0x7fff12340000ULL, captured}}};
+            Require(shared->AcquireShared(outside, failure) == nullptr && failure == GuestBufferMemory::SharedFailure::Snapshot, "a captured region outside the space was served by a shared upload");
+            use.reset();
+        } else {
+            std::cout << "the leased block is not served in place: shared uploads not tested\n";
+            shared->WriteBack();
+            shared.reset();
+        }
         GuestHeap::GuestHeapFree_nid_postfix(block);
         Require(!registered(), "freed guest heap block remains registered");
+        if (shared.has_value()) {
+            auto failure = GuestBufferMemory::SharedFailure::None;
+            Require(shared->AcquireShared({}, failure) == nullptr && failure == GuestBufferMemory::SharedFailure::Space, "a shared upload outlived its address space");
+        }
         const auto dropped = AddressSpaceCounters();
         if (dropped.enabled) Require(dropped.waiterDrops == after.waiterDrops + 1 && LeaseCounters().cacheDrops == dropped.waiterDrops, "the free did not drop the cached address space");
     }
