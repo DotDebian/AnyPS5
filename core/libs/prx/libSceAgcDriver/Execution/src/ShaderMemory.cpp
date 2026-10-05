@@ -107,9 +107,14 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
             ++CaptureTotals().pagesWordwise;
             return page;
         }
-        const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool timed = CaptureProfiled() || timeFetches;
+        const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         GuestMemory::Read(base, std::as_writable_bytes(std::span(page.words)), sizeof(std::uint32_t));
-        if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
+        if (timed) {
+            const auto nanoseconds = NanosecondsSince(started);
+            if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += nanoseconds;
+            fetchNanoseconds += nanoseconds;
+        }
         page.valid.set();
     }
     return page;
@@ -129,6 +134,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             if (offset < previous->second.size()) {
                 if (previous->second.size() - offset < sizeof(*value)) throw std::runtime_error("AGC driver: shader memory read crosses a snapshot boundary");
                 std::memcpy(value, previous->second.data() + offset, sizeof(*value));
+                if (self.readLog != nullptr) self.readLog->push_back({address, *value, false});
                 return true;
             }
         }
@@ -149,7 +155,8 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             if (self.hookWaits == nullptr || self.hookWaits() != waitsBefore) self.observe(address, unchanged);
             else ++CaptureTotals().observationsSkipped;
         };
-        const auto fetchStarted = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool fetchTimed = CaptureProfiled() || self.timeFetches;
+        const auto fetchStarted = fetchTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (policy == PendingWrite::KnownValue || policy == PendingWrite::VerifyKnownValue) {
             // The query stored the known dword in `word`.
             ++CaptureTotals().wordsKnown;
@@ -191,19 +198,30 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             }
             if (observed) report(waitsBefore, before == word);
         }
-        if (CaptureProfiled()) CaptureTotals().wordReadNanoseconds += NanosecondsSince(fetchStarted);
+        if (fetchTimed) {
+            const auto nanoseconds = NanosecondsSince(fetchStarted);
+            if (CaptureProfiled()) CaptureTotals().wordReadNanoseconds += nanoseconds;
+            self.fetchNanoseconds += nanoseconds;
+        }
         page.words[index] = word;
         page.valid.set(index);
     }
     page.read.set(index);
     page.recent.set(index);
     *value = page.words[index];
+    if (self.readLog != nullptr) self.readLog->push_back({address, *value, false});
     return true;
 }
 
 bool ShaderMemory::readable(void* context, std::uint64_t address) {
     auto& self = *static_cast<ShaderMemory*>(context);
-    if (address % sizeof(std::uint32_t) != 0 || address > std::numeric_limits<std::uint64_t>::max() - sizeof(std::uint32_t)) return false;
+    // A probe that finds its dword unmapped is a step of the walk (ReadEvent); one that finds it
+    // mapped is followed by the read, which is the step.
+    const auto unreadable = [&] {
+        if (self.readLog != nullptr) self.readLog->push_back({address, 0, true});
+        return false;
+    };
+    if (address % sizeof(std::uint32_t) != 0 || address > std::numeric_limits<std::uint64_t>::max() - sizeof(std::uint32_t)) return unreadable();
     if (!self.initial.empty()) {
         const auto next = self.initial.upper_bound(address);
         if (next != self.initial.begin()) {
@@ -215,7 +233,33 @@ bool ShaderMemory::readable(void* context, std::uint64_t address) {
     auto& page = self.page(address & ~static_cast<std::uint64_t>(PageBytes - 1));
     const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(std::uint32_t));
     if (page.wordwise || page.valid.test(index)) return true;
-    return GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(std::uint32_t));
+    return GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(std::uint32_t)) || unreadable();
+}
+
+ShaderMemory::Replay ShaderMemory::ReplayReads(std::span<const ReadEvent> log) {
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
+    // The replay is not a walk to log.
+    struct Unlogged {
+        ShaderMemory& self;
+        std::vector<ReadEvent>* previous;
+        ~Unlogged() { self.readLog = previous; }
+    } unlogged{*this, readLog};
+    readLog = nullptr;
+    for (const auto& event : log) {
+        if (event.unreadable) {
+            if (readable(this, event.address)) return Replay::Differs;
+            continue;
+        }
+        std::uint32_t word = 0;
+        try {
+            if (!read(this, event.address, &word)) return Replay::Differs;
+        } catch (const std::runtime_error&) {
+            // Unmapped since (the walk probes or fails there itself).
+            return Replay::Unreadable;
+        }
+        if (word != event.word) return Replay::Differs;
+    }
+    return Replay::Same;
 }
 
 ShaderMemory::Recheck ShaderMemory::RecheckReads(PendingWriteQuery pendingWrite) const {
@@ -264,6 +308,16 @@ void ShaderMemory::CountHandleMemo(bool hit) {
 }
 
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle) {
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    capturing(request, [&](const ShaderRecompiler::SrtRuntime& runtime) -> const ShaderRecompiler::ResourceCapture& {
+        capture = handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+        return *capture;
+    });
+    return capture;
+}
+
+template <typename Call>
+void ShaderMemory::capturing(const ShaderRecompiler::RecompileRequest& request, Call&& call) {
     // The capture's word and page reads (through `read`) are attributed to it ([hooksync], [guestmem]).
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
     const bool profile = CaptureProfiled();
@@ -278,7 +332,8 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
     runtime.readMemory = &read;
     runtime.readSpecializationMemory = &read;
     runtime.isReadable = &readable;
-    auto capture = handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+    const ShaderRecompiler::ResourceCapture& made = call(runtime);
+    const auto* capture = &made;
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);
         totals.resolveNanoseconds += capture->sourceNanoseconds;
@@ -297,11 +352,16 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
             AgcDriver::ReportLine("[capture] %llu captures: %llu word reads, %llu pages fetched (%llu read word by word over pending GPU writes: %llu words waited %.2f s, %llu read raw on evidence, %llu verified with %llu mismatches, %llu served from known values, %llu hook reads not observed: no GPU wait), capture (plan lookup + materialize) %.1f s, %llu KiB registered code this capture; sub-phases (s, us per capture): source resolve %.2f/%.1f, walk %.2f/%.1f, specialization (every materialize) %.2f/%.1f, page reads %.2f/%.1f, word reads %.2f/%.1f, hook GPU waits inside %.2f/%.1f; source handle memo %llu hits, %llu resolves\n", static_cast<unsigned long long>(totals.captures.load()), static_cast<unsigned long long>(totals.reads.load()), static_cast<unsigned long long>(totals.pages.load()), static_cast<unsigned long long>(totals.pagesWordwise.load()), static_cast<unsigned long long>(totals.wordWaits.load()), totals.wordWaitNanoseconds.load() / 1e9, static_cast<unsigned long long>(totals.wordsRaw.load()), static_cast<unsigned long long>(totals.wordsVerified.load()), static_cast<unsigned long long>(totals.wordMismatches.load()), static_cast<unsigned long long>(totals.wordsKnown.load()), static_cast<unsigned long long>(totals.observationsSkipped.load()), captureNs / 1e9, static_cast<unsigned long long>(initialBytes / 1024), resolveNs / 1e9, resolveNs / captures / 1e3, walkNs / 1e9, walkNs / captures / 1e3, specializationNs / 1e9, specializationNs / captures / 1e3, pageNs / 1e9, pageNs / captures / 1e3, wordNs / 1e9, wordNs / captures / 1e3, hookNs / 1e9, hookNs / captures / 1e3, static_cast<unsigned long long>(totals.handleHits.load()), static_cast<unsigned long long>(totals.handleMisses.load()));
         }
     }
-    return capture;
 }
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
     std::vector<ShaderRecompiler::MemoryRegion> result;
+    Regions(result);
+    return result;
+}
+
+void ShaderMemory::Regions(std::vector<ShaderRecompiler::MemoryRegion>& result) const {
+    result.clear();
     result.reserve(initial.size() + pages.size());
     auto next = initial.begin();
     // Both maps are ordered by address and never overlap, so a merge keeps the result sorted.
@@ -321,7 +381,6 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {
         }
     }
     for (; next != initial.end(); ++next) result.push_back({next->first, next->second});
-    return result;
 }
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::TakeRecentRegions() {

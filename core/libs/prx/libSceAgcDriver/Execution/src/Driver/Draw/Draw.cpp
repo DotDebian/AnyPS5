@@ -262,8 +262,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& program = programs[i];
         pushOffsets[i] = pushCursorBytes;
         if (adopted) {
+            // A stage the front end left without a copy of its result
+            // (APS5_DRAW_AHEAD_SHARED_RESULTS) draws from the shared one its capture holds.
             resultIndex[i] = prepared->resultIndex[i];
-            programResults[i] = &results[resultIndex[i]];
+            programResults[i] = resultIndex[i] == PreparedDraw::NoResult ? stageCaptures[i].compiled.get() : &results[resultIndex[i]];
         } else if (drawHit) {
 
             programResults[i] = matched[i]->compiled.get();
