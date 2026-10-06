@@ -3318,9 +3318,11 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         }
         // APS5_COPYBACK_SKIP=1 (diagnostic, wrong results): no copy back of staged regions at all,
         // to bound what the copies cost the GPU timeline.
-        static const bool skip = std::getenv("APS5_COPYBACK_SKIP") != nullptr;
+        // APS5_COPYBACK_SKIP=2: only the dispatches' (a recorded draw's staged regions are still
+        // copied back).
+        static const int skip = std::getenv("APS5_COPYBACK_SKIP") != nullptr ? std::atoi(std::getenv("APS5_COPYBACK_SKIP")) : 0;
         for (const auto& [begin, end] : merged) {
-            if (skip && region.deviceLocal) break;
+            if (region.deviceLocal && (skip == 1 || (skip == 2 && !drawStaging))) break;
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
             if (from >= to) continue;
