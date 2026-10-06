@@ -21,6 +21,94 @@ struct AdoptedDrawLeftovers {
     std::vector<StageCapture> stageCaptures;
 };
 
+// APS5_WORKER_SCRATCH=1 (local, not for upstream): the worker's per-draw vectors are kept per
+// thread and cleared (not freed) between draws, an adopted draw takes the front end's vectors
+// without making empty ones first, and its leftovers go back into the prepared draw instead of a
+// holder made per draw. A nested draw (the queued-label retry) uses vectors of its own.
+bool WorkerScratch() {
+    static const bool enabled = std::getenv("APS5_WORKER_SCRATCH") != nullptr;
+    return enabled;
+}
+
+struct DrawScratch {
+    bool busy = false;
+    std::vector<ShaderRecompiler::LinkedProgram> linked;
+    std::vector<Graphics::CompiledShader> stages;
+    std::vector<const ShaderRecompiler::RecompileResult*> programResults;
+    std::vector<std::shared_ptr<DispatchVariant>> matched;
+    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions;
+    std::vector<std::shared_ptr<DispatchVariant>> fresh;
+    std::vector<bool> recompiled;
+    std::vector<std::uint32_t> pushOffsets;
+    std::vector<std::size_t> resultIndex;
+    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    void clear() {
+        linked.clear();
+        stages.clear();
+        programResults.clear();
+        matched.clear();
+        for (auto& regions : matchedRegions) regions.clear();
+        fresh.clear();
+        recompiled.clear();
+        pushOffsets.clear();
+        resultIndex.clear();
+        snapshots.clear();
+        recipeStages.clear();
+    }
+};
+
+// APS5_TRACE_WORKER_SPLIT=1 (local, not for upstream): the worker's time per direct draw by step,
+// printed as [workersplit] every 10 s: from the call to the end of the recheck, to the rejection
+// check (decode, vectors, stage results), the rejection check, the lock and labels, the device
+// call (Graphics::Draw), and the release after it.
+struct WorkerSplit {
+    enum Step { Recheck, Prepare, Rejection, Lock, Device, Release, Count };
+    bool on = false;
+    std::chrono::steady_clock::time_point mark;
+    void lap(Step step);
+};
+struct WorkerSplitTotals {
+    std::array<std::uint64_t, WorkerSplit::Count> ns{};
+    std::uint64_t draws = 0, adopted = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+WorkerSplitTotals& TheWorkerSplit() {
+    thread_local WorkerSplitTotals totals;
+    return totals;
+}
+bool WorkerSplitTraced() {
+    static const bool traced = std::getenv("APS5_TRACE_WORKER_SPLIT") != nullptr;
+    return traced;
+}
+void WorkerSplit::lap(Step step) {
+    if (!on) return;
+    const auto now = std::chrono::steady_clock::now();
+    TheWorkerSplit().ns[step] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - mark).count());
+    mark = now;
+}
+void ReportWorkerSplit(bool adopted) {
+    auto& totals = TheWorkerSplit();
+    ++totals.draws;
+    if (adopted) ++totals.adopted;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - totals.last < std::chrono::seconds(10)) return;
+    totals.last = now;
+    const auto per = [&](WorkerSplit::Step step) { return totals.draws != 0 ? static_cast<double>(totals.ns[step]) / 1000.0 / static_cast<double>(totals.draws) : 0.0; };
+    AgcDriver::ReportLine("[workersplit] direct draws (10 s): %llu (%llu adopted); avg us per draw: recheck %.2f, prepare %.2f, rejection check %.2f, lock and labels %.2f, device call %.2f, release %.2f\n", static_cast<unsigned long long>(totals.draws), static_cast<unsigned long long>(totals.adopted), per(WorkerSplit::Recheck), per(WorkerSplit::Prepare), per(WorkerSplit::Rejection), per(WorkerSplit::Lock), per(WorkerSplit::Device), per(WorkerSplit::Release));
+    totals = {};
+    totals.last = now;
+}
+
+struct DrawScratchLease {
+    DrawScratch* held = nullptr;
+    ~DrawScratchLease() {
+        if (held == nullptr) return;
+        held->clear();
+        held->busy = false;
+    }
+};
+
 }
 
 void Driver::setMeshIndexWords(DrawProgram& front, const Graphics::State& graphics, const Pm4::DrawParameters& parameters) {
@@ -61,6 +149,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         Graphics::Recorder::NoteProgram(low == queue.shader.end() || high == queue.shader.end() ? 0 : (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u));
     }
     PerformanceTimer timing("Driver.Draw");
+    WorkerSplit split;
+    split.on = WorkerSplitTraced();
+    if (split.on) split.mark = std::chrono::steady_clock::now();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
@@ -123,6 +214,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (prepared != nullptr && (lockedPrepare || (drawParameters.indirect && !AdoptableIndirect(*prepared, localDevice->DrawIndirectSupport(), IndirectDrawAheadEnabled())))) prepared = nullptr;
     const bool lookupFirst = prepared != nullptr && prepared->keyKnown && registerKey;
     if (prepared != nullptr && !lookupFirst && !recheckPreparedDraw(*prepared, localDevice->Serial())) prepared = nullptr;
+    split.lap(WorkerSplit::Recheck);
     bool adopted = prepared != nullptr && !lookupFirst;
     if (adopted) {
         drawKey = prepared->drawKey;
@@ -158,7 +250,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto locate = [&](std::uint32_t location) { return LocateDrawUserWord(programs, roles, location); };
     if (drawParameters.indirect) ResolveIndirectSgprs(programs, roles, *drawParameters.indirect);
     std::vector<ShaderRecompiler::MemoryRegion> memory;
-    std::vector<ShaderRecompiler::LinkedProgram> linked;
+    const bool scratchOn = WorkerScratch();
+    DrawScratch localScratch;
+    thread_local DrawScratch threadScratch;
+    DrawScratchLease scratchLease;
+    if (scratchOn && !threadScratch.busy) {
+        threadScratch.busy = true;
+        scratchLease.held = &threadScratch;
+    }
+    DrawScratch& scratch = scratchLease.held != nullptr ? threadScratch : localScratch;
+    auto& linked = scratch.linked;
     if (adopted) memory = std::move(prepared->memory);
     for (std::size_t i = 0; i < programs.size() && !adopted; ++i) {
         const auto& program = programs[i];
@@ -168,11 +269,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("prepare");
     phaseTiming.Phase(DrawRowProgramPrepare);
 
-    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos(programs.size());
-    std::vector<std::vector<Graphics::DecodeRead>> decodeReads(programs.size());
-    if (adopted) {
+    std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
+    std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
+    if (adopted && scratchOn) {
         vertexInfos = std::move(prepared->vertexInfos);
         decodeReads = std::move(prepared->decodeReads);
+    } else {
+        vertexInfos.resize(programs.size());
+        decodeReads.resize(programs.size());
+        if (adopted) {
+            vertexInfos = std::move(prepared->vertexInfos);
+            decodeReads = std::move(prepared->decodeReads);
+        }
     }
     const auto decodeVertexInfo = [&](std::size_t i) { decodeProgramVertexInfo(programs[i], roles[i], vertexInfos[i], decodeReads[i]); };
     if (!registerKey && !adopted) {
@@ -182,18 +290,35 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::optional<ShaderMemory> ownMemory;
     if (!adopted) ownMemory.emplace(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
     std::vector<ShaderRecompiler::RecompileResult> results;
-    std::vector<Graphics::CompiledShader> stages;
+    auto& stages = scratch.stages;
     if (adopted) results = std::move(prepared->results);
     results.reserve(programs.size() + (graphics.rectList ? 2u : 0u));
     stages.reserve(programs.size());
     std::uint32_t pushCursorBytes = 0;
 
-    std::vector<const ShaderRecompiler::RecompileResult*> programResults(programs.size(), nullptr);
+    auto& programResults = scratch.programResults;
+    programResults.assign(programs.size(), nullptr);
 
-    std::vector<StageCapture> stageCaptures(programs.size());
-    if (adopted) stageCaptures = std::move(prepared->stageCaptures);
+    std::vector<StageCapture> stageCaptures;
+    if (adopted && scratchOn) {
+        stageCaptures = std::move(prepared->stageCaptures);
+    } else {
+        stageCaptures.resize(programs.size());
+        if (adopted) stageCaptures = std::move(prepared->stageCaptures);
+    }
     const auto releaseAdopted = [&] {
         if (!adopted) return;
+        if (scratchOn) {
+            // The prepared draw is the holder: what was taken from it goes back.
+            prepared->programs = std::move(programs);
+            prepared->memory = std::move(memory);
+            prepared->vertexInfos = std::move(vertexInfos);
+            prepared->decodeReads = std::move(decodeReads);
+            prepared->results = std::move(results);
+            prepared->stageCaptures = std::move(stageCaptures);
+            Graphics::Recorder::ReleaseLater(std::move(prepared));
+            return;
+        }
         auto leftovers = std::make_shared<AdoptedDrawLeftovers>();
         leftovers->prepared = std::move(prepared);
         leftovers->programs = std::move(programs);
@@ -204,12 +329,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         leftovers->stageCaptures = std::move(stageCaptures);
         Graphics::Recorder::ReleaseLater(std::move(leftovers));
     };
-    std::vector<std::shared_ptr<DispatchVariant>> matched(programs.size());
-    std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions(programs.size());
+    auto& matched = scratch.matched;
+    matched.assign(programs.size(), nullptr);
+    auto& matchedRegions = scratch.matchedRegions;
+    matchedRegions.resize(programs.size());
 
-    std::vector<std::shared_ptr<DispatchVariant>> fresh(programs.size());
+    auto& fresh = scratch.fresh;
+    fresh.assign(programs.size(), nullptr);
 
-    std::vector<bool> recompiled(programs.size(), false);
+    auto& recompiled = scratch.recompiled;
+    recompiled.assign(programs.size(), false);
     bool drawHit = false;
     bool verifyHit = false;
     if (!adopted) lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
@@ -254,8 +383,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto fold = [&](const ShaderRecompiler::RecompileResult& main, Pm4::DrawParameters& parameters) { foldDrawOffsets(main, programs.front(), parameters); };
 
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
-    std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
-    std::vector<std::size_t> resultIndex(programs.size(), 0);
+    auto& pushOffsets = scratch.pushOffsets;
+    pushOffsets.assign(programs.size(), 0);
+    auto& resultIndex = scratch.resultIndex;
+    resultIndex.assign(programs.size(), 0);
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
@@ -316,7 +447,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowRectList);
     };
     if (graphics.rectList) buildRectList();
-    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    auto& snapshots = scratch.snapshots;
     const auto snapshot = [&] {
         snapshots.clear();
         for (const auto& region : memory) snapshots.push_back({region.guestAddress, region.bytes});
@@ -417,7 +548,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return drawn();
     }
 
-    std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+    auto& recipeStages = scratch.recipeStages;
     if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
@@ -428,15 +559,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         recipe = findDrawRecipe(drawKey, recipeStages);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }
+    split.lap(WorkerSplit::Prepare);
     if (recipe == nullptr) {
         if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
             rejected = std::move(*known);
             return DrawVerdict::Rejected;
         }
     }
+    split.lap(WorkerSplit::Rejection);
     lockForDraw();
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
+    split.lap(WorkerSplit::Lock);
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) {
             phaseTiming.Phase(DrawRowGraphics);
@@ -450,9 +584,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, stateKey);
     phaseTiming.Phase(DrawRowGraphics);
+    split.lap(WorkerSplit::Device);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
+    const bool wasAdopted = adopted;
     releaseAdopted();
+    if (split.on) {
+        split.lap(WorkerSplit::Release);
+        ReportWorkerSplit(wasAdopted);
+    }
     return drawn();
 }
 
