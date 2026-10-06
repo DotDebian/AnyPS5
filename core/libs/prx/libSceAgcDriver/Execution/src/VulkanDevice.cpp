@@ -3277,6 +3277,25 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     Graphics::SyncDepthSurfaceTextures(context, nullptr, resources.SampledTextures());
+    // APS5_COPYBACK_BATCH: a dispatch that reads and writes guest memory through descriptors only,
+    // none of it in place over an import range a queued copy back writes, records inside the
+    // deferral scope (its own copies back join the queue); any other one finds them recorded.
+    std::optional<Graphics::Recorder::DeferScope> deferScope;
+    if (recorder.HasDeferredCopies()) {
+        bool clear = !resources.UsesBda() && !resources.HoldsLease() && !(argumentImport != nullptr && recorder.DeferredCopiesOverlap(arguments, 12));
+        if (clear) {
+            for (const auto& [begin, end] : resources.InPlaceReads()) {
+                if (recorder.DeferredCopiesOverlap(begin, static_cast<std::size_t>(end - begin))) {
+                    clear = false;
+                    break;
+                }
+            }
+        }
+        if (clear) deferScope.emplace(recorder);
+        else recorder.FlushDeferredCopies(Graphics::Recorder::CopyFlush::Dispatch);
+    } else if (Graphics::Recorder::CopyBackBatching()) {
+        deferScope.emplace(recorder);
+    }
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     recordStep(PhaseRecordCommands);

@@ -175,6 +175,11 @@ std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t l
 
 // A device-local staging shadow kept between uses (APS5_RESIDENT_STAGING, GuestBufferMemory.cpp).
 struct ResidentShadow;
+// APS5_TRACE_COPYBACK=1 (local diagnostic): the [copyback] line every 10 s, the copies back of staged
+// regions into guest memory and who reads those ranges before the next copy back of the same range.
+enum class CopyBackReader : std::uint8_t { Shadow, StagingIn, InPlace, AddressElement, AddressPending, CpuFault, PageQuery, Count };
+bool CopyBackTraceEnabled();
+void NoteCopyBackRead(std::uint64_t address, std::size_t bytes, CopyBackReader reader);
 // APS5_TRACE_VRAM: the [vram] line's segment for the staging shadows and the host imports.
 std::string DescribeGuestBufferHolders(const Context& context);
 
@@ -238,6 +243,10 @@ public:
     // scan), so until then no stamp tells a resident shadow that its range may have been written:
     // every shadow completed before this call copies in at its next use. Under GuestMemory::GpuMutex.
     static void NoteAddressStores();
+    // APS5_COPYBACK_REDIRECT: the binding of a read-only range of an address-based draw to the
+    // resident staging shadow holding it, when one does and provably matches the import (no
+    // refresh is recorded for a draw: without the proof the caller keeps its own path).
+    static bool ResidentReadBinding(const Context& context, Recorder& recorder, std::uint64_t begin, std::size_t bytes, VkDescriptorBufferInfo& info);
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -387,6 +396,7 @@ private:
         bool gpuCopy = false;
         VkBuffer copySource = VK_NULL_HANDLE;
         std::uint64_t copySourceBase = 0;
+        VkDeviceAddress copySourceAddress = 0;
         bool copiedBack = false;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
@@ -401,6 +411,11 @@ private:
         // APS5_RESIDENT_STAGING: the resident shadow `buffer` belongs to while the region is staged
         // (see GuestBufferMemory.cpp); meaningful only while its buffer is this region's.
         std::shared_ptr<ResidentShadow> resident {};
+        // APS5_COPYBACK_REDIRECT: a read-only region inside a resident shadow's range binds that
+        // shadow (`buffer`, whose first byte is `resident->begin`) instead of the import, which
+        // stays the source of the copy-in (`copySource`) a use records when the CPU stored into the
+        // range since the shadow last matched it (see GuestBufferMemory.cpp).
+        bool redirected = false;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -443,6 +458,10 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    // APS5_COPYBACK_REDIRECT: binds a read-only region to the resident shadow holding its range,
+    // when there is one; and records, for a use, what makes the shadow hold the import's bytes.
+    bool takeResidentFor(Region& region, VkBuffer importBuffer, std::uint64_t importBase);
+    void recordRedirects(std::span<Region* const> redirects);
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;

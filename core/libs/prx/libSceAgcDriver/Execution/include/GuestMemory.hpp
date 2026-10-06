@@ -14,6 +14,17 @@
 namespace AgcDriver::GuestMemory {
 
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
+// APS5_COPYBACK_PROTECT=1 (local diagnostic, Windows): the whole pages of [address, address + bytes)
+// lose all access (when they are private read-write memory) until the first CPU access to them,
+// which the vectored handler counts by thread and code module, reports to the hook with `tag`, and
+// resumes after giving the range its access back. A page query of the range (the driver's page
+// cache) gives the access back first. The [copyback-faults] line comes from
+// DiagnosticProtectReport. Resumed faults on guest threads clobber the System V red zone: short
+// diagnostic runs only.
+bool DiagnosticProtectEnabled();
+void DiagnosticProtect(std::uint64_t address, std::size_t bytes, std::uint64_t tag);
+void SetDiagnosticFaultHook(void (*hook)(std::uint64_t tag, bool write, bool host));
+std::string DiagnosticProtectReport();
 // CheckRange without throwing: whether the whole range is mapped with the requested access.
 bool Accessible(const void* pointer, std::size_t bytes, bool writable = false);
 // The accessible parts [begin, end) of a range, in address order. GPU heaps are often bound whole while
