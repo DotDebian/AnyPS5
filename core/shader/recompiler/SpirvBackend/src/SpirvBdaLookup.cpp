@@ -6,6 +6,8 @@
 
 namespace ShaderRecompiler {
 
+bool BdaNoSearchExperiment();
+
 namespace {
 
 void ReturnBdaZeroIf(SpirvEmitterState& state, std::uint32_t condition) {
@@ -77,19 +79,42 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     if (cached) {
         // An empty cache holds [0, 0), which no access lies in; a wrapping access (its end at or
         // below its address) and a zero-byte one miss too and fault in the search below.
-        const auto cachedBegin = loadCache(u64, state.bdaCacheBegin);
         const auto accessEnd = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
-        auto hit = binary(spv::OpUGreaterThanEqual, boolean, address, cachedBegin);
-        hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpULessThanEqual, boolean, accessEnd, loadCache(u64, state.bdaCacheEnd)));
-        hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpUGreaterThan, boolean, accessEnd, address));
-        hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, loadCache(u32, state.bdaCachePermissions), constant(permission)), constant(0)));
-        const auto found = state.module.AllocateId();
-        const auto search = state.module.AllocateId();
-        state.module.AddFunction(spv::OpSelectionMerge, search, spv::SelectionControlMaskNone);
-        state.module.AddFunction(spv::OpBranchConditional, hit, found, search);
-        EmitLabel(state, found);
-        state.module.AddFunction(spv::OpReturnValue, binary(spv::OpIAdd, u64, loadCache(u64, state.bdaCacheBase), binary(spv::OpISub, u64, address, cachedBegin)));
-        EmitLabel(state, search);
+        for (std::uint32_t way = 0; way < state.bdaCacheWays; way++) {
+            const auto beginVariable = way == 0u ? state.bdaCacheBegin : state.bdaWayBegin[way - 1u];
+            const auto endVariable = way == 0u ? state.bdaCacheEnd : state.bdaWayEnd[way - 1u];
+            const auto baseVariable = way == 0u ? state.bdaCacheBase : state.bdaWayBase[way - 1u];
+            const auto permissionVariable = way == 0u ? state.bdaCachePermissions : state.bdaWayPermissions[way - 1u];
+            const auto cachedBegin = loadCache(u64, beginVariable);
+            auto hit = binary(spv::OpUGreaterThanEqual, boolean, address, cachedBegin);
+            hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpULessThanEqual, boolean, accessEnd, loadCache(u64, endVariable)));
+            hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpUGreaterThan, boolean, accessEnd, address));
+            hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, loadCache(u32, permissionVariable), constant(permission)), constant(0)));
+            const auto found = state.module.AllocateId();
+            const auto search = state.module.AllocateId();
+            state.module.AddFunction(spv::OpSelectionMerge, search, spv::SelectionControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, hit, found, search);
+            EmitLabel(state, found);
+            state.module.AddFunction(spv::OpReturnValue, binary(spv::OpIAdd, u64, loadCache(u64, baseVariable), binary(spv::OpISub, u64, address, cachedBegin)));
+            EmitLabel(state, search);
+        }
+        if (BdaNoSearchExperiment()) {
+            // Experiment only, wrong data: a miss reads the first cached range at the clamped offset
+            // instead of searching the table (it stays inside that range, so the read is in bounds).
+            const auto cachedBegin = loadCache(u64, state.bdaCacheBegin);
+            const auto span = binary(spv::OpISub, u64, loadCache(u64, state.bdaCacheEnd), cachedBegin);
+            const auto wide = Unary(state, spv::OpUConvert, u64, bytes);
+            const auto usable = binary(spv::OpLogicalAnd, boolean, binary(spv::OpUGreaterThanEqual, boolean, span, wide), binary(spv::OpINotEqual, boolean, span, BdaConstant(state, 0u)));
+            const auto found = state.module.AllocateId();
+            const auto search = state.module.AllocateId();
+            state.module.AddFunction(spv::OpSelectionMerge, search, spv::SelectionControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, usable, found, search);
+            EmitLabel(state, found);
+            const auto offset = state.module.AllocateId();
+            state.module.AddFunction(spv::OpExtInst, u64, offset, GlslStd450(state), 38u, binary(spv::OpISub, u64, address, cachedBegin), binary(spv::OpISub, u64, span, wide));
+            state.module.AddFunction(spv::OpReturnValue, binary(spv::OpIAdd, u64, loadCache(u64, state.bdaCacheBase), offset));
+            EmitLabel(state, search);
+        }
     }
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
@@ -151,11 +176,25 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow);
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
     fail(binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow);
-    if (cached) {
+    if (cached && state.bdaCacheWays == 1u) {
         state.module.AddFunction(spv::OpStore, state.bdaCacheBegin, begin);
         state.module.AddFunction(spv::OpStore, state.bdaCacheEnd, finish);
         state.module.AddFunction(spv::OpStore, state.bdaCacheBase, base);
         state.module.AddFunction(spv::OpStore, state.bdaCachePermissions, permissions);
+    } else if (cached) {
+        const auto next = loadCache(u32, state.bdaCacheNext);
+        for (std::uint32_t way = 0; way < state.bdaCacheWays; way++) {
+            EmitIfCondition(state, binary(spv::OpIEqual, boolean, next, constant(way)), [&] {
+                state.module.AddFunction(spv::OpStore, way == 0u ? state.bdaCacheBegin : state.bdaWayBegin[way - 1u], begin);
+                state.module.AddFunction(spv::OpStore, way == 0u ? state.bdaCacheEnd : state.bdaWayEnd[way - 1u], finish);
+                state.module.AddFunction(spv::OpStore, way == 0u ? state.bdaCacheBase : state.bdaWayBase[way - 1u], base);
+                state.module.AddFunction(spv::OpStore, way == 0u ? state.bdaCachePermissions : state.bdaWayPermissions[way - 1u], permissions);
+            });
+        }
+        const auto advanced = binary(spv::OpIAdd, u32, next, constant(1u));
+        const auto wrapped = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelect, u32, wrapped, binary(spv::OpULessThan, boolean, advanced, constant(state.bdaCacheWays)), advanced, constant(0u));
+        state.module.AddFunction(spv::OpStore, state.bdaCacheNext, wrapped);
     }
     state.module.AddFunction(spv::OpReturnValue, result);
     state.module.AddFunction(spv::OpFunctionEnd);
@@ -212,6 +251,23 @@ bool BdaLookupCached() {
     return !disabled;
 }
 
+// APS5_BDA_CACHE_WAYS=2..4 (not for upstream): the lookups keep that many ranges, filled in turn.
+std::uint32_t BdaCacheWays() {
+    static const std::uint32_t ways = [] {
+        const char* text = std::getenv("APS5_BDA_CACHE_WAYS");
+        const auto value = text != nullptr ? std::strtoul(text, nullptr, 10) : 1ul;
+        return static_cast<std::uint32_t>(value < 1ul ? 1ul : value > 4ul ? 4ul : value);
+    }();
+    return ways;
+}
+
+// APS5_EXP_BDA_NO_SEARCH=1 (not for upstream, experiment, wrong image): a miss reads the cached
+// range at a clamped offset instead of searching the table. Measures what the searches cost.
+bool BdaNoSearchExperiment() {
+    static const bool enabled = std::getenv("APS5_EXP_BDA_NO_SEARCH") != nullptr;
+    return enabled;
+}
+
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (!state.program.Info().usesDma) return;
     if (BdaLookupCached()) {
@@ -226,6 +282,14 @@ void DefineGetBdaPointer(SpirvEmitterState& state) {
         state.module.AddName(state.bdaCacheEnd, "bda_cache_end");
         state.module.AddName(state.bdaCacheBase, "bda_cache_base");
         state.module.AddName(state.bdaCachePermissions, "bda_cache_permissions");
+        state.bdaCacheWays = BdaCacheWays();
+        for (std::uint32_t way = 1; way < state.bdaCacheWays; way++) {
+            state.bdaWayBegin[way - 1u] = state.module.DefineInitializedGlobalVariable(address, spv::StorageClassPrivate, zero);
+            state.bdaWayEnd[way - 1u] = state.module.DefineInitializedGlobalVariable(address, spv::StorageClassPrivate, zero);
+            state.bdaWayBase[way - 1u] = state.module.DefineInitializedGlobalVariable(address, spv::StorageClassPrivate, zero);
+            state.bdaWayPermissions[way - 1u] = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate, ConstantU32(state, 0u));
+        }
+        if (state.bdaCacheWays > 1u) state.bdaCacheNext = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate, ConstantU32(state, 0u));
     }
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);

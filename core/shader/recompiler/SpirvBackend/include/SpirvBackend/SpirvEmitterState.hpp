@@ -133,6 +133,13 @@ struct SpirvEmitterState {
     std::uint32_t bdaCacheEnd = 0;
     std::uint32_t bdaCacheBase = 0;
     std::uint32_t bdaCachePermissions = 0;
+    // APS5_BDA_CACHE_WAYS=2..4 (not for upstream): further cached ranges, filled in turn (bdaCacheNext).
+    std::array<std::uint32_t, 3> bdaWayBegin {};
+    std::array<std::uint32_t, 3> bdaWayEnd {};
+    std::array<std::uint32_t, 3> bdaWayBase {};
+    std::array<std::uint32_t, 3> bdaWayPermissions {};
+    std::uint32_t bdaCacheWays = 1;
+    std::uint32_t bdaCacheNext = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
@@ -160,6 +167,19 @@ struct SpirvEmitterState {
     std::uint32_t meshPrimitiveData = 0;
     std::uint32_t meshPrimitives = 0;
     std::uint32_t meshCull = 0;
+    // Vertex dedup of a passthrough triangle-list subgroup (IrOpcode::MeshDedup, APS5_MESH_DEDUP):
+    // workgroup hash table (keys, lowest owning lane, slot), each input vertex's slot, the unique
+    // vertices by slot and their count; per lane half, the lane's key and hash entry.
+    std::uint32_t meshDedupHashKey = 0;
+    std::uint32_t meshDedupHashOwner = 0;
+    std::uint32_t meshDedupHashSlot = 0;
+    std::uint32_t meshDedupSlot = 0;
+    std::uint32_t meshDedupUnique = 0;
+    std::uint32_t meshDedupCount = 0;
+    std::uint32_t meshDedupLaneKey = 0;
+    std::uint32_t meshDedupLaneEntry = 0;
+    std::uint32_t meshDedupLanes = 0;
+    std::uint32_t meshDedupHashSize = 0;
     std::uint32_t entryLabel = 0;
     std::uint32_t currentLabel = 0;
     const IrBlock* currentBlock = nullptr;

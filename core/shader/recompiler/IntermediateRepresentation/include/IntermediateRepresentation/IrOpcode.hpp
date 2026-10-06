@@ -80,6 +80,8 @@ enum class IrOpcode : std::uint16_t {
     MeshDrawParameter,
     MeshArgument,
     MeshAllocate,
+    MeshDedup,
+    MeshDedupRead,
     TessellationBase,
     GetTessellationAttribute,
     SetTessellationAttribute,

@@ -3,6 +3,7 @@
 #include "Translation/DispatchInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -86,6 +87,20 @@ const ShaderWorkgroupInputInfo* shaderWorkgroupInput(ShaderStageKind stage, cons
     default:
         return nullptr;
     }
+}
+
+// APS5_MESH_DEDUP=1 (not for upstream): a passthrough triangle-list subgroup shades each distinct
+// index once (see EmitMeshDedup) instead of three vertices per triangle. A recompiler switch: the
+// shader disk cache keys it.
+bool meshDedupEnabled() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_MESH_DEDUP"); return text != nullptr && text[0] == '1'; }();
+    return enabled;
+}
+
+// APS5_EXP_MESH_DEDUP_NOOP=1 (not for upstream, experiment): run the dedup, ignore its result.
+bool meshDedupNoopExperiment() {
+    static const bool enabled = std::getenv("APS5_EXP_MESH_DEDUP_NOOP") != nullptr;
+    return enabled;
 }
 
 bool isCodeTableLoad(const ControlFlowGraph& cfg, std::uint32_t programCounter) {
@@ -321,7 +336,31 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         for (std::uint32_t reg = 4u; reg < 8u; reg++) {
             entryIr.SetScalarReg(static_cast<ScalarReg>(reg), u32(0u));
         }
-        entryIr.SetVectorReg(static_cast<VectorReg>(5), entryIr.IAdd(draw(1u), entryIr.Select(indexed, index, inputVertex)));
+        IrValue& vertexKey = entryIr.Select(indexed, index, inputVertex);
+        // One guest wave per subgroup, triangle list, passthrough: the only layout whose inputs are
+        // the ES vertices themselves (v0 packs their lanes, v5 is the vertex id, s2 and s3 count them).
+        if (meshDedupEnabled() && mesh.passthrough && mesh.inputPrimitive == 4u && size == 3u && stepCount == 3u && totalThreads <= 256u) {
+            const auto dedupRead = [&](std::uint32_t kind, IrValue& index) -> IrValue& {
+                return entryIr.Emit(IrOpcode::MeshDedupRead, IrOpcodeType(IrOpcode::MeshDedupRead), {&u32(kind), &index});
+            };
+            (void)entryIr.Emit(IrOpcode::MeshDedup, IrType::Void, {&vertexKey, &vertices});
+            IrValue& unique = dedupRead(2u, u32(0u));
+            entryIr.SetScalarReg(static_cast<ScalarReg>(2), entryIr.BitwiseOr(entryIr.ShiftLeftLogical(unique, u32(12u)), entryIr.ShiftLeftLogical(primitives, u32(22u))));
+            IrValue& uniqueCount = minimum(subtractSaturate(unique, waveBase), u32(waveSize));
+            entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.BitwiseOr(waveInfo, entryIr.BitwiseOr(entryIr.ShiftLeftLogical(primitiveCount, u32(8u)), uniqueCount)));
+            IrValue& slot0 = dedupRead(1u, vertex);
+            IrValue& slot1 = dedupRead(1u, entryIr.IAdd(vertex, u32(1u)));
+            IrValue& slot2 = dedupRead(1u, entryIr.IAdd(vertex, u32(2u)));
+            entryIr.SetVectorReg(static_cast<VectorReg>(0), entryIr.BitwiseOr(slot0, entryIr.BitwiseOr(entryIr.ShiftLeftLogical(slot1, u32(10u)), entryIr.ShiftLeftLogical(slot2, u32(20u)))));
+            entryIr.SetVectorReg(static_cast<VectorReg>(5), entryIr.IAdd(draw(1u), dedupRead(0u, local)));
+        } else if (meshDedupNoopExperiment() && mesh.passthrough && mesh.inputPrimitive == 4u && size == 3u && stepCount == 3u && totalThreads <= 256u) {
+            // Experiment: the dedup work without using its result (its cost alone; same image).
+            (void)entryIr.Emit(IrOpcode::MeshDedup, IrType::Void, {&vertexKey, &vertices});
+            IrValue& unique = entryIr.Emit(IrOpcode::MeshDedupRead, IrOpcodeType(IrOpcode::MeshDedupRead), {&u32(2u), &u32(0u)});
+            entryIr.SetVectorReg(static_cast<VectorReg>(5), entryIr.IAdd(entryIr.IAdd(draw(1u), vertexKey), entryIr.BitwiseAnd(unique, u32(0u))));
+        } else {
+            entryIr.SetVectorReg(static_cast<VectorReg>(5), entryIr.IAdd(draw(1u), vertexKey));
+        }
         entryIr.SetVectorReg(static_cast<VectorReg>(6), u32(0u));
         entryIr.SetVectorReg(static_cast<VectorReg>(7), u32(0u));
         entryIr.SetVectorReg(static_cast<VectorReg>(8), entryIr.IAdd(draw(2u), builtin(StageInputKind::WorkgroupId, 1u)));

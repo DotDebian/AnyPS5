@@ -76,6 +76,8 @@ void DefineTessellationExecutionModes(SpirvEmitterState& state);
 void DefineMeshOutputs(SpirvEmitterState& state);
 void EmitMeshEntryPoint(SpirvEmitterState& state);
 void EmitMeshAllocate(SpirvValueEmitContext& ctx, const IrValue& inst);
+void EmitMeshDedup(SpirvValueEmitContext& ctx, const IrValue& inst);
+std::uint32_t EmitMeshDedupRead(SpirvValueEmitContext& ctx, const IrValue& inst);
 std::uint32_t MeshOutputPointer(SpirvEmitterState& state, StageOutputKind kind, std::uint32_t index = 0);
 std::uint32_t MeshPrimitivePointer(SpirvEmitterState& state);
 DppTargetLane EmitDppQuadPermTargetLane(SpirvEmitterState& state, std::uint32_t subid, std::uint32_t control);
