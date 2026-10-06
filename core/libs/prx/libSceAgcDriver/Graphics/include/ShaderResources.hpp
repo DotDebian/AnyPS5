@@ -520,6 +520,25 @@ private:
     std::shared_ptr<DrawBindings> addressDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
     // The descriptor counts of a draw's own set (PrepareDrawBindings), computed once.
     mutable std::vector<VkDescriptorPoolSize> drawBindingSizes;
+    // APS5_OWNED_DRAW_SETS=1 (local, not for upstream): the sets addressDrawBindings made for this
+    // template come back to it when their batch retires, holding the template's set but for the
+    // elements the draw wrote (`deviations`: binding, array element). The next draw restores those
+    // it does not write itself (one-element copies from `_set`) and writes its own: no allocation
+    // and no copy of the whole set. The pool outlives the template while a batch holds one of its
+    // sets; it frees what it holds to the descriptor cache when it goes.
+public:
+    struct OwnedDrawSet {
+        DescriptorCache::SetAllocation allocation;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> deviations;
+    };
+    struct OwnedSetPool {
+        DescriptorCache* cache = nullptr;
+        std::mutex mutex;
+        std::vector<OwnedDrawSet> free;
+        ~OwnedSetPool();
+    };
+private:
+    mutable std::shared_ptr<OwnedSetPool> ownedSets;
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys
