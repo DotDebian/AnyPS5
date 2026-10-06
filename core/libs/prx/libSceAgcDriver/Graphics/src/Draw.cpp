@@ -680,6 +680,15 @@ std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
     return failures;
 }
 
+// APS5_WORKER_SCRATCH=1 (local, not for upstream): whether any validation failure was ever noted.
+// While none was, KnownValidationFailure answers without building the key or taking the mutex
+// (it runs for every draw that has no draw-cache recipe, i.e. every adopted draw).
+std::atomic<bool> validationFailureNoted{false};
+bool WorkerScratchGraphics() {
+    static const bool enabled = std::getenv("APS5_WORKER_SCRATCH") != nullptr;
+    return enabled;
+}
+
 std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
     memoized = false;
     hit = false;
@@ -702,6 +711,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
             std::lock_guard lock(validationMutex());
             auto& failures = validationFailures();
             if (failures.size() >= 1024) failures.clear();
+            validationFailureNoted.store(true, std::memory_order_release);
             failures.emplace(std::move(key), error.what());
         }
         throw;
@@ -2106,6 +2116,7 @@ std::span<const CompiledShader> drawnStages(const State& state, std::span<const 
 }
 
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
+    if (WorkerScratchGraphics() && !validationFailureNoted.load(std::memory_order_acquire)) return std::nullopt;
     std::vector<std::uint64_t> key;
     if (!ValidationKey(context, shaders, state, key)) return std::nullopt;
     std::lock_guard lock(validationMutex());
