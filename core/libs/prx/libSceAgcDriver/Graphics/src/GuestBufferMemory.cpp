@@ -3215,7 +3215,16 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
-        if (region->deviceLocal && region->resident != nullptr && region->resident->buffer == region->buffer && region->resident->reference != nullptr) referenceFills.push_back(region);
+        if (region->deviceLocal && region->resident != nullptr && region->resident->buffer == region->buffer && region->resident->reference != nullptr) {
+            // APS5_COPYBACK_DELTA_PCIE_FILL=1: the reference read from the import too, as first written.
+            static const bool pcieFill = std::getenv("APS5_COPYBACK_DELTA_PCIE_FILL") != nullptr;
+            if (pcieFill) {
+                CopyBuffer(context, commands, copySource, copyOffset, region->resident->reference->Handle(), 0, bytes);
+                recorder->Keep(region->resident->reference);
+            } else {
+                referenceFills.push_back(region);
+            }
+        }
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);

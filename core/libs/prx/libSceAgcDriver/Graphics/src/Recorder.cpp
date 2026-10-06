@@ -1885,21 +1885,39 @@ void Recorder::FlushDeferredCopies(CopyFlush reason) {
     if (open->renderPass.open) endOpenRenderPass();
     const auto commands = open->commands;
     const auto timing = beginTiming(ClassKey(CommandClass::StagingOut));
-    // The shaders' stores into the shadows and earlier writes into the imports precede the copies.
-    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-    CountBarriers(CommandClass::StagingOut);
     std::vector<Batch::DeferredCopy> deltas;
     std::erase_if(copies, [&](const auto& entry) {
         if (entry.sourceAddress == 0) return false;
         deltas.push_back(entry);
         return true;
     });
+    // APS5_COPYBACK_NARROW=1: one leading barrier for the copies and the delta kernels together,
+    // with only the stages and accesses they use, left out when the last recorded barrier already
+    // made every earlier write visible to those accesses (a dispatch's trailing barrier: the
+    // recorder's covered accesses, as the dispatches' own leading barrier elision reads them),
+    // and one trailing barrier from the stages that ran. Without it: a pair per kind, as before.
+    static const bool narrow = std::getenv("APS5_COPYBACK_NARROW") != nullptr;
+    const VkAccessFlags leadingAccess = (copies.empty() ? 0 : VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT) | (deltas.empty() ? 0 : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    const VkPipelineStageFlags usedStages = (copies.empty() ? 0 : VK_PIPELINE_STAGE_TRANSFER_BIT) | (deltas.empty() ? 0 : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    static std::uint64_t leadingSkipped = 0;
+    if (narrow) {
+        if ((open->coveredAccess & leadingAccess) == leadingAccess) {
+            ++leadingSkipped;
+        } else {
+            recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, usedStages, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, leadingAccess);
+            CountBarriers(CommandClass::StagingOut);
+        }
+    } else {
+        // The shaders' stores into the shadows and earlier writes into the imports precede the copies.
+        recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        CountBarriers(CommandClass::StagingOut);
+    }
     std::stable_sort(copies.begin(), copies.end(), [](const auto& left, const auto& right) { return std::tie(left.source, left.destination) < std::tie(right.source, right.destination); });
     std::vector<VkBufferCopy> regions;
     std::uint64_t bytes = 0;
     std::uint64_t recorded = 0;
     if (!deltas.empty()) {
-        recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        if (!narrow) recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, deltaCopyPipeline);
         for (const auto& entry : deltas) {
             struct {
@@ -1916,8 +1934,10 @@ void Recorder::FlushDeferredCopies(CopyFlush reason) {
             bytes += entry.bytes;
             ++recorded;
         }
-        recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT);
-        CountBarriers(CommandClass::StagingOut, 2);
+        if (!narrow) {
+            recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+            CountBarriers(CommandClass::StagingOut, 2);
+        }
         // A later compute dispatch rebinds its own pipeline.
     }
     const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
@@ -1933,7 +1953,11 @@ void Recorder::FlushDeferredCopies(CopyFlush reason) {
         at = next;
     }
     constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
-    recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
+    if (narrow) {
+        recordBarrier(commands, usedStages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, (copies.empty() ? 0 : VK_ACCESS_TRANSFER_WRITE_BIT) | (deltas.empty() ? 0 : VK_ACCESS_SHADER_WRITE_BIT), copiedAccess);
+    } else {
+        recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
+    }
     CountBarriers(CommandClass::StagingOut);
     open->coveredAccess |= copiedAccess;
     EndGpuTiming(timing, bytes);
@@ -1949,7 +1973,7 @@ void Recorder::FlushDeferredCopies(CopyFlush reason) {
         static constexpr const char* names[static_cast<std::size_t>(CopyFlush::Count)] = {"commands", "submit", "store-run", "key-stores", "dispatch", "copy-in", "conflict"};
         std::string text;
         for (std::size_t index = 0; index < stats.reasons.size(); ++index) text += std::string(" ") + names[index] + " " + std::to_string(stats.reasons[index]);
-        AgcDriver::ReportLine("[copyback-batch] %.1f s: %llu copies back deferred (%llu duplicates dropped), %llu flushes (%.1f copies, %.2f MiB each; %llu vkCmdCopyBuffer) by reason:%s\n", std::chrono::duration<double>(now - stats.last).count(), static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.deduplicated), static_cast<unsigned long long>(stats.flushes), stats.flushes != 0 ? double(stats.flushedCopies) / stats.flushes : 0.0, stats.flushes != 0 ? stats.bytes / 1048576.0 / stats.flushes : 0.0, static_cast<unsigned long long>(stats.commands), text.c_str());
+        AgcDriver::ReportLine("[copyback-batch] %.1f s: %llu leading barriers left out (cumulative), %llu copies back deferred (%llu duplicates dropped), %llu flushes (%.1f copies, %.2f MiB each; %llu vkCmdCopyBuffer) by reason:%s\n", std::chrono::duration<double>(now - stats.last).count(), static_cast<unsigned long long>(leadingSkipped), static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.deduplicated), static_cast<unsigned long long>(stats.flushes), stats.flushes != 0 ? double(stats.flushedCopies) / stats.flushes : 0.0, stats.flushes != 0 ? stats.bytes / 1048576.0 / stats.flushes : 0.0, static_cast<unsigned long long>(stats.commands), text.c_str());
         stats = CopyBatchStats{};
         stats.last = now;
     }
