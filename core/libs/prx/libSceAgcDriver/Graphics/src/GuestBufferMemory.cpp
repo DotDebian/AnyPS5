@@ -3159,6 +3159,9 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     else RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
     bool stagedAny = false;
+    // APS5_COPYBACK_DELTA: shadows refilled from their imports, whose references take the same
+    // bytes from them in video memory after the copies.
+    std::vector<const Region*> referenceFills;
     std::uint64_t copiedBytes = 0;
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
@@ -3212,10 +3215,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
-        if (region->deviceLocal && region->resident != nullptr && region->resident->buffer == region->buffer && region->resident->reference != nullptr) {
-            CopyBuffer(context, commands, copySource, copyOffset, region->resident->reference->Handle(), 0, bytes);
-            recorder->Keep(region->resident->reference);
-        }
+        if (region->deviceLocal && region->resident != nullptr && region->resident->buffer == region->buffer && region->resident->reference != nullptr) referenceFills.push_back(region);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -3249,6 +3249,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 Copies().stagedInBytes.fetch_add(bytes, std::memory_order_relaxed);
                 if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
             }
+        }
+    }
+    if (!referenceFills.empty()) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        for (const auto* region : referenceFills) {
+            CopyBuffer(context, commands, region->buffer->Handle(), 0, region->resident->reference->Handle(), 0, region->end - region->begin);
+            recorder->Keep(region->resident->reference);
         }
     }
     if (stagedAny) reportStaging();
