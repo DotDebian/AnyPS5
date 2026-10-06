@@ -148,6 +148,8 @@ public:
     // `registryGeneration`: GuestAllocationsGeneration read before the copy, like `generation`.
     // `derived`: a value computed from the copied bytes, returned with the snapshot on reuse.
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    std::shared_ptr<Buffer> DerivedDrawBuffer(const std::shared_ptr<Buffer>& copy, std::uint64_t key, std::uint32_t& value) const;
+    void KeepDerivedDrawBuffer(const std::shared_ptr<Buffer>& copy, std::uint64_t key, std::shared_ptr<Buffer> derived, std::uint32_t value);
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
@@ -882,6 +884,13 @@ private:
         std::size_t bytes = 0;
     };
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
+    struct DerivedDrawBufferEntry {
+        std::weak_ptr<Buffer> copy;
+        std::shared_ptr<Buffer> derived;
+        std::uint32_t value = 0;
+    };
+    std::map<std::pair<const Buffer*, std::uint64_t>, DerivedDrawBufferEntry> derivedDrawBuffers;
+    std::size_t derivedDrawSweep = 256;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
     std::shared_ptr<Buffer> reuseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator found, std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation);

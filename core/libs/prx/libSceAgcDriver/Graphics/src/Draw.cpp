@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <functional>
 #include <optional>
@@ -480,6 +481,8 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
             add(mesh.provokingVertex);
             add(mesh.esgsItemSize);
             add(mesh.passthrough);
+            add(mesh.reuseVertices);
+            add(mesh.reusePrimitives);
         }
         add(state.stages.tessellation.has_value());
         if (state.stages.tessellation) {
@@ -629,6 +632,96 @@ MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshA
     return {groups, groups != 0 ? record.instances : 0u, groups != 0 ? 1u : 0u, effective, first};
 }
 
+MeshGroupTable BuildMeshGroupTable(const ShaderRecompiler::MeshConfiguration& mesh, std::span<const std::byte> indices, std::uint32_t indexSize, std::uint32_t indexCount) {
+    const auto size = mesh.inputPrimitive == 1 ? 1u : mesh.inputPrimitive == 2 ? 2u : 3u;
+    const auto step = mesh.inputPrimitive == 5 || mesh.inputPrimitive == 6 ? 1u : size;
+    const auto vertexLimit = mesh.reuseVertices;
+    const auto primitiveLimit = mesh.reusePrimitives;
+    Require(vertexLimit >= size && vertexLimit <= 0x3ffu && primitiveLimit != 0 && primitiveLimit <= 0xffffu, "invalid mesh vertex-reuse limits");
+    Require(indexSize == 2 || indexSize == 4, "only uint16 and uint32 index buffers are supported");
+    Require(indexCount >= size && static_cast<std::uint64_t>(indexCount) * indexSize <= indices.size(), "mesh group table index range");
+    const auto primitives = (indexCount - size) / step + 1u;
+    const auto stride = ShaderRecompiler::MeshGroupTableStride(mesh);
+    const auto at = [&](std::uint32_t position) -> std::uint32_t {
+        if (indexSize == 2) {
+            std::uint16_t value;
+            std::memcpy(&value, indices.data() + 2u * static_cast<std::size_t>(position), sizeof(value));
+            return value;
+        }
+        std::uint32_t value;
+        std::memcpy(&value, indices.data() + 4u * static_cast<std::size_t>(position), sizeof(value));
+        return value;
+    };
+    const auto positions = [&](std::uint32_t p, std::array<std::uint32_t, 3>& out) {
+        if (mesh.inputPrimitive == 5) {
+            out = {p + 1u, p + 2u, 0u};
+        } else if (mesh.inputPrimitive == 6) {
+            const auto parity = p & 1u;
+            out = {p + parity, p + 1u - parity, p + 2u};
+        } else {
+            for (std::uint32_t k = 0; k < size; ++k) out[k] = p * size + k;
+        }
+    };
+    const std::size_t slots = std::bit_ceil(std::max<std::size_t>(16u, 2u * vertexLimit));
+    const auto shift = static_cast<std::uint32_t>(32 - std::countr_zero(slots));
+    std::vector<std::uint32_t> keys(slots), locals(slots), stamps(slots, 0u);
+    std::uint32_t stamp = 0;
+    const auto slotOf = [&](std::uint32_t value) {
+        auto slot = static_cast<std::size_t>((value * 0x9e3779b1u) >> shift);
+        while (stamps[slot] == stamp && keys[slot] != value) slot = (slot + 1u) & (slots - 1u);
+        return slot;
+    };
+    MeshGroupTable table;
+    table.words.assign(ShaderRecompiler::MeshArgumentBytes / 4u, 0u);
+    table.words.reserve(table.words.size() + static_cast<std::size_t>(primitives / primitiveLimit + 1u) * stride);
+    std::size_t record = 0;
+    std::uint32_t vertices = 0, assembled = 0;
+    const auto close = [&] {
+        if (table.groups != 0) table.words[record + 1u] = vertices | (assembled << 16u);
+    };
+    const auto open = [&](std::uint32_t first) {
+        close();
+        record = table.words.size();
+        table.words.resize(record + stride, 0u);
+        table.words[record] = first;
+        vertices = 0;
+        assembled = 0;
+        ++stamp;
+        ++table.groups;
+    };
+    std::array<std::uint32_t, 3> position{};
+    std::array<std::uint32_t, 3> value{};
+    for (std::uint32_t p = 0; p < primitives; ++p) {
+        positions(p, position);
+        std::uint32_t fresh = 0;
+        for (std::uint32_t k = 0; k < size; ++k) {
+            value[k] = at(position[k]);
+            bool seen = table.groups != 0 && stamps[slotOf(value[k])] == stamp;
+            for (std::uint32_t j = 0; j < k && !seen; ++j) seen = value[j] == value[k];
+            if (!seen) ++fresh;
+        }
+        if (table.groups == 0 || assembled == primitiveLimit || vertices + fresh > vertexLimit) open(p);
+        std::uint32_t packed = 0;
+        for (std::uint32_t k = 0; k < size; ++k) {
+            const auto slot = slotOf(value[k]);
+            if (stamps[slot] != stamp) {
+                stamps[slot] = stamp;
+                keys[slot] = value[k];
+                locals[slot] = vertices;
+                table.words[record + ShaderRecompiler::MeshGroupRecordHeaderDwords + vertices] = value[k];
+                ++vertices;
+            }
+            packed |= locals[slot] << (10u * k);
+        }
+        table.words[record + ShaderRecompiler::MeshGroupRecordHeaderDwords + vertexLimit + assembled] = packed;
+        ++assembled;
+    }
+    close();
+    const MeshArguments arguments{table.groups, 1u, 1u, indexCount, 0u, stride};
+    std::memcpy(table.words.data(), &arguments, sizeof(arguments));
+    return table;
+}
+
 std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters() {
     // Never destroyed: a completion action of a batch still in flight at static teardown may erase from it.
     static auto* const writers = new std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>>(std::make_shared<std::vector<std::shared_ptr<ShaderResources>>>());
@@ -776,7 +869,64 @@ struct DrawInputs {
     std::set<std::uint32_t> fragmentOutputs;
     VkPipelineStageFlags shaderStages = 0;
     std::uint32_t meshGroups = 0;
+    std::shared_ptr<Buffer> meshTable;
 };
+
+std::shared_ptr<Buffer> meshGroupTable(const Context& context, const ShaderRecompiler::MeshConfiguration& mesh, const std::shared_ptr<Buffer>& indices, std::uint32_t indexSize, std::uint32_t indexCount, std::uint32_t& groups) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::mutex profileMutex;
+    static std::uint64_t built = 0, reused = 0, builtGroups = 0, builtBytes = 0;
+    static double buildUs = 0;
+    static auto last = std::chrono::steady_clock::now();
+    const auto count = [&](bool fresh, std::uint64_t madeGroups, std::uint64_t bytes, double us) {
+        if (!profile) return;
+        std::lock_guard lock(profileMutex);
+        if (fresh) {
+            ++built;
+            builtGroups += madeGroups;
+            builtBytes += bytes;
+            buildUs += us;
+        } else {
+            ++reused;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::seconds(10)) return;
+        last = now;
+        std::fprintf(stderr, "[meshtable] group tables (10 s): built %llu (%.1f ms, %llu groups, %.1f MiB), reused %llu\n", static_cast<unsigned long long>(built), buildUs / 1000.0, static_cast<unsigned long long>(builtGroups), builtBytes / 1048576.0, static_cast<unsigned long long>(reused));
+        built = reused = builtGroups = builtBytes = 0;
+        buildUs = 0;
+    };
+    const auto key = static_cast<std::uint64_t>(indexCount) | (static_cast<std::uint64_t>(mesh.reuseVertices) << 32u) | (static_cast<std::uint64_t>(mesh.reusePrimitives) << 42u) | (static_cast<std::uint64_t>(mesh.inputPrimitive & 7u) << 58u) | (static_cast<std::uint64_t>(indexSize == 4 ? 1u : 0u) << 61u);
+    Require(mesh.reuseVertices <= 0x3ffu && mesh.reusePrimitives <= 0xffffu && mesh.inputPrimitive <= 7u, "invalid mesh vertex-reuse limits");
+    auto* recorder = context.recorder;
+    if (recorder != nullptr) {
+        if (auto table = recorder->DerivedDrawBuffer(indices, key, groups)) {
+            count(false, 0, 0, 0);
+            return table;
+        }
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const auto made = BuildMeshGroupTable(mesh, indices->Bytes(), indexSize, indexCount);
+    const auto bytes = made.words.size() * sizeof(std::uint32_t);
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    constexpr VkMemoryPropertyFlags deviceLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    bool local = false;
+    for (std::uint32_t type = 0; type < context.memory.memoryTypeCount && !local; ++type) local = (context.memory.memoryTypes[type].propertyFlags & deviceLocal) == deviceLocal;
+    std::shared_ptr<Buffer> table;
+    if (local) {
+        try {
+            table = std::make_shared<Buffer>(context, bytes, usage, deviceLocal);
+        } catch (const std::runtime_error&) {
+            table = nullptr;
+        }
+    }
+    if (table == nullptr) table = std::make_shared<Buffer>(context, bytes, usage);
+    std::memcpy(table->Bytes().data(), made.words.data(), bytes);
+    groups = made.groups;
+    if (recorder != nullptr) recorder->KeepDerivedDrawBuffer(indices, key, table, made.groups);
+    count(true, made.groups, bytes, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count());
+    return table;
+}
 
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
 // stages and the vertex input layout are the recipe's (derived from the same compiled stages)
@@ -807,6 +957,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     }
     if (args == nullptr) Require(draw.indexCount != 0 && draw.instanceCount != 0, "zero-count indexed draws are unsupported");
     else Require((!state.stages.mesh || draw.indexed) && !state.stages.tessellation && !state.rectList, "indirect draw on a non-vertex path must be resolved by the driver");
+    if (args != nullptr && state.stages.mesh && state.stages.mesh->reuseVertices != 0) {
+        static std::once_flag reported;
+        std::call_once(reported, [] { std::fprintf(stderr, "[gpu] indirect geometry draws take their subgroups without vertex reuse\n"); });
+    }
     inputs.indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
     const auto indexBytes = inputs.indexBytes;
     APS5_LOG_OUT_DEBUG("Index buffer bytes=%llu", static_cast<unsigned long long>(indexBytes));
@@ -867,6 +1021,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
         Require(highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         Require(!state.stages.mesh || state.stages.mesh->inputPrimitive != 5 || !state.primitiveRestart || highest != (draw.indexSize == 2 ? 0xffffu : 0xffffffffu), "primitive restart in a triangle fan geometry draw is unsupported");
+        if (state.stages.mesh && state.stages.mesh->reuseVertices != 0 && args == nullptr) {
+            inputs.meshTable = meshGroupTable(context, *state.stages.mesh, copy.buffer, draw.indexSize, draw.indexCount, inputs.meshGroups);
+            APS5_LOG_OUT_DEBUG("Mesh vertex-reuse groups=%u", inputs.meshGroups);
+            Require(inputs.meshGroups <= context.meshLimits.maxMeshWorkGroupCount[0] && static_cast<std::uint64_t>(inputs.meshGroups) * draw.instanceCount <= context.meshLimits.maxMeshWorkGroupTotalCount, "mesh draw exceeds workgroup count limits");
+        }
         inputs.maxIndex = highest;
         inputs.indices = std::move(copy.buffer);
     }
@@ -1414,7 +1573,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
     std::unique_ptr<DeviceBuffer> scratch;
-    std::shared_ptr<Buffer> meshArguments;
+    std::shared_ptr<Buffer> meshArguments = inputs.meshTable;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
@@ -1869,7 +2028,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, 0, 1, &upload, 0, nullptr, 0, nullptr);
     countBarrier();
     APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");
-    std::shared_ptr<Buffer> meshArguments;
+    std::shared_ptr<Buffer> meshArguments = inputs.meshTable;
     if (state.stages.mesh && args != nullptr) {
         meshArguments = recordMeshArguments(context, commands, recorder, recorded, state, draw, indirect, countBarrier);
         argumentBuffer = meshArguments->Handle();

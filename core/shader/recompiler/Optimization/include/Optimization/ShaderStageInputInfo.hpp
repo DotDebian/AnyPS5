@@ -117,6 +117,8 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
     std::uint32_t provokingVertex = 0;
     std::uint32_t esgsItemSize = 0;
     bool passthrough = false;
+    std::uint32_t reuseVertices = 0;
+    std::uint32_t reusePrimitives = 0;
 
     // The vertices of one input primitive: VGT_PRIMITIVE_TYPE point list (1), line list (2), else
     // a triangle list (4), fan (5) or strip (6).

@@ -87,6 +87,8 @@ private:
         if (mesh == nullptr) return;
         append(key, mesh->passthrough);
         for (const auto value : {mesh->inputPrimitive, mesh->primitivesPerGroup, mesh->verticesPerGroup, mesh->maxVertices, mesh->maxPrimitives, mesh->threadsPerGroup, mesh->ldsSizeDwords, mesh->provokingVertex, mesh->esgsItemSize}) append(key, value);
+        append(key, mesh->reuseVertices);
+        append(key, mesh->reusePrimitives);
     }
 
     template<typename TValue>

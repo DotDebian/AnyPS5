@@ -82,7 +82,7 @@ static_assert(sizeof(ResourceSpecialization) == 72, "ResourceSpecialization chan
 static_assert(sizeof(ResourceSpecialization::Buffer) == 16, "ResourceSpecialization::Buffer changed: update BuildKey");
 static_assert(sizeof(ResourceSpecialization::Image) == 40, "ResourceSpecialization::Image changed: update BuildKey");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
-static_assert(sizeof(RecompileRequest) == 1720, "RecompileRequest changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(RecompileRequest) == 1728, "RecompileRequest changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(SpirvTarget) == 200, "SpirvTarget changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(LocalMemoryProbeDevice) == 28, "LocalMemoryProbeDevice changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(GuestContext) == 1312, "GuestContext changed: key the new field in BuildKey or RecompileCacheKey::Build");
@@ -91,8 +91,8 @@ static_assert(sizeof(ShaderComputeStageInfo) == 36, "ShaderComputeStageInfo chan
 static_assert(sizeof(ShaderPixelStageInfo) == 184, "ShaderPixelStageInfo changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(ShaderVertexStageInfo) == 1040, "ShaderVertexStageInfo changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(ShaderVertexResourceDestination) == 16, "ShaderVertexResourceDestination changed: key the new field in BuildKey or RecompileCacheKey::Build");
-static_assert(sizeof(GraphicsCompileContext) == 120, "GraphicsCompileContext changed: key the new field in BuildKey or RecompileCacheKey::Build");
-static_assert(sizeof(MeshConfiguration) == 40, "MeshConfiguration changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(GraphicsCompileContext) == 128, "GraphicsCompileContext changed: key the new field in BuildKey or RecompileCacheKey::Build");
+static_assert(sizeof(MeshConfiguration) == 48, "MeshConfiguration changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(MeshTargetLimits) == 44, "MeshTargetLimits changed: key the new field in BuildKey or RecompileCacheKey::Build");
 static_assert(sizeof(TessellationTargetLimits) == 28, "TessellationTargetLimits changed: key the new field in BuildKey or RecompileCacheKey::Build");
 #endif

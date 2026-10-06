@@ -596,6 +596,7 @@ void ShaderStageTests() {
     auto stages = AgcDriver::Graphics::DecodeState(queue).stages;
     Require(stages.path == AgcDriver::Graphics::ShaderPath::Geometry && stages.mesh && stages.mesh->primitivesPerGroup == 21 && stages.mesh->verticesPerGroup == 63, "geometry assembly changed");
     Require(stages.mesh->maxVertices == 64 && stages.mesh->maxPrimitives == 21 && stages.mesh->threadsPerGroup == 64 && stages.mesh->esgsItemSize == 4, "geometry subgroup outputs changed");
+    Require(stages.mesh->reuseVertices == 64 && stages.mesh->reusePrimitives == 21, "geometry vertex-reuse limits changed");
     for (const auto routing : {0x02002000u, 0x02002010u, 0x02402000u, 0x02402010u}) {
         queue.context[0x2d5] = routing;
         queue.context[0x2ce] = 0;
@@ -603,6 +604,17 @@ void ShaderStageTests() {
         const auto pass = AgcDriver::Graphics::DecodeState(queue).stages;
         Require(pass.path == AgcDriver::Graphics::ShaderPath::Geometry && pass.mesh && pass.mesh->passthrough && pass.mesh->verticesPerGroup == 63 && pass.mesh->primitivesPerGroup == 21, "passthrough subgroup assembly changed");
         Require(pass.vertexWaveSize == ((routing & 0x00400000u) ? 32u : 64u), "passthrough wave size changed");
+        Require(pass.mesh->reuseVertices == 64 && pass.mesh->reusePrimitives == 21, "passthrough vertex-reuse limits changed");
+    }
+    {
+        auto robots = queue;
+        robots.context[0x2d5] = 0x02002000u;
+        robots.context[0x2ce] = 0;
+        robots.context[0x29b] = 0;
+        robots.userConfig[0x25b] = 0x8040u;
+        const auto pass = AgcDriver::Graphics::DecodeState(robots).stages;
+        Require(pass.mesh && pass.mesh->passthrough && pass.mesh->primitivesPerGroup == 21 && pass.mesh->verticesPerGroup == 63 && pass.mesh->threadsPerGroup == 64 && pass.mesh->maxVertices == 64 && pass.mesh->maxPrimitives == 64, "64-vertex, 64-primitive passthrough subgroup assembly changed");
+        Require(pass.mesh->reuseVertices == 64 && pass.mesh->reusePrimitives == 64, "64-vertex, 64-primitive passthrough subgroups do not reuse vertices up to GE_CNTL");
     }
     {
         auto fan = makeState();
@@ -624,6 +636,7 @@ void ShaderStageTests() {
         Require(state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && state.primitiveRestart && state.stages.path == AgcDriver::Graphics::ShaderPath::Geometry && state.stages.mesh && !state.stages.mesh->passthrough, "a triangle fan did not decode as geometry input");
         const auto& mesh = *state.stages.mesh;
         Require(mesh.inputPrimitive == 5 && mesh.primitivesPerGroup == 30 && mesh.verticesPerGroup == 32 && mesh.maxVertices == 256 && mesh.maxPrimitives == 192 && mesh.threadsPerGroup == 256 && mesh.esgsItemSize == 4, "triangle fan subgroup assembly changed");
+        Require(mesh.reuseVertices == 32 && mesh.reusePrimitives == 32, "triangle fan vertex-reuse limits changed");
         fan.userConfig[0x25b] = (3u << 9u) | 3u;
         Require(AgcDriver::Graphics::DecodeState(fan).stages.mesh->primitivesPerGroup == 1, "a three-vertex subgroup did not take one fan triangle");
         fan.userConfig[0x25b] = (2u << 9u) | 3u;
@@ -2725,7 +2738,7 @@ void meshArgumentTests() {
     const ShaderRecompiler::MeshConfiguration triangles{4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u};
     const ShaderRecompiler::MeshConfiguration strip{6u, 8u, 10u, 10u, 8u, 64u, 1024u, 0u, 4u};
     const ShaderRecompiler::MeshConfiguration fan{5u, 30u, 32u, 256u, 192u, 256u, 1024u, 0u, 4u};
-    const auto same = [](const MeshArguments& a, const MeshArguments& b) { return a.groups == b.groups && a.instances == b.instances && a.layers == b.layers && a.indexCount == b.indexCount && a.firstIndex == b.firstIndex; };
+    const auto same = [](const MeshArguments& a, const MeshArguments& b) { return a.groups == b.groups && a.instances == b.instances && a.layers == b.layers && a.indexCount == b.indexCount && a.firstIndex == b.firstIndex && a.groupStride == 0 && b.groupStride == 0; };
     const auto rules = [&](const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t indexCount) { return AgcDriver::Graphics::MeshArgumentRulesFor(context, mesh, indexCount); };
     const auto record = [](std::uint32_t count, std::uint32_t instances, std::uint32_t first) { return AgcDriver::Pm4::DrawArguments{count, instances, first, 0, 0}; };
     Require(same(ResolveMeshArguments(record(1, 512, 0), rules(points, 1)), {1, 512, 1, 1, 0}), "one point, 512 instances");
@@ -2747,6 +2760,170 @@ void meshArgumentTests() {
     Require(same(ResolveMeshArguments(record(96 * 6, 600, 0), rules(triangles, 96 * 6)), {6, 600, 1, 96 * 6, 0}), "groups times instances at the device limit");
     Require(same(ResolveMeshArguments(record(0xffffffffu, 1, 0xfffffff0u), rules(points, 0xffffffffu)), {15, 1, 1, 15, 0xfffffff0u}), "first index near the end of a huge index buffer");
     Require(same(ResolveMeshArguments(record(0xffffffffu, 1, 0), rules(points, 0xffffffffu)), {0, 0, 0, 0xffffffffu, 0}), "groups over the device limit draw nothing");
+}
+
+std::vector<std::vector<std::uint32_t>> meshPrimitives(std::uint32_t topology, const std::vector<std::uint32_t>& values) {
+    const std::uint32_t size = topology == 1 ? 1u : topology == 2 ? 2u : 3u;
+    const std::uint32_t step = topology == 5 || topology == 6 ? 1u : size;
+    std::vector<std::vector<std::uint32_t>> result;
+    if (values.size() < size) return result;
+    for (std::uint32_t p = 0; p <= (values.size() - size) / step; ++p) {
+        if (topology == 5) result.push_back({values[p + 1], values[p + 2], values[0]});
+        else if (topology == 6) result.push_back(p % 2 == 0 ? std::vector<std::uint32_t>{values[p], values[p + 1], values[p + 2]} : std::vector<std::uint32_t>{values[p + 1], values[p], values[p + 2]});
+        else result.emplace_back(values.begin() + p * size, values.begin() + p * size + size);
+    }
+    return result;
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> meshHardwareGroups(const std::vector<std::vector<std::uint32_t>>& primitives, std::uint32_t vertexLimit, std::uint32_t primitiveLimit) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> groups;
+    std::set<std::uint32_t> open;
+    std::uint32_t count = 0;
+    for (const auto& primitive : primitives) {
+        std::set<std::uint32_t> merged = open;
+        merged.insert(primitive.begin(), primitive.end());
+        if (groups.empty() || count == primitiveLimit || merged.size() > vertexLimit) {
+            if (!groups.empty()) groups.back() = {static_cast<std::uint32_t>(open.size()), count};
+            groups.emplace_back(0u, 0u);
+            open.clear();
+            count = 0;
+            merged = std::set<std::uint32_t>(primitive.begin(), primitive.end());
+        }
+        open = std::move(merged);
+        ++count;
+    }
+    if (!groups.empty()) groups.back() = {static_cast<std::uint32_t>(open.size()), count};
+    return groups;
+}
+
+AgcDriver::Graphics::MeshGroupTable checkMeshGroupTable(const std::string& what, std::uint32_t topology, std::uint32_t vertexLimit, std::uint32_t primitiveLimit, const std::vector<std::uint32_t>& values, std::uint32_t indexSize) {
+    ShaderRecompiler::MeshConfiguration mesh{topology, 1u, 3u, 256u, 256u, 256u, 1024u, 0u, 4u};
+    mesh.reuseVertices = vertexLimit;
+    mesh.reusePrimitives = primitiveLimit;
+    std::vector<std::byte> bytes(values.size() * indexSize);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (indexSize == 2) {
+            const auto value = static_cast<std::uint16_t>(values[i]);
+            std::memcpy(bytes.data() + 2 * i, &value, 2);
+        } else {
+            std::memcpy(bytes.data() + 4 * i, &values[i], 4);
+        }
+    }
+    const auto table = AgcDriver::Graphics::BuildMeshGroupTable(mesh, bytes, indexSize, static_cast<std::uint32_t>(values.size()));
+    std::vector<std::uint32_t> truncated(values);
+    if (indexSize == 2) for (auto& value : truncated) value &= 0xffffu;
+    const auto expected = meshPrimitives(topology, truncated);
+    const auto hardware = meshHardwareGroups(expected, vertexLimit, primitiveLimit);
+    const std::uint32_t size = topology == 1 ? 1u : topology == 2 ? 2u : 3u;
+    const auto stride = ShaderRecompiler::MeshGroupTableStride(mesh);
+    const auto& words = table.words;
+    Require(table.groups == hardware.size(), what + ": " + std::to_string(table.groups) + " groups, the hardware forms " + std::to_string(hardware.size()));
+    Require(words.size() == ShaderRecompiler::MeshArgumentBytes / 4 + static_cast<std::size_t>(table.groups) * stride, what + ": table size");
+    Require(words[0] == table.groups && words[1] == 1 && words[2] == 1 && words[3] == values.size() && words[4] == 0 && words[ShaderRecompiler::MeshArgumentGroupStrideDword] == stride, what + ": arguments");
+    std::uint32_t next = 0;
+    for (std::uint32_t group = 0; group < table.groups; ++group) {
+        const auto* record = words.data() + ShaderRecompiler::MeshArgumentBytes / 4 + static_cast<std::size_t>(group) * stride;
+        const auto vertices = record[1] & 0xffffu;
+        const auto primitives = record[1] >> 16u;
+        const auto name = what + ": group " + std::to_string(group);
+        Require(std::pair{vertices, primitives} == hardware[group], name + " has " + std::to_string(vertices) + " vertices and " + std::to_string(primitives) + " primitives, the hardware " + std::to_string(hardware[group].first) + " and " + std::to_string(hardware[group].second));
+        Require(record[0] == next, name + " does not continue the draw's primitives");
+        const auto* list = record + ShaderRecompiler::MeshGroupRecordHeaderDwords;
+        const auto* packed = list + vertexLimit;
+        Require(std::set<std::uint32_t>(list, list + vertices).size() == vertices, name + " lists a vertex twice");
+        for (std::uint32_t i = vertices; i < vertexLimit; ++i) Require(list[i] == 0, name + " has a value past its vertices");
+        for (std::uint32_t i = primitives; i < primitiveLimit; ++i) Require(packed[i] == 0, name + " has a primitive past its count");
+        std::vector<bool> used(vertices, false);
+        std::uint32_t firstUse = 0;
+        for (std::uint32_t p = 0; p < primitives; ++p) {
+            Require(next + p < expected.size(), name + " has more primitives than the draw");
+            for (std::uint32_t k = 0; k < 3; ++k) {
+                const auto local = (packed[p] >> (10u * k)) & 0x3ffu;
+                if (k >= size) {
+                    Require(local == 0, name + " sets an unused vertex field");
+                    continue;
+                }
+                Require(local < vertices && list[local] == expected[next + p][k], name + " primitive " + std::to_string(p) + " vertex " + std::to_string(k) + " differs from the program without reuse");
+                if (!used[local]) {
+                    Require(local == firstUse++, name + " does not list vertices in first-use order");
+                    used[local] = true;
+                }
+            }
+            Require((packed[p] >> 30u) == 0, name + " sets the top bits");
+        }
+        Require(firstUse == vertices, name + " lists a vertex no primitive uses");
+        next += primitives;
+    }
+    Require(next == expected.size(), what + ": " + std::to_string(next) + " primitives, the draw has " + std::to_string(expected.size()));
+    return table;
+}
+
+void meshGroupTableTests() {
+    std::vector<std::uint32_t> grid;
+    for (std::uint32_t y = 0; y < 8; ++y) {
+        for (std::uint32_t x = 0; x < 12; ++x) {
+            const auto v = y * 13 + x;
+            for (const auto value : {v, v + 1, v + 13, v + 1, v + 14, v + 13}) grid.push_back(value);
+        }
+    }
+    for (const auto indexSize : {2u, 4u}) {
+        const auto table = checkMeshGroupTable("grid", 4, 64, 64, grid, indexSize);
+        Require(table.groups < (grid.size() / 3 + 20) / 21, "the grid took as many groups as without reuse");
+        checkMeshGroupTable("grid, 128 primitives", 4, 64, 128, grid, indexSize);
+        checkMeshGroupTable("grid, small subgroups", 4, 6, 4, grid, indexSize);
+    }
+    std::vector<std::uint32_t> shared;
+    for (std::uint32_t t = 0; t < 200; ++t) {
+        for (const auto value : {0u, t + 1, t + 2}) shared.push_back(value);
+    }
+    const auto sharedTable = checkMeshGroupTable("shared vertex", 4, 64, 64, shared, 2);
+    for (std::uint32_t group = 0; group < sharedTable.groups; ++group) Require(sharedTable.words[ShaderRecompiler::MeshArgumentBytes / 4 + group * ShaderRecompiler::MeshGroupTableStride({4u, 1u, 3u, 256u, 256u, 256u, 1024u, 0u, 4u, false, 64u, 64u}) + ShaderRecompiler::MeshGroupRecordHeaderDwords] == 0, "a group does not start with the shared vertex");
+    std::vector<std::uint32_t> separate(3 * 100);
+    for (std::uint32_t i = 0; i < separate.size(); ++i) separate[i] = i;
+    for (const auto [limit, perGroup] : {std::pair{64u, 21u}, std::pair{63u, 21u}, std::pair{62u, 20u}, std::pair{3u, 1u}}) {
+        const auto table = checkMeshGroupTable("separate triangles, " + std::to_string(limit) + " vertices", 4, limit, 64, separate, 2);
+        Require(table.groups == (100 + perGroup - 1) / perGroup, "separate triangles took " + std::to_string(table.groups) + " groups");
+    }
+    const std::vector<std::uint32_t> single(3 * 10, 7u);
+    Require(checkMeshGroupTable("one vertex", 4, 3, 4, single, 2).groups == 3, "ten triangles of one vertex did not take three groups of four");
+    checkMeshGroupTable("degenerate", 4, 64, 64, {5, 5, 6, 7, 7, 7, 5, 6, 8, 0xffff, 1, 0xffff, 2, 3, 0xffff}, 2);
+    checkMeshGroupTable("restart value", 4, 6, 64, {0xffff, 1, 2, 3, 0xffff, 4, 5, 6, 0xffff, 1, 2, 3}, 2);
+    checkMeshGroupTable("32-bit values", 4, 6, 64, {0xffffffffu, 0x1000000u, 0x10000u, 0xffffffffu, 2, 0x1000000u, 0x7fffffffu, 0x80000000u, 0xfffffffeu}, 4);
+    checkMeshGroupTable("trailing indices", 4, 64, 64, {0, 1, 2, 3, 4}, 2);
+    std::vector<std::uint32_t> strip(40);
+    for (std::uint32_t i = 0; i < strip.size(); ++i) strip[i] = (i * 7) % 23;
+    checkMeshGroupTable("strip", 6, 8, 5, strip, 2);
+    checkMeshGroupTable("fan", 5, 8, 5, strip, 4);
+    checkMeshGroupTable("lines", 2, 4, 3, strip, 2);
+    checkMeshGroupTable("points", 1, 4, 3, strip, 2);
+    std::uint64_t seed = 0x9e3779b97f4a7c15ull;
+    const auto random = [&](std::uint32_t bound) {
+        seed ^= seed << 13u;
+        seed ^= seed >> 7u;
+        seed ^= seed << 17u;
+        return static_cast<std::uint32_t>(seed % bound);
+    };
+    for (std::uint32_t round = 0; round < 300; ++round) {
+        const std::uint32_t topology = std::array<std::uint32_t, 5>{1u, 2u, 4u, 5u, 6u}[random(5)];
+        const std::uint32_t size = topology == 1 ? 1u : topology == 2 ? 2u : 3u;
+        const auto indexSize = random(2) == 0 ? 2u : 4u;
+        const auto vertexLimit = size + random(80);
+        const auto primitiveLimit = 1u + random(130);
+        std::vector<std::uint32_t> values(size + random(2000));
+        std::uint32_t base = random(1000);
+        for (auto& value : values) {
+            if (random(50) == 0) base = random(indexSize == 2 ? 0xffffu : 0xfffffff0u);
+            value = base + random(40);
+        }
+        checkMeshGroupTable("random draw " + std::to_string(round), topology, vertexLimit, primitiveLimit, values, indexSize);
+    }
+    ShaderRecompiler::MeshConfiguration invalid{4u, 1u, 3u, 256u, 256u, 256u, 1024u, 0u, 4u};
+    invalid.reuseVertices = 2;
+    invalid.reusePrimitives = 4;
+    const std::array<std::byte, 6> few{};
+    expectFailure([&] { static_cast<void>(AgcDriver::Graphics::BuildMeshGroupTable(invalid, few, 2, 3)); }, "invalid mesh vertex-reuse limits");
+    invalid.reuseVertices = 3;
+    expectFailure([&] { static_cast<void>(AgcDriver::Graphics::BuildMeshGroupTable(invalid, few, 2, 4)); }, "mesh group table index range");
 }
 
 void debugBranchTests() {
@@ -2803,6 +2980,7 @@ int main() {
         misalignedShaderDataTests();
         debugBranchTests();
         meshArgumentTests();
+        meshGroupTableTests();
         parallelCompareTests();
         validationTests();
         vertexCopyTests();

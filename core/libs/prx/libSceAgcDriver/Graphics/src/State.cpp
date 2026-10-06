@@ -550,9 +550,17 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
         validate(((read(queue.shader, 0x8a, RegisterBank::Shader) >> 29u) & 3u) == 3 && ((resources >> 16u) & 3u) == 3, "unsupported geometry VGPR allocation");
         const auto esgsItemSize = read(queue.context, 0x2ab);
         validate(esgsItemSize != 0 && esgsItemSize * vertices <= 0xffffu, "invalid VGT_ESGS_RING_ITEMSIZE");
-        const auto threads = std::max({(groupPrimitives - 1u) * inputStep + inputSize, primitives, maxVertices, primitives * (verticesPerPrimitive - 2u)});
+        static const bool vertexReuse = std::getenv("APS5_NO_NGG_VERTEX_REUSE") == nullptr;
+        const auto reuseVertices = vertexReuse ? (passthrough ? std::min(vertices, maxVertices) : vertices) : 0u;
+        const auto reusePrimitives = vertexReuse ? (passthrough ? primitives : std::min(primitives, maxVertices / verticesPerPrimitive)) : 0u;
+        const bool reuse = reuseVertices >= inputSize && reusePrimitives != 0u && reuseVertices <= 0x3ffu;
+        const auto threads = std::max({(groupPrimitives - 1u) * inputStep + inputSize, primitives, maxVertices, primitives * (verticesPerPrimitive - 2u), reuse ? std::max(reuseVertices, reusePrimitives) : 0u});
         result.mesh = ShaderRecompiler::MeshConfiguration{primitive, groupPrimitives, (groupPrimitives - 1u) * inputStep + inputSize, maxVertices, primitives * (verticesPerPrimitive - 2u), ((threads + result.vertexWaveSize - 1u) / result.vertexWaveSize) * result.vertexWaveSize, ((resources >> 19u) & 0xffu) * 128u, 0, esgsItemSize};
         result.mesh->passthrough = passthrough;
+        if (reuse) {
+            result.mesh->reuseVertices = reuseVertices;
+            result.mesh->reusePrimitives = reusePrimitives;
+        }
     }
     return result;
 }

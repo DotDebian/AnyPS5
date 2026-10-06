@@ -1,12 +1,14 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "Recompiler.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -38,6 +40,29 @@ alignas(256) constexpr std::array<std::uint32_t, 104> GeometryCode{
 
 alignas(256) constexpr std::array<std::uint32_t, 7> PixelCode{
     0xc8020002, 0xc8060102, 0xc80a0202, 0xc80e0302, 0xf800180f, 0x03020100, 0xbf810000,
+};
+
+// A passthrough NGG program (llvm-mc -triple=amdgcn -mcpu=gfx1030): wave 0 sends GS_ALLOC_REQ for
+// the subgroup's vertices (GS_TG_INFO, s2 [20:12]) and primitives (s2 [30:22]); the primitive
+// threads export v0 as their primitive, the vertex threads fetch their vertex v5 (32-byte records,
+// V# in s[8:11]) and export position and color.
+//
+//   s_bfe_u32 s12, s2, 0x9000c / s_bfe_u32 s13, s2, 0x90016 / s_lshl_b32 s14, s13, 12
+//   s_or_b32 m0, s12, s14 / s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)
+//   v_mbcnt_lo_u32_b32 v9, -1, 0 / v_mbcnt_hi_u32_b32 v9, -1, v9
+//   v_cmpx_gt_u32 s13, v9 / s_cbranch_execz prim_done / exp prim v0, off, off, off done
+// prim_done:
+//   s_mov_b64 exec, -1 / v_cmpx_gt_u32 s12, v9 / s_cbranch_execz end
+//   buffer_load_dwordx4 v[16:19], v5, s[8:11], 0 idxen
+//   buffer_load_dwordx4 v[20:23], v5, s[8:11], 0 idxen offset:16 / s_waitcnt vmcnt(0)
+//   exp pos0 v16, v17, v18, v19 done / exp param0 v20, v21, v22, v23
+// end:
+//   s_endpgm
+alignas(256) constexpr std::array<std::uint32_t, 28> PassthroughCode{
+    0x938cff02, 0x0009000c, 0x938dff02, 0x00090016, 0x8f0e8c0d, 0x887c0e0c, 0xbf900009, 0xd7650009,
+    0x000100c1, 0xd7660009, 0x000212c1, 0x7da8120d, 0xbf880002, 0xf8000941, 0x00000000, 0xbefe04c1,
+    0x7da8120c, 0xbf880009, 0xe0382000, 0x80021005, 0xe0382010, 0x80021405, 0xbf8c3f70, 0xf80008cf,
+    0x13121110, 0xf800020f, 0x17161514, 0xbf810000,
 };
 
 struct Vertex {
@@ -80,6 +105,18 @@ alignas(256) std::array<std::uint16_t, 3 * Triangles> Indices{};
 alignas(256) std::array<Vertex, 3 * Triangles> Ordered{};
 alignas(256) std::array<Vertex, 2 * Columns + 2> Strip{};
 
+constexpr std::uint32_t GridColumns = 12;
+constexpr std::uint32_t GridRows = 8;
+constexpr std::uint32_t GridVertices = (GridColumns + 1) * (GridRows + 1);
+constexpr std::uint32_t BigBase = 70000;
+alignas(256) std::array<Vertex, GridVertices> Grid{};
+alignas(256) std::array<Vertex, BigBase + GridVertices> BigVertices{};
+std::vector<std::uint32_t> GridList;
+alignas(256) std::array<std::uint16_t, 2048> GridIndices16{};
+alignas(256) std::array<std::uint32_t, 2048> GridIndices32{};
+alignas(256) std::array<std::uint32_t, 2048> BigIndices32{};
+alignas(256) std::array<std::uint16_t, 256> GridStrip16{};
+
 constexpr std::uint32_t FanRim = 8;
 constexpr float FanStep = 6.28318530718f / FanRim;
 alignas(256) std::array<Vertex, FanRim + 1> Fan{};
@@ -117,6 +154,7 @@ struct MeshDraw {
     std::array<std::uint32_t, 4> vertexBuffer;
     std::uint32_t geometryPushBytes = ShaderRecompiler::MeshDrawPushOffsetBytes;
     bool restart = false;
+    std::span<const std::uint32_t> code = GeometryCode;
 };
 
 void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
@@ -125,9 +163,9 @@ void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
     const auto index = AgcDriver::Graphics::MeshIndexBufferDescriptor(setup.draw, reinterpret_cast<std::uintptr_t>(GeometryCode.data()));
     std::copy(index.begin(), index.end(), userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
     std::copy(setup.vertexBuffer.begin(), setup.vertexBuffer.end(), userData.begin() + 8);
-    const std::array<ShaderRecompiler::MemoryRegion, 1> geometryMemory{{{reinterpret_cast<std::uintptr_t>(GeometryCode.data()), std::as_bytes(std::span(GeometryCode))}}};
+    const std::array<ShaderRecompiler::MemoryRegion, 1> geometryMemory{{{reinterpret_cast<std::uintptr_t>(setup.code.data()), std::as_bytes(setup.code)}}};
     ShaderRecompiler::RecompileRequest geometry{
-        {ShaderStage::Mesh, reinterpret_cast<std::uintptr_t>(GeometryCode.data()), GeometryCode, 0, {}},
+        {ShaderStage::Mesh, reinterpret_cast<std::uintptr_t>(setup.code.data()), setup.code, 0, {}},
         {64, 0, userData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, geometryMemory},
         target,
         {0, 0, 0, setup.geometryPushBytes},
@@ -239,6 +277,43 @@ int main() {
         }
         FanRestart[FanRim] = 0xffffu;
 
+        for (std::uint32_t y = 0; y <= GridRows; ++y) {
+            for (std::uint32_t x = 0; x <= GridColumns; ++x) {
+                const auto v = y * (GridColumns + 1) + x;
+                const float wobble = 0.03f * static_cast<float>((v * 7u) % 5u);
+                Grid[v] = {{-0.95f + 1.9f * static_cast<float>(x) / GridColumns + wobble, -0.95f + 1.9f * static_cast<float>(y) / GridRows - wobble, 0.5f, 1.0f}, {static_cast<float>((v * 37u) % 256u) / 255.0f, static_cast<float>((v * 101u) % 256u) / 255.0f, static_cast<float>((v * 53u + 17u) % 256u) / 255.0f, 1.0f}};
+                BigVertices[BigBase + v] = Grid[v];
+            }
+        }
+        for (std::uint32_t y = 0; y < GridRows; ++y) {
+            for (std::uint32_t x = 0; x < GridColumns; ++x) {
+                const auto v = y * (GridColumns + 1) + x;
+                const auto across = (x + y) % 2u == 0u;
+                for (const auto value : across ? std::array<std::uint32_t, 6>{v, v + 1, v + GridColumns + 2, v, v + GridColumns + 2, v + GridColumns + 1} : std::array<std::uint32_t, 6>{v, v + 1, v + GridColumns + 1, v + 1, v + GridColumns + 2, v + GridColumns + 1}) GridList.push_back(value);
+            }
+        }
+        for (std::uint32_t t = 0; t < 40; ++t) {
+            const auto a = (t * 29u) % GridVertices, b = (t * 61u + 13u) % GridVertices, c = (t * 83u + 41u) % GridVertices;
+            for (const auto value : {a, b, c}) GridList.push_back(value);
+        }
+        for (const auto value : {5u, 5u, 9u, 20u, 20u, 20u, 0xffffu, 3u, 4u, 30u, 0xffffu, 0xffffu}) GridList.push_back(value);
+        for (std::uint32_t t = 0; t < 30; ++t) {
+            const auto a = (t * 47u + 3u) % GridVertices, b = (t * 11u + 70u) % GridVertices, c = (t * 97u + 5u) % GridVertices;
+            for (const auto value : {a, b, c}) GridList.push_back(value);
+        }
+        Require(GridList.size() <= GridIndices16.size(), "the grid list does not fit");
+        for (std::size_t i = 0; i < GridList.size(); ++i) {
+            GridIndices16[i] = static_cast<std::uint16_t>(GridList[i]);
+            GridIndices32[i] = GridList[i];
+            BigIndices32[i] = GridList[i] == 0xffffu ? 0xffffffffu : GridList[i] + BigBase;
+        }
+        for (std::uint32_t i = 0; i < GridStrip16.size(); ++i) {
+            const auto column = (i / 2u) % (2u * GridColumns);
+            const auto x = column <= GridColumns ? column : 2u * GridColumns - column;
+            const auto row = (i / (4u * GridColumns)) % GridRows;
+            GridStrip16[i] = static_cast<std::uint16_t>((row + i % 2u) * (GridColumns + 1) + x);
+        }
+
         AgcDriver::VulkanDevice device;
         const auto target = device.Target();
         if (!target.mesh.has_value()) {
@@ -330,6 +405,81 @@ int main() {
         ClearPixels();
         DrawMesh(device, {fan, fanDraw, VertexBufferDescriptor(FanScrambled.data(), static_cast<std::uint32_t>(FanScrambled.size()))});
         CheckFan("indirect indexed triangle fan");
+
+        const auto withReuse = [](ShaderRecompiler::MeshConfiguration mesh, std::uint32_t vertices, std::uint32_t primitives) {
+            mesh.reuseVertices = vertices;
+            mesh.reusePrimitives = primitives;
+            return mesh;
+        };
+        const auto sameAsWithoutReuse = [&](const std::string& what, MeshDraw setup, std::uint32_t vertices, std::uint32_t primitives) {
+            ClearPixels();
+            DrawMesh(device, setup);
+            const auto without = Pixels;
+            Require(!std::all_of(without.begin(), without.end(), [&](std::byte value) { return value == without[0]; }), what + ": nothing was drawn");
+            setup.mesh = withReuse(setup.mesh, vertices, primitives);
+            ClearPixels();
+            DrawMesh(device, setup);
+            for (std::size_t offset = 0; offset < Pixels.size(); offset += 4) {
+                Require(std::memcmp(Pixels.data() + offset, without.data() + offset, 4) == 0, what + ": pixel " + std::to_string(offset / 4) + " is " + PixelText(offset) + " with vertex reuse");
+            }
+        };
+        const ShaderRecompiler::MeshConfiguration robots{4u, 21u, 63u, 64u, 64u, 64u, 0u, 0u, 4u, true};
+        const ShaderRecompiler::MeshConfiguration smallPassthrough{4u, 4u, 12u, 12u, 4u, 64u, 0u, 0u, 4u, true};
+        const auto gridCount = static_cast<std::uint32_t>(GridList.size());
+        const auto grid = VertexBufferDescriptor(Grid.data(), GridVertices);
+        const auto big = VertexBufferDescriptor(BigVertices.data(), static_cast<std::uint32_t>(BigVertices.size()));
+        struct Program {
+            const char* name;
+            ShaderRecompiler::MeshConfiguration mesh;
+            std::span<const std::uint32_t> code;
+            std::uint32_t vertices;
+            std::uint32_t primitives;
+        };
+        for (const auto& program : {Program{"64-vertex passthrough", robots, PassthroughCode, 64u, 64u}, Program{"12-vertex passthrough", smallPassthrough, PassthroughCode, 12u, 4u}, Program{"one-wave geometry", SmallSubgroup, GeometryCode, 12u, 4u}, Program{"two-wave geometry", WideSubgroup, GeometryCode, 96u, 32u}}) {
+            const std::string name = program.name;
+            auto setup = [&](AgcDriver::Pm4::DrawParameters draw, const std::array<std::uint32_t, 4>& vertices) {
+                MeshDraw result{program.mesh, draw, vertices};
+                result.code = program.code;
+                return result;
+            };
+            sameAsWithoutReuse(name + ", 16-bit grid", setup({reinterpret_cast<std::uintptr_t>(GridIndices16.data()), gridCount, 2, 1, 0, true}, grid), program.vertices, program.primitives);
+            sameAsWithoutReuse(name + ", 32-bit grid", setup({reinterpret_cast<std::uintptr_t>(GridIndices32.data()), gridCount, 4, 1, 0, true}, grid), program.vertices, program.primitives);
+            sameAsWithoutReuse(name + ", 32-bit values past 16 bits", setup({reinterpret_cast<std::uintptr_t>(BigIndices32.data()), gridCount, 4, 1, 0, true}, big), program.vertices, program.primitives);
+            auto based = setup({reinterpret_cast<std::uintptr_t>(GridIndices16.data()), gridCount, 2, 1, 0, true}, big);
+            based.draw.firstVertex = BigBase;
+            sameAsWithoutReuse(name + ", base vertex", based, program.vertices, program.primitives);
+            sameAsWithoutReuse(name + ", three instances", setup({reinterpret_cast<std::uintptr_t>(GridIndices16.data()), gridCount, 2, 3, 0, true}, grid), program.vertices, program.primitives);
+            auto restart = setup({reinterpret_cast<std::uintptr_t>(GridIndices16.data()), gridCount, 2, 1, 0, true}, grid);
+            restart.restart = true;
+            sameAsWithoutReuse(name + ", restart enabled", restart, program.vertices, program.primitives);
+            sameAsWithoutReuse(name + ", trailing indices", setup({reinterpret_cast<std::uintptr_t>(GridIndices16.data()), gridCount - 2u, 2, 1, 0, true}, grid), program.vertices, program.primitives);
+            ClearPixels();
+            DrawMesh(device, setup({reinterpret_cast<std::uintptr_t>(Indices.data()), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true}, VertexBufferDescriptor(Scrambled.data(), static_cast<std::uint32_t>(Scrambled.size()))));
+            CheckTriangles((name + ", indexed triangle list without reuse").c_str());
+            auto scrambled = setup({reinterpret_cast<std::uintptr_t>(Indices.data()), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true}, VertexBufferDescriptor(Scrambled.data(), static_cast<std::uint32_t>(Scrambled.size())));
+            scrambled.mesh = withReuse(scrambled.mesh, program.vertices, program.primitives);
+            ClearPixels();
+            DrawMesh(device, scrambled);
+            CheckTriangles((name + ", indexed triangle list with vertex reuse").c_str());
+            auto plain = setup({0, static_cast<std::uint32_t>(Ordered.size()), 0, 1, 0, false}, VertexBufferDescriptor(Ordered.data(), static_cast<std::uint32_t>(Ordered.size())));
+            plain.mesh = withReuse(plain.mesh, program.vertices, program.primitives);
+            ClearPixels();
+            DrawMesh(device, plain);
+            CheckTriangles((name + ", non-indexed triangle list with the reuse layout").c_str());
+        }
+        const ShaderRecompiler::MeshConfiguration passthroughStrip{6u, 62u, 64u, 64u, 64u, 64u, 0u, 0u, 4u, true};
+        MeshDraw stripDraw{passthroughStrip, {reinterpret_cast<std::uintptr_t>(GridStrip16.data()), static_cast<std::uint32_t>(GridStrip16.size()), 2, 1, 0, true}, grid};
+        stripDraw.code = PassthroughCode;
+        sameAsWithoutReuse("passthrough indexed strip", stripDraw, 64u, 64u);
+        sameAsWithoutReuse("indexed fan", {fan, {reinterpret_cast<std::uintptr_t>(FanIndices.data()), static_cast<std::uint32_t>(FanIndices.size()), 2, 1, 0, true}, VertexBufferDescriptor(FanScrambled.data(), static_cast<std::uint32_t>(FanScrambled.size()))}, 5u, 3u);
+        const std::array<std::uint32_t, 5> gridWords{gridCount, 2u, 0u, 0u, 0u};
+        std::copy(gridWords.begin(), gridWords.end(), record);
+        AgcDriver::Pm4::DrawParameters indirectGrid{reinterpret_cast<std::uintptr_t>(GridIndices16.data()), gridCount, 2, 1, 0, true};
+        indirectGrid.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(record), 0x25u, 20u, 20u, 1u, false, 0u, 0x280u, 0x280u, 0x280u, false, 0u};
+        sameAsWithoutReuse("indirect geometry grid", {WideSubgroup, indirectGrid, grid}, 96u, 32u);
+        MeshDraw indirectPassthrough{robots, indirectGrid, grid};
+        indirectPassthrough.code = PassthroughCode;
+        sameAsWithoutReuse("indirect passthrough grid", indirectPassthrough, 64u, 64u);
 
         std::puts("Mesh tests passed");
         return 0;
