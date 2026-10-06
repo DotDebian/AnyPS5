@@ -3409,12 +3409,43 @@ const ShaderResources::AddressSnapshotStats& ShaderResources::AddressSnapshotCou
     return addressSnapshotStats;
 }
 
+namespace {
+// APS5_TRACE_BIND_SPLIT: addressSnapshot's time by step, in nanoseconds, and how its calls ended
+// (see [bindsplit]). Plain counters: the callers hold GuestMemory::GpuMutex.
+struct SnapSplit {
+    std::uint64_t calls = 0, checksNs = 0, epochNs = 0, pendingNs = 0, smallNs = 0, collectNs = 0;
+    std::uint64_t refused = 0, epochHits = 0, small = 0, collected = 0, dataNs = 0, dataBuffers = 0;
+};
+SnapSplit snapSplit;
+bool SnapSplitTraced() {
+    static const bool traced = std::getenv("APS5_TRACE_BIND_SPLIT") != nullptr;
+    return traced;
+}
+struct SnapLaps {
+    bool on = SnapSplitTraced();
+    std::chrono::steady_clock::time_point mark = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void lap(std::uint64_t SnapSplit::*field) {
+        if (!on) return;
+        const auto at = std::chrono::steady_clock::now();
+        snapSplit.*field += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(at - mark).count());
+        mark = at;
+    }
+    void count(std::uint64_t SnapSplit::*field) {
+        if (on) ++(snapSplit.*field);
+    }
+};
+}
+
 bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, std::size_t bytes, VkDescriptorBufferInfo& info, bool& transient) const {
     transient = false;
     auto& stats = addressSnapshotStats;
     const auto& window = AddressSnapshots();
+    SnapLaps laps;
+    laps.count(&SnapSplit::calls);
     const auto leave = [&](SnapshotRefusal reason) {
         ++stats.inPlace[static_cast<std::size_t>(reason)];
+        laps.count(&SnapSplit::refused);
+        laps.lap(&SnapSplit::checksNs);
         return false;
     };
     const auto bind = [&](VkBuffer buffer, VkDeviceSize offset, bool video) {
@@ -3431,7 +3462,11 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
     if (!guestMemory.BoundInPlace(begin, bytes, &region)) return leave(SnapshotRefusal::OutsideImport);
     // A range proved in this collect epoch under the stamp still in force: no check is repeated.
     const auto& now = addressSnapshotStamp;
-    if (const auto proved = recorder.EpochSnapshot(begin, bytes, now); proved.buffer != VK_NULL_HANDLE) {
+    laps.lap(&SnapSplit::checksNs);
+    const auto proved = recorder.EpochSnapshot(begin, bytes, now);
+    laps.lap(&SnapSplit::epochNs);
+    if (proved.buffer != VK_NULL_HANDLE) {
+        laps.count(&SnapSplit::epochHits);
         ++stats.epochSkips;
         if (proved.rechecked) ++stats.epochRechecks;
         transient = proved.transient;
@@ -3442,6 +3477,7 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
     // place without flushing them either, so a copy of the import's bytes reads what the import
     // would; the snapshot path of the builds never asked.)
     if (recorder.PendingWriteHits(begin, bytes)) return leave(SnapshotRefusal::Pending);
+    laps.lap(&SnapSplit::pendingNs);
     // A small element: its bytes into the batch arena, with no collect and no cache entry. Its
     // proof is the copy itself, good for the collect epoch like a memo hit's (a later use in the
     // epoch binds the same bytes, the next epoch copies again); the range lies in an import the
@@ -3452,6 +3488,8 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
             recorder.NoteEpochSnapshot(begin, bytes, now, 0, arena.block, arena.offset);
             ++stats.small;
             stats.smallBytes += bytes;
+            laps.count(&SnapSplit::small);
+            laps.lap(&SnapSplit::smallNs);
             transient = true;
             return bind(arena.block->Handle(), arena.offset, arena.block->InVideoMemory());
         }
@@ -3485,6 +3523,8 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
     }
     recorder.NoteEpochSnapshot(begin, bytes, now, generation, buffer);
     CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+    laps.count(&SnapSplit::collected);
+    laps.lap(&SnapSplit::collectNs);
     return bind(buffer->Handle(), 0, buffer->InVideoMemory());
 }
 
@@ -3519,6 +3559,10 @@ void ReportBindSplit() {
     const auto per = [&](std::uint64_t ns, std::uint64_t n) { return n != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(n) : 0.0; };
     const auto avg = [&](std::uint64_t value) { return split.built != 0 ? static_cast<double>(value) / static_cast<double>(split.built) : 0.0; };
     AgcDriver::ReportLine("[bindsplit] address draw sets (10 s): %llu calls, %llu sets built; avg us per call: gather %.2f, memo %.2f; per set built: allocate %.2f, copy of the template set %.2f, writes %.2f; per set built: %.1f bindings, %.1f descriptors (storage buffers %.1f, sampled images %.1f, storage images %.1f, samplers %.1f, other %.1f), %.1f selected, %.1f writes; largest set %llu descriptors, %llu sets over 32; owned sets: %llu taken back, %llu one-element restores\n", static_cast<unsigned long long>(split.calls), static_cast<unsigned long long>(split.built), per(split.gatherNs, split.calls), per(split.memoNs, split.calls), per(split.allocNs, split.built), per(split.copyNs, split.built), per(split.writeNs, split.built), avg(split.bindings), avg(split.descriptors), avg(split.byType[0]), avg(split.byType[1]), avg(split.byType[2]), avg(split.byType[3]), avg(split.byType[4]), avg(split.selected), avg(split.writes), static_cast<unsigned long long>(split.maxDescriptors), static_cast<unsigned long long>(split.overPush), static_cast<unsigned long long>(ownedReused), static_cast<unsigned long long>(ownedRestores));
+    const auto& snap = snapSplit;
+    const auto perSnap = [&](std::uint64_t ns) { return snap.calls != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(snap.calls) : 0.0; };
+    AgcDriver::ReportLine("[bindsplit] snapshots of address draws (10 s): %llu elements (%.1f per call), avg us per element: checks %.3f, epoch lookup %.3f, pending writes %.3f, small copy %.3f, collect and cache %.3f; ended: %llu left in place, %llu epoch hits, %llu small copies, %llu collected; data buffers %llu, %.3f us each\n", static_cast<unsigned long long>(snap.calls), split.calls != 0 ? static_cast<double>(snap.calls) / static_cast<double>(split.calls) : 0.0, perSnap(snap.checksNs), perSnap(snap.epochNs), perSnap(snap.pendingNs), perSnap(snap.smallNs), perSnap(snap.collectNs), static_cast<unsigned long long>(snap.refused), static_cast<unsigned long long>(snap.epochHits), static_cast<unsigned long long>(snap.small), static_cast<unsigned long long>(snap.collected), static_cast<unsigned long long>(snap.dataBuffers), snap.dataBuffers != 0 ? static_cast<double>(snap.dataNs) / 1000.0 / static_cast<double>(snap.dataBuffers) : 0.0);
+    snapSplit = {};
     ownedReused = ownedRestores = 0;
     split = {};
     split.last = now;
@@ -3578,6 +3622,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
             // The draw's own data buffer, from the arena (a Buffer of its own when it is too large).
+            SnapLaps dataLaps;
+            dataLaps.count(&SnapSplit::dataBuffers);
             VkDescriptorBufferInfo info{};
             std::byte* bytes = nullptr;
             if (const auto arena = recorder.ArenaAllocate(override->size); arena.bytes != nullptr) {
@@ -3604,6 +3650,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
             selected.push_back(index);
             infos.push_back(info);
             mixBinding(index, info, true);
+            dataLaps.lap(&SnapSplit::dataNs);
             continue;
         }
         if (override != moved.end() && override->inPlace) {
