@@ -129,6 +129,14 @@ private:
     static void foldDrawOffsets(const ShaderRecompiler::RecompileResult& main, const DrawProgram& front, Pm4::DrawParameters& parameters);
     static void decodeProgramVertexInfo(const DrawProgram& program, ShaderRecompiler::ProgramRole role, std::optional<ShaderRecompiler::ShaderVertexStageInfo>& info, std::vector<Graphics::DecodeRead>& reads);
     static bool drawAheadEnabled();
+    // APS5_SHADOW_DRAW_EVERY=<n> (a speed hack, off by default; 0 or 1: off): the draws into a
+    // shadow map (Graphics::ShadowMapDraw) are recorded one frame in n only; on the other frames
+    // the maps keep what they held, so shadows lag the scene by up to n - 1 frames. The worker
+    // decides by the flips it has counted (Driver::draw, before anything else); the front end asks
+    // the same question to leave such a draw unprepared, and a draw it judged otherwise (a flip
+    // between the two) only costs the worker the preparation or the front end its work.
+    static std::uint64_t shadowDrawEvery();
+    bool shadowFrameSkipped() const;
     DrawAhead* frontEnd(std::uint32_t queue);
     std::shared_ptr<PreparedDraw> prepareDrawAhead(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission);
     static ShaderMemory::PendingWrite pendingOverlap(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);

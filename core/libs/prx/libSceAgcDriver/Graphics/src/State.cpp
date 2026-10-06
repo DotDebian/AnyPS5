@@ -871,6 +871,24 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     return pass;
 }
 
+bool ShadowMapDraw(const QueueState& queue) {
+    const auto& cx = queue.context;
+    const auto value = [&](std::uint32_t offset) -> std::optional<std::uint32_t> {
+        const auto it = find(cx, offset);
+        if (it == cx.end()) return std::nullopt;
+        return it->second;
+    };
+    const auto size = value(0x7);
+    if (!size) return false;
+    const auto width = (*size & 0x3fffu) + 1u;
+    const auto height = ((*size >> 16u) & 0x3fffu) + 1u;
+    if (width < 2048 || width != height) return false;
+    // CB_TARGET_MASK and CB_SHADER_MASK: an absent one writes no color.
+    if ((value(0x8e).value_or(0u) & value(0x8f).value_or(0u)) != 0) return false;
+    // DB_Z_INFO FORMAT and DB_DEPTH_CONTROL Z_ENABLE.
+    return (value(0x10).value_or(0u) & 3u) != 0 && (value(0x200).value_or(0u) & 2u) != 0;
+}
+
 bool DepthMetadataBlit(const QueueState& queue) {
     const auto& cx = queue.context;
     const auto value = [&](std::uint32_t offset) -> std::optional<std::uint32_t> {

@@ -1539,13 +1539,20 @@ std::shared_ptr<const DrawRecipe> ShaderResources::FindPlan(std::uint64_t planKe
     return nullptr;
 }
 
-void ShaderResources::AttachPlan(std::uint64_t planKey, std::shared_ptr<const DrawRecipe> plan) {
+bool ShaderResources::AttachPlan(std::uint64_t planKey, std::shared_ptr<const DrawRecipe> plan) {
     // One template serves a material's draws into a handful of passes (the state keys differ by
     // target, viewport or blend); eight covers them without the list becoming a search.
-    constexpr std::size_t MaxPlans = 8;
+    // APS5_DRAW_PLAN_SLOTS=<n> (1 to 64) keeps n instead.
+    static const std::size_t MaxPlans = [] {
+        const char* text = std::getenv("APS5_DRAW_PLAN_SLOTS");
+        const auto value = text != nullptr ? std::strtoul(text, nullptr, 0) : 8ul;
+        return static_cast<std::size_t>(std::clamp(value, 1ul, 64ul));
+    }();
     plans.erase(std::remove_if(plans.begin(), plans.end(), [&](const auto& entry) { return entry.first == planKey; }), plans.end());
     plans.insert(plans.begin(), {planKey, std::move(plan)});
-    if (plans.size() > MaxPlans) plans.pop_back();
+    if (plans.size() <= MaxPlans) return false;
+    plans.pop_back();
+    return true;
 }
 
 ShaderResources::SharedLease ShaderResources::ShareLease() {

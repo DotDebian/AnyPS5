@@ -156,6 +156,11 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
 // surface's memory is not coherent with its resident image, HTILE fills only mark clears), so such a
 // blit changes nothing here. A register a rule needs that is absent makes it no blit.
 bool DepthMetadataBlit(const QueueState& queue);
+// A draw into a shadow map, told from the registers alone (APS5_SHADOW_DRAW_EVERY): nothing reaches
+// a color target (no enabled channel the shader exports), a depth surface is bound with the depth
+// test on, and the surface is square and 2048 texels or more a side. The draw front end and the
+// worker ask the same question of the same registers.
+bool ShadowMapDraw(const QueueState& queue);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
 // The message DecodeState (or the pixel stage decode after it) would throw for the register rules
 // this precheck covers, evaluated without exceptions before the draw is decoded; empty when they

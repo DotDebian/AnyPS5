@@ -82,6 +82,8 @@ std::shared_ptr<PreparedDraw> Driver::prepareDrawAhead(const QueueState& queue, 
     using Role = ShaderRecompiler::ProgramRole;
     static const bool locked = std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr || std::getenv("APS5_DUMP_DRAW_SHADERS") != nullptr || std::getenv("APS5_DUMP_DRAW_SLOT1") != nullptr;
     if (locked || ShaderRecompiler::DebugProbeActive()) return nullptr;
+    // APS5_SHADOW_DRAW_EVERY: a shadow map draw of a frame the worker skips is left unprepared.
+    if (shadowFrameSkipped() && Graphics::ShadowMapDraw(queue)) return nullptr;
     const GuestMemory::UnhookedReadScope unhooked;
     const bool timed = AheadTraced();
     const auto startedAt = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

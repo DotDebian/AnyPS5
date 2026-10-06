@@ -55,7 +55,32 @@ void Driver::decodeProgramVertexInfo(const DrawProgram& program, ShaderRecompile
     info = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, vertexUserData, &reads);
 }
 
+std::uint64_t Driver::shadowDrawEvery() {
+    static const std::uint64_t every = [] { const char* text = std::getenv("APS5_SHADOW_DRAW_EVERY"); return text ? std::strtoull(text, nullptr, 0) : 0ull; }();
+    return every;
+}
+
+bool Driver::shadowFrameSkipped() const {
+    const auto every = shadowDrawEvery();
+    return every > 1 && flipsCounted.load(std::memory_order_relaxed) % every != 0;
+}
+
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected, std::shared_ptr<PreparedDraw> prepared) {
+    if (shadowDrawEvery() > 1 && Graphics::ShadowMapDraw(queue)) {
+        // A [shadow-skip] line every 10 s, with the draws the front end judged otherwise.
+        static thread_local std::uint64_t skippedDraws = 0, skippedPrepared = 0, recordedDraws = 0, recordedUnprepared = 0;
+        static thread_local auto lastReport = std::chrono::steady_clock::now();
+        const bool skip = shadowFrameSkipped();
+        ++(skip ? skippedDraws : recordedDraws);
+        if (skip && prepared != nullptr) ++skippedPrepared;
+        if (!skip && prepared == nullptr) ++recordedUnprepared;
+        if (const auto now = std::chrono::steady_clock::now(); now - lastReport > std::chrono::seconds(10)) {
+            AgcDriver::ReportLine("[shadow-skip] shadow map draws (10 s): %llu skipped (%llu of them prepared by the front end), %llu recorded (%llu of them without a prepared draw); one frame in %llu\n", static_cast<unsigned long long>(skippedDraws), static_cast<unsigned long long>(skippedPrepared), static_cast<unsigned long long>(recordedDraws), static_cast<unsigned long long>(recordedUnprepared), static_cast<unsigned long long>(shadowDrawEvery()));
+            skippedDraws = skippedPrepared = recordedDraws = recordedUnprepared = 0;
+            lastReport = now;
+        }
+        if (skip) return DrawVerdict::Nothing;
+    }
     {
         const auto low = queue.shader.find(0x8);
         const auto high = queue.shader.find(0x9);

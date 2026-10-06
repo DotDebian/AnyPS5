@@ -517,6 +517,7 @@ struct DrawPlanStats {
     std::uint64_t noPlan = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeMiss::Count)> misses{};
     std::uint64_t attached = 0;
+    std::uint64_t displaced = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -534,7 +535,7 @@ void reportDrawPlans() {
     for (std::size_t i = 1; i < stats.misses.size(); ++i) {
         if (stats.misses[i] != 0) misses += " " + std::string(DrawRecipeMissName(static_cast<DrawRecipeMiss>(i))) + " " + std::to_string(stats.misses[i]);
     }
-    AgcDriver::ReportLine("[drawplan] draws with a state key (10 s): %llu plan hits avg %.1f us; no plan tried: %llu not eligible, %llu no template, %llu template without a plan for the state; plans that missed:%s; %llu plans attached\n", static_cast<unsigned long long>(stats.hits), stats.hits != 0 ? stats.hitUs / static_cast<double>(stats.hits) : 0.0, static_cast<unsigned long long>(stats.ineligible), static_cast<unsigned long long>(stats.noTemplate), static_cast<unsigned long long>(stats.noPlan), misses.empty() ? " none" : misses.c_str(), static_cast<unsigned long long>(stats.attached));
+    AgcDriver::ReportLine("[drawplan] draws with a state key (10 s): %llu plan hits avg %.1f us; no plan tried: %llu not eligible, %llu no template, %llu template without a plan for the state; plans that missed:%s; %llu plans attached (%llu put an older plan out of a full template)\n",static_cast<unsigned long long>(stats.hits), stats.hits != 0 ? stats.hitUs / static_cast<double>(stats.hits) : 0.0, static_cast<unsigned long long>(stats.ineligible), static_cast<unsigned long long>(stats.noTemplate), static_cast<unsigned long long>(stats.noPlan), misses.empty() ? " none" : misses.c_str(), static_cast<unsigned long long>(stats.attached), static_cast<unsigned long long>(stats.displaced));
     if (AddressDrawTimes()) {
         auto& times = PlanTimeTotals();
         const auto average = [&](double total) { return times.hits != 0 ? total / static_cast<double>(times.hits) : 0.0; };
@@ -2506,7 +2507,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             recipe->fragmentOutputs = inputs.fragmentOutputs;
             recipe->shaderStages = inputs.shaderStages;
             if (wantsPlan) {
-                resources->AttachPlan(planKey, recipe);
+                if (resources->AttachPlan(planKey, recipe)) ++DrawPlanCounts().displaced;
                 ++DrawPlanCounts().attached;
             }
             if (wantsRecipe) *recipeOut = std::move(recipe);
