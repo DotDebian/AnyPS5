@@ -2566,6 +2566,14 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
+    // APS5_WORKER_SCRATCH: the cached context by reference (no copy of the device limits and
+    // memory properties, no pool reference counted, per draw).
+    static const bool scratch = std::getenv("APS5_WORKER_SCRATCH") != nullptr && std::getenv("APS5_NO_CONTEXT_CACHE") == nullptr;
+    if (scratch && state->contextReady) {
+        Graphics::Draw(state->context, graphics, draw, shaders, snapshots, recipe, stateKey);
+        if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
+        return;
+    }
     const auto context = graphicsContext();
     Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe, stateKey);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");

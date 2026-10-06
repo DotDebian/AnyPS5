@@ -64,7 +64,7 @@ struct DrawScratch {
 // check (decode, vectors, stage results), the rejection check, the lock and labels, the device
 // call (Graphics::Draw), and the release after it.
 struct WorkerSplit {
-    enum Step { Recheck, Prepare, Rejection, Lock, Device, Release, Count };
+    enum Step { Entry, Recheck, Prepare, Rejection, Lock, Device, Release, Count };
     bool on = false;
     std::chrono::steady_clock::time_point mark;
     void lap(Step step);
@@ -96,7 +96,7 @@ void ReportWorkerSplit(bool adopted) {
     if (now - totals.last < std::chrono::seconds(10)) return;
     totals.last = now;
     const auto per = [&](WorkerSplit::Step step) { return totals.draws != 0 ? static_cast<double>(totals.ns[step]) / 1000.0 / static_cast<double>(totals.draws) : 0.0; };
-    AgcDriver::ReportLine("[workersplit] direct draws (10 s): %llu (%llu adopted); avg us per draw: recheck %.2f, prepare %.2f, rejection check %.2f, lock and labels %.2f, device call %.2f, release %.2f\n", static_cast<unsigned long long>(totals.draws), static_cast<unsigned long long>(totals.adopted), per(WorkerSplit::Recheck), per(WorkerSplit::Prepare), per(WorkerSplit::Rejection), per(WorkerSplit::Lock), per(WorkerSplit::Device), per(WorkerSplit::Release));
+    AgcDriver::ReportLine("[workersplit] direct draws (10 s): %llu (%llu adopted); avg us per draw: entry %.2f, recheck %.2f, prepare %.2f, rejection check %.2f, lock and labels %.2f, device call %.2f, release %.2f\n", static_cast<unsigned long long>(totals.draws), static_cast<unsigned long long>(totals.adopted), per(WorkerSplit::Entry), per(WorkerSplit::Recheck), per(WorkerSplit::Prepare), per(WorkerSplit::Rejection), per(WorkerSplit::Lock), per(WorkerSplit::Device), per(WorkerSplit::Release));
     totals = {};
     totals.last = now;
 }
@@ -239,6 +239,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::shared_ptr<const DrawDecode> decode;
     if (prepared != nullptr && (lockedPrepare || (drawParameters.indirect && !AdoptableIndirect(*prepared, localDevice->DrawIndirectSupport(), IndirectDrawAheadEnabled())))) prepared = nullptr;
     const bool lookupFirst = prepared != nullptr && prepared->keyKnown && registerKey;
+    split.lap(WorkerSplit::Entry);
     if (prepared != nullptr && !lookupFirst && !recheckPreparedDraw(*prepared, localDevice->Serial())) prepared = nullptr;
     split.lap(WorkerSplit::Recheck);
     bool adopted = prepared != nullptr && !lookupFirst;
