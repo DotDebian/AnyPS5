@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -630,6 +631,90 @@ bool cachedMappingRun(std::uintptr_t cursor, std::uintptr_t end, PageRun& run) {
 }
 #endif
 
+#ifdef _WIN32
+// APS5_COPYBACK_PROTECT (see GuestMemory.hpp): the pages taken away, by first page, and who touched them.
+struct DiagnosticPages {
+    std::mutex mutex;
+    struct Entry {
+        std::uintptr_t end;
+        std::uint64_t tag;
+    };
+    std::map<std::uintptr_t, Entry> ranges;
+    // By "thread name|module of the faulting code": reads, writes.
+    std::map<std::string, std::array<std::uint64_t, 2>> faults;
+    std::unordered_map<DWORD, std::string> names;
+    std::uint64_t protects = 0, protectedBytes = 0, skipped = 0, queries = 0, faultCount = 0;
+    void (*hook)(std::uint64_t, bool, bool) = nullptr;
+    bool installed = false;
+};
+
+DiagnosticPages& Diagnostic() {
+    static DiagnosticPages* pages = new DiagnosticPages;
+    return *pages;
+}
+
+LONG CALLBACK diagnosticFault(EXCEPTION_POINTERS* info) {
+    const auto* record = info->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
+    const bool write = record->ExceptionInformation[0] == 1;
+    auto& pages = Diagnostic();
+    std::unique_lock lock(pages.mutex);
+    auto found = pages.ranges.upper_bound(address);
+    if (found == pages.ranges.begin()) return EXCEPTION_CONTINUE_SEARCH;
+    --found;
+    if (address >= found->second.end) return EXCEPTION_CONTINUE_SEARCH;
+    DWORD previous = 0;
+    VirtualProtect(reinterpret_cast<void*>(found->first), found->second.end - found->first, PAGE_READWRITE, &previous);
+    const auto tag = found->second.tag;
+    pages.ranges.erase(found);
+    ++pages.faultCount;
+    const auto thread = GetCurrentThreadId();
+    auto name = pages.names.find(thread);
+    if (name == pages.names.end()) {
+        char text[128] = "";
+        PWSTR description = nullptr;
+        if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description != nullptr) {
+            WideCharToMultiByte(CP_UTF8, 0, description, -1, text, sizeof(text), nullptr, nullptr);
+            LocalFree(description);
+        }
+        if (text[0] == '\0') std::snprintf(text, sizeof(text), "tid%lu", thread);
+        name = pages.names.emplace(thread, text).first;
+    }
+    HMODULE module = nullptr;
+    char moduleName[MAX_PATH] = "guest";
+    const bool host = GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(info->ContextRecord->Rip), &module) && module != nullptr;
+    if (host) {
+        char path[MAX_PATH] = "";
+        GetModuleFileNameA(module, path, sizeof(path));
+        const char* base = std::strrchr(path, '\\');
+        std::snprintf(moduleName, sizeof(moduleName), "%s+0x%llx", base != nullptr ? base + 1 : path, static_cast<unsigned long long>(info->ContextRecord->Rip - reinterpret_cast<std::uintptr_t>(module)));
+    }
+    ++pages.faults[name->second + "|" + moduleName][write ? 1 : 0];
+    const auto hook = pages.hook;
+    lock.unlock();
+    if (hook != nullptr) hook(tag, write, host);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// A page query is about to read the protection of [begin, end): taken pages get their access back
+// first, so the driver's page cache never stores them as inaccessible.
+void diagnosticRelease(std::uintptr_t begin, std::uintptr_t end) {
+    static const bool enabled = std::getenv("APS5_COPYBACK_PROTECT") != nullptr;
+    if (!enabled) return;
+    auto& pages = Diagnostic();
+    std::lock_guard lock(pages.mutex);
+    auto cursor = pages.ranges.upper_bound(begin);
+    if (cursor != pages.ranges.begin() && std::prev(cursor)->second.end > begin) --cursor;
+    while (cursor != pages.ranges.end() && cursor->first < end) {
+        DWORD previous = 0;
+        VirtualProtect(reinterpret_cast<void*>(cursor->first), cursor->second.end - cursor->first, PAGE_READWRITE, &previous);
+        ++pages.queries;
+        cursor = pages.ranges.erase(cursor);
+    }
+}
+#endif
+
 // Calls `emit` with consecutive runs of uniform accessibility covering [address, address + bytes) in
 // order, stopping early when it returns false. Returns false when the address space cannot be queried.
 template <class Emit>
@@ -650,6 +735,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         }
 #ifdef _WIN32
         const TimedAccess timed(CounterQuery, 0);
+        diagnosticRelease(cursor, end);
         MEMORY_BASIC_INFORMATION memory{};
         const auto queryStart = std::chrono::steady_clock::now();
         // A mutation that changes these pages while they are being queried bumps the generation
@@ -805,6 +891,86 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
 bool Accessible(const void* pointer, std::size_t bytes, bool writable) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     return address != 0 && bytes <= std::numeric_limits<std::uintptr_t>::max() - address && verify(address, bytes, writable).empty();
+}
+
+bool DiagnosticProtectEnabled() {
+    static const bool enabled = std::getenv("APS5_COPYBACK_PROTECT") != nullptr;
+    return enabled;
+}
+
+void SetDiagnosticFaultHook(void (*hook)(std::uint64_t tag, bool write, bool host)) {
+#ifdef _WIN32
+    auto& pages = Diagnostic();
+    std::lock_guard lock(pages.mutex);
+    pages.hook = hook;
+#else
+    static_cast<void>(hook);
+#endif
+}
+
+void DiagnosticProtect(std::uint64_t address, std::size_t bytes, std::uint64_t tag) {
+#ifdef _WIN32
+    if (!DiagnosticProtectEnabled()) return;
+    constexpr std::uintptr_t page = 4096;
+    auto begin = (static_cast<std::uintptr_t>(address) + page - 1) & ~(page - 1);
+    const auto end = (static_cast<std::uintptr_t>(address) + bytes) & ~(page - 1);
+    auto& pages = Diagnostic();
+    std::lock_guard lock(pages.mutex);
+    if (!pages.installed) {
+        AddVectoredExceptionHandler(1, diagnosticFault);
+        pages.installed = true;
+    }
+    while (begin < end) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<const void*>(begin), &memory, sizeof(memory)) != sizeof(memory)) return;
+        const auto regionEnd = std::min<std::uintptr_t>(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+        // Only private read-write pages (watched guest memory): a section view's protection is the
+        // write tracking's (WindowsMappings), and pages already taken stay as they are.
+        bool overlaps = false;
+        const auto next = pages.ranges.upper_bound(begin);
+        if (next != pages.ranges.begin() && std::prev(next)->second.end > begin) overlaps = true;
+        else if (next != pages.ranges.end() && next->first < regionEnd) overlaps = true;
+        if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || memory.Protect != PAGE_READWRITE || overlaps) {
+            ++pages.skipped;
+            begin = regionEnd;
+            continue;
+        }
+        DWORD previous = 0;
+        if (VirtualProtect(reinterpret_cast<void*>(begin), regionEnd - begin, PAGE_NOACCESS, &previous)) {
+            pages.ranges[begin] = {regionEnd, tag};
+            ++pages.protects;
+            pages.protectedBytes += regionEnd - begin;
+        }
+        begin = regionEnd;
+    }
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    static_cast<void>(tag);
+#endif
+}
+
+std::string DiagnosticProtectReport() {
+#ifdef _WIN32
+    auto& pages = Diagnostic();
+    std::lock_guard lock(pages.mutex);
+    char text[512];
+    std::snprintf(text, sizeof(text), "%llu ranges taken (%.1f MiB), %llu skipped, %zu still taken; %llu given back by a page query; %llu CPU faults by thread|code (reads/writes):", static_cast<unsigned long long>(pages.protects), pages.protectedBytes / 1048576.0, static_cast<unsigned long long>(pages.skipped), pages.ranges.size(), static_cast<unsigned long long>(pages.queries), static_cast<unsigned long long>(pages.faultCount));
+    std::string result = text;
+    std::vector<std::pair<std::uint64_t, std::string>> order;
+    for (const auto& [key, counts] : pages.faults) order.emplace_back(counts[0] + counts[1], key);
+    std::sort(order.rbegin(), order.rend());
+    for (std::size_t index = 0; index < order.size() && index < 16; ++index) {
+        const auto& counts = pages.faults[order[index].second];
+        std::snprintf(text, sizeof(text), " %s %llu/%llu", order[index].second.c_str(), static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]));
+        result += text;
+    }
+    pages.faults.clear();
+    pages.protects = pages.protectedBytes = pages.skipped = pages.queries = pages.faultCount = 0;
+    return result;
+#else
+    return "not on this platform";
+#endif
 }
 
 std::uint64_t ForgetSerial() {

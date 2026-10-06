@@ -3401,6 +3401,12 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
     if (guestMemory.WritesOverlap(begin, bytes)) return leave(SnapshotRefusal::Written);
     std::pair<std::uint64_t, std::uint64_t> region;
     if (!guestMemory.BoundInPlace(begin, bytes, &region)) return leave(SnapshotRefusal::OutsideImport);
+    NoteCopyBackRead(begin, bytes, CopyBackReader::AddressElement);
+    // APS5_COPYBACK_REDIRECT: a range a resident staging shadow holds is read from it.
+    if (VkDescriptorBufferInfo resident{}; GuestBufferMemory::ResidentReadBinding(context, recorder, begin, bytes, resident)) {
+        transient = true;
+        return bind(resident.buffer, resident.offset, true);
+    }
     // A range proved in this collect epoch under the stamp still in force: no check is repeated.
     const auto& now = addressSnapshotStamp;
     if (const auto proved = recorder.EpochSnapshot(begin, bytes, now); proved.buffer != VK_NULL_HANDLE) {
@@ -3413,7 +3419,10 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
     // results and unit shadows are not asked about: an address-based build binds its elements in
     // place without flushing them either, so a copy of the import's bytes reads what the import
     // would; the snapshot path of the builds never asked.)
-    if (recorder.PendingWriteHits(begin, bytes)) return leave(SnapshotRefusal::Pending);
+    if (recorder.PendingWriteHits(begin, bytes)) {
+        NoteCopyBackRead(begin, bytes, CopyBackReader::AddressPending);
+        return leave(SnapshotRefusal::Pending);
+    }
     // A small element: its bytes into the batch arena, with no collect and no cache entry. Its
     // proof is the copy itself, good for the collect epoch like a memo hit's (a later use in the
     // epoch binds the same bytes, the next epoch copies again); the range lies in an import the
@@ -4138,6 +4147,9 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder, bool repeated) {
     // notes that space's heaps once per batch (the set is the same for every such use, and the
     // batch keeps it), unless the capture trace wants every note.
     const auto readSet = ReuseAddressDraws() && Recorder::ReadTracking() && !CaptureTrace::Enabled() ? guestMemory.ReadSetToken() : 0;
+    if (CopyBackTraceEnabled() && !guestMemory.HoldsLease()) {
+        for (const auto& [begin, end] : guestMemory.InPlaceReads()) NoteCopyBackRead(begin, static_cast<std::size_t>(end - begin), CopyBackReader::InPlace);
+    }
     if (readSet == 0 || !recorder.ReadSetNoted(readSet)) {
         recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
         if (readSet != 0) recorder.NoteReadSet(readSet);
