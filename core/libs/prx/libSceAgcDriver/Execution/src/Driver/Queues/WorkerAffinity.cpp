@@ -3,6 +3,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -20,7 +25,33 @@ std::uint64_t WorkerAffinityMask() {
     return mask;
 }
 
+// APS5_WORKER_PRIORITY=<n> (local, not for upstream): SetThreadPriority level of the driver's pinned
+// threads (queue workers, presenter, draw front end): 1 ABOVE_NORMAL, 2 HIGHEST, 15 TIME_CRITICAL.
+// APS5_PROCESS_PRIORITY=above|high: the process priority class, set once.
+static void RaiseWorkerPriority(const char* role) {
+#ifdef _WIN32
+    static const int level = [] {
+        const char* text = std::getenv("APS5_WORKER_PRIORITY");
+        return text != nullptr ? std::atoi(text) : 0;
+    }();
+    static std::once_flag processClass;
+    std::call_once(processClass, [] {
+        const char* text = std::getenv("APS5_PROCESS_PRIORITY");
+        if (text == nullptr) return;
+        const DWORD wanted = std::strcmp(text, "high") == 0 ? HIGH_PRIORITY_CLASS : ABOVE_NORMAL_PRIORITY_CLASS;
+        const bool set = SetPriorityClass(GetCurrentProcess(), wanted) != 0;
+        AgcDriver::ReportLine("[affinity] process priority class %s: %s\n", text, set ? "set" : "refused");
+    });
+    if (level == 0) return;
+    const bool set = SetThreadPriority(GetCurrentThread(), level) != 0;
+    AgcDriver::ReportLine("[affinity] %s priority %d: %s\n", role, level, set ? "set" : "refused");
+#else
+    static_cast<void>(role);
+#endif
+}
+
 void PinWorkerThread(const char* role) {
+    RaiseWorkerPriority(role);
     const auto mask = WorkerAffinityMask();
     if (mask == 0) return;
     static std::once_flag summary;
