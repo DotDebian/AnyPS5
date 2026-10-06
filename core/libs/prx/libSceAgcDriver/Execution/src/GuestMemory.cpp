@@ -6,6 +6,8 @@
 #include <mutex>
 #include <array>
 #include <chrono>
+#include <condition_variable>
+#include <thread>
 #include <atomic>
 #include <algorithm>
 #include <cerrno>
@@ -1441,6 +1443,228 @@ std::uint64_t dropWalkedBlocks(const WriteTracker& tracker, std::uint32_t since,
     return dropped;
 }
 
+// APS5_PREWALK=1 (local, not for upstream; Windows): walks ahead of the queue workers. A worker's
+// memo-miss walks of one collect epoch are logged under the begin of the epoch's first walk; when
+// a later epoch starts with a walk of the same address, a helper thread (one per worker, on the
+// efficiency cores) looks at the ranges logged last time, in order, while the worker records. The
+// look resets nothing and holds no lock during GetWriteWatch (WindowsMappings::ProbeClean): when
+// it finds every page of a range clean, the range's 64 KiB blocks are marked walked with a
+// generation taken before the look (walkedBlocks, as a walk of another thread marks them), and the
+// worker's later collect drops the marked blocks instead of walking them, as shared walks do.
+// Safety, under the epoch contract of GuestMemory.hpp: the helper starts after the worker's
+// ordering point (it is woken by a walk of the new epoch), so its generation is newer than the
+// worker's epoch generation. A CPU write made before the ordering point either still has its dirty
+// bit at the look (the range is not marked, the worker walks it) or had it cleared by a resetting
+// walk, which stamped the block under the tracker mutex before releasing it; the mark is made under
+// that mutex after the look, so the stamp is already in. A mapping change between the resolve of
+// the range and the mark (WindowsMappings change serial) drops the mark. Partial blocks: a worker
+// piece inside a marked block is dropped too (the mark covers the whole block).
+bool prewalkEnabled() {
+#ifdef _WIN32
+    static const bool enabled = std::getenv("APS5_PREWALK") != nullptr;
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+std::atomic<std::uint64_t> prewalkEpochs{0}, prewalkKeyHits{0}, prewalkJobs{0}, prewalkPieces{0}, prewalkClean{0}, prewalkNotClean{0}, prewalkChanged{0}, prewalkSkipped{0}, prewalkStale{0};
+std::atomic<std::uint64_t> prewalkDroppedCollects{0}, prewalkDroppedWhole{0}, prewalkDroppedBytes{0}, prewalkProbeNanoseconds{0};
+
+using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+#ifdef _WIN32
+struct Prewalker {
+    std::mutex mutex;
+    std::condition_variable wake;
+    Ranges job;
+    std::uint64_t jobSerial = 0;
+    // The owner's epoch generation when the job was posted: a block already walked after it is skipped.
+    std::uint32_t since = 0;
+    std::atomic<std::uint64_t> latest{0};
+
+    void Post(const Ranges& ranges, std::uint32_t ownerSince) {
+        {
+            std::lock_guard lock(mutex);
+            job = ranges;
+            since = ownerSince;
+            latest.store(++jobSerial, std::memory_order_relaxed);
+        }
+        wake.notify_one();
+    }
+
+    void Run();
+};
+
+struct MarkStep {
+    WriteTracker* tracker;
+    std::uint64_t first;
+    std::uint64_t stop;
+    std::uint32_t generation;
+};
+
+void markWalked(void* context) {
+    auto& step = *static_cast<MarkStep*>(context);
+    auto& tracker = *step.tracker;
+    const auto firstBlock = (step.first - tracker.base + WriteBlockBytes - 1) / WriteBlockBytes;
+    const auto endBlock = (step.stop - tracker.base) / WriteBlockBytes;
+    for (auto block = firstBlock; block < endBlock && block < tracker.walkedBlocks.size(); ++block) tracker.walkedBlocks[block] = std::max(tracker.walkedBlocks[block], step.generation);
+}
+
+void Prewalker::Run() {
+    const auto efficient = [] {
+        DWORD_PTR process = 0, system = 0;
+        if (!GetProcessAffinityMask(GetCurrentProcess(), &process, &system)) return DWORD_PTR{0};
+        DWORD length = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+        std::vector<unsigned char> buffer(length);
+        if (length == 0 || !GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()), &length)) return DWORD_PTR{0};
+        DWORD_PTR lowest = 0;
+        int lowestClass = 256;
+        for (DWORD offset = 0; offset + 8 <= length;) {
+            const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+            if (entry->Size == 0) break;
+            if (entry->Processor.GroupCount >= 1 && entry->Processor.GroupMask[0].Group == 0) {
+                const int cls = entry->Processor.EfficiencyClass;
+                if (cls < lowestClass) {
+                    lowestClass = cls;
+                    lowest = 0;
+                }
+                if (cls == lowestClass) lowest |= entry->Processor.GroupMask[0].Mask;
+            }
+            offset += entry->Size;
+        }
+        return lowest & process;
+    }();
+    if (efficient != 0 && std::getenv("APS5_PREWALK_ANY_CORE") == nullptr) SetThreadAffinityMask(GetCurrentThread(), efficient);
+    SetThreadDescription(GetCurrentThread(), L"APS5 prewalk");
+    auto& tracker = Tracker();
+    Ranges ranges;
+    for (;;) {
+        std::uint64_t serial;
+        std::uint32_t ownerSince;
+        {
+            std::unique_lock lock(mutex);
+            wake.wait(lock, [&] { return !job.empty(); });
+            ranges.swap(job);
+            job.clear();
+            serial = jobSerial;
+            ownerSince = since;
+        }
+        prewalkJobs.fetch_add(1, std::memory_order_relaxed);
+        for (const auto& [begin, end] : ranges) {
+            if (latest.load(std::memory_order_relaxed) != serial) {
+                prewalkStale.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            prewalkPieces.fetch_add(1, std::memory_order_relaxed);
+            // Whole blocks inside the arena, so the mark covers the range.
+            auto first = tracker.base + (begin - tracker.base) / WriteBlockBytes * WriteBlockBytes;
+            auto stop = std::min<std::uint64_t>(tracker.base + tracker.size, tracker.base + (end - tracker.base + WriteBlockBytes - 1) / WriteBlockBytes * WriteBlockBytes);
+            std::uint32_t generation;
+            {
+                const auto lock = lockTracker(tracker);
+                bool walked = true;
+                for (auto block = (first - tracker.base) / WriteBlockBytes; block * WriteBlockBytes + tracker.base < stop && block < tracker.walkedBlocks.size() && walked; ++block) walked = tracker.walkedBlocks[block] > ownerSince;
+                if (walked) {
+                    prewalkSkipped.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                generation = ++tracker.generation;
+            }
+            const auto probeStart = std::chrono::steady_clock::now();
+            std::uint64_t mappings = 0;
+            bool clean = GuestArena::GuestArenaProbeClean_nid_postfix(first, stop - first, &mappings);
+            if (!clean && (first != begin || stop != end)) {
+                first = begin;
+                stop = end;
+                clean = GuestArena::GuestArenaProbeClean_nid_postfix(first, stop - first, &mappings);
+            }
+            prewalkProbeNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - probeStart).count()), std::memory_order_relaxed);
+            if (!clean) {
+                prewalkNotClean.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            MarkStep step{&tracker, first, stop, generation};
+            const auto lock = lockTracker(tracker);
+            if (GuestArena::GuestArenaIfUnchanged_nid_postfix(mappings, &markWalked, &step)) prewalkClean.fetch_add(1, std::memory_order_relaxed);
+            else prewalkChanged.fetch_add(1, std::memory_order_relaxed);
+        }
+        ranges.clear();
+    }
+}
+
+// The calling worker's log and helper (see above).
+struct PrewalkOwner {
+    std::uint64_t epoch = 0;
+    std::uint64_t key = 0;
+    Ranges walks;
+    std::unordered_map<std::uint64_t, Ranges> lists;
+    Prewalker* helper = nullptr;
+
+    void Note(std::uint64_t epoch, std::uint32_t since, const Ranges& pieces) {
+        if (pieces.empty()) return;
+        if (epoch != this->epoch) {
+            if (this->epoch != 0 && key != 0) {
+                if (lists.size() >= 4096) lists.clear();
+                lists[key] = walks;
+            }
+            this->epoch = epoch;
+            key = pieces.front().first;
+            walks.clear();
+            prewalkEpochs.fetch_add(1, std::memory_order_relaxed);
+            const auto found = lists.find(key);
+            if (found != lists.end() && !found->second.empty()) {
+                prewalkKeyHits.fetch_add(1, std::memory_order_relaxed);
+                if (helper == nullptr) {
+                    helper = new Prewalker();
+                    std::thread([helper = helper] { helper->Run(); }).detach();
+                }
+                helper->Post(found->second, since);
+            }
+            walks.insert(walks.end(), pieces.begin() + 1, pieces.end());
+            return;
+        }
+        if (walks.size() < 1024) walks.insert(walks.end(), pieces.begin(), pieces.end());
+    }
+};
+thread_local PrewalkOwner prewalkOwner;
+#endif
+
+// Of `pieces`, the parts inside a 64 KiB block that a walk or a clean look newer than `since`
+// covered whole, partial blocks included; returns the bytes removed. Under the tracker mutex.
+std::uint64_t dropWalkedPieces(const WriteTracker& tracker, std::uint32_t since, Ranges& pieces) {
+    std::uint64_t dropped = 0;
+#ifdef _WIN32
+    if (tracker.walkedBlocks.empty()) return 0;
+    thread_local Ranges kept;
+    kept.clear();
+    for (const auto& [begin, end] : pieces) {
+        if (begin < tracker.base) {
+            kept.emplace_back(begin, end);
+            continue;
+        }
+        auto cursor = begin;
+        for (auto block = (begin - tracker.base) / WriteBlockBytes; tracker.base + block * WriteBlockBytes < end && block < tracker.walkedBlocks.size(); ++block) {
+            if (tracker.walkedBlocks[block] <= since) continue;
+            const auto blockBegin = tracker.base + block * WriteBlockBytes;
+            const auto from = std::max<std::uint64_t>(blockBegin, begin);
+            const auto to = std::min<std::uint64_t>(blockBegin + WriteBlockBytes, end);
+            if (cursor < from) kept.emplace_back(cursor, from);
+            cursor = to;
+            dropped += to - from;
+        }
+        if (cursor < end) kept.emplace_back(cursor, end);
+    }
+    if (dropped != 0) pieces = kept;
+#else
+    static_cast<void>(tracker);
+    static_cast<void>(since);
+    static_cast<void>(pieces);
+#endif
+    return dropped;
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -1519,6 +1743,17 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     } else if (covered != 0) {
         pieces.assign(1, {first, stop});
     }
+#ifdef _WIN32
+    if (hasEpoch && useMemo && prewalkEnabled() && !sharedWalksEnabled()) {
+        prewalkOwner.Note(epoch, threadEpochGeneration, pieces);
+        const auto dropped = dropWalkedPieces(tracker, threadEpochGeneration, pieces);
+        if (dropped != 0) {
+            prewalkDroppedCollects.fetch_add(1, std::memory_order_relaxed);
+            prewalkDroppedBytes.fetch_add(dropped, std::memory_order_relaxed);
+            if (pieces.empty()) prewalkDroppedWhole.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else
+#endif
     if (hasEpoch) {
         // Blocks a walk of another thread (or an uncached one of this thread's, already counted)
         // covered since this thread's epoch began: skipped by a memoized collect under shared
@@ -1625,6 +1860,16 @@ std::string WalkTraceReport() {
     const auto shared = take(sharedCollects);
     const auto sharedWhole = take(sharedWholeCollects);
     const auto sharedBytes = take(sharedBytesSkipped);
+    if (prewalkEnabled()) {
+        const auto take64 = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+        char line[400];
+        const auto pieces = take64(prewalkPieces);
+        const auto probeNanoseconds = take64(prewalkProbeNanoseconds);
+        std::snprintf(line, sizeof(line), "; prewalk: epochs %llu, key hits %llu, jobs %llu, ranges %llu (clean %llu, not clean %llu, mapping changed %llu, already walked %llu), stale jobs %llu, look %.1f us avg; worker collects trimmed %llu (%llu without a walk), %.0f MiB not walked",
+                      take64(prewalkEpochs), take64(prewalkKeyHits), take64(prewalkJobs), pieces, take64(prewalkClean), take64(prewalkNotClean), take64(prewalkChanged), take64(prewalkSkipped), take64(prewalkStale), pieces != 0 ? probeNanoseconds / 1000.0 / static_cast<double>(pieces) : 0.0,
+                      take64(prewalkDroppedCollects), take64(prewalkDroppedWhole), static_cast<double>(take64(prewalkDroppedBytes)) / 1048576.0);
+        report += line;
+    }
     std::snprintf(text, sizeof(text), "; gap walks %s: %llu collects, %.0f MiB not walked; shared walks %s: %llu collects (%llu without a walk), %.0f MiB not walked", gapWalksEnabled() ? "on" : "off", static_cast<unsigned long long>(gaps), gapBytes / 1048576.0, sharedWalksEnabled() ? "on" : "off", static_cast<unsigned long long>(shared), static_cast<unsigned long long>(sharedWhole), sharedBytes / 1048576.0);
     return report + text;
 }
