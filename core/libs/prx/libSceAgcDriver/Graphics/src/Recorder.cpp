@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/GpuTimestamps_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/DeltaCopy_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
@@ -1520,6 +1521,8 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     // for a caller whose ranges overlap a queued store: FlushStores).
     if (open->renderPass.open) endOpenRenderPass();
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
+    // APS5_COPYBACK_BATCH: anything but a deferral scope's own work finds the copies back recorded.
+    if (!open->deferred.empty() && deferDepth == 0) FlushDeferredCopies(CopyFlush::Commands);
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
     return open->commands;
@@ -1641,6 +1644,7 @@ void Recorder::FlushKeyStores() {
 }
 
 void Recorder::recordKeyStores(bool forWriter) {
+    if (open != nullptr && !open->deferred.empty()) FlushDeferredCopies(CopyFlush::KeyStores);
     auto stores = std::move(open->keyStores);
     open->keyStores.clear();
     if (stores.empty()) return;
@@ -1782,6 +1786,175 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     if (!LabelRunsEnabled()) closeStoreRun();
 }
 
+bool Recorder::CopyBackBatching() {
+    static const bool enabled = std::getenv("APS5_COPYBACK_BATCH") != nullptr || CopyBackDelta();
+    return enabled;
+}
+
+bool Recorder::CopyBackDelta() {
+    static const bool enabled = std::getenv("APS5_COPYBACK_DELTA") != nullptr;
+    return enabled;
+}
+
+bool Recorder::ensureDeltaCopy() {
+    if (deltaCopyState != 0) return deltaCopyState > 0;
+    deltaCopyState = -1;
+    VkShaderModule module = VK_NULL_HANDLE;
+    try {
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &deltaCopyLayout), "vkCreatePipelineLayout delta copy");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = sizeof(DELTA_COPY_SPV);
+        moduleInfo.pCode = DELTA_COPY_SPV;
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule delta copy");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = deltaCopyLayout;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &deltaCopyPipeline), "vkCreateComputePipelines delta copy");
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        deltaCopyState = 1;
+    } catch (const std::exception& error) {
+        if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        AgcDriver::ReportLine("[gpu] delta copies back unavailable, full copies instead: %s\n", error.what());
+    }
+    return deltaCopyState > 0;
+}
+
+void Recorder::DeferDeltaCopyBack(VkBuffer source, VkDeviceAddress sourceAddress, VkDeviceAddress referenceAddress, VkBuffer destination, VkDeviceAddress destinationAddress, VkDeviceSize bytes, std::uint64_t guestAddress) {
+    queueDeferred({source, 0, destination, 0, bytes, sourceAddress, referenceAddress, destinationAddress}, guestAddress);
+}
+
+namespace {
+// [copyback-batch] counters (under GuestMemory::GpuMutex, like the recording itself).
+struct CopyBatchStats {
+    std::uint64_t deferred = 0, deduplicated = 0, flushes = 0, flushedCopies = 0, commands = 0, bytes = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(Recorder::CopyFlush::Count)> reasons{};
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+CopyBatchStats copyBatchStats;
+}
+
+void Recorder::queueDeferred(const Batch::DeferredCopy& entry, std::uint64_t guestAddress) {
+    ensureOpen();
+    auto& stats = copyBatchStats;
+    ++stats.deferred;
+    const auto end = guestAddress + entry.bytes;
+    for (std::size_t index = 0; index < open->deferred.size(); ++index) {
+        const auto& copy = open->deferred[index];
+        const auto& range = open->deferredRanges[index];
+        if (copy.destination != entry.destination || guestAddress >= range.second || range.first >= end) continue;
+        // The same bytes from the same place again: the queued copy reads the source as it is
+        // when recorded, the later use's state.
+        if (copy.source == entry.source && range.first == guestAddress && range.second == end && (copy.sourceAddress != 0) == (entry.sourceAddress != 0)) {
+            ++stats.deduplicated;
+            return;
+        }
+        // Another source over the same destination bytes: program order decides, so the queued
+        // ones are recorded first.
+        if (copy.source != entry.source) {
+            FlushDeferredCopies(CopyFlush::Conflict);
+            break;
+        }
+    }
+    ensureOpen();
+    open->deferred.push_back(entry);
+    open->deferredRanges.emplace_back(guestAddress, end);
+}
+
+void Recorder::DeferCopyBack(VkBuffer source, VkDeviceSize sourceOffset, VkBuffer destination, VkDeviceSize destinationOffset, VkDeviceSize bytes, std::uint64_t guestAddress) {
+    queueDeferred({source, sourceOffset, destination, destinationOffset, bytes}, guestAddress);
+}
+
+bool Recorder::DeferredCopiesOverlap(std::uint64_t address, std::size_t bytes) const {
+    if (open == nullptr || open->deferred.empty()) return false;
+    return std::any_of(open->deferredRanges.begin(), open->deferredRanges.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+}
+
+void Recorder::FlushDeferredCopies(CopyFlush reason) {
+    if (open == nullptr || open->deferred.empty() || flushingDeferred) return;
+    flushingDeferred = true;
+    auto copies = std::move(open->deferred);
+    open->deferred.clear();
+    open->deferredRanges.clear();
+    if (open->renderPass.open) endOpenRenderPass();
+    const auto commands = open->commands;
+    const auto timing = beginTiming(ClassKey(CommandClass::StagingOut));
+    // The shaders' stores into the shadows and earlier writes into the imports precede the copies.
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    CountBarriers(CommandClass::StagingOut);
+    std::vector<Batch::DeferredCopy> deltas;
+    std::erase_if(copies, [&](const auto& entry) {
+        if (entry.sourceAddress == 0) return false;
+        deltas.push_back(entry);
+        return true;
+    });
+    std::stable_sort(copies.begin(), copies.end(), [](const auto& left, const auto& right) { return std::tie(left.source, left.destination) < std::tie(right.source, right.destination); });
+    std::vector<VkBufferCopy> regions;
+    std::uint64_t bytes = 0;
+    std::uint64_t recorded = 0;
+    if (!deltas.empty()) {
+        recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, deltaCopyPipeline);
+        for (const auto& entry : deltas) {
+            struct {
+                VkDeviceAddress source;
+                VkDeviceAddress reference;
+                VkDeviceAddress destination;
+                std::uint32_t count;
+                std::uint32_t unused;
+            } parameters{entry.sourceAddress, entry.referenceAddress, entry.destinationAddress, static_cast<std::uint32_t>(entry.bytes / 4), 0u};
+            static_assert(sizeof(parameters) == 32);
+            function(cmdPushConstants, "vkCmdPushConstants")(commands, deltaCopyLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(parameters), &parameters);
+            const auto groups = static_cast<std::uint32_t>(std::min<VkDeviceSize>((entry.bytes / 4 + 255) / 256, 2048));
+            function(cmdDispatch, "vkCmdDispatch")(commands, std::max(groups, 1u), 1, 1);
+            bytes += entry.bytes;
+            ++recorded;
+        }
+        recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        CountBarriers(CommandClass::StagingOut, 2);
+        // A later compute dispatch rebinds its own pipeline.
+    }
+    const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+    for (std::size_t at = 0; at < copies.size();) {
+        regions.clear();
+        auto next = at;
+        for (; next < copies.size() && copies[next].source == copies[at].source && copies[next].destination == copies[at].destination; ++next) {
+            regions.push_back({copies[next].sourceOffset, copies[next].destinationOffset, copies[next].bytes});
+            bytes += copies[next].bytes;
+        }
+        copy(commands, copies[at].source, copies[at].destination, static_cast<std::uint32_t>(regions.size()), regions.data());
+        ++recorded;
+        at = next;
+    }
+    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
+    CountBarriers(CommandClass::StagingOut);
+    open->coveredAccess |= copiedAccess;
+    EndGpuTiming(timing, bytes);
+    auto& stats = copyBatchStats;
+    ++stats.flushes;
+    ++stats.reasons[static_cast<std::size_t>(reason)];
+    stats.flushedCopies += copies.size();
+    stats.commands += recorded;
+    stats.bytes += bytes;
+    flushingDeferred = false;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - stats.last >= std::chrono::seconds(10)) {
+        static constexpr const char* names[static_cast<std::size_t>(CopyFlush::Count)] = {"commands", "submit", "store-run", "key-stores", "dispatch", "copy-in", "conflict"};
+        std::string text;
+        for (std::size_t index = 0; index < stats.reasons.size(); ++index) text += std::string(" ") + names[index] + " " + std::to_string(stats.reasons[index]);
+        AgcDriver::ReportLine("[copyback-batch] %.1f s: %llu copies back deferred (%llu duplicates dropped), %llu flushes (%.1f copies, %.2f MiB each; %llu vkCmdCopyBuffer) by reason:%s\n", std::chrono::duration<double>(now - stats.last).count(), static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.deduplicated), static_cast<unsigned long long>(stats.flushes), stats.flushes != 0 ? double(stats.flushedCopies) / stats.flushes : 0.0, stats.flushes != 0 ? stats.bytes / 1048576.0 / stats.flushes : 0.0, static_cast<unsigned long long>(stats.commands), text.c_str());
+        stats = CopyBatchStats{};
+        stats.last = now;
+    }
+}
+
 void Recorder::recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const {
     if (cmdPipelineBarrier == nullptr) {
         RecordMemoryBarrier(context, commands, sourceStage, destinationStage, sourceAccess, destinationAccess);
@@ -1801,6 +1974,8 @@ void Recorder::flushPendingStore() {
 }
 
 bool Recorder::closeStoreRun(bool atSubmit) {
+    // Labels follow the copies back of the work before them.
+    if (!open->deferred.empty()) FlushDeferredCopies(CopyFlush::StoreRun);
     auto& run = open->run;
     if (LabelRunsPerBatch()) {
         auto stores = std::move(run.queued);
@@ -3767,6 +3942,7 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    if (!open->deferred.empty()) FlushDeferredCopies(CopyFlush::Submit);
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();
