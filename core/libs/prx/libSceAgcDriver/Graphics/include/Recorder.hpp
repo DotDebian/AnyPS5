@@ -895,7 +895,9 @@ private:
     PFN_vkCmdDispatch cmdDispatch = nullptr;
     template<typename TFunction>
     TFunction function(TFunction resolved, const char* name) const {
-        return resolved != nullptr ? resolved : context.Function<TFunction>(name);
+        if (resolved == nullptr) return context.Function<TFunction>(name);
+        VulkanCalls::CountCmd(name);
+        return resolved;
     }
     VkResult fenceStatus(VkFence fence) const { return function(getFenceStatus, "vkGetFenceStatus")(context.device, fence); }
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;

@@ -2315,6 +2315,22 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         previousKey = key;
         ownTiming = recorder->BeginGpuTimingInPass(repeated ? key | 0x0800000000000000ull : key);
     }
+    // Local, not for upstream (lot fps2-gpu-anatomy): the draw's class (0 shadow map: depth only,
+    // square 2048 or more, as Graphics::ShadowMapDraw; 1 other depth only, the prepass; 2 color
+    // targets; 3 no attachment) for APS5_GPU_DRAW_HIST=1 (a [gputime] range per draw, keyed
+    // 0xe... with the class, the kind and the mesh groups times instances, reported on the
+    // [drawhist] line). The scissor and mesh group divisor experiments are not ported.
+    static const bool histDraws = std::getenv("APS5_GPU_DRAW_HIST") != nullptr && Recorder::GpuTimingEnabled() && !timeDraws;
+    if (histDraws) {
+        const bool noTargets = std::all_of(record.targets.begin(), record.targets.end(), [](const auto& target) { return target == nullptr; });
+        const std::uint32_t drawClass = !noTargets ? 2u : record.depth == nullptr ? 3u : state.renderExtent.width >= 2048 && state.renderExtent.width == state.renderExtent.height ? 0u : 1u;
+        const bool directMesh = state.stages.mesh && args == nullptr;
+        static thread_local const void* previousPipeline = nullptr;
+        const std::uint64_t kind = !continued ? 0u : previousPipeline == record.pipeline.get() ? 2u : 1u;
+        previousPipeline = record.pipeline.get();
+        const std::uint64_t size = directMesh ? std::min<std::uint64_t>(static_cast<std::uint64_t>(inputs.meshGroups) * draw.instanceCount, 0xffffffffull) : 0u;
+        ownTiming = recorder->BeginGpuTimingInPass(0xe000000000000000ull | (kind << 58) | (static_cast<std::uint64_t>(drawClass) << 56) | size);
+    }
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     if (ownTiming != Recorder::NoTiming) recorder->EndGpuTiming(ownTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
