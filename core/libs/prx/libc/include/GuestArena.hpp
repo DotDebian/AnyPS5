@@ -26,6 +26,9 @@ void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 void GuestArenaUnpinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* protection);
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear);
+// APS5_PREWALK (local): a look that resets nothing, see WindowsMappings::ProbeClean / IfUnchanged.
+bool GuestArenaProbeClean_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint64_t* serial);
+bool GuestArenaIfUnchanged_nid_postfix(std::uint64_t serial, void (*step)(void*), void* context);
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule);
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes);

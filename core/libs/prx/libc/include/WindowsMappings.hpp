@@ -33,6 +33,7 @@ public:
 
     void Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         std::lock_guard lock(mutex);
+        ++changes;
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
         for (auto cursor = reinterpret_cast<std::uintptr_t>(address); cursor < end;) {
             const auto memory = query(cursor);
@@ -67,6 +68,7 @@ public:
 
     void Reset(void* address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        ++changes;
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
@@ -77,6 +79,7 @@ public:
     // by write protection. APS5_SHARED_DIRECT_MEMORY=1 maps every page as a view as before.
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection, bool watched) {
         std::lock_guard lock(mutex);
+        ++changes;
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         reset(cursor, bytes);
         watchResident = watched;
@@ -141,6 +144,7 @@ public:
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
         std::lock_guard lock(mutex);
+        ++changes;
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
             it->second.armed = false;
@@ -150,6 +154,7 @@ public:
 
     void Pin(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        ++changes;
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& page = *it->second.page;
             ++page.pins;
@@ -166,6 +171,7 @@ public:
 
     void Unpin(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        ++changes;
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& page = *it->second.page;
             if (page.pins != 0) --page.pins;
@@ -175,6 +181,7 @@ public:
 
     bool HandleWrite(std::uintptr_t address) {
         std::lock_guard lock(mutex);
+        ++changes;
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
         if (found == views.end() || !writable(found->second.protection)) return false;
@@ -194,6 +201,7 @@ public:
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        ++changes;
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
         for (auto it = first; it != views.end() && it->first < end; ++it) {
@@ -213,6 +221,7 @@ public:
 
     void EndHostWrite(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        ++changes;
         const auto end = address + bytes;
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
             --it->second.hostWrites;
@@ -222,6 +231,7 @@ public:
 
     void* MapAlias(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        ++changes;
         const auto refuse = [&](const char* reason) {
             char text[192];
             std::snprintf(text, sizeof(text), "read-write alias of shared guest memory 0x%llx+0x%llx: %s", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), reason);
@@ -265,6 +275,66 @@ public:
         const auto found = views.find(address & ~(pageBytes - 1));
         if (found == views.end()) return false;
         *protection = found->second.protection;
+        return true;
+    }
+
+    // APS5_PREWALK (local, not for upstream): a look at [address, address + bytes) that resets
+    // nothing and holds the mutex only to resolve the range, so it runs beside the clearing
+    // collects. True when every page is resident or private memory that no write reached since
+    // its last clearing collect (pieces in cleanRanges are skipped, as collect does); false when a
+    // page was written, is fresh, is a view, is not committed, or the call failed. *serial gets
+    // the change serial at the resolve: IfUnchanged runs a step only while no mapping changed.
+    bool ProbeClean(std::uintptr_t address, std::size_t bytes, std::uint64_t* serial) {
+        thread_local std::vector<std::pair<std::uintptr_t, std::uintptr_t>> pieces;
+        pieces.clear();
+        {
+            std::lock_guard lock(mutex);
+            *serial = changes;
+            const auto end = address + bytes;
+            for (auto cursor = address; cursor < end;) {
+                const auto nextClean = cleanRanges.upper_bound(cursor);
+                if (nextClean != cleanRanges.begin()) {
+                    const auto clean = std::prev(nextClean);
+                    if (cursor < clean->second) {
+                        cursor = std::min(end, clean->second);
+                        continue;
+                    }
+                }
+                const auto found = views.find(cursor & ~(pageBytes - 1));
+                if (found != views.end()) {
+                    if (!found->second.resident) return false;
+                    const auto run = std::prev(residentRuns.upper_bound(cursor));
+                    const auto& state = run->second;
+                    const auto stop = std::min(end, state.end);
+                    const auto firstBit = (cursor - run->first) >> 12;
+                    const auto lastBit = (stop - 1 - run->first) >> 12;
+                    for (auto bit = firstBit; state.fresh != 0 && bit <= lastBit; ++bit) {
+                        if ((state.collected[bit >> 6] >> (bit & 63) & 1) == 0) return false;
+                    }
+                    pieces.emplace_back(cursor, stop);
+                    cursor = stop;
+                } else {
+                    const auto memory = query(cursor);
+                    if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
+                    const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                    pieces.emplace_back(cursor, stop);
+                    cursor = stop;
+                }
+            }
+        }
+        for (const auto& [begin, stop] : pieces) {
+            void* page = nullptr;
+            ULONG_PTR count = 1;
+            DWORD granularity = 0;
+            if (GetWriteWatch(0, reinterpret_cast<void*>(begin), stop - begin, &page, &count, &granularity) != 0 || count != 0) return false;
+        }
+        return true;
+    }
+
+    bool IfUnchanged(std::uint64_t serial, void (*step)(void*), void* context) {
+        std::lock_guard lock(mutex);
+        if (changes != serial) return false;
+        step(context);
         return true;
     }
 
@@ -745,6 +815,8 @@ private:
     bool residentDirect = true;
     bool watchResident = false;
     std::mutex mutex;
+    // Bumped under the mutex by every method that changes a mapping, a view or a protection.
+    std::uint64_t changes = 0;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;
