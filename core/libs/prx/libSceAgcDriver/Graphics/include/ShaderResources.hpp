@@ -645,6 +645,21 @@ private:
         std::uint64_t batch = 0;
     };
     mutable std::array<DrawSetMemo, 4> drawSetMemos{};
+    // APS5_EPOCH_MEMO=1 (local, not for upstream): per element, the last snapshot
+    // addressDrawBindings bound, with the stamp (Recorder::SnapshotStamp's five counters) and the
+    // batch it was bound under. While the stamp is the call's own and the batch is the open one, the
+    // element binds it again without the recorder's epoch table (the table would answer the same:
+    // the same proof, the buffer kept by the same batch).
+    struct ElementMemo {
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        std::array<std::uint64_t, 5> stamp{};
+        std::uint64_t batch = 0;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        bool transient = false;
+    };
+    mutable std::vector<ElementMemo> elementMemos;
     mutable std::uint8_t drawSetNext = 0;
     mutable std::vector<std::pair<VkImage, bool>> storageImageList;
     mutable bool storageImagesListed = false;

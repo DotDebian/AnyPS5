@@ -262,12 +262,100 @@ ShaderMemory::Replay ShaderMemory::ReplayReads(std::span<const ReadEvent> log) {
     return Replay::Same;
 }
 
+ShaderMemory::RecheckCounts& ShaderMemory::TheRecheckCounts() {
+    thread_local RecheckCounts counts;
+    return counts;
+}
+
+// APS5_RECHECK_COALESCE=1 (local, not for upstream): RecheckReads asks once per run of adjacent
+// fully fetched pages (the pending-write query, the flush hook and the accessibility check over
+// the run, then the compares), and a partly fetched page is flushed and checked once (over the
+// span of its read words) before its words are compared, instead of one guarded read per word.
+// The same ranges are flushed and asked about, in larger calls.
+ShaderMemory::Recheck ShaderMemory::recheckCoalesced(PendingWriteQuery pendingWrite) const {
+    auto& counts = TheRecheckCounts();
+    const auto compareWords = [](const std::uint32_t* now, const Page& page) {
+        for (std::size_t index = 0; index < PageWords;) {
+            if (!page.read.test(index)) {
+                ++index;
+                continue;
+            }
+            const auto first = index;
+            while (index < PageWords && page.read.test(index)) ++index;
+            if (std::memcmp(now + first, page.words.data() + first, (index - first) * sizeof(std::uint32_t)) != 0) return false;
+        }
+        return true;
+    };
+    for (auto it = pages.begin(); it != pages.end();) {
+        const auto base = it->first;
+        const auto& page = it->second;
+        if (page.read.none()) {
+            ++it;
+            continue;
+        }
+        if (page.wordwise) return Recheck::Pending;
+        if (page.valid.all()) {
+            // The run of adjacent fully fetched pages starting here.
+            auto end = std::next(it);
+            auto runEnd = base + PageBytes;
+            while (end != pages.end() && end->first == runEnd && !end->second.wordwise && end->second.valid.all() && end->second.read.any()) {
+                runEnd += PageBytes;
+                ++end;
+            }
+            const auto bytes = static_cast<std::size_t>(runEnd - base);
+            ++counts.runs;
+            if (pendingWrite != nullptr && pendingWrite(base, bytes, {}) != PendingWrite::None) return Recheck::Pending;
+            GuestMemory::FlushGpuWrites(base, bytes);
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), bytes)) return Recheck::Unreadable;
+            for (; it != end; ++it) {
+                ++counts.fullPages;
+                if (it->second.read.none()) continue;
+                if (!compareWords(reinterpret_cast<const std::uint32_t*>(it->first), it->second)) return Recheck::Differs;
+            }
+            continue;
+        }
+        ++counts.partialPages;
+        std::size_t first = PageWords, last = 0;
+        for (std::size_t index = 0; index < PageWords; ++index) {
+            if (!page.read.test(index)) continue;
+            first = std::min(first, index);
+            last = index;
+        }
+        GuestMemory::FlushGpuWrites(base + first * sizeof(std::uint32_t), (last - first + 1) * sizeof(std::uint32_t));
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
+            // As the guarded reads would find it: word by word.
+            for (std::size_t index = 0; index < PageWords; ++index) {
+                if (!page.read.test(index)) continue;
+                std::uint32_t word = 0;
+                try {
+                    GuestMemory::Read(base + index * sizeof(word), std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
+                } catch (const std::runtime_error&) {
+                    return Recheck::Unreadable;
+                }
+                if (word != page.words[index]) return Recheck::Differs;
+            }
+            ++it;
+            continue;
+        }
+        const auto* now = reinterpret_cast<const std::uint32_t*>(base);
+        for (std::size_t index = 0; index < PageWords; ++index) {
+            if (page.read.test(index) && now[index] != page.words[index]) return Recheck::Differs;
+        }
+        ++it;
+    }
+    return Recheck::Same;
+}
+
 ShaderMemory::Recheck ShaderMemory::RecheckReads(PendingWriteQuery pendingWrite) const {
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
+    static const bool coalesce = std::getenv("APS5_RECHECK_COALESCE") != nullptr;
+    if (coalesce) return recheckCoalesced(pendingWrite);
+    auto& counts = TheRecheckCounts();
     for (const auto& [base, page] : pages) {
         if (page.read.none()) continue;
         if (page.wordwise) return Recheck::Pending;
         if (page.valid.all()) {
+            ++counts.fullPages;
             if (pendingWrite != nullptr && pendingWrite(base, PageBytes, {}) != PendingWrite::None) return Recheck::Pending;
             GuestMemory::FlushGpuWrites(base, PageBytes);
             if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) return Recheck::Unreadable;
@@ -283,8 +371,10 @@ ShaderMemory::Recheck ShaderMemory::RecheckReads(PendingWriteQuery pendingWrite)
             }
             continue;
         }
+        ++counts.partialPages;
         for (std::size_t index = 0; index < PageWords; ++index) {
             if (!page.read.test(index)) continue;
+            ++counts.guardedWords;
             std::uint32_t word = 0;
             try {
                 GuestMemory::Read(base + index * sizeof(word), std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));

@@ -78,6 +78,11 @@ public:
     static void CountHandleMemo(bool hit);
     enum class Recheck : std::uint8_t { Same, Pending, Differs, Unreadable };
     [[nodiscard]] Recheck RecheckReads(PendingWriteQuery pendingWrite) const;
+    // What RecheckReads went through on this thread so far ([workersplit], local).
+    struct RecheckCounts {
+        std::uint64_t fullPages = 0, partialPages = 0, guardedWords = 0, runs = 0;
+    };
+    static RecheckCounts& TheRecheckCounts();
     // One step of a capture's walk, in the walk's order: a dword read with the value it returned,
     // or a probe (`readable`) that found its dword unmapped. A walk is a function of its plan, of
     // its user data and of these answers in this order (the address of every read is computed
@@ -118,6 +123,7 @@ private:
     };
 
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
+    Recheck recheckCoalesced(PendingWriteQuery pendingWrite) const;
     // SrtRuntime::isReadable: the snapshot's words and mapped guest pages.
     static bool readable(void* context, std::uint64_t address);
     Page& page(std::uint64_t base);

@@ -3626,6 +3626,28 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
         mixInto(stable, info.offset);
         mixInto(stable, info.range);
     };
+    // APS5_EPOCH_MEMO (see ElementMemo): the element's last binding under this very stamp and batch.
+    static const bool epochMemo = std::getenv("APS5_EPOCH_MEMO") != nullptr;
+    const std::array<std::uint64_t, 5> memoStamp{addressSnapshotStamp.epoch, addressSnapshotStamp.driverStores, addressSnapshotStamp.writeNotes, addressSnapshotStamp.registry, addressSnapshotStamp.space};
+    const std::uint64_t memoBatch = epochMemo ? recorder.OpenBatchId() : 0;
+    if (epochMemo && elementMemos.size() != allocations.size()) elementMemos.assign(allocations.size(), {});
+    const auto snapshotOf = [&](std::size_t index, std::uint64_t begin, std::size_t bytes, VkDescriptorBufferInfo& info, bool& transient) {
+        if (!epochMemo || memoStamp[0] == 0 || memoStamp[4] == 0) return addressSnapshot(recorder, begin, bytes, info, transient);
+        auto& memo = elementMemos[index];
+        if (memo.buffer != VK_NULL_HANDLE && memo.address == begin && memo.bytes == bytes && memo.batch == memoBatch && memo.stamp == memoStamp) {
+            ++addressSnapshotStats.bound;
+            ++addressSnapshotStats.epochSkips;
+            info = {memo.buffer, memo.offset, bytes};
+            transient = memo.transient;
+            return true;
+        }
+        if (!addressSnapshot(recorder, begin, bytes, info, transient)) {
+            memo.buffer = VK_NULL_HANDLE;
+            return false;
+        }
+        memo = {begin, bytes, memoStamp, memoBatch, info.buffer, info.offset, transient};
+        return true;
+    };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -3669,7 +3691,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
             // else in place, as MovedReadOnlyBuffers found it.
             auto info = override->info;
             bool transient = false;
-            if (window.enabled) addressSnapshot(recorder, override->address - override->adjustment, override->size + override->adjustment, info, transient);
+            if (window.enabled) snapshotOf(index, override->address - override->adjustment, override->size + override->adjustment, info, transient);
             selected.push_back(index);
             infos.push_back(info);
             mixBinding(index, info, transient);
@@ -3686,7 +3708,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
         }
         VkDescriptorBufferInfo info{};
         bool transient = false;
-        if (!addressSnapshot(recorder, item.address - item.adjustment, item.size + item.adjustment, info, transient)) continue;
+        if (!snapshotOf(index, item.address - item.adjustment, item.size + item.adjustment, info, transient)) continue;
         selected.push_back(index);
         infos.push_back(info);
         mixBinding(index, info, transient);
