@@ -1962,7 +1962,40 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         previousKey = key;
         ownTiming = recorder->BeginGpuTimingInPass(repeated ? key | 0x0800000000000000ull : key);
     }
+    // Local, not for upstream (lot fps2-gpu-anatomy): the draw's class (0 shadow map: depth only,
+    // square 2048 or more, as Graphics::ShadowMapDraw; 1 other depth only, the prepass; 2 color
+    // targets; 3 no attachment) for APS5_GPU_DRAW_HIST=1 (a [gputime] range per draw, keyed
+    // 0xe... with the class, the kind and the mesh groups times instances, reported on the
+    // [drawhist] line) and for the fill and geometry experiments: APS5_SHADOW_SCISSOR_1PX=1 /
+    // APS5_DEPTH_SCISSOR_1PX=1 / APS5_COLOR_SCISSOR_1PX=1 set a 1x1 scissor on the draws of that
+    // class (the image is wrong: measure only); APS5_SHADOW_GROUPS_DIV=<n> launches 1/n of a direct
+    // shadow mesh draw's groups (likewise APS5_DEPTH_GROUPS_DIV, APS5_COLOR_GROUPS_DIV).
+    static const bool histDraws = std::getenv("APS5_GPU_DRAW_HIST") != nullptr && Recorder::GpuTimingEnabled() && !timeDraws;
+    static const bool scissorTests[3] = {std::getenv("APS5_SHADOW_SCISSOR_1PX") != nullptr, std::getenv("APS5_DEPTH_SCISSOR_1PX") != nullptr, std::getenv("APS5_COLOR_SCISSOR_1PX") != nullptr};
+    static const std::uint32_t groupDivisors[3] = {
+        static_cast<std::uint32_t>(std::max(1l, std::strtol(std::getenv("APS5_SHADOW_GROUPS_DIV") != nullptr ? std::getenv("APS5_SHADOW_GROUPS_DIV") : "1", nullptr, 10))),
+        static_cast<std::uint32_t>(std::max(1l, std::strtol(std::getenv("APS5_DEPTH_GROUPS_DIV") != nullptr ? std::getenv("APS5_DEPTH_GROUPS_DIV") : "1", nullptr, 10))),
+        static_cast<std::uint32_t>(std::max(1l, std::strtol(std::getenv("APS5_COLOR_GROUPS_DIV") != nullptr ? std::getenv("APS5_COLOR_GROUPS_DIV") : "1", nullptr, 10)))};
+    const bool noTargets = std::all_of(record.targets.begin(), record.targets.end(), [](const auto& target) { return target == nullptr; });
+    const std::uint32_t drawClass = !noTargets ? 2u : record.depth == nullptr ? 3u : state.renderExtent.width >= 2048 && state.renderExtent.width == state.renderExtent.height ? 0u : 1u;
+    const bool directMesh = state.stages.mesh && args == nullptr;
+    const auto savedGroups = inputs.meshGroups;
+    if (drawClass < 3) {
+        if (scissorTests[drawClass]) {
+            const VkRect2D tiny{{0, 0}, {1, 1}};
+            context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &tiny);
+        }
+        if (directMesh && groupDivisors[drawClass] > 1) inputs.meshGroups = std::max(1u, inputs.meshGroups / groupDivisors[drawClass]);
+    }
+    if (histDraws) {
+        static thread_local const void* previousPipeline = nullptr;
+        const std::uint64_t kind = !continued ? 0u : previousPipeline == record.pipeline.get() ? 2u : 1u;
+        previousPipeline = record.pipeline.get();
+        const std::uint64_t size = directMesh ? std::min<std::uint64_t>(static_cast<std::uint64_t>(inputs.meshGroups) * draw.instanceCount, 0xffffffffull) : 0u;
+        ownTiming = recorder->BeginGpuTimingInPass(0xe000000000000000ull | (kind << 58) | (static_cast<std::uint64_t>(drawClass) << 56) | size);
+    }
     recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
+    inputs.meshGroups = savedGroups;
     if (ownTiming != Recorder::NoTiming) recorder->EndGpuTiming(ownTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (writesDepth) record.depth->NoteWritten();

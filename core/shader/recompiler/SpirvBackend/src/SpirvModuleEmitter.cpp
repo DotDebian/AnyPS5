@@ -8,6 +8,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <limits>
 #include <stdexcept>
 
@@ -550,6 +551,27 @@ void DefineMeshOutputs(SpirvEmitterState& state) {
     state.module.AddAnnotation(spv::OpDecorate, state.meshPrimitives, spv::DecorationBuiltIn, spv::BuiltInPrimitiveTriangleIndicesEXT);
     state.module.AddAnnotation(spv::OpDecorate, state.meshCull, spv::DecorationBuiltIn, spv::BuiltInCullPrimitiveEXT);
     state.module.AddAnnotation(spv::OpDecorate, state.meshCull, spv::DecorationPerPrimitiveEXT);
+    bool dedup = false;
+    for (const auto* block : state.program.BlockOrder()) {
+        for (const auto* inst : block->Instructions()) dedup |= inst->Opcode() == IrOpcode::MeshDedup;
+    }
+    if (dedup) {
+        const auto lanes = std::max(mesh.threadsNum[0], 1u);
+        state.meshDedupLanes = lanes;
+        state.meshDedupHashSize = std::bit_ceil(2u * lanes);
+        const auto u32 = TypeU32(state);
+        state.meshDedupHashKey = MeshArray(state, spv::StorageClassWorkgroup, u32, state.meshDedupHashSize);
+        state.meshDedupHashOwner = MeshArray(state, spv::StorageClassWorkgroup, u32, state.meshDedupHashSize);
+        state.meshDedupHashSlot = MeshArray(state, spv::StorageClassWorkgroup, u32, state.meshDedupHashSize);
+        state.meshDedupSlot = MeshArray(state, spv::StorageClassWorkgroup, u32, lanes);
+        state.meshDedupUnique = MeshArray(state, spv::StorageClassWorkgroup, u32, lanes);
+        state.meshDedupCount = MeshArray(state, spv::StorageClassWorkgroup, u32, 1u);
+        state.meshDedupLaneKey = MeshArray(state, spv::StorageClassPrivate, u32, state.laneCount);
+        state.meshDedupLaneEntry = MeshArray(state, spv::StorageClassPrivate, u32, state.laneCount);
+        state.module.AddName(state.meshDedupHashKey, "mesh_dedup_hash_key");
+        state.module.AddName(state.meshDedupSlot, "mesh_dedup_slot");
+        state.module.AddName(state.meshDedupUnique, "mesh_dedup_unique");
+    }
 }
 
 void EmitMeshEntryPoint(SpirvEmitterState& state) {
@@ -645,6 +667,132 @@ void EmitMeshAllocate(SpirvValueEmitContext& ctx, const IrValue& inst) {
             state.module.AddFunction(spv::OpStore, pointer, value);
         }
     });
+}
+
+// APS5_MESH_DEDUP (not for upstream): IrOpcode::MeshDedup(key, valid input vertices) gives each
+// distinct key among the subgroup's input vertices one output slot. Every lane half stores its key;
+// the last half then runs, for all the lanes of the invocation, a workgroup hash table: insert the
+// key (the lowest lane owns the entry), owners take slots from a counter, every input vertex reads
+// its slot. Slots follow the counter, not the lanes: the vertex order within the subgroup is free,
+// the primitive order is kept. MeshDedupRead(0, s) is the key of slot s, (1, i) input vertex i's
+// slot, (2, -) the slot count. The prologue runs in uniform control flow, so the barriers do too.
+void EmitMeshDedup(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    auto& state = ctx.state;
+    if (state.meshDedupHashKey == 0u) ctx.Fail(inst, "mesh vertex dedup storage is missing");
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto shared = [&](std::uint32_t variable, std::uint32_t index) { return MeshElement(state, variable, spv::StorageClassWorkgroup, u32, index); };
+    const auto lane = [&](std::uint32_t variable, std::uint32_t half) { return MeshElement(state, variable, spv::StorageClassPrivate, u32, constant(half)); };
+    const auto load = [&](std::uint32_t pointer) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, pointer);
+        return value;
+    };
+    const auto compare = [&](std::uint32_t op, std::uint32_t left, std::uint32_t right) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(op, boolean, value, left, right);
+        return value;
+    };
+    const auto barrier = [&] {
+        state.module.AddFunction(spv::OpControlBarrier, constant(spv::ScopeWorkgroup), constant(spv::ScopeWorkgroup), constant(spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
+    };
+    const auto scope = constant(spv::ScopeWorkgroup);
+    const auto relaxed = constant(spv::MemorySemanticsMaskNone);
+    const auto half = state.laneHalf;
+    state.module.AddFunction(spv::OpStore, lane(state.meshDedupLaneKey, half), ctx.Arg(inst, 0));
+    if (half + 1u != state.laneCount) return;
+    const auto valid = ctx.Arg(inst, 1);
+    const auto empty = constant(0xffffffffu);
+    const auto hashSize = state.meshDedupHashSize;
+    const auto forEachLane = [&](auto&& body) {
+        for (std::uint32_t h = 0; h < state.laneCount; h++) {
+            state.laneHalf = h;
+            body(h, EmitLocalInvocationIndex(state));
+        }
+        state.laneHalf = half;
+    };
+    forEachLane([&](std::uint32_t, std::uint32_t index) {
+        for (std::uint32_t round = 0; round < hashSize; round += state.meshDedupLanes) {
+            const auto entry = EmitBinaryU32(state, spv::OpIAdd, index, constant(round));
+            EmitIfCondition(state, compare(spv::OpULessThan, entry, constant(hashSize)), [&] {
+                state.module.AddFunction(spv::OpStore, shared(state.meshDedupHashKey, entry), empty);
+                state.module.AddFunction(spv::OpStore, shared(state.meshDedupHashOwner, entry), empty);
+            });
+        }
+        EmitIfCondition(state, compare(spv::OpIEqual, index, constant(0u)), [&] {
+            state.module.AddFunction(spv::OpStore, shared(state.meshDedupCount, constant(0u)), constant(0u));
+        });
+    });
+    barrier();
+    forEachLane([&](std::uint32_t h, std::uint32_t index) {
+        EmitIfCondition(state, compare(spv::OpULessThan, index, valid), [&] {
+            const auto key = load(lane(state.meshDedupLaneKey, h));
+            const auto hashed = EmitBinaryU32(state, spv::OpShiftRightLogical, EmitBinaryU32(state, spv::OpIMul, key, constant(0x9e3779b1u)), constant(32u - static_cast<std::uint32_t>(std::countr_zero(hashSize))));
+            state.module.AddFunction(spv::OpStore, lane(state.meshDedupLaneEntry, h), hashed);
+            const auto header = state.module.AllocateId();
+            const auto body = state.module.AllocateId();
+            const auto next = state.module.AllocateId();
+            const auto merge = state.module.AllocateId();
+            state.module.AddFunction(spv::OpBranch, header);
+            EmitLabel(state, header);
+            state.module.AddFunction(spv::OpLoopMerge, merge, next, spv::LoopControlMaskNone);
+            state.module.AddFunction(spv::OpBranch, body);
+            EmitLabel(state, body);
+            const auto entry = load(lane(state.meshDedupLaneEntry, h));
+            const auto previous = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAtomicCompareExchange, u32, previous, shared(state.meshDedupHashKey, entry), scope, relaxed, relaxed, key, empty);
+            const auto found = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLogicalOr, boolean, found, compare(spv::OpIEqual, previous, empty), compare(spv::OpIEqual, previous, key));
+            state.module.AddFunction(spv::OpBranchConditional, found, merge, next);
+            EmitLabel(state, next);
+            state.module.AddFunction(spv::OpStore, lane(state.meshDedupLaneEntry, h), EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpIAdd, entry, constant(1u)), constant(hashSize - 1u)));
+            state.module.AddFunction(spv::OpBranch, header);
+            EmitLabel(state, merge);
+            const auto owned = load(lane(state.meshDedupLaneEntry, h));
+            state.module.AddFunction(spv::OpAtomicUMin, u32, state.module.AllocateId(), shared(state.meshDedupHashOwner, owned), scope, relaxed, index);
+        });
+    });
+    barrier();
+    forEachLane([&](std::uint32_t h, std::uint32_t index) {
+        EmitIfCondition(state, compare(spv::OpULessThan, index, valid), [&] {
+            const auto entry = load(lane(state.meshDedupLaneEntry, h));
+            EmitIfCondition(state, compare(spv::OpIEqual, load(shared(state.meshDedupHashOwner, entry)), index), [&] {
+                const auto slot = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAtomicIAdd, u32, slot, shared(state.meshDedupCount, constant(0u)), scope, relaxed, constant(1u));
+                state.module.AddFunction(spv::OpStore, shared(state.meshDedupHashSlot, entry), slot);
+                state.module.AddFunction(spv::OpStore, shared(state.meshDedupUnique, slot), load(lane(state.meshDedupLaneKey, h)));
+            });
+        });
+    });
+    barrier();
+    forEachLane([&](std::uint32_t h, std::uint32_t index) {
+        EmitIfCondition(state, compare(spv::OpULessThan, index, valid), [&] {
+            const auto entry = load(lane(state.meshDedupLaneEntry, h));
+            state.module.AddFunction(spv::OpStore, shared(state.meshDedupSlot, index), load(shared(state.meshDedupHashSlot, entry)));
+        });
+    });
+    barrier();
+}
+
+std::uint32_t EmitMeshDedupRead(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    auto& state = ctx.state;
+    if (state.meshDedupHashKey == 0u) ctx.Fail(inst, "mesh vertex dedup storage is missing");
+    const auto kind = inst.Argument(0)->ImmediateU32();
+    const auto u32 = TypeU32(state);
+    if (kind == 2u) return MeshLoad(state, state.meshDedupCount, spv::StorageClassWorkgroup, u32, ConstantU32(state, 0u));
+    if (kind > 2u) ctx.Fail(inst, "invalid mesh vertex dedup read");
+    auto index = state.module.AllocateId();
+    state.module.AddFunction(spv::OpExtInst, u32, index, GlslStd450(state), GLSLstd450UMin, ctx.Arg(inst, 1), ConstantU32(state, state.meshDedupLanes - 1u));
+    if (kind == 0u) {
+        // A lane past the slots shades slot 0's vertex: its key was never written.
+        const auto inside = state.module.AllocateId();
+        state.module.AddFunction(spv::OpULessThan, TypeBool(state), inside, index, MeshLoad(state, state.meshDedupCount, spv::StorageClassWorkgroup, u32, ConstantU32(state, 0u)));
+        const auto clamped = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelect, u32, clamped, inside, index, ConstantU32(state, 0u));
+        index = clamped;
+    }
+    return MeshLoad(state, kind == 0u ? state.meshDedupUnique : state.meshDedupSlot, spv::StorageClassWorkgroup, u32, index);
 }
 
 std::uint32_t MeshOutputPointer(SpirvEmitterState& state, StageOutputKind kind, std::uint32_t index) {

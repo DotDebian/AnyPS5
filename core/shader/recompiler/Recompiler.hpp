@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -458,6 +459,13 @@ struct RecompileResult {
 [[nodiscard]] bool LayoutChosenByProbe(const RecompileRequest& request);
 
 [[nodiscard]] bool InexactSingleLane(const RecompileRequest& request);
+
+// APS5_NGG_AS_VERTEX (not for upstream): whether every lane of a program works on its own data, so
+// that the program may run at one guest lane per vertex shader invocation with the lanes regrouped
+// by the hardware: no LDS or GDS access (DS), no DPP, no v_readlane / v_writelane / v_permlane*,
+// and v_mbcnt only over all lanes (the lane id). v_readfirstlane stays allowed (a waterfall loop or a
+// uniform value gives the same result over any subset of the lanes). Empty `reason` when it does.
+[[nodiscard]] bool LaneIndependentProgram(std::span<const std::uint32_t> code, std::string* reason = nullptr);
 
 // The resource plan, snapshot and specialization a driver captured for the request (see
 // CaptureResources in Optimization/ResourceProgram.hpp): this overload reuses them instead of

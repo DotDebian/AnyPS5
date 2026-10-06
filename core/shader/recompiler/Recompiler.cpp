@@ -127,6 +127,48 @@ bool InexactSingleLane(const RecompileRequest& request) {
     return ListedProgram(inexact, request);
 }
 
+bool LaneIndependentProgram(std::span<const std::uint32_t> code, std::string* reason) {
+    const auto fail = [&](const RdnaInstruction& inst, const char* what) {
+        if (reason != nullptr) {
+            char text[96];
+            std::snprintf(text, sizeof(text), "%s at pc 0x%x", what, inst.programCounter);
+            *reason = text;
+        }
+        return false;
+    };
+    RdnaProgram decoded;
+    try {
+        constexpr RdnaInstructionDecoder decoder;
+        decoded = decoder.Decode(code);
+    } catch (const std::exception&) {
+        if (reason != nullptr) *reason = "undecodable";
+        return false;
+    }
+    const auto allLanes = [](const RdnaOperand& operand) {
+        return (operand.kind == RdnaOperandKind::IntegerInlineConstant && operand.signedVal == -1) || (operand.kind == RdnaOperandKind::LiteralConstant && operand.value == 0xffffffffu);
+    };
+    for (const auto& inst : decoded.instructions) {
+        if (inst.family == RdnaInstructionFamily::DS) return fail(inst, "DS");
+        for (const auto* operand : {&inst.source0, &inst.source1, &inst.source2, &inst.source3}) {
+            if (operand->dpp) return fail(inst, "DPP");
+        }
+        switch (inst.op) {
+            case RdnaOpcode::VReadlaneB32:
+            case RdnaOpcode::VWritelaneB32:
+            case RdnaOpcode::VPermlane16B32:
+            case RdnaOpcode::VPermlanex16B32:
+                return fail(inst, "lane read/write");
+            case RdnaOpcode::VMbcntLoU32B32:
+            case RdnaOpcode::VMbcntHiU32B32:
+                if (!allLanes(inst.source0)) return fail(inst, "mbcnt over a mask");
+                break;
+            default: break;
+        }
+    }
+    if (reason != nullptr) reason->clear();
+    return true;
+}
+
 namespace {
 
 // The layout the request compiles to: its WaveLayoutFor, with an Auto program compiled as TwoLane
@@ -183,7 +225,8 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     constexpr InstructionTranslator translator;
 
     EmbeddedFetchPlan embeddedFetch;
-    if ((stageKind == ShaderStageKind::Vertex || stageKind == ShaderStageKind::Local) && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded) {
+    // A merged NGG program run as a vertex shader (APS5_NGG_AS_VERTEX, user data from s0) fetches as its mesh form does.
+    if ((stageKind == ShaderStageKind::Vertex || stageKind == ShaderStageKind::Local) && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded && !(stageKind == ShaderStageKind::Vertex && request.context.userDataBaseRegister == 0u)) {
         constexpr EmbeddedVertexFetchAnalyzer embeddedFetchAnalyzer;
         embeddedFetch = embeddedFetchAnalyzer.Analyze(decoded, inputInfo.vertex->fetchAttribReg, inputInfo.vertex->fetchBufferReg, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), request.context.waveSize);
     }

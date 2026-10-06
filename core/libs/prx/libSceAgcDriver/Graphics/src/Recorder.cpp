@@ -1985,6 +1985,7 @@ void Recorder::recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sour
         return;
     }
     const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, sourceAccess, destinationAccess};
+    VulkanCalls::CountCmd("vkCmdPipelineBarrier");
     cmdPipelineBarrier(commands, sourceStage, destinationStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
@@ -2111,7 +2112,8 @@ void Recorder::FlushStores() {
 
 namespace {
 
-constexpr std::uint32_t MaxTimedRanges = 512;
+// APS5_GPU_DRAW_HIST=1 times every draw (Recorder::DrawHistKey): 2048 ranges per batch then.
+const std::uint32_t MaxTimedRanges = std::getenv("APS5_GPU_DRAW_HIST") != nullptr ? 2048u : 512u;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
 constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "dispatch-snap"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
@@ -2139,6 +2141,80 @@ std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
+
+// APS5_GPU_DRAW_HIST=1 (local, not for upstream): each draw's own GPU range (Recorder::DrawHistKey),
+// from the completion of the work before it to its own completion, i.e. what the draw adds to its
+// pass. By draw class (0 shadow map: depth only, square 2048 or more; 1 other depth only; 2 color
+// targets; 3 no attachment), a histogram of microseconds, and the mean by size (mesh groups times
+// instances; 0 when unknown: indirect or not a mesh draw), apart for the first draw of a pass, a
+// draw after a pipeline change in its pass, and a draw with its predecessor's pipeline.
+constexpr std::size_t HistClasses = 4, HistUs = 5, HistSizes = 9, HistKinds = 3;
+constexpr const char* HistClassNames[HistClasses] = {"shadow", "depth", "color", "none"};
+constexpr const char* HistSizeNames[HistSizes] = {"?", "1", "2-4", "5-16", "17-64", "65-256", "257-1k", "1k-4k", ">4k"};
+constexpr const char* HistKindNames[HistKinds] = {"first", "switch", "same"};
+struct DrawHist {
+    std::uint64_t us[HistClasses][HistUs]{};
+    std::uint64_t count[HistClasses][HistSizes]{};
+    double sumUs[HistClasses][HistSizes]{};
+    double sumGroups[HistClasses][HistSizes]{};
+    std::uint64_t kindCount[HistClasses][HistKinds]{};
+    double kindUs[HistClasses][HistKinds]{};
+    double passUs = 0;
+    std::uint64_t passes = 0;
+} drawHist;
+
+void addDrawHist(std::uint64_t key, double ns) {
+    const auto cls = static_cast<std::size_t>((key >> 56) & 3u);
+    const auto kind = std::min<std::size_t>(static_cast<std::size_t>((key >> 58) & 3u), HistKinds - 1);
+    const auto groups = static_cast<std::uint32_t>(key);
+    const double us = ns / 1e3;
+    const std::size_t usBucket = us < 5 ? 0 : us < 10 ? 1 : us < 20 ? 2 : us < 50 ? 3 : 4;
+    std::size_t size = 0;
+    if (groups != 0) {
+        size = 1;
+        for (std::uint32_t limit = 1; groups > limit && size < HistSizes - 1; limit *= 4) ++size;
+    }
+    ++drawHist.us[cls][usBucket];
+    ++drawHist.count[cls][size];
+    drawHist.sumUs[cls][size] += us;
+    drawHist.sumGroups[cls][size] += groups;
+    ++drawHist.kindCount[cls][kind];
+    drawHist.kindUs[cls][kind] += us;
+}
+
+void reportDrawHist(std::uint64_t presents) {
+    if (std::getenv("APS5_GPU_DRAW_HIST") == nullptr) return;
+    const double perPresent = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
+    std::string line;
+    for (std::size_t cls = 0; cls < HistClasses; ++cls) {
+        std::uint64_t draws = 0;
+        double totalUs = 0;
+        for (std::size_t size = 0; size < HistSizes; ++size) {
+            draws += drawHist.count[cls][size];
+            totalUs += drawHist.sumUs[cls][size];
+        }
+        if (draws == 0) continue;
+        char text[512];
+        std::snprintf(text, sizeof(text), "\n  %s: %.1f draws %.2f ms per present, mean %.1f us; us <5 %llu, 5-10 %llu, 10-20 %llu, 20-50 %llu, >50 %llu; by kind:", HistClassNames[cls], static_cast<double>(draws) * perPresent, totalUs / 1e3 * perPresent, totalUs / static_cast<double>(draws), static_cast<unsigned long long>(drawHist.us[cls][0]), static_cast<unsigned long long>(drawHist.us[cls][1]), static_cast<unsigned long long>(drawHist.us[cls][2]), static_cast<unsigned long long>(drawHist.us[cls][3]), static_cast<unsigned long long>(drawHist.us[cls][4]));
+        line += text;
+        for (std::size_t kind = 0; kind < HistKinds; ++kind) {
+            if (drawHist.kindCount[cls][kind] == 0) continue;
+            std::snprintf(text, sizeof(text), " %s %llu x %.1f us", HistKindNames[kind], static_cast<unsigned long long>(drawHist.kindCount[cls][kind]), drawHist.kindUs[cls][kind] / static_cast<double>(drawHist.kindCount[cls][kind]));
+            line += text;
+        }
+        line += "; by groups (draws, mean groups, mean us, us per group):";
+        for (std::size_t size = 0; size < HistSizes; ++size) {
+            const auto count = drawHist.count[cls][size];
+            if (count == 0) continue;
+            const double groups = drawHist.sumGroups[cls][size] / static_cast<double>(count);
+            const double us = drawHist.sumUs[cls][size] / static_cast<double>(count);
+            std::snprintf(text, sizeof(text), " [%s] %llu %.0f %.1f %.3f", HistSizeNames[size], static_cast<unsigned long long>(count), groups, us, groups > 0 ? us / groups : 0.0);
+            line += text;
+        }
+    }
+    AgcDriver::ReportLine("[drawhist] 10 s, %llu presents:%s\n", static_cast<unsigned long long>(presents), line.c_str());
+    drawHist = {};
+}
 
 bool DrawOrGpuProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || Recorder::GpuTimingEnabled();
@@ -2989,6 +3065,10 @@ void Recorder::readGpuTiming(Batch& batch) {
             continue;
         }
         const auto key = batch.timedKeys[i];
+        if ((key >> 60) == 0xe) {
+            addDrawHist(key, ns);
+            continue;
+        }
         auto& totals = timingByKey[key];
         ++totals.count;
         totals.ms += ns / 1e6;
@@ -3030,8 +3110,10 @@ void Recorder::readGpuTiming(Batch& batch) {
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
+    reportDrawHist(presents);
     lock.unlock();
     reportBarriers();
+    if (VulkanCalls::CmdCounted()) AgcDriver::ReportLine("[vkcount] 10 s, %llu presents; commands (per present):%s\n", static_cast<unsigned long long>(presents), VulkanCalls::TakeCmdCounts(presents).c_str());
 }
 
 bool Recorder::FlipReadCheck() {

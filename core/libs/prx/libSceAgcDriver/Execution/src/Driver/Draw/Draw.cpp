@@ -139,7 +139,8 @@ void Driver::decodeProgramVertexInfo(const DrawProgram& program, ShaderRecompile
     if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment || role == ShaderRecompiler::ProgramRole::GeometryBack) return;
     reads.clear();
     std::span<const std::uint32_t> vertexUserData = program.userData;
-    if (program.binary.stage == ShaderRecompiler::ShaderStage::Mesh) {
+    // A passthrough program run as a vertex shader (APS5_NGG_AS_VERTEX) keeps its hidden words.
+    if (program.binary.stage == ShaderRecompiler::ShaderStage::Mesh || (program.binary.stage == ShaderRecompiler::ShaderStage::Vertex && program.firstUserSgpr == 0u)) {
         require(vertexUserData.size() >= 8u, "mesh vertex metadata requires eight hidden user words");
         vertexUserData = vertexUserData.subspan(8u);
     }

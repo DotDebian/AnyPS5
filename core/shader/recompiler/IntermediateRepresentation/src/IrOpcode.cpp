@@ -121,6 +121,8 @@ constexpr std::array<OpcodeMeta, static_cast<std::size_t>(IrOpcode::Count)> Meta
     makeMeta("MeshDrawParameter", U32, U32),
     makeMeta("MeshArgument", U32, U32),
     makeMeta("MeshAllocate", Void, U32),
+    makeMeta("MeshDedup", Void, U32, U32),
+    makeMeta("MeshDedupRead", U32, U32, U32),
     makeMeta("TessellationBase", U32, U32),
     makeMeta("GetTessellationAttribute", U32, U32, U32, U1),
     makeMeta("SetTessellationAttribute", Void, U32, U32, U32, U1),
@@ -724,6 +726,8 @@ bool IrOpcodeHasSideEffects(IrOpcode opcode) {
         case IrOpcode::SetVccHi:
         case IrOpcode::SetM0:
         case IrOpcode::MeshAllocate:
+        case IrOpcode::MeshDedup:
+        case IrOpcode::MeshDedupRead:
         case IrOpcode::Barrier:
         case IrOpcode::Waitcnt:
         case IrOpcode::Sendmsg:
