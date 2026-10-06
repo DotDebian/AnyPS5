@@ -43,6 +43,23 @@ const DescriptorSource* Source(const IrResourcePlan& program, std::uint32_t sour
     return &program.descriptorSources[source];
 }
 
+// The lists of one EvaluateRuntimeSourcesImpl call, kept per thread between calls so a walk
+// allocates none of them once they have grown. `busy` while a call uses them: a call made inside
+// another one on the thread (none is known) takes lists of its own.
+struct RuntimeSourcesScratch {
+    std::vector<std::uint8_t> active;
+    std::vector<std::uint8_t> visited;
+    std::vector<std::uint32_t> pending;
+    std::vector<DescriptorValue> evaluated;
+    std::vector<std::uint32_t> flattened;
+    bool busy = false;
+};
+
+RuntimeSourcesScratch& ThreadRuntimeSourcesScratch() {
+    struct RuntimeSourcesScratchTag {};
+    return HostThreadLocal<RuntimeSourcesScratch, RuntimeSourcesScratchTag>();
+}
+
 }
 
 bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources) {
@@ -57,11 +74,25 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
     if (std::any_of(cleanFlatSlots.begin(), cleanFlatSlots.end(), [](std::uint8_t clean) { return clean != 0u; }) && runtime.readSpecializationMemory == nullptr) {
         return Fail("clean flat slots need specialization memory");
     }
+    auto& kept = ThreadRuntimeSourcesScratch();
+    RuntimeSourcesScratch own;
+    const bool borrowed = !kept.busy;
+    auto& scratch = borrowed ? kept : own;
+    struct BusyScope {
+        bool* flag;
+        ~BusyScope() {
+            if (flag != nullptr) *flag = false;
+        }
+    } busyScope {borrowed ? &kept.busy : nullptr};
+    if (borrowed) {
+        kept.busy = true;
+    }
     SrtRuntime cleanRuntime = runtime;
     cleanRuntime.readMemory = runtime.readSpecializationMemory;
     Evaluator cleanEvaluator(program, cleanRuntime);
     Evaluator evaluator(program, runtime, cleanFlatSlots, &cleanEvaluator);
-    std::vector<std::uint8_t> active;
+    auto& active = scratch.active;
+    active.clear();
     if (evaluateFlat) {
         active.assign(program.descriptorSources.size(), 1u);
     }
@@ -71,8 +102,10 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
                 active.at(source) = 0u;
             }
         }
-        std::vector<std::uint8_t> visited(program.controlFlow.size());
-        std::vector<std::uint32_t> pending {0};
+        auto& visited = scratch.visited;
+        visited.assign(program.controlFlow.size(), 0u);
+        auto& pending = scratch.pending;
+        pending.assign(1u, 0u);
         while (!pending.empty()) {
             const auto index = pending.back();
             pending.pop_back();
@@ -93,7 +126,8 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
             }
         }
     }
-    std::vector<DescriptorValue> evaluated;
+    auto& evaluated = scratch.evaluated;
+    evaluated.clear();
     evaluated.reserve(sources.size());
     for (const auto sourceIndex : sources) {
         const auto* source = Source(program, sourceIndex);
@@ -117,7 +151,8 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
         }
         evaluated.push_back(value);
     }
-    std::vector<std::uint32_t> flattened;
+    auto& flattened = scratch.flattened;
+    flattened.clear();
     if (evaluateFlat) {
         evaluator.ReadUnmappedAsZero();
         cleanEvaluator.ReadUnmappedAsZero();
@@ -145,10 +180,11 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
         static std::atomic<bool> reported {false};
         if (!reported.exchange(true)) std::fprintf(stderr, "[srt] flattened SRT slots read unmapped guest memory (%u dwords); they read as zero (reported once)\n", evaluator.UnmappedReads() + cleanEvaluator.UnmappedReads());
     }
-    results = std::move(evaluated);
-    activeSources = std::move(active);
+    // Copied into the caller's lists (which keep their storage when the caller keeps them).
+    results.assign(evaluated.begin(), evaluated.end());
+    activeSources.assign(active.begin(), active.end());
     if (evaluateFlat) {
-        flat = std::move(flattened);
+        flat.assign(flattened.begin(), flattened.end());
     }
     return true;
 }

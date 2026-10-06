@@ -61,8 +61,9 @@ CaptureMemo& TheCaptureMemo() {
     return memo;
 }
 
-// The thread's read log (see the memo above).
+// The thread's capture and read log (see AheadStage::scratch and the memo above).
 struct StageScratch {
+    ShaderRecompiler::ResourceCapture capture;
     std::vector<ShaderMemory::ReadEvent> reads;
 };
 
@@ -173,8 +174,9 @@ ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::u
             table.outcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
         }
         if (memoized == nullptr) {
-            // The thread's log, for the front end's stages that record only.
-            auto* scratch = record ? &ThreadStageScratch() : nullptr;
+            // The thread's storage, for the front end's stages that ask for it only.
+            const bool keptCapture = ahead != nullptr && ahead->scratch && handle != nullptr;
+            auto* scratch = record || keptCapture ? &ThreadStageScratch() : nullptr;
             struct LogScope {
                 ShaderMemory& memory;
                 ~LogScope() { memory.LogReads(nullptr); }
@@ -183,8 +185,13 @@ ShaderRecompiler::RecompileResult Driver::compileDrawStage(std::size_t i, std::u
                 scratch->reads.clear();
                 shaderMemory.LogReads(&scratch->reads);
             }
-            ownedCapture = shaderMemory.Capture(request, handle.get());
-            capture = ownedCapture.get();
+            if (keptCapture) {
+                shaderMemory.CaptureInto(request, *handle, scratch->capture);
+                capture = &scratch->capture;
+            } else {
+                ownedCapture = shaderMemory.Capture(request, handle.get());
+                capture = ownedCapture.get();
+            }
         }
     }
     lap(&AheadStage::captureNs);

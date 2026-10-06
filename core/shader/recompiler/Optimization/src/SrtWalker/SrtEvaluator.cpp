@@ -2,6 +2,7 @@
 #include "Optimization/SrtWalker/SrtAddressArithmetic.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -10,9 +11,83 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 
 namespace ShaderRecompiler::Detail {
+
+namespace {
+
+// See SrtEvaluator.hpp. A handful of each is all a walk holds at once (two evaluators and the
+// ReadFirstLane ones nested at that moment); a table or list grown past the bound (a plan of
+// tens of thousands of values) is freed as before instead of being kept for the thread's life.
+struct EvaluatorStorage {
+    std::vector<std::vector<EvaluatedSlot>> tables;
+    std::vector<std::vector<const IrValue*>> lists;
+};
+
+constexpr std::size_t KeptEvaluatorTables = 16;
+constexpr std::size_t KeptEvaluatorLists = 32;
+constexpr std::size_t KeptEvaluatorEntries = 1u << 16u;
+
+EvaluatorStorage& ThreadEvaluatorStorage() {
+    struct EvaluatorStorageTag {};
+    return HostThreadLocal<EvaluatorStorage, EvaluatorStorageTag>();
+}
+
+}
+
+std::vector<EvaluatedSlot> TakeEvaluatorTable() {
+    auto& tables = ThreadEvaluatorStorage().tables;
+    if (tables.empty()) {
+        return {};
+    }
+    auto table = std::move(tables.back());
+    tables.pop_back();
+    return table;
+}
+
+void ReturnEvaluatorTable(std::vector<EvaluatedSlot>&& table) noexcept {
+    // Called from destructors: a table that cannot be kept is left to its owner, which frees it.
+    try {
+        auto& tables = ThreadEvaluatorStorage().tables;
+        if (tables.size() < KeptEvaluatorTables && table.capacity() <= KeptEvaluatorEntries) {
+            tables.push_back(std::move(table));
+        }
+    } catch (...) {
+    }
+}
+
+std::vector<const IrValue*> TakeEvaluatorList() {
+    auto& lists = ThreadEvaluatorStorage().lists;
+    if (lists.empty()) {
+        return {};
+    }
+    auto list = std::move(lists.back());
+    lists.pop_back();
+    list.clear();
+    return list;
+}
+
+void ReturnEvaluatorList(std::vector<const IrValue*>&& list) noexcept {
+    try {
+        auto& lists = ThreadEvaluatorStorage().lists;
+        if (lists.size() < KeptEvaluatorLists && list.capacity() <= KeptEvaluatorEntries) {
+            list.clear();
+            lists.push_back(std::move(list));
+        }
+    } catch (...) {
+    }
+}
+
+Evaluator::~Evaluator() {
+    if (_visiting.capacity() != 0u) {
+        ReturnEvaluatorList(std::move(_visiting));
+    }
+    if (_conditionalReads.capacity() != 0u) {
+        ReturnEvaluatorList(std::move(_conditionalReads));
+    }
+}
 
 bool Evaluator::Evaluate(IrValue* value, std::uint32_t& result) {
     std::uint64_t wide = 0;
@@ -48,6 +123,9 @@ bool Evaluator::EvaluateWide(IrValue* raw, std::uint64_t& result) {
     }
     if (std::find(_visiting.begin(), _visiting.end(), inst) != _visiting.end()) {
         return false;
+    }
+    if (_visiting.capacity() == 0u) {
+        _visiting = TakeEvaluatorList();
     }
     _visiting.push_back(inst);
     std::uint64_t out = 0;
@@ -114,11 +192,13 @@ bool Evaluator::EvaluateExtract(IrValue& inst, std::uint64_t& result) {
 bool Evaluator::IsConditionalSlotRead(const IrValue& inst) {
     if (!_conditionalReadsBuilt) {
         _conditionalReadsBuilt = true;
+        _conditionalReads = TakeEvaluatorList();
         for (const auto& read : _program.srtReads) {
-            if (read.conditional && read.value != nullptr) _conditionalReads.insert(read.value->Resolve());
+            if (read.conditional && read.value != nullptr) _conditionalReads.push_back(read.value->Resolve());
         }
+        std::sort(_conditionalReads.begin(), _conditionalReads.end(), std::less<const IrValue*>{});
     }
-    return _conditionalReads.contains(&inst);
+    return std::binary_search(_conditionalReads.begin(), _conditionalReads.end(), &inst, std::less<const IrValue*>{});
 }
 
 bool Evaluator::EvaluateRawRead(IrValue& inst, std::uint64_t& result) {

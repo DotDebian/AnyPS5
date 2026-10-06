@@ -63,6 +63,10 @@ public:
     // (the driver's memoized ShaderRecompiler::ResolveSource result) the capture skips the source
     // resolution.
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> Capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle = nullptr);
+    // The same into a capture the caller keeps between calls (its lists keep their storage, so
+    // the capture allocates nothing once it has grown): for a caller that hands it to
+    // ShaderRecompiler::Recompile(request, capture) at once and to nothing else.
+    void CaptureInto(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle& handle, ShaderRecompiler::ResourceCapture& capture);
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> Regions() const;
     // The same into the caller's vector, which keeps its storage.
     void Regions(std::vector<ShaderRecompiler::MemoryRegion>& result) const;
@@ -117,8 +121,8 @@ private:
     // SrtRuntime::isReadable: the snapshot's words and mapped guest pages.
     static bool readable(void* context, std::uint64_t address);
     Page& page(std::uint64_t base);
-    // Capture: the runtime over this memory, the read site and the [capture] accounting around
-    // `call`, which makes the capture and returns it.
+    // Capture and CaptureInto: the runtime over this memory, the read site and the [capture]
+    // accounting around `call`, which makes the capture and returns it.
     template <typename Call>
     void capturing(const ShaderRecompiler::RecompileRequest& request, Call&& call);
 

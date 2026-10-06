@@ -3298,6 +3298,11 @@ VkDescriptorSetLayout ShaderResources::Layout() const {
     return _layout;
 }
 
+ShaderResources::OwnedSetPool::~OwnedSetPool() {
+    if (cache == nullptr) return;
+    for (const auto& set : free) cache->Free(set.allocation);
+}
+
 ShaderResources::DrawBindings::~DrawBindings() {
     if (cache != nullptr && allocation.set != VK_NULL_HANDLE) cache->Free(allocation);
 }
@@ -3365,11 +3370,34 @@ thread_local Recorder::SnapshotStamp addressSnapshotStamp;
 struct DrawBatchSets {
     DescriptorCache* cache = nullptr;
     std::vector<DescriptorCache::SetAllocation> sets;
+    // APS5_OWNED_DRAW_SETS: the sets that go back to their template's pool instead.
+    std::vector<std::pair<std::shared_ptr<ShaderResources::OwnedSetPool>, ShaderResources::OwnedDrawSet>> owned;
     ~DrawBatchSets() {
+        for (auto& [pool, set] : owned) {
+            std::lock_guard lock(pool->mutex);
+            if (pool->free.size() < 16) {
+                try {
+                    pool->free.push_back(std::move(set));
+                    continue;
+                } catch (...) {
+                }
+            }
+            if (pool->cache != nullptr) pool->cache->Free(set.allocation);
+        }
         if (cache == nullptr) return;
         for (const auto& allocation : sets) cache->Free(allocation);
     }
 };
+
+bool OwnedDrawSets() {
+    static const bool enabled = std::getenv("APS5_OWNED_DRAW_SETS") != nullptr;
+    return enabled;
+}
+
+// APS5_OWNED_DRAW_SETS counters for [bindsplit]: sets taken back from a template's pool, and the
+// one-element restores they needed.
+std::uint64_t ownedReused = 0;
+std::uint64_t ownedRestores = 0;
 
 }
 
@@ -3381,12 +3409,43 @@ const ShaderResources::AddressSnapshotStats& ShaderResources::AddressSnapshotCou
     return addressSnapshotStats;
 }
 
+namespace {
+// APS5_TRACE_BIND_SPLIT: addressSnapshot's time by step, in nanoseconds, and how its calls ended
+// (see [bindsplit]). Plain counters: the callers hold GuestMemory::GpuMutex.
+struct SnapSplit {
+    std::uint64_t calls = 0, checksNs = 0, epochNs = 0, pendingNs = 0, smallNs = 0, collectNs = 0;
+    std::uint64_t refused = 0, epochHits = 0, small = 0, collected = 0, dataNs = 0, dataBuffers = 0;
+};
+SnapSplit snapSplit;
+bool SnapSplitTraced() {
+    static const bool traced = std::getenv("APS5_TRACE_BIND_SPLIT") != nullptr;
+    return traced;
+}
+struct SnapLaps {
+    bool on = SnapSplitTraced();
+    std::chrono::steady_clock::time_point mark = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void lap(std::uint64_t SnapSplit::*field) {
+        if (!on) return;
+        const auto at = std::chrono::steady_clock::now();
+        snapSplit.*field += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(at - mark).count());
+        mark = at;
+    }
+    void count(std::uint64_t SnapSplit::*field) {
+        if (on) ++(snapSplit.*field);
+    }
+};
+}
+
 bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, std::size_t bytes, VkDescriptorBufferInfo& info, bool& transient) const {
     transient = false;
     auto& stats = addressSnapshotStats;
     const auto& window = AddressSnapshots();
+    SnapLaps laps;
+    laps.count(&SnapSplit::calls);
     const auto leave = [&](SnapshotRefusal reason) {
         ++stats.inPlace[static_cast<std::size_t>(reason)];
+        laps.count(&SnapSplit::refused);
+        laps.lap(&SnapSplit::checksNs);
         return false;
     };
     const auto bind = [&](VkBuffer buffer, VkDeviceSize offset, bool video) {
@@ -3403,7 +3462,11 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
     if (!guestMemory.BoundInPlace(begin, bytes, &region)) return leave(SnapshotRefusal::OutsideImport);
     // A range proved in this collect epoch under the stamp still in force: no check is repeated.
     const auto& now = addressSnapshotStamp;
-    if (const auto proved = recorder.EpochSnapshot(begin, bytes, now); proved.buffer != VK_NULL_HANDLE) {
+    laps.lap(&SnapSplit::checksNs);
+    const auto proved = recorder.EpochSnapshot(begin, bytes, now);
+    laps.lap(&SnapSplit::epochNs);
+    if (proved.buffer != VK_NULL_HANDLE) {
+        laps.count(&SnapSplit::epochHits);
         ++stats.epochSkips;
         if (proved.rechecked) ++stats.epochRechecks;
         transient = proved.transient;
@@ -3414,6 +3477,7 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
     // place without flushing them either, so a copy of the import's bytes reads what the import
     // would; the snapshot path of the builds never asked.)
     if (recorder.PendingWriteHits(begin, bytes)) return leave(SnapshotRefusal::Pending);
+    laps.lap(&SnapSplit::pendingNs);
     // A small element: its bytes into the batch arena, with no collect and no cache entry. Its
     // proof is the copy itself, good for the collect epoch like a memo hit's (a later use in the
     // epoch binds the same bytes, the next epoch copies again); the range lies in an import the
@@ -3424,6 +3488,8 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
             recorder.NoteEpochSnapshot(begin, bytes, now, 0, arena.block, arena.offset);
             ++stats.small;
             stats.smallBytes += bytes;
+            laps.count(&SnapSplit::small);
+            laps.lap(&SnapSplit::smallNs);
             transient = true;
             return bind(arena.block->Handle(), arena.offset, arena.block->InVideoMemory());
         }
@@ -3457,12 +3523,68 @@ bool ShaderResources::addressSnapshot(Recorder& recorder, std::uint64_t begin, s
     }
     recorder.NoteEpochSnapshot(begin, bytes, now, generation, buffer);
     CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+    laps.count(&SnapSplit::collected);
+    laps.lap(&SnapSplit::collectNs);
     return bind(buffer->Handle(), 0, buffer->InVideoMemory());
+}
+
+namespace {
+// APS5_TRACE_BIND_SPLIT=1 (local, not for upstream): where addressDrawBindings spends its time,
+// printed as [bindsplit] every 10 s: the gather (snapshots, data buffers), the memo, the set's
+// allocation, the copy of the template's set and the writes of the selected elements, with what
+// a set holds (bindings, descriptors by type, writes). Plain counters: the callers hold
+// GuestMemory::GpuMutex.
+struct BindSplit {
+    std::uint64_t calls = 0, built = 0, gatherNs = 0, memoNs = 0, allocNs = 0, copyNs = 0, writeNs = 0;
+    std::uint64_t bindings = 0, descriptors = 0, writes = 0, selected = 0;
+    std::array<std::uint64_t, 5> byType{};
+    std::uint64_t maxDescriptors = 0, overPush = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+bool BindSplitTraced() {
+    static const bool traced = std::getenv("APS5_TRACE_BIND_SPLIT") != nullptr;
+    return traced;
+}
+BindSplit& TheBindSplit() {
+    static BindSplit split;
+    return split;
+}
+std::uint64_t SplitNs(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+}
+void ReportBindSplit() {
+    auto& split = TheBindSplit();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - split.last < std::chrono::seconds(10)) return;
+    const auto per = [&](std::uint64_t ns, std::uint64_t n) { return n != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(n) : 0.0; };
+    const auto avg = [&](std::uint64_t value) { return split.built != 0 ? static_cast<double>(value) / static_cast<double>(split.built) : 0.0; };
+    AgcDriver::ReportLine("[bindsplit] address draw sets (10 s): %llu calls, %llu sets built; avg us per call: gather %.2f, memo %.2f; per set built: allocate %.2f, copy of the template set %.2f, writes %.2f; per set built: %.1f bindings, %.1f descriptors (storage buffers %.1f, sampled images %.1f, storage images %.1f, samplers %.1f, other %.1f), %.1f selected, %.1f writes; largest set %llu descriptors, %llu sets over 32; owned sets: %llu taken back, %llu one-element restores\n", static_cast<unsigned long long>(split.calls), static_cast<unsigned long long>(split.built), per(split.gatherNs, split.calls), per(split.memoNs, split.calls), per(split.allocNs, split.built), per(split.copyNs, split.built), per(split.writeNs, split.built), avg(split.bindings), avg(split.descriptors), avg(split.byType[0]), avg(split.byType[1]), avg(split.byType[2]), avg(split.byType[3]), avg(split.byType[4]), avg(split.selected), avg(split.writes), static_cast<unsigned long long>(split.maxDescriptors), static_cast<unsigned long long>(split.overPush), static_cast<unsigned long long>(ownedReused), static_cast<unsigned long long>(ownedRestores));
+    const auto& snap = snapSplit;
+    const auto perSnap = [&](std::uint64_t ns) { return snap.calls != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(snap.calls) : 0.0; };
+    AgcDriver::ReportLine("[bindsplit] snapshots of address draws (10 s): %llu elements (%.1f per call), avg us per element: checks %.3f, epoch lookup %.3f, pending writes %.3f, small copy %.3f, collect and cache %.3f; ended: %llu left in place, %llu epoch hits, %llu small copies, %llu collected; data buffers %llu, %.3f us each\n", static_cast<unsigned long long>(snap.calls), split.calls != 0 ? static_cast<double>(snap.calls) / static_cast<double>(split.calls) : 0.0, perSnap(snap.checksNs), perSnap(snap.epochNs), perSnap(snap.pendingNs), perSnap(snap.smallNs), perSnap(snap.collectNs), static_cast<unsigned long long>(snap.refused), static_cast<unsigned long long>(snap.epochHits), static_cast<unsigned long long>(snap.small), static_cast<unsigned long long>(snap.collected), static_cast<unsigned long long>(snap.dataBuffers), snap.dataBuffers != 0 ? static_cast<double>(snap.dataNs) / 1000.0 / static_cast<double>(snap.dataBuffers) : 0.0);
+    snapSplit = {};
+    ownedReused = ownedRestores = 0;
+    split = {};
+    split.last = now;
+}
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     const auto& window = AddressSnapshots();
     if (!window.enabled && moved.empty()) return {};
+    const bool splitTraced = BindSplitTraced();
+    const auto splitStart = splitTraced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto splitMark = splitStart;
+    const auto splitLap = [&](std::uint64_t BindSplit::*field) {
+        if (!splitTraced) return;
+        const auto at = std::chrono::steady_clock::now();
+        TheBindSplit().*field += SplitNs(splitMark, at);
+        splitMark = at;
+    };
+    if (splitTraced) {
+        ++TheBindSplit().calls;
+        ReportBindSplit();
+    }
     // The call's result and scratch, kept per thread: nearly every address-based draw gets here.
     thread_local DrawBindings result;
     thread_local std::vector<std::size_t> selected;
@@ -3500,6 +3622,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
             // The draw's own data buffer, from the arena (a Buffer of its own when it is too large).
+            SnapLaps dataLaps;
+            dataLaps.count(&SnapSplit::dataBuffers);
             VkDescriptorBufferInfo info{};
             std::byte* bytes = nullptr;
             if (const auto arena = recorder.ArenaAllocate(override->size); arena.bytes != nullptr) {
@@ -3526,6 +3650,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
             selected.push_back(index);
             infos.push_back(info);
             mixBinding(index, info, true);
+            dataLaps.lap(&SnapSplit::dataNs);
             continue;
         }
         if (override != moved.end() && override->inPlace) {
@@ -3557,6 +3682,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
         infos.push_back(info);
         mixBinding(index, info, transient);
     }
+    splitLap(&BindSplit::gatherNs);
     if (selected.empty()) return {};
     // An identical draw of this batch (the same bindings, hence the same bytes: the batch keeps
     // every buffer, and a set made for it is not written again) binds that draw's set. One of
@@ -3578,6 +3704,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
             repeatedButArena = true;
         }
     }
+    splitLap(&BindSplit::memoNs);
     ++addressSnapshotStats.setsBuilt;
     if (repeatedAcross) ++addressSnapshotStats.setsRepeatedAcrossBatches;
     else if (repeatedButArena) ++addressSnapshotStats.setsRepeatedButArena;
@@ -3587,9 +3714,25 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
         for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
         for (const auto& [type, count] : counts) drawBindingSizes.push_back({type, count});
     }
-    const auto allocation = context.descriptorCache->Allocate(_layout, drawBindingSizes);
+    const bool owning = OwnedDrawSets();
+    OwnedDrawSet owned;
+    bool reusedOwned = false;
+    if (owning) {
+        if (ownedSets == nullptr) {
+            ownedSets = std::make_shared<OwnedSetPool>();
+            ownedSets->cache = context.descriptorCache;
+        }
+        std::lock_guard lock(ownedSets->mutex);
+        if (!ownedSets->free.empty()) {
+            owned = std::move(ownedSets->free.back());
+            ownedSets->free.pop_back();
+            reusedOwned = true;
+        }
+    }
+    if (!reusedOwned) owned.allocation = context.descriptorCache->Allocate(_layout, drawBindingSizes);
+    const auto allocation = owned.allocation;
     Require(allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
-    // The batch frees the set with its kept objects.
+    // The batch frees the set with its kept objects (or gives it back to the template's pool).
     auto& scratch = recorder.BatchScratch();
     if (scratch == nullptr) {
         auto sets = std::make_shared<DrawBatchSets>();
@@ -3597,16 +3740,20 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
         scratch = sets;
         recorder.Keep(std::move(sets));
     }
-    static_cast<DrawBatchSets*>(scratch.get())->sets.push_back(allocation);
+    auto& batchSets = *static_cast<DrawBatchSets*>(scratch.get());
+    if (!owning) batchSets.sets.push_back(allocation);
+    splitLap(&BindSplit::allocNs);
     copies.clear();
-    for (const auto& binding : bindings) {
-        VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
-        copy.srcSet = _set;
-        copy.srcBinding = binding.layout.binding;
-        copy.dstSet = allocation.set;
-        copy.dstBinding = binding.layout.binding;
-        copy.descriptorCount = binding.layout.descriptorCount;
-        copies.push_back(copy);
+    if (!reusedOwned) {
+        for (const auto& binding : bindings) {
+            VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+            copy.srcSet = _set;
+            copy.srcBinding = binding.layout.binding;
+            copy.dstSet = allocation.set;
+            copy.dstBinding = binding.layout.binding;
+            copy.descriptorCount = binding.layout.descriptorCount;
+            copies.push_back(copy);
+        }
     }
     writes.clear();
     for (const auto& binding : bindings) {
@@ -3623,9 +3770,51 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::addressDrawBindi
             writes.push_back(write);
         }
     }
+    if (owning) {
+        // A reused set: the elements its last draw wrote that this one leaves go back to the
+        // template's descriptors. Then the set's deviations are this draw's writes.
+        for (const auto& [binding, element] : owned.deviations) {
+            const bool rewritten = std::any_of(writes.begin(), writes.end(), [&](const VkWriteDescriptorSet& write) { return write.dstBinding == binding && write.dstArrayElement == element; });
+            if (rewritten) continue;
+            VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+            copy.srcSet = _set;
+            copy.srcBinding = binding;
+            copy.srcArrayElement = element;
+            copy.dstSet = allocation.set;
+            copy.dstBinding = binding;
+            copy.dstArrayElement = element;
+            copy.descriptorCount = 1;
+            copies.push_back(copy);
+            ++ownedRestores;
+        }
+        if (reusedOwned) ++ownedReused;
+        owned.deviations.clear();
+        for (const auto& write : writes) owned.deviations.emplace_back(write.dstBinding, write.dstArrayElement);
+        batchSets.owned.emplace_back(ownedSets, std::move(owned));
+    }
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
-    update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
+    if (splitTraced) splitMark = std::chrono::steady_clock::now();
+    if (!copies.empty()) update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
+    splitLap(&BindSplit::copyNs);
     update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    splitLap(&BindSplit::writeNs);
+    if (splitTraced) {
+        auto& split = TheBindSplit();
+        ++split.built;
+        split.bindings += bindings.size();
+        split.writes += writes.size();
+        split.selected += selected.size();
+        std::uint64_t total = 0;
+        for (const auto& binding : bindings) {
+            const auto type = binding.layout.descriptorType;
+            const std::size_t slot = type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? 0 : type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ? 1 : type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? 2 : type == VK_DESCRIPTOR_TYPE_SAMPLER ? 3 : 4;
+            split.byType[slot] += binding.layout.descriptorCount;
+            total += binding.layout.descriptorCount;
+        }
+        split.descriptors += total;
+        split.maxDescriptors = std::max(split.maxDescriptors, total);
+        if (total > 32) ++split.overPush;
+    }
     drawSetMemos[drawSetNext++ % drawSetMemos.size()] = {full, stable, allocation.set, batch};
     // The set only: `cache` stays null, so the scratch frees nothing.
     result.allocation.set = allocation.set;

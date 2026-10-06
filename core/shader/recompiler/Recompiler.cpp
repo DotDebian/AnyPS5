@@ -244,10 +244,16 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
 // A materialized result of one variant over one snapshot (Recompile(request, capture)): the
 // shared immutable object every later capture that reproduces the snapshot receives, so Populate
 // and the per-request copy run once per distinct snapshot.
+// APS5_TRACE_RESULT_MEMO=1 (local, not for upstream): the hash of each part of the key, kept in
+// the entry so a miss can say which parts differ from the closest entry of the same variant.
+constexpr std::size_t MemoKeyParts = 12;
+using MemoKeyHashes = std::array<std::uint64_t, MemoKeyParts>;
+
 struct ResultMemoEntry {
     std::uint64_t variantId;
     std::uint64_t hash;
     std::shared_ptr<const RecompileResult> result;
+    MemoKeyHashes parts{};
 };
 
 struct SourceEntry {
@@ -270,6 +276,9 @@ struct SourceEntry {
     // The result memo, most recently used first, at most ResultMemoEntries (under mutex).
     std::list<ResultMemoEntry> memo;
     std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoIndex;
+    // APS5_TRACE_RESULT_MEMO: the keys evicted last, to tell a capacity miss from a new key.
+    std::array<std::uint64_t, 256> evicted{};
+    std::size_t nextEvicted = 0;
 };
 
 namespace {
@@ -666,6 +675,144 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     return hash;
 }
 
+bool resultMemoTraced() {
+    static const bool traced = std::getenv("APS5_TRACE_RESULT_MEMO") != nullptr;
+    return traced;
+}
+
+// Parts: 0 buffers, 1 buffers without their base address, 2 images, 3 images without their base
+// address, 4 samplers, 5 flattened SRT, 6 user data, 7 uniform fill, 8 partial threads, 9 vertex
+// resources, 10 vertex resources without their base address, 11 user data without words that look
+// like addresses (high dword 0x5.. or 0x10..).
+MemoKeyHashes snapshotParts(const RecompileRequest& request, const ResourceSnapshot& snapshot) {
+    MemoKeyHashes parts{};
+    const auto mixer = [](std::uint64_t& hash, std::uint64_t value) {
+        hash ^= value;
+        hash *= 0x100000001b3ull;
+    };
+    for (auto& part : parts) part = 0xcbf29ce484222325ull;
+    const auto descriptors = [&](std::size_t full, std::size_t masked, const std::vector<DescriptorValue>& values, std::uint32_t highMask) {
+        mixer(parts[full], values.size());
+        mixer(parts[masked], values.size());
+        for (const auto& value : values) {
+            for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) {
+                mixer(parts[full], value.dwords[i]);
+                mixer(parts[masked], i == 0 ? 0u : i == 1 ? (value.dwords[i] & highMask) : value.dwords[i]);
+            }
+        }
+    };
+    descriptors(0, 1, snapshot.buffers, 0xffff0000u);
+    descriptors(2, 3, snapshot.images, 0xffffff00u);
+    mixer(parts[4], snapshot.samplers.size());
+    for (const auto& value : snapshot.samplers) {
+        for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) mixer(parts[4], value.dwords[i]);
+    }
+    for (const auto word : snapshot.flattenedSrt) mixer(parts[5], word);
+    mixer(parts[5], snapshot.flattenedSrt.size());
+    for (std::size_t i = 0; i < snapshot.userData.size(); ++i) {
+        const auto word = snapshot.userData[i];
+        mixer(parts[6], word);
+        const bool high = i + 1 < snapshot.userData.size() && (snapshot.userData[i + 1] == 5 || snapshot.userData[i + 1] == 0x10);
+        const bool low = i > 0 && (word == 5 || word == 0x10) && i % 2 == 1;
+        mixer(parts[11], high || low ? 0u : word);
+    }
+    mixer(parts[7], static_cast<std::uint64_t>(snapshot.uniformFill.kind));
+    mixer(parts[7], snapshot.uniformFill.resource);
+    for (const auto stride : snapshot.uniformFill.groupStride) mixer(parts[7], stride);
+    mixer(parts[7], snapshot.uniformFill.words);
+    mixer(parts[7], snapshot.uniformFill.value);
+    for (const auto threads : partialThreads(request)) mixer(parts[8], threads);
+    if (request.context.vertex) {
+        const auto& vertex = *request.context.vertex;
+        const auto count = std::min<std::uint32_t>(vertex.resourcesNum, ShaderVertexStageInfo::MaxResources);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            std::size_t f = 0;
+            for (const auto field : vertex.resources[i].fields) {
+                mixer(parts[9], field);
+                mixer(parts[10], f == 0 ? 0u : field);
+                ++f;
+            }
+        }
+    }
+    return parts;
+}
+
+struct MemoTrace {
+    std::atomic<std::uint64_t> misses{0}, noVariant{0}, evictedKey{0}, sameVariant{0};
+    std::array<std::atomic<std::uint64_t>, MemoKeyParts> differs{};
+    // Misses whose closest entry differs only in the parts named (bitmask over 0,2,4,5,6,7,8,9).
+    std::array<std::atomic<std::uint64_t>, 8> onlyOne{};
+    std::atomic<std::uint64_t> addressOnly{0}, entries{0}, sources{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+MemoTrace& memoTrace() {
+    static MemoTrace trace;
+    return trace;
+}
+
+// Under source.mutex, on a miss.
+void traceMemoMiss(const SourceEntry& source, std::uint64_t variantId, std::uint64_t hash, const MemoKeyHashes& parts) {
+    auto& trace = memoTrace();
+    trace.misses.fetch_add(1, std::memory_order_relaxed);
+    for (const auto evicted : source.evicted) {
+        if (evicted == ((variantId * 0x9e3779b97f4a7c15ull) ^ hash) && evicted != 0) {
+            trace.evictedKey.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+    }
+    static constexpr std::array<std::size_t, 8> primary{0, 2, 4, 5, 6, 7, 8, 9};
+    const ResultMemoEntry* best = nullptr;
+    int bestSame = -1;
+    for (const auto& entry : source.memo) {
+        if (entry.variantId != variantId) continue;
+        int same = 0;
+        for (const auto part : primary) same += entry.parts[part] == parts[part] ? 1 : 0;
+        if (same > bestSame) {
+            bestSame = same;
+            best = &entry;
+        }
+    }
+    if (best == nullptr) {
+        trace.noVariant.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    trace.sameVariant.fetch_add(1, std::memory_order_relaxed);
+    std::size_t differing = 0, which = 0;
+    for (std::size_t k = 0; k < primary.size(); ++k) {
+        if (best->parts[primary[k]] != parts[primary[k]]) {
+            ++differing;
+            which = k;
+        }
+    }
+    for (std::size_t part = 0; part < MemoKeyParts; ++part) {
+        if (best->parts[part] != parts[part]) trace.differs[part].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (differing == 1) trace.onlyOne[which].fetch_add(1, std::memory_order_relaxed);
+    const bool addressOnly = best->parts[1] == parts[1] && best->parts[3] == parts[3] && best->parts[4] == parts[4] && best->parts[5] == parts[5] && best->parts[7] == parts[7] && best->parts[8] == parts[8] && best->parts[10] == parts[10] && best->parts[11] == parts[11];
+    if (addressOnly) trace.addressOnly.fetch_add(1, std::memory_order_relaxed);
+}
+
+void reportMemoTrace(std::uint64_t hits) {
+    static std::atomic<std::uint64_t> hitCount{0};
+    hitCount.fetch_add(hits, std::memory_order_relaxed);
+    auto& trace = memoTrace();
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = trace.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        trace.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !trace.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    char text[1024];
+    int length = std::snprintf(text, sizeof(text), "[resultmemo] 10 s: %llu hits, %llu misses: %llu no entry of the variant, %llu with one (key evicted earlier %llu); parts differing from the closest entry: buffers %llu (without address %llu), images %llu (without address %llu), samplers %llu, flat SRT %llu, user data %llu (without address-like words %llu), uniform fill %llu, partial threads %llu, vertex %llu (without address %llu)",
+        take(hitCount), take(trace.misses), take(trace.noVariant), take(trace.sameVariant), take(trace.evictedKey), take(trace.differs[0]), take(trace.differs[1]), take(trace.differs[2]), take(trace.differs[3]), take(trace.differs[4]), take(trace.differs[5]), take(trace.differs[6]), take(trace.differs[11]), take(trace.differs[7]), take(trace.differs[8]), take(trace.differs[9]), take(trace.differs[10]));
+    length += std::snprintf(text + length, sizeof(text) - length, "; only one part differs: buffers %llu, images %llu, samplers %llu, flat SRT %llu, user data %llu, uniform fill %llu, partial threads %llu, vertex %llu; differ only by base addresses %llu\n",
+        take(trace.onlyOne[0]), take(trace.onlyOne[1]), take(trace.onlyOne[2]), take(trace.onlyOne[3]), take(trace.onlyOne[4]), take(trace.onlyOne[5]), take(trace.onlyOne[6]), take(trace.onlyOne[7]), take(trace.addressOnly));
+    std::fputs(text, stderr);
+}
+
 // The memo'd result of `source`'s variant for the snapshot (design13 R5): a hit returns the shared
 // object, a miss materializes outside the source mutex and inserts (a concurrent miss's object is
 // as good). `memoHit` reports the hit.
@@ -674,6 +821,8 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
     std::shared_ptr<const CompiledVariant> variant;
     bool cacheHit = false;
     const auto hash = snapshotHash(request, snapshot);
+    const bool traced = resultMemoTraced();
+    const auto parts = traced ? snapshotParts(request, snapshot) : MemoKeyHashes{};
     std::uint64_t index = 0;
     auto& counters = resultMemoCounters();
     {
@@ -686,9 +835,12 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
             counters.hits.fetch_add(1, std::memory_order_relaxed);
             if (memoHit != nullptr) *memoHit = true;
             reportResultMemo();
+            if (traced) reportMemoTrace(1);
             return found->second->result;
         }
+        if (traced) traceMemoMiss(source, variant->result.variantId, hash, parts);
     }
+    if (traced) reportMemoTrace(0);
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
     result->cacheHit = cacheHit;
@@ -708,11 +860,12 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
             }
         }
         if (source.memoIndex.find(index) == source.memoIndex.end()) {
-            source.memo.push_front({variant->result.variantId, hash, shared});
+            source.memo.push_front({variant->result.variantId, hash, shared, parts});
             source.memoIndex.emplace(index, source.memo.begin());
             while (source.memo.size() > ResultMemoEntries) {
                 const auto& last = source.memo.back();
                 source.memoIndex.erase((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
+                if (traced) source.evicted[source.nextEvicted++ % source.evicted.size()] = (last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash;
                 source.memo.pop_back();
                 counters.evictions.fetch_add(1, std::memory_order_relaxed);
             }
@@ -761,13 +914,18 @@ namespace {
 // traced into the capture (ResourceCapture::readTrace).
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     const auto& plan = *capture.plan;
+    // Straight into the capture: a new one, or one a driver keeps (whose trace is emptied here).
+    capture.readTrace.leaf = nullptr;
+    capture.readTrace.leafSlot = 0;
+    capture.readTrace.leaves.clear();
+    capture.readTrace.otherReads.clear();
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
-        ResourceMaterializer{}.Materialize(plan, runtime, capture.snapshot, capture.specialization);
+        ResourceMaterializer{}.MaterializeInto(plan, runtime, capture.snapshot, capture.specialization);
         return;
     }
     SrtRuntime traced = runtime;
     traced.readTrace = &capture.readTrace;
-    ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, capture.specialization);
+    ResourceMaterializer{}.MaterializeInto(plan, traced, capture.snapshot, capture.specialization);
     auto& other = capture.readTrace.otherReads;
     std::sort(other.begin(), other.end());
     other.erase(std::unique(other.begin(), other.end()), other.end());
@@ -799,16 +957,20 @@ std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& reques
 }
 
 std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime, const SourceHandle& handle) {
+    auto capture = std::make_shared<ResourceCapture>();
+    CaptureResources(request, runtime, handle, *capture);
+    return capture;
+}
+
+void CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime, const SourceHandle& handle, ResourceCapture& capture) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // The whole vertex family (Vertex, Local, TC, TE, Mesh) validates V# fields the memo key does not cover.
     if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) static_cast<void>(RequestInputInfo(request));
-    auto capture = std::make_shared<ResourceCapture>();
-    capture->source = handle.source;
-    capture->plan = handle.source->plan;
-    if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-    materializeCapture(*capture, runtime);
-    return capture;
+    capture.source = handle.source;
+    capture.plan = handle.source->plan;
+    capture.sourceNanoseconds = profile ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0;
+    materializeCapture(capture, runtime);
 }
 
 RecompileResult Recompile(const RecompileRequest& request) {

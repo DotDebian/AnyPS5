@@ -3,6 +3,7 @@
 #include "IntermediateRepresentation/IrBuilder.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -410,8 +411,40 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     if (BindlessTraced()) traceTable(plan, image, table, heapBase, materialBase, {materialMode, entries, materialEntries, static_cast<std::uint32_t>(resolution.mapping.size())});
 }
 
-void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, ResourceSnapshot& snapshot, std::vector<TableResolution>& tables) {
+// The lists of one materialization that are not part of its result, kept per thread between
+// materializations. `busy` while one uses them: a materialization made inside another one on the
+// thread (none is known) takes lists of its own.
+struct MaterializeScratch {
+    std::vector<DescriptorValue> values;
+    std::vector<std::uint8_t> activeSources;
+    std::vector<TableResolution> tables;
+    bool busy = false;
+};
+
+MaterializeScratch& ThreadMaterializeScratch() {
+    struct MaterializeScratchTag {};
+    return HostThreadLocal<MaterializeScratch, MaterializeScratchTag>();
+}
+
+// `snapshot` as a new one, its lists emptied but keeping their storage.
+void resetSnapshot(ResourceSnapshot& snapshot) {
+    ResourceSnapshot kept = std::move(snapshot);
     snapshot = ResourceSnapshot{};
+    kept.buffers.clear();
+    kept.images.clear();
+    kept.samplers.clear();
+    kept.flattenedSrt.clear();
+    kept.userData.clear();
+    snapshot.buffers = std::move(kept.buffers);
+    snapshot.images = std::move(kept.images);
+    snapshot.samplers = std::move(kept.samplers);
+    snapshot.flattenedSrt = std::move(kept.flattenedSrt);
+    snapshot.userData = std::move(kept.userData);
+}
+
+void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, ResourceSnapshot& snapshot, MaterializeScratch& scratch) {
+    auto& tables = scratch.tables;
+    resetSnapshot(snapshot);
     if (plan.uniformFill.fill.kind != UniformFillKind::None) {
         const auto words = plan.uniformFill.fill.words;
         if (words == 0u || words > plan.uniformFill.values.size()) {
@@ -432,8 +465,10 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     }
     snapshot.userData.assign(runtime.userData.begin(), runtime.userData.begin() + plan.userDataCount);
 
-    std::vector<DescriptorValue> values;
-    std::vector<std::uint8_t> activeSources;
+    auto& values = scratch.values;
+    auto& activeSources = scratch.activeSources;
+    values.clear();
+    activeSources.clear();
     walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources);
 
     std::size_t cursor = 0;
@@ -489,8 +524,12 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     snapshot.samplers.assign(values.begin() + cursor, values.begin() + cursor + plan.info.samplers.size());
 }
 
+// Written straight into `specialization` (its lists keep their storage).
 void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& snapshot, const std::vector<TableResolution>& tables, ResourceSpecialization& specialization) {
-    ResourceSpecialization result;
+    auto& result = specialization;
+    result.buffers.clear();
+    result.images.clear();
+    result.boundDescriptors.clear();
     result.buffers.reserve(plan.info.buffers.size());
     for (std::uint32_t i = 0; i < plan.info.buffers.size(); i++) {
         const ShaderBufferResource decoded = decodeBufferDescriptor(snapshot.buffers[i]);
@@ -573,7 +612,6 @@ void buildResourceSpecialization(const IrResourcePlan& plan, ResourceSnapshot& s
     for (std::uint32_t index = 0; index < result.images.size(); index++) {
         result.boundDescriptors.push_back(index);
     }
-    specialization = std::move(result);
 }
 
 }
@@ -901,6 +939,14 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
 }
 
 void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) const {
+    ResourceSnapshot nextSnapshot;
+    ResourceSpecialization nextSpecialization;
+    MaterializeInto(program, runtime, nextSnapshot, nextSpecialization);
+    snapshot = std::move(nextSnapshot);
+    specialization = std::move(nextSpecialization);
+}
+
+void ResourceMaterializer::MaterializeInto(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization) const {
     const IrResourcePlan& plan = program;
     if (!plan.resourceTrackingComplete) {
         throw std::runtime_error("ResourceMaterializer::Materialize requires a completed resource plan");
@@ -909,20 +955,28 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
         throw std::runtime_error("ResourceMaterializer::Materialize requires runtime memory access for indirect images");
     }
     SrtWalker walker;
-    ResourceSnapshot nextSnapshot;
-    std::vector<TableResolution> tables;
+    auto& kept = ThreadMaterializeScratch();
+    MaterializeScratch own;
+    const bool borrowed = !kept.busy;
+    auto& scratch = borrowed ? kept : own;
+    struct BusyScope {
+        bool* flag;
+        ~BusyScope() {
+            if (flag != nullptr) *flag = false;
+        }
+    } busyScope {borrowed ? &kept.busy : nullptr};
+    if (borrowed) {
+        kept.busy = true;
+    }
     try {
-        materializeSnapshot(plan, runtime, walker, nextSnapshot, tables);
+        materializeSnapshot(plan, runtime, walker, snapshot, scratch);
     } catch (...) {
         reportBindless();
         throw;
     }
-    ResourceSpecialization nextSpecialization;
     const auto started = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    buildResourceSpecialization(plan, nextSnapshot, tables, nextSpecialization);
+    buildResourceSpecialization(plan, snapshot, scratch.tables, specialization);
     if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
-    snapshot = std::move(nextSnapshot);
-    specialization = std::move(nextSpecialization);
     reportBindless();
 }
 

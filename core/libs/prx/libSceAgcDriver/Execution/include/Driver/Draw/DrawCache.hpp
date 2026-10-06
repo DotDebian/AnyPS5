@@ -77,6 +77,9 @@ struct StageCapture {
 struct AheadStage {
     // APS5_TRACE_DRAW_AHEAD=1: the times below are taken.
     bool timed = false;
+    // APS5_CAPTURE_SCRATCH=1: the capture is made into the thread's own ResourceCapture, which
+    // keeps its storage from one stage to the next (it serves the Recompile call and nothing else).
+    bool scratch = false;
     // APS5_CAPTURE_MEMO=1: a stage whose inputs repeat and whose walk reads the same words takes
     // the compiled result of the first time (DrawCapture.cpp).
     bool memo = false;
