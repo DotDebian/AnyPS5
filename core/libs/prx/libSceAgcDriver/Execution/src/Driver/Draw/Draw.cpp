@@ -96,7 +96,10 @@ void ReportWorkerSplit(bool adopted) {
     if (now - totals.last < std::chrono::seconds(10)) return;
     totals.last = now;
     const auto per = [&](WorkerSplit::Step step) { return totals.draws != 0 ? static_cast<double>(totals.ns[step]) / 1000.0 / static_cast<double>(totals.draws) : 0.0; };
-    AgcDriver::ReportLine("[workersplit] direct draws (10 s): %llu (%llu adopted); avg us per draw: entry %.2f, recheck %.2f, prepare %.2f, rejection check %.2f, lock and labels %.2f, device call %.2f, release %.2f\n", static_cast<unsigned long long>(totals.draws), static_cast<unsigned long long>(totals.adopted), per(WorkerSplit::Entry), per(WorkerSplit::Recheck), per(WorkerSplit::Prepare), per(WorkerSplit::Rejection), per(WorkerSplit::Lock), per(WorkerSplit::Device), per(WorkerSplit::Release));
+    auto& rechecks = ShaderMemory::TheRecheckCounts();
+    const auto perDraw = [&](std::uint64_t value) { return totals.draws != 0 ? static_cast<double>(value) / static_cast<double>(totals.draws) : 0.0; };
+    AgcDriver::ReportLine("[workersplit] direct draws (10 s): %llu (%llu adopted); avg us per draw: entry %.2f, recheck %.2f, prepare %.2f, rejection check %.2f, lock and labels %.2f, device call %.2f, release %.2f; recheck per draw: %.1f full pages, %.1f partly fetched pages, %.1f guarded word reads, %.1f coalesced runs\n", static_cast<unsigned long long>(totals.draws), static_cast<unsigned long long>(totals.adopted), per(WorkerSplit::Entry), per(WorkerSplit::Recheck), per(WorkerSplit::Prepare), per(WorkerSplit::Rejection), per(WorkerSplit::Lock), per(WorkerSplit::Device), per(WorkerSplit::Release), perDraw(rechecks.fullPages), perDraw(rechecks.partialPages), perDraw(rechecks.guardedWords), perDraw(rechecks.runs));
+    rechecks = {};
     totals = {};
     totals.last = now;
 }
