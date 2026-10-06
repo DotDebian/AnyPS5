@@ -416,6 +416,21 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
             entryIr.SetVectorReg(static_cast<VectorReg>(vgpr(PixelInput::Ancillary)), builtin(StageInputKind::PackedAncillary));
         }
     } else if (options.stage == ShaderStageKind::Vertex) {
+        if (options.userDataBaseRegister == 0u && options.userDataCount >= 8u) {
+            // APS5_NGG_AS_VERTEX (not for upstream): a merged NGG passthrough program (its eight
+            // hidden user words at s0-s7) run at one vertex per invocation. Its wave holds 64 ES
+            // vertices and no primitive (the primitive export and GS_ALLOC_REQ are skipped: the
+            // input assembler builds the primitives), s4-s7 and the GS inputs read as the mesh
+            // prologue gives them, the vertex and instance ids come from the vertex stage.
+            entryIr.SetScalarReg(static_cast<ScalarReg>(2), entryIr.Constant(64u << 12u));
+            entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant((1u << 28u) | 64u));
+            for (std::uint32_t reg = 4u; reg < 8u; reg++) {
+                entryIr.SetScalarReg(static_cast<ScalarReg>(reg), entryIr.Constant(0u));
+            }
+            for (const std::uint32_t reg : {0u, 1u, 2u, 3u, 4u, 6u, 7u}) {
+                entryIr.SetVectorReg(static_cast<VectorReg>(reg), entryIr.Constant(0u));
+            }
+        }
         entryIr.SetVectorReg(static_cast<VectorReg>(5), builtin(StageInputKind::VertexIndex));
         entryIr.SetVectorReg(static_cast<VectorReg>(8), builtin(StageInputKind::InstanceIndex));
     }

@@ -3,7 +3,49 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
+#include <cstdlib>
+#include <map>
+#include <mutex>
+
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// APS5_NGG_AS_VERTEX=1 (not for upstream): an NGG passthrough draw (a plain vertex shader Sony
+// compiled as a merged ES/GS program) whose program is lane independent (see
+// ShaderRecompiler::LaneIndependentProgram) and uses no LDS takes the vertex path instead of a mesh
+// shader at 21 triangles per guest wave: one invocation per vertex, hardware vertex reuse, no
+// two-half wave64 emulation, no per-workgroup cost. Triangle lists and strips only. The program
+// verdicts are kept per shader registration and code offset.
+bool nggAsVertexEnabled() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_NGG_AS_VERTEX"); return text != nullptr && text[0] == '1'; }();
+    return enabled;
+}
+
+bool nggAsVertex(const Graphics::State& state, const DrawProgram& program) {
+    if (!nggAsVertexEnabled() || !state.stages.mesh) return false;
+    const auto& mesh = *state.stages.mesh;
+    if (!mesh.passthrough || (mesh.inputPrimitive != 4u && mesh.inputPrimitive != 6u) || mesh.ldsSizeDwords != 0u || state.rectList) return false;
+    static std::mutex mutex;
+    static std::map<std::pair<const void*, std::size_t>, std::pair<std::weak_ptr<const ShaderSnapshot>, bool>> verdicts;
+    static std::uint64_t converted = 0;
+    static std::uint64_t refused = 0;
+    const auto key = std::make_pair(static_cast<const void*>(program.snapshot.get()), program.codeOffset);
+    {
+        std::lock_guard lock(mutex);
+        const auto found = verdicts.find(key);
+        if (found != verdicts.end() && !found->second.first.expired()) return found->second.second;
+    }
+    std::string reason;
+    const bool independent = ShaderRecompiler::LaneIndependentProgram(program.binary.code, &reason);
+    std::lock_guard lock(mutex);
+    verdicts[key] = {program.snapshot, independent};
+    ++(independent ? converted : refused);
+    if (!independent || converted <= 4) AgcDriver::ReportLine("[ngg-vertex] program 0x%llx %s%s (%llu converted, %llu kept as mesh)\n", static_cast<unsigned long long>(program.binary.codeAddress), independent ? "runs as a vertex shader" : "stays a mesh shader: ", reason.c_str(), static_cast<unsigned long long>(converted), static_cast<unsigned long long>(refused));
+    return independent;
+}
+
+}
 
 std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
     using Stage = ShaderRecompiler::ShaderStage;
@@ -84,6 +126,13 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
             append(0xc8, type, Stage::Mesh, 0x8b, 0x8c, Role::Main);
             initializeMerged(programs.back(), 0x82, type == 4);
             if (type == 4) append(0x88, 6, Stage::Mesh, 0x8b, 0x8c, Role::GeometryBack);
+            else if (nggAsVertex(product->state, programs.back())) {
+                // APS5_NGG_AS_VERTEX: the passthrough program runs as a vertex shader of the vertex
+                // path (vkCmdDraw*, the input assembler builds the primitives and reuses vertices).
+                product->state.stages.path = Graphics::ShaderPath::Vertex;
+                product->state.stages.mesh.reset();
+                programs.back().binary.stage = Stage::Vertex;
+            }
         } else {
             append(0xc8, 2, Stage::Vertex, 0x8b, 0x8c, Role::Main);
         }
