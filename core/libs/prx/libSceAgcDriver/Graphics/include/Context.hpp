@@ -7,8 +7,12 @@
 #include <vulkan/vulkan.h>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <atomic>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -132,6 +136,65 @@ inline std::string Describe() {
     return text;
 }
 
+// APS5_COUNT_VK=1 (local, not for upstream): how many vkCmd* commands and vkQueueSubmit calls the
+// driver records, by name, for the [vkcount] line (per 10 s and per present). Every call through
+// Context::Function, Context::Resolved and the recorder's cached pointers is counted; a counter
+// slot per distinct name, found through a per-thread cache keyed by the literal's address.
+inline bool CmdCounted() {
+    static const bool counted = std::getenv("APS5_COUNT_VK") != nullptr;
+    return counted;
+}
+
+struct CmdTable {
+    static constexpr std::size_t Slots = 96;
+    std::mutex mutex;
+    std::vector<std::string> names;
+    std::atomic<std::uint64_t> counts[Slots]{};
+};
+
+inline CmdTable& CmdCounts() {
+    static CmdTable table;
+    return table;
+}
+
+inline void CountCmd(const char* name, std::uint64_t count = 1) {
+    if (!CmdCounted() || name == nullptr) return;
+    if (std::strncmp(name, "vkCmd", 5) != 0 && std::strcmp(name, "vkQueueSubmit") != 0) return;
+    thread_local std::unordered_map<const char*, std::size_t> slots;
+    auto it = slots.find(name);
+    if (it == slots.end()) {
+        auto& table = CmdCounts();
+        std::lock_guard lock(table.mutex);
+        std::size_t slot = 0;
+        while (slot < table.names.size() && table.names[slot] != name) ++slot;
+        if (slot == table.names.size()) {
+            if (slot >= CmdTable::Slots) return;
+            table.names.emplace_back(name);
+        }
+        it = slots.emplace(name, slot).first;
+    }
+    CmdCounts().counts[it->second].fetch_add(count, std::memory_order_relaxed);
+}
+
+// " name count (per present x)" for every counted name, highest first; clears the counts.
+inline std::string TakeCmdCounts(std::uint64_t presents) {
+    auto& table = CmdCounts();
+    std::vector<std::pair<std::uint64_t, std::string>> rows;
+    {
+        std::lock_guard lock(table.mutex);
+        for (std::size_t i = 0; i < table.names.size(); ++i) rows.emplace_back(table.counts[i].exchange(0, std::memory_order_relaxed), table.names[i]);
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string text;
+    for (const auto& [count, name] : rows) {
+        if (count == 0) continue;
+        char row[128];
+        std::snprintf(row, sizeof(row), " %s %llu (%.1f)", name.c_str() + 2, static_cast<unsigned long long>(count), presents != 0 ? static_cast<double>(count) / static_cast<double>(presents) : 0.0);
+        text += row;
+    }
+    return text;
+}
+
 }
 
 inline std::uint64_t& DeviceProcLookups() {
@@ -214,6 +277,7 @@ struct Context {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
         ++DeviceProcLookups();
         VulkanCalls::Count(name);
+        VulkanCalls::CountCmd(name);
         const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
         if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
         return function;
@@ -222,7 +286,10 @@ struct Context {
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.
     template<typename TFunction>
     TFunction Resolved(TFunction DeviceFunctions::*member, const char* name) const {
-        if (functions != nullptr && functions->*member != nullptr) return functions->*member;
+        if (functions != nullptr && functions->*member != nullptr) {
+            VulkanCalls::CountCmd(name);
+            return functions->*member;
+        }
         return Function<TFunction>(name);
     }
 
