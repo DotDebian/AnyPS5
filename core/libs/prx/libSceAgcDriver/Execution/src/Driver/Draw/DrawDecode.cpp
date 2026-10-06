@@ -2,8 +2,45 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "Translation/NggPassthrough.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <tuple>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+bool PassthroughVertexPath() {
+    static const bool enabled = std::getenv("APS5_NGG_PASSTHROUGH_MESH") == nullptr;
+    return enabled;
+}
+
+bool PassthroughRunsPerVertex(const std::shared_ptr<const ShaderSnapshot>& snapshot, std::size_t codeOffset, std::uint64_t address, std::uint32_t userCount, const ShaderRecompiler::NggSubgroupLimits& limits) {
+    using Key = std::tuple<const ShaderSnapshot*, std::size_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>;
+    struct Verdict {
+        std::weak_ptr<const ShaderSnapshot> snapshot;
+        bool perVertex;
+    };
+    static std::mutex mutex;
+    static std::map<Key, Verdict> verdicts;
+    const Key key{snapshot.get(), codeOffset, userCount, limits.waveSize, limits.vertices, limits.primitives};
+    {
+        std::lock_guard lock(mutex);
+        const auto found = verdicts.find(key);
+        if (found != verdicts.end() && found->second.snapshot.lock() == snapshot) return found->second.perVertex;
+    }
+    const auto reason = ShaderRecompiler::NggPassthroughSubgroupDependence(std::span(snapshot->code).subspan(codeOffset), userCount, limits);
+    static const bool trace = std::getenv("APS5_TRACE_NGG_PASSTHROUGH") != nullptr;
+    if (trace) std::fprintf(stderr, "[gpu] NGG passthrough program 0x%llx (wave%u, subgroup %u vertices / %u primitives): %s\n", static_cast<unsigned long long>(address), limits.waveSize, limits.vertices, limits.primitives, reason ? ("mesh path, " + *reason).c_str() : "vertex path");
+    std::lock_guard lock(mutex);
+    verdicts[key] = {snapshot, !reason.has_value()};
+    return !reason.has_value();
+}
+
+}
 
 std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Submission& submission) {
     using Stage = ShaderRecompiler::ShaderStage;
@@ -46,7 +83,30 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
     };
     {
         auto product = std::make_shared<DrawDecode>();
-        product->state = Graphics::DecodeState(queue);
+        const auto passthroughPerVertex = [&] {
+            Graphics::NoteRegisterRead(Graphics::RegisterBank::Context, 0x2d5);
+            const auto stagesRegister = queue.context.find(0x2d5);
+            if (stagesRegister == queue.context.end()) return false;
+            const auto stages = stagesRegister->second;
+            if ((stages & 0x02000000u) == 0 || (stages & 0x24u) != 0 || !PassthroughVertexPath()) return false;
+            const auto address = programAddress(0xc8);
+            auto it = submission.shaders->upper_bound(address);
+            if (it == submission.shaders->begin()) return false;
+            --it;
+            const auto& snapshot = it->second;
+            const auto codeOffset = static_cast<std::size_t>((address - snapshot->codeAddress) / sizeof(std::uint32_t));
+            if (codeOffset >= snapshot->code.size()) return false;
+            Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, 0x8b);
+            Graphics::NoteRegisterRead(Graphics::RegisterBank::UserConfig, 0x25b);
+            const auto resources = readRegister(queue.shader, 0x8b);
+            const auto userCount = ((resources >> 1u) & 0x1fu) | (((resources >> 27u) & 1u) << 5u);
+            const auto groupRegister = queue.userConfig.find(0x25b);
+            if (groupRegister == queue.userConfig.end()) return false;
+            const auto group = groupRegister->second;
+            const ShaderRecompiler::NggSubgroupLimits limits{(stages & 0x00400000u) != 0 ? 32u : 64u, (group >> 9u) & 0x1ffu, group & 0x1ffu};
+            return PassthroughRunsPerVertex(snapshot, codeOffset, address, userCount, limits);
+        }();
+        product->state = Graphics::DecodeState(queue, passthroughPerVertex);
         auto& programs = product->programs;
         auto& roles = product->roles;
         programs.reserve(5);

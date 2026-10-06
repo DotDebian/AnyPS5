@@ -615,6 +615,18 @@ void ShaderStageTests() {
         const auto pass = AgcDriver::Graphics::DecodeState(robots).stages;
         Require(pass.mesh && pass.mesh->passthrough && pass.mesh->primitivesPerGroup == 21 && pass.mesh->verticesPerGroup == 63 && pass.mesh->threadsPerGroup == 64 && pass.mesh->maxVertices == 64 && pass.mesh->maxPrimitives == 64, "64-vertex, 64-primitive passthrough subgroup assembly changed");
         Require(pass.mesh->reuseVertices == 64 && pass.mesh->reusePrimitives == 64, "64-vertex, 64-primitive passthrough subgroups do not reuse vertices up to GE_CNTL");
+        const auto perVertex = AgcDriver::Graphics::DecodeState(robots, true).stages;
+        Require(perVertex.path == AgcDriver::Graphics::ShaderPath::Vertex && !perVertex.mesh && perVertex.vertexWaveSize == 64, "a per-vertex passthrough program did not take the vertex path");
+        robots.userConfig[0x242] = 0x11;
+        const auto rect = AgcDriver::Graphics::DecodeState(robots, true);
+        Require(rect.rectList && rect.stages.path == AgcDriver::Graphics::ShaderPath::Vertex, "a per-vertex passthrough rect list did not take the vertex path");
+        bool refused = false;
+        try {
+            static_cast<void>(AgcDriver::Graphics::DecodeState(robots));
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        Require(refused, "a passthrough rect list was accepted by the mesh path");
     }
     {
         auto fan = makeState();

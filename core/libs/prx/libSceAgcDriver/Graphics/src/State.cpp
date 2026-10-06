@@ -501,7 +501,7 @@ void intersect(VkRect2D& result, const Registers& registers, std::uint32_t offse
 
 }
 
-ShaderStages DecodeShaderStages(const QueueState& queue) {
+ShaderStages DecodeShaderStages(const QueueState& queue, bool passthroughPerVertex) {
     const auto value = read(queue.context, 0x2d5);
     const auto validate = [&](bool condition, const char* reason) {
         if (condition) return;
@@ -513,9 +513,9 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
     validate((value & 3u) != 3u && ((value >> 3u) & 3u) != 3u && ((value >> 6u) & 3u) != 3u, "reserved LS_EN, ES_EN or VS_EN encoding");
     const auto primitive = read(queue.userConfig, 0x242, RegisterBank::UserConfig);
     const bool tessellation = primitive == 9;
-    const bool passthrough = (value & 0x02000000u) != 0;
+    validate((value & 0x02000000u) == 0 || (value & 0x2000u) != 0, "passthrough routing without PRIMGEN_EN is unsupported");
+    const bool passthrough = (value & 0x02000000u) != 0 && !passthroughPerVertex;
     const bool geometry = (value & 0x20u) != 0 || passthrough;
-    validate(!passthrough || (value & 0x2000u) != 0, "passthrough routing without PRIMGEN_EN is unsupported");
     validate(tessellation == ((value & 4u) != 0), "Patch topology and HS_EN disagree");
     validate(!tessellation || !geometry, "combined tessellation and geometry is unsupported by the reference path");
     const auto path = tessellation ? ShaderPath::Tessellation : geometry ? ShaderPath::Geometry : ShaderPath::Vertex;
@@ -565,10 +565,10 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
     return result;
 }
 
-State DecodeState(const QueueState& queue) {
+State DecodeState(const QueueState& queue, bool passthroughPerVertex) {
     const auto& cx = queue.context;
     State result{};
-    result.stages = DecodeShaderStages(queue);
+    result.stages = DecodeShaderStages(queue, passthroughPerVertex);
     const auto primitive = read(queue.userConfig, 0x242, RegisterBank::UserConfig);
     APS5_LOG_OUT_DEBUG("DecodeState primitive=%u path=%u vertexWave=%u", primitive, static_cast<unsigned>(result.stages.path), result.stages.vertexWaveSize);
     switch (primitive) {

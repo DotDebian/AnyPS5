@@ -323,6 +323,14 @@ target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driv
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
 
+add_test_executable(agc_ngg_passthrough_tests EXCLUDE_FROM_ALL
+        tests/NggPassthrough.cpp
+)
+target_include_directories(agc_ngg_passthrough_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_ngg_passthrough_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_ngg_passthrough_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_ngg_passthrough_tests)
+
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
@@ -651,7 +659,7 @@ set_target_properties(agc_driver_wave_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_wave_tests)
 
 if(BUILD_TESTING)
-    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_write_tracking_tests agc_structurizer_tests agc_dpp_write_tests agc_masked_select_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_shader_disk_cache_tests agc_texture_residency_tests agc_pass_hazards_tests agc_gpu_clock_tests agc_dcc_key_sharing_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_resident_present_tests ${agcExecutionTests})
+    foreach(agcTest IN ITEMS agc_driver_tests agc_shader_memory_tests agc_ngg_passthrough_tests agc_write_tracking_tests agc_structurizer_tests agc_dpp_write_tests agc_masked_select_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_shader_disk_cache_tests agc_texture_residency_tests agc_pass_hazards_tests agc_gpu_clock_tests agc_dcc_key_sharing_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_resident_present_tests ${agcExecutionTests})
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
         set_target_properties(${agcTest} PROPERTIES EXCLUDE_FROM_ALL OFF)
         add_test(NAME ${agcTestName} COMMAND ${agcTest})

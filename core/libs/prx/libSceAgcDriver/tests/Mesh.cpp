@@ -214,6 +214,56 @@ void DrawMesh(AgcDriver::VulkanDevice& device, const MeshDraw& setup) {
     device.WaitIdle();
 }
 
+void DrawVertexPath(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint32_t vertexCount, const std::array<std::uint32_t, 4>& vertexBuffer) {
+    const auto target = device.Target();
+    const std::vector<std::uint32_t> userData(vertexBuffer.begin(), vertexBuffer.end());
+    const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
+    ShaderRecompiler::RecompileRequest vertex{
+        {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
+        {64, 8, userData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, vertexMemory},
+        target,
+        {0, 0, 0, AgcDriver::Graphics::PipelinePushConstantBytes},
+        ShaderRecompiler::GraphicsCompileContext{8, {}, std::nullopt, std::nullopt, {0, vertexCount, 0, 1}}
+    };
+    const auto vertexResult = ShaderRecompiler::Recompile(vertex);
+    const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
+    ShaderRecompiler::ShaderPixelStageInfo pixel{};
+    pixel.interpolatorCount = 1;
+    pixel.interpolatorSettings[0] = 0x400u;
+    pixel.targetOutputMode[0] = 9;
+    pixel.targetExportMapping.fill(0xe4u);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(PixelCode.data()), std::as_bytes(std::span(PixelCode))}}};
+    ShaderRecompiler::RecompileRequest fragment{
+        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(PixelCode.data()), PixelCode, 0, {}},
+        {64, 0, {}, std::nullopt, pixel, std::nullopt, pixelMemory},
+        target,
+        {0, 0, vertexPush, AgcDriver::Graphics::PipelinePushConstantBytes - vertexPush},
+        std::nullopt
+    };
+    const auto pixelResult = ShaderRecompiler::Recompile(fragment);
+    const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
+        {ShaderStage::Vertex, &vertexResult, 0},
+        {ShaderStage::Fragment, &pixelResult, vertexPush}
+    }};
+    AgcDriver::Graphics::State state{};
+    state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0x02002000u, 64, 64, std::nullopt, std::nullopt};
+    state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), {Width, Height}, VK_FORMAT_R8G8B8A8_UNORM, Pixels.size(), 0xe4u};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {Width, Height};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
+    state.negativeOneToOne = false;
+    state.scissor = {{0, 0}, {Width, Height}};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    state.blendConstants = {};
+    device.Draw(state, {0, vertexCount, 0, 1, 0, false}, shaders);
+    device.WaitIdle();
+}
+
 constexpr ShaderRecompiler::MeshConfiguration SmallSubgroup{4u, 4u, 12u, 12u, 4u, 64u, 1024u, 0u, 4u};
 constexpr ShaderRecompiler::MeshConfiguration WideSubgroup{4u, 32u, 96u, 96u, 32u, 128u, 2048u, 0u, 4u};
 
@@ -367,6 +417,10 @@ int main() {
         ClearPixels();
         DrawMesh(device, {SmallSubgroup, {0, static_cast<std::uint32_t>(Ordered.size()), 0, 1, 0, false}, VertexBufferDescriptor(Ordered.data(), static_cast<std::uint32_t>(Ordered.size())), 0});
         CheckTriangles("mesh program without push data");
+
+        ClearPixels();
+        DrawVertexPath(device, PassthroughCode, static_cast<std::uint32_t>(Ordered.size()), VertexBufferDescriptor(Ordered.data(), static_cast<std::uint32_t>(Ordered.size())));
+        CheckTriangles("passthrough program gated by its subgroup counts on the vertex path");
 
         ClearPixels();
         const ShaderRecompiler::MeshConfiguration strip{6u, 3u, 5u, 9u, 3u, 64u, 1024u, 0u, 4u};

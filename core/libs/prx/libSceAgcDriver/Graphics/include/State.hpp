@@ -129,8 +129,8 @@ struct State {
     DepthState depth;
 };
 
-ShaderStages DecodeShaderStages(const QueueState& queue);
-State DecodeState(const QueueState& queue);
+ShaderStages DecodeShaderStages(const QueueState& queue, bool passthroughPerVertex = false);
+State DecodeState(const QueueState& queue, bool passthroughPerVertex = false);
 // One color buffer (CB_COLOR<slot>_*): its surface, format, extent of the viewed mip and DCC metadata.
 ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
 

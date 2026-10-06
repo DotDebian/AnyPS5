@@ -66,6 +66,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/IntermediateRepresentation/src/IrBuilder/IrBuilderLogic.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Translation/src/EmbeddedVertexFetch.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Translation/src/InstructionTranslator.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Translation/src/NggPassthrough.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Translation/src/ShaderInputInfoBuilder.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Translation/src/TranslationContext/OperandAccess.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Translation/src/TranslationContext/SubwordPacking.cpp
@@ -212,6 +213,7 @@ function(add_shader_recompiler target runtimeTarget)
             DepthBitsTextureWidth
             HashBytes
             MeshGroupTableStride
+            NggPassthroughSubgroupDependence
             PixelInput
             PixelInputBit
             ReadWholeFile

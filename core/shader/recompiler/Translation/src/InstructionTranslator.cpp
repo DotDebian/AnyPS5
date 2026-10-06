@@ -428,6 +428,18 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
             entryIr.SetVectorReg(static_cast<VectorReg>(vgpr(PixelInput::Ancillary)), builtin(StageInputKind::PackedAncillary));
         }
     } else if (options.stage == ShaderStageKind::Vertex) {
+        const std::uint32_t waveSize = options.waveSize;
+        if (options.subgroupContextMarkers) {
+            for (std::uint32_t reg = 0; reg < 8u; reg++) {
+                entryIr.SetScalarReg(static_cast<ScalarReg>(reg), entryIr.GetUserData(static_cast<ScalarReg>(SubgroupMarkerFirstRegister + reg)));
+            }
+            for (const std::uint32_t reg : {0u, 1u, 2u, 3u, 4u, 6u, 7u}) {
+                entryIr.SetVectorReg(static_cast<VectorReg>(reg), entryIr.GetUserData(static_cast<ScalarReg>(SubgroupMarkerFirstRegister + SubgroupMarkerVectorOffset + reg)));
+            }
+        } else if (options.userDataBaseRegister > 3u) {
+            entryIr.SetScalarReg(static_cast<ScalarReg>(2), entryIr.Constant((waveSize << 12u) | (waveSize << 22u)));
+            entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(waveSize | (waveSize << 8u) | (1u << 28u)));
+        }
         entryIr.SetVectorReg(static_cast<VectorReg>(5), builtin(StageInputKind::VertexIndex));
         entryIr.SetVectorReg(static_cast<VectorReg>(8), builtin(StageInputKind::InstanceIndex));
     }
