@@ -209,6 +209,11 @@ struct DrawOutcome {
     // in ownSyncUs: those wait by design and would otherwise count as nested hook waits.
     double hookWaitUs = 0;
     double ownSyncUs = 0;
+    bool cacheableBuild = false;
+    bool inserted = false;
+    bool notRecorded = false;
+    bool movedRefused = false;
+    ShaderResources::ReuseRefusal refusal = ShaderResources::ReuseRefusal::None;
 };
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
@@ -220,6 +225,12 @@ struct DrawProfile {
     std::mutex mutex;
     std::array<double, KindCount> kindUs{};
     std::array<std::uint64_t, KindCount> kindCounts{};
+    std::array<std::array<double, PhaseCount>, KindCount> kindPhaseUs{};
+    std::uint64_t cacheableBuilds = 0;
+    std::uint64_t buildsInserted = 0;
+    std::uint64_t buildsNotRecorded = 0;
+    std::uint64_t movedRefused = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::ReuseRefusal::Count)> buildRefusals{};
     std::uint64_t fullScissorLookups = 0;
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
@@ -333,6 +344,14 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
+        for (std::size_t i = 0; i < PhaseCount; ++i) profile.kindPhaseUs[outcome.kind][i] += us[i];
+    }
+    if (outcome.movedRefused) ++profile.movedRefused;
+    if (outcome.cacheableBuild) {
+        ++profile.cacheableBuilds;
+        if (outcome.inserted) ++profile.buildsInserted;
+        else if (outcome.notRecorded) ++profile.buildsNotRecorded;
+        else ++profile.buildRefusals[static_cast<std::size_t>(outcome.refusal)];
     }
     if (outcome.validateMemoized) ++(outcome.validateHit ? profile.validateHits : profile.validateMisses);
     const auto now = std::chrono::steady_clock::now();
@@ -383,6 +402,29 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
+    std::string kinds = "[drawkinds] us/draw by phase (10 s):";
+    for (std::size_t kind = 0; kind < KindCount; ++kind) {
+        if (profile.kindCounts[kind] == 0) continue;
+        char item[128];
+        std::snprintf(item, sizeof(item), " %s x%llu {", DrawKindNames[kind], static_cast<unsigned long long>(profile.kindCounts[kind]));
+        kinds += item;
+        for (std::size_t i = 0; i < PhaseCount; ++i) {
+            const auto phaseUs = average(profile.kindPhaseUs[kind][i], profile.kindCounts[kind]);
+            if (phaseUs < 0.05) continue;
+            std::snprintf(item, sizeof(item), " %s %.1f", DrawPhaseNames[i], phaseUs);
+            kinds += item;
+        }
+        kinds += " }";
+    }
+    char reuse[160];
+    std::snprintf(reuse, sizeof(reuse), "; cacheable builds %llu: inserted %llu, not recorded %llu, template found but buffers not movable %llu, not reusable:", static_cast<unsigned long long>(profile.cacheableBuilds), static_cast<unsigned long long>(profile.buildsInserted), static_cast<unsigned long long>(profile.buildsNotRecorded), static_cast<unsigned long long>(profile.movedRefused));
+    kinds += reuse;
+    for (std::size_t i = 0; i < profile.buildRefusals.size(); ++i) {
+        if (profile.buildRefusals[i] == 0) continue;
+        std::snprintf(reuse, sizeof(reuse), " %s %llu", ShaderResources::RefusalName(static_cast<ShaderResources::ReuseRefusal>(i)), static_cast<unsigned long long>(profile.buildRefusals[i]));
+        kinds += reuse;
+    }
+    std::fprintf(stderr, "%s\n", kinds.c_str());
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
@@ -399,6 +441,9 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.lookupUs = 0;
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
+    for (auto& phases : profile.kindPhaseUs) phases.fill(0);
+    profile.cacheableBuilds = profile.buildsInserted = profile.buildsNotRecorded = profile.movedRefused = 0;
+    profile.buildRefusals.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
     profile.validateHits = profile.validateMisses = 0;
     profile.recipeHits = 0;
@@ -1156,6 +1201,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
+                outcome.movedRefused = true;
                 countCache(&DrawProfile::cacheMisses);
             } else {
                 SharedResourceCache().Remove(resolved.contentKey);
@@ -1904,6 +1950,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
+    if (cacheable && built != nullptr) {
+        outcome.cacheableBuild = true;
+        outcome.notRecorded = !recorded;
+        outcome.refusal = resources->Refusal();
+        outcome.inserted = recorded && resources->Reusable();
+    }
     if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout

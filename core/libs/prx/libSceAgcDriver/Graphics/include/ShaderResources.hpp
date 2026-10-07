@@ -184,6 +184,9 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    enum class ReuseRefusal : std::uint8_t { None, NotBuilt, Completion, Lease, LargeData, NotUploaded, SpaceRegion, CpuCopy, GpuCopy, WritableMirror, HeapMirror, ImportChanged, NoSerial, Count };
+    ReuseRefusal Refusal() const { return refusal; }
+    static const char* RefusalName(ReuseRefusal reason);
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
@@ -436,6 +439,7 @@ private:
     std::vector<bool> storageWritten;
     std::vector<std::shared_ptr<Sampler>> samplers;
     bool reusable = false;
+    ReuseRefusal refusal = ReuseRefusal::NotBuilt;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before

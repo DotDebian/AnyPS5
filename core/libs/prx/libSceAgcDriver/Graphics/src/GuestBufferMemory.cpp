@@ -2590,12 +2590,16 @@ void GuestBufferMemory::WriteBack() {
     heapReferences.clear();
 }
 
-std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions() const {
-    if (!uploaded || committed) return std::nullopt;
+std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions(DirectRefusal* refusal) const {
+    const auto refuse = [&](DirectRefusal reason) -> std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> {
+        if (refusal != nullptr) *refusal = reason;
+        return std::nullopt;
+    };
+    if (!uploaded || committed) return refuse(DirectRefusal::NotUploaded);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (space != nullptr) {
         for (const auto& region : space->base) {
-            if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return std::nullopt;
+            if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return refuse(DirectRefusal::SpaceRegion);
             result.emplace_back(region.begin, region.end);
         }
     }
@@ -2605,7 +2609,10 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
         // of its copy-in and the destination of its copy-back, both recorded per use.
         const bool fixedMirror = region.mirror != nullptr && !region.mirror->writable && !region.mirror->heap;
         const bool staged = region.gpuCopy && region.deviceLocal;
-        if (region.direct == nullptr && !fixedMirror && !staged) return std::nullopt;
+        if (region.direct == nullptr && !fixedMirror && !staged) {
+            if (region.mirror != nullptr) return refuse(region.mirror->writable ? DirectRefusal::WritableMirror : DirectRefusal::HeapMirror);
+            return refuse(region.gpuCopy ? DirectRefusal::GpuCopy : DirectRefusal::CpuCopy);
+        }
         if (staged) {
             // A later use copies from `copySource` again, so it must still be the import serving
             // the range (the flush before the copy-in can retire and remake imports): the serial
@@ -2613,10 +2620,11 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
             const auto* entry = state.device == context.device ? findImport(state, region.begin, region.end) : nullptr;
-            if (entry == nullptr || entry->buffer != region.copySource) return std::nullopt;
+            if (entry == nullptr || entry->buffer != region.copySource) return refuse(DirectRefusal::ImportChanged);
         }
         result.emplace_back(region.begin, region.end);
     }
+    if (refusal != nullptr) *refusal = DirectRefusal::None;
     return result;
 }
 

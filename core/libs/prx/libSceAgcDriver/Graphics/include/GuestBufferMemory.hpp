@@ -251,7 +251,8 @@ public:
     // Every uploaded region as [begin, end) when all of them are served by host imports, in place or
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
-    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions() const;
+    enum class DirectRefusal : std::uint8_t { None, NotUploaded, SpaceRegion, CpuCopy, GpuCopy, WritableMirror, HeapMirror, ImportChanged, Count };
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions(DirectRefusal* refusal = nullptr) const;
     // Every region the recorded work reads in place through a host import, as [begin, end): the
     // regions bound in place (`direct`), an address-based build's leased heaps included. A region
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.

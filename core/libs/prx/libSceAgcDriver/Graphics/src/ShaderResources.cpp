@@ -28,6 +28,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include "prx/libc/include/GuestAllocations.hpp"
 
 namespace AgcDriver::Graphics {
@@ -109,6 +110,7 @@ struct TextureCache {
     std::uint64_t sweptDepartures = 0;
     std::uint64_t maintainedFrame = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t erasures = 0;
+    std::unordered_set<std::size_t> evictedKeys;
 };
 
 TextureCache& Textures() {
@@ -249,6 +251,10 @@ struct TextureCounters {
     std::atomic<std::uint64_t> storageSoft{0};
     std::atomic<std::uint64_t> storageHard{0};
     std::atomic<std::uint64_t> exhaustedRetries{0};
+    std::atomic<std::uint64_t> madeAfterEviction{0};
+    std::atomic<std::uint64_t> madeAfterChange{0};
+    std::atomic<std::uint64_t> snapshotReadUs{0};
+    std::atomic<std::uint64_t> snapshotReadBytes{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -356,7 +362,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; residency: sampled %llu MiB held (%llu MiB host copies, soft %llu, hard %llu), %llu evicted (%llu MiB), %llu rescued, %llu dead views dropped; storage %llu MiB held (soft %llu, hard %llu), %llu evicted (%llu MiB); %llu retries after device memory ran out\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.sampledBytes) >> 20u, count(counters.sampledHostBytes) >> 20u, count(counters.sampledSoft) >> 20u, count(counters.sampledHard) >> 20u, count(counters.sampledEvicted), count(counters.sampledEvictedBytes) >> 20u, count(counters.sampledRescued), count(counters.deadViews), count(counters.storageBytes) >> 20u, count(counters.storageSoft) >> 20u, count(counters.storageHard) >> 20u, count(counters.storageEvicted), count(counters.storageEvictedBytes) >> 20u, count(counters.exhaustedRetries));
+    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; residency: sampled %llu MiB held (%llu MiB host copies, soft %llu, hard %llu), %llu evicted (%llu MiB), %llu rescued, %llu dead views dropped; storage %llu MiB held (soft %llu, hard %llu), %llu evicted (%llu MiB); %llu retries after device memory ran out; snapshots made after their key's eviction %llu, after a content change %llu; snapshot reads %llu ms for %llu MiB\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.sampledBytes) >> 20u, count(counters.sampledHostBytes) >> 20u, count(counters.sampledSoft) >> 20u, count(counters.sampledHard) >> 20u, count(counters.sampledEvicted), count(counters.sampledEvictedBytes) >> 20u, count(counters.sampledRescued), count(counters.deadViews), count(counters.storageBytes) >> 20u, count(counters.storageSoft) >> 20u, count(counters.storageHard) >> 20u, count(counters.storageEvicted), count(counters.storageEvictedBytes) >> 20u, count(counters.exhaustedRetries), count(counters.madeAfterEviction), count(counters.madeAfterChange), count(counters.snapshotReadUs) / 1000u, count(counters.snapshotReadBytes) >> 20u);
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -469,7 +475,13 @@ EvictionOutcome evictSampled(TextureCache& cache, ResidencyUsage& usage, const R
                 it->lastUse = std::max(it->lastUse, it->texture->ResidencyUse());
                 cache.entries.splice(cache.entries.begin(), cache.entries, it);
             },
-            [&](std::list<CachedTexture>::iterator it) { eraseTexture(cache, it); });
+            [&](std::list<CachedTexture>::iterator it) {
+                if (LookupOutcomes::Profiled()) {
+                    if (cache.evictedKeys.size() >= (1u << 20u)) cache.evictedKeys.clear();
+                    cache.evictedKeys.insert(TextureKeyHash{}(it->key));
+                }
+                eraseTexture(cache, it);
+            });
     auto& counters = TextureCounts();
     counters.sampledEvicted.fetch_add(outcome.evicted, std::memory_order_relaxed);
     counters.sampledEvictedBytes.fetch_add(outcome.deviceBytes, std::memory_order_relaxed);
@@ -643,7 +655,11 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
             }
         }
         eraseTexture(cache, it);
+        if (profile) counters.madeAfterChange.fetch_add(1, std::memory_order_relaxed);
+    } else if (profile && cache.evictedKeys.erase(TextureKeyHash{}(key)) != 0) {
+        counters.madeAfterEviction.fetch_add(1, std::memory_order_relaxed);
     }
+    const auto readStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
     entry.accounted = source != nullptr && !ChargeTextureViews() ? 0u : guestBytes;
     if (source != nullptr) {
@@ -655,6 +671,10 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         if (*keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
         ReadTextureSurface(resource, *keys, entry.bytes);
+        if (profile) {
+            counters.snapshotReadUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - readStart).count()), std::memory_order_relaxed);
+            counters.snapshotReadBytes.fetch_add(entry.bytes.size(), std::memory_order_relaxed);
+        }
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
             std::size_t nonzero = 0;
@@ -1475,10 +1495,33 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
-    if (NeedsCompletion() || HoldsLease()) return;
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
-    const auto regions = guestMemory.DirectRegions();
-    if (!regions.has_value()) return;
+    if (NeedsCompletion()) {
+        refusal = ReuseRefusal::Completion;
+        return;
+    }
+    if (HoldsLease()) {
+        refusal = ReuseRefusal::Lease;
+        return;
+    }
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) {
+        refusal = ReuseRefusal::LargeData;
+        return;
+    }
+    auto direct = GuestBufferMemory::DirectRefusal::None;
+    const auto regions = guestMemory.DirectRegions(&direct);
+    if (!regions.has_value()) {
+        switch (direct) {
+            case GuestBufferMemory::DirectRefusal::NotUploaded: refusal = ReuseRefusal::NotUploaded; break;
+            case GuestBufferMemory::DirectRefusal::SpaceRegion: refusal = ReuseRefusal::SpaceRegion; break;
+            case GuestBufferMemory::DirectRefusal::CpuCopy: refusal = ReuseRefusal::CpuCopy; break;
+            case GuestBufferMemory::DirectRefusal::GpuCopy: refusal = ReuseRefusal::GpuCopy; break;
+            case GuestBufferMemory::DirectRefusal::WritableMirror: refusal = ReuseRefusal::WritableMirror; break;
+            case GuestBufferMemory::DirectRefusal::HeapMirror: refusal = ReuseRefusal::HeapMirror; break;
+            case GuestBufferMemory::DirectRefusal::ImportChanged: refusal = ReuseRefusal::ImportChanged; break;
+            default: throw std::runtime_error("AGC graphics: ShaderResources found no reason for a refused direct region");
+        }
+        return;
+    }
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
         // against them.
@@ -1486,10 +1529,34 @@ void ShaderResources::noteReusable() {
         // Read-only image mirrors (exe ranges) are as stable as imports; their serials have the top
         // bit set, so the two spaces never collide.
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return;
+        if (serial == 0) {
+            refusal = ReuseRefusal::NoSerial;
+            return;
+        }
         directRegions.push_back({begin, end, serial});
     }
     reusable = true;
+    refusal = ReuseRefusal::None;
+}
+
+const char* ShaderResources::RefusalName(ReuseRefusal reason) {
+    switch (reason) {
+        case ReuseRefusal::None: return "reusable";
+        case ReuseRefusal::NotBuilt: return "not built";
+        case ReuseRefusal::Completion: return "completion";
+        case ReuseRefusal::Lease: return "lease";
+        case ReuseRefusal::LargeData: return "data over 64 KiB";
+        case ReuseRefusal::NotUploaded: return "not uploaded";
+        case ReuseRefusal::SpaceRegion: return "address-space region";
+        case ReuseRefusal::CpuCopy: return "CPU-copied region";
+        case ReuseRefusal::GpuCopy: return "GPU-copied region";
+        case ReuseRefusal::WritableMirror: return "writable mirror";
+        case ReuseRefusal::HeapMirror: return "heap mirror";
+        case ReuseRefusal::ImportChanged: return "staged import changed";
+        case ReuseRefusal::NoSerial: return "no import serial";
+        case ReuseRefusal::Count: break;
+    }
+    throw std::runtime_error("AGC graphics: unknown resource reuse refusal");
 }
 
 bool ShaderResources::keepsTemplateRecords() const {
@@ -2219,12 +2286,16 @@ struct ChurnCounts {
     std::uint64_t sameKey = 0;
     std::uint64_t layout = 0;
     std::uint64_t drawWords = 0;
+    std::uint64_t evicted = 0;
+    std::uint64_t replaced = 0;
+    std::uint64_t missedAfterEviction = 0;
 };
 
 // Dispatch keys and draw keys are counted apart: what churns a draw's key decides the draw steps.
 struct ChurnProfile {
     std::mutex mutex;
     std::unordered_map<std::uint64_t, ResourceCache::Key> lastByVariant;
+    std::unordered_set<std::uint64_t> evictedKeys;
     ChurnCounts dispatch;
     ChurnCounts draws;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -2233,6 +2304,31 @@ struct ChurnProfile {
 ChurnProfile& Churn() {
     static ChurnProfile profile;
     return profile;
+}
+
+bool ChurnProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+std::uint64_t ChurnKeyHash(const ResourceCache::Key& key) {
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const auto word : key) hash = (hash ^ word) * 1099511628211ull;
+    return hash;
+}
+
+void NoteEviction(const ResourceCache::Key& key, bool replaced) {
+    if (!ChurnProfiled() || key.empty()) return;
+    auto& churn = Churn();
+    std::lock_guard lock(churn.mutex);
+    auto& counts = key[0] == 0xffffffffu ? churn.draws : churn.dispatch;
+    if (replaced) {
+        ++counts.replaced;
+        return;
+    }
+    ++counts.evicted;
+    if (churn.evictedKeys.size() >= (1u << 20u)) churn.evictedKeys.clear();
+    churn.evictedKeys.insert(ChurnKeyHash(key));
 }
 
 // Charges word `diff` of `key` to the binding of the ContentKey that starts at `at` (the layout of
@@ -2312,6 +2408,7 @@ void ResourceCache::noteMiss(const Key& key) {
     auto& churn = Churn();
     std::lock_guard lock(churn.mutex);
     auto& counts = draw ? churn.draws : churn.dispatch;
+    if (churn.evictedKeys.erase(ChurnKeyHash(key)) != 0) ++counts.missedAfterEviction;
     const auto found = churn.lastByVariant.find(variants);
     if (found == churn.lastByVariant.end()) {
         ++counts.firstSeen;
@@ -2357,6 +2454,8 @@ void ResourceCache::noteMiss(const Key& key) {
         }
         std::snprintf(item, sizeof(item), "; layout %llu, draw target/index %llu, same key %llu (not inserted or evicted), first seen %llu", static_cast<unsigned long long>(churn.layout), static_cast<unsigned long long>(churn.drawWords), static_cast<unsigned long long>(churn.sameKey), static_cast<unsigned long long>(churn.firstSeen));
         line += item;
+        std::snprintf(item, sizeof(item), "; LRU evictions %llu, replaced under the key %llu, misses on a key evicted before %llu", static_cast<unsigned long long>(churn.evicted), static_cast<unsigned long long>(churn.replaced), static_cast<unsigned long long>(churn.missedAfterEviction));
+        line += item;
         std::fprintf(stderr, "%s\n", line.c_str());
     };
     report("dispatch", churn.dispatch);
@@ -2366,6 +2465,7 @@ void ResourceCache::noteMiss(const Key& key) {
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
     if (const auto found = index.find(key); found != index.end()) {
+        NoteEviction(key, true);
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         entries.erase(found->second);
         index.erase(found);
@@ -2381,6 +2481,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
     while (entries.size() > capacity) {
+        NoteEviction(entries.back().first, false);
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
         index.erase(entries.back().first);
         entries.pop_back();
