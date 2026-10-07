@@ -369,8 +369,10 @@ private:
     bool anyLayerPending() const;
     void refreshGeneration();
     bool refreshProved();
-    void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;
+    bool othersHold();
+    bool snapshotAlias(const StorageTexture& source, std::int64_t unitShift);
+    bool aliasUnitsHold(const StorageTexture& source, std::int64_t unitShift) const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
@@ -404,6 +406,7 @@ private:
         bool remapped = false;
     };
     Alias pendingAlias(const char** refusal = nullptr) const;
+    void takeRefreshProof(const Alias& alias);
     std::optional<AliasSurface> aliasSurface() const;
     struct AliasPlan {
         AliasSurface source{};
@@ -467,8 +470,23 @@ private:
         std::uint64_t keyGeneration = 0;
         DccKeys keys = DccKeys::Uncompressed;
         std::uint8_t refused = 0;
+        struct Other {
+            const StorageTexture* texture = nullptr;
+            std::uint64_t identity = 0;
+            std::uint64_t version = 0;
+            DccKeys keys = DccKeys::Uncompressed;
+            bool cached = false;
+            bool inside = false;
+        };
+        std::array<Other, 4> others{};
+        std::uint8_t otherCount = 0;
+        std::uint64_t ownVersion = 0;
+        std::uint64_t ownMarks = 0;
+        std::uint64_t ownForgets = 0;
+        std::int64_t insideShift = 0;
     };
     RefreshProof refreshProof;
+    std::vector<std::uint64_t> aliasSnapshot;
     struct ForeignKeyProof {
         std::uint64_t dccAddress = 0;
         DccKeyProof proof;
@@ -512,6 +530,10 @@ private:
     // Results are on the GPU only (guarded by the pending-write registry lock).
     bool dirty = false;
     std::uint64_t version = 0;
+    std::uint64_t pendingMarks = 0;
+    std::uint64_t borrowForgets = 0;
+    const std::uint64_t identity = NextIdentity();
+    static std::uint64_t NextIdentity();
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     bool originalValid = true;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so

@@ -89,7 +89,7 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
 std::atomic<std::uint64_t> refreshesProved{0}, refreshesFull{0};
-constexpr std::array<const char*, 14> proofMissNames{"not taken", "aliased", "untracked", "keys unproved", "other pending at take", "unlocked at take", "generation moved", "keys moved", "unlocked", "uncollected", "key proof moved", "keys uncollected", "stamped", "other pending"};
+constexpr std::array<const char*, 17> proofMissNames{"not taken", "aliased", "untracked", "keys unproved", "other pending at take", "unlocked at take", "generation moved", "keys moved", "unlocked", "uncollected", "key proof moved", "keys uncollected", "stamped", "other pending", "too many pending at take", "pending moved", "alias results moved"};
 std::array<std::atomic<std::uint64_t>, proofMissNames.size()> proofMisses{};
 std::atomic<std::uint64_t> fullUnchanged{0};
 
@@ -1352,7 +1352,7 @@ bool StorageTexture::Refresh() {
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
-        takeRefreshProof(alias.source != nullptr);
+        takeRefreshProof(alias);
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
@@ -1497,6 +1497,10 @@ bool StorageTexture::refreshProved() {
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
     if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return miss(12);
+    if (refreshProof.otherCount != 0) {
+        if (!othersHold()) return miss(refreshProof.refused);
+        return true;
+    }
     const auto serial = PendingSerial();
     if (serial != refreshProof.pendingSerial) {
         if (otherPendingOverlaps()) return miss(13);
@@ -1505,10 +1509,97 @@ bool StorageTexture::refreshProved() {
     return true;
 }
 
-void StorageTexture::takeRefreshProof(bool aliased) {
+std::uint64_t StorageTexture::NextIdentity() {
+    static std::atomic<std::uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool StorageTexture::snapshotAlias(const StorageTexture& source, std::int64_t unitShift) {
+    const auto first = static_cast<std::uint32_t>(std::max<std::int64_t>(0, -unitShift));
+    const auto end = static_cast<std::uint32_t>(std::clamp<std::int64_t>(static_cast<std::int64_t>(source.trackedLayers) - unitShift, 0, trackedLayers));
+    aliasSnapshot.clear();
+    if (first >= end) return true;
+    std::vector<std::uint8_t> stamped(end - first, 0);
+    const auto begin = layerBegin(first);
+    const auto bytes = layerBegin(end - 1) + layerBytes(end - 1) - begin;
+    const auto generations = std::span<const std::uint64_t>(source.layerGeneration).subspan(static_cast<std::size_t>(first + unitShift), end - first);
+    if (!GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(bytes), generations, stamped)) return false;
+    for (auto unit = first; unit < end; ++unit) {
+        const auto theirs = static_cast<std::size_t>(unit + unitShift);
+        const bool pending = source.layerPending[theirs];
+        const auto stamp = stamped[unit - first];
+        const bool lendable = stamp == GuestMemory::BlockUnchanged;
+        if (pending && (source.layerGeneration[theirs] == 0 || stamp == GuestMemory::BlockMaybeWritten)) return false;
+        if (pending && lendable && (layerPending[unit] || borrowedUnits.size() != trackedLayers || !borrowedUnits[unit])) return false;
+        aliasSnapshot.push_back(source.layerGeneration[theirs]);
+        aliasSnapshot.push_back((pending ? 1u : 0u) | (lendable ? 2u : 0u));
+    }
+    return true;
+}
+
+bool StorageTexture::aliasUnitsHold(const StorageTexture& source, std::int64_t unitShift) const {
+    const auto first = static_cast<std::uint32_t>(std::max<std::int64_t>(0, -unitShift));
+    const auto end = static_cast<std::uint32_t>(std::clamp<std::int64_t>(static_cast<std::int64_t>(source.trackedLayers) - unitShift, 0, trackedLayers));
+    if (first >= end) return aliasSnapshot.empty();
+    if (aliasSnapshot.size() != 2 * static_cast<std::size_t>(end - first)) return false;
+    for (auto unit = first; unit < end; ++unit) {
+        const auto theirs = static_cast<std::size_t>(unit + unitShift);
+        if (!source.layerPending[theirs]) continue;
+        const auto at = 2 * static_cast<std::size_t>(unit - first);
+        const auto flags = aliasSnapshot[at + 1];
+        if ((flags & 1u) == 0 || source.layerGeneration[theirs] != aliasSnapshot[at]) return false;
+        if ((flags & 2u) != 0 && (layerPending[unit] || borrowedUnits.size() != trackedLayers || !borrowedUnits[unit])) return false;
+    }
+    return true;
+}
+
+bool StorageTexture::othersHold() {
+    auto& proof = refreshProof;
+    proof.refused = 15;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    bool inside = false;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        const auto serial = PendingSerial();
+        const auto begin = proof.others.begin(), end = proof.others.begin() + proof.otherCount;
+        if (serial != proof.pendingSerial) {
+            std::size_t found = 0;
+            for (auto* texture : pending.textures) {
+                if (texture == this || !texture->overlaps(descriptor.baseAddress, bytes)) continue;
+                if (std::none_of(begin, end, [&](const RefreshProof::Other& other) { return other.texture == texture && other.identity == texture->identity; })) return false;
+                ++found;
+            }
+            if (found != proof.otherCount) return false;
+            if (std::any_of(pending.flushing.begin(), pending.flushing.end(), [&](const StorageTexture* texture) { return texture != this && texture->overlaps(descriptor.baseAddress, bytes); })) return false;
+            proof.pendingSerial = serial;
+        }
+        for (auto it = begin; it != end; ++it) {
+            auto& other = *it;
+            const auto& texture = *other.texture;
+            if (texture.version != other.version || texture.uploadedKeys != other.keys || texture.Cached() != other.cached) return false;
+            if (!other.inside) continue;
+            const bool marksOnly = version - proof.ownVersion == pendingMarks - proof.ownMarks && borrowForgets == proof.ownForgets;
+            if (!marksOnly || !aliasUnitsHold(texture, proof.insideShift)) {
+                proof.refused = 16;
+                if (texture.pendingUnitInside(descriptor.baseAddress, bytes)) return false;
+                other.inside = false;
+                proof.refused = 15;
+                continue;
+            }
+            inside = true;
+        }
+    }
+    if (inside && HostImportFor(context, descriptor.baseAddress, bytes) == nullptr) return false;
+    proof.refused = 0;
+    return true;
+}
+
+void StorageTexture::takeRefreshProof(const Alias& alias) {
     refreshProof = {};
     if (!RefreshProofs()) return;
-    if (aliased) {
+    static const bool aliasProofs = std::getenv("APS5_NO_ALIAS_REFRESH_PROOF") == nullptr;
+    if (alias.source != nullptr && !aliasProofs) {
         refreshProof.refused = 1;
         return;
     }
@@ -1524,12 +1615,52 @@ void StorageTexture::takeRefreshProof(bool aliased) {
         refreshProof.refused = 3;
         return;
     }
-    const auto serial = PendingSerial();
-    if (otherPendingOverlaps()) {
-        refreshProof.refused = 4;
+    if (!aliasProofs) {
+        const auto serial = PendingSerial();
+        if (otherPendingOverlaps()) {
+            refreshProof.refused = 4;
+            return;
+        }
+        refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
         return;
     }
-    refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
+    RefreshProof proof{generation, 0, keyProof.generation, uploadedKeys};
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    const StorageTexture* insideAlias = nullptr;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        proof.pendingSerial = PendingSerial();
+        for (auto* texture : pending.textures) {
+            if (texture == this || !texture->overlaps(descriptor.baseAddress, bytes)) continue;
+            const bool inside = texture->pendingUnitInside(descriptor.baseAddress, bytes);
+            if (inside && texture != alias.source.get()) {
+                refreshProof.refused = 4;
+                return;
+            }
+            if (proof.otherCount == proof.others.size()) {
+                refreshProof.refused = 14;
+                return;
+            }
+            proof.others[proof.otherCount++] = {texture, texture->identity, texture->version, texture->uploadedKeys, texture->Cached(), inside};
+            if (inside) insideAlias = texture;
+        }
+        if (std::any_of(pending.flushing.begin(), pending.flushing.end(), [&](const StorageTexture* texture) { return texture != this && texture->overlaps(descriptor.baseAddress, bytes); })) {
+            refreshProof.refused = 4;
+            return;
+        }
+    }
+    if (insideAlias != nullptr) {
+        proof.insideShift = alias.unitShift;
+        if (!snapshotAlias(*alias.source, alias.unitShift)) {
+            refreshProof.refused = 4;
+            return;
+        }
+    }
+    proof.ownVersion = version;
+    proof.ownMarks = pendingMarks;
+    proof.ownForgets = borrowForgets;
+    refreshProof = proof;
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {
@@ -2450,6 +2581,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         static_cast<void>(hooked);
     }
     ++version;
+    ++pendingMarks;
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
         if (wasLent) BumpPendingSerial();
@@ -3501,6 +3633,7 @@ std::optional<AliasSurface> StorageTexture::aliasSurface() const {
 }
 
 void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
+    ++borrowForgets;
     if (borrowedUnits.empty()) return;
     for (auto unit = first; unit < first + count && unit < borrowedUnits.size(); ++unit) borrowedUnits[unit] = false;
     if (std::none_of(borrowedUnits.begin(), borrowedUnits.end(), [](bool held) { return held; })) {
