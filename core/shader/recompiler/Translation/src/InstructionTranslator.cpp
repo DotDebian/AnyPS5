@@ -473,6 +473,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     program.Resources().shaderHash = options.shaderHash;
     program.Resources().userDataBase = options.userDataBaseRegister;
     program.Resources().userDataCount = options.userDataCount;
+    program.Resources().allocationRequests = options.subgroupContextMarkers;
     program.Info().scratchDwords = options.scratchDwords;
     if (options.embeddedFetch != nullptr) {
         program.Info().vertexOffsetSgpr = options.embeddedFetch->vertexOffsetSgpr;

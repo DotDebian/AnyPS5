@@ -25,6 +25,11 @@ namespace {
 constexpr std::uint64_t MaxContexts = 3'000'000u;
 constexpr std::uint32_t MaxCleanBools = 4u;
 constexpr int VectorZeroMarker = static_cast<int>(SubgroupMarkerVectorOffset);
+constexpr std::uint64_t GroupInfoUnmodelledBits = 0xffffffffu & ~((0x1ffu << 12u) | (0x1ffu << 22u));
+constexpr std::uint64_t WaveInfoUnmodelledBits = 0x00ff0000u;
+constexpr std::uint32_t AllocationVertexBits = 0x3ffu;
+constexpr std::uint32_t AllocationPrimitiveShift = 12u;
+constexpr std::uint32_t AllocationPrimitiveBits = 0x7ffu;
 
 struct SubgroupContext {
     bool host;
@@ -54,6 +59,12 @@ bool forbiddenOpcode(IrOpcode opcode) {
     return false;
 }
 
+std::uint64_t widthBits(IrType type) {
+    if (type == IrType::Bool) return 1u;
+    if (type == IrType::U64 || type == IrType::S64) return ~0ull;
+    return 0xffffffffu;
+}
+
 std::uint64_t mask(IrType type, std::uint64_t value) {
     if (type == IrType::Bool) return value != 0u ? 1u : 0u;
     if (type == IrType::U64 || type == IrType::S64) return value;
@@ -72,7 +83,10 @@ public:
         std::vector<IrValue*> values;
         for (const auto& block : program.Blocks()) {
             for (IrValue* value : block->Instructions()) {
-                if (value != nullptr && !value->IsEmpty()) values.push_back(value);
+                if (value != nullptr && !value->IsEmpty()) {
+                    values.push_back(value);
+                    blockOf.emplace(value, block.get());
+                }
             }
         }
         for (IrValue* value : values) {
@@ -82,11 +96,13 @@ public:
         if (auto failure = buildContexts()) return failure;
         for (IrValue* value : values) classify(value);
         std::uint32_t primitiveExports = 0;
+        std::uint32_t allocations = 0;
         for (IrValue* value : values) {
             const auto opcode = value->Opcode();
             if (opcode == IrOpcode::SetAttribute) {
                 const auto& info = program.Metadata().exportInfo.at(value->Flags<ExportFlags>().index);
                 if (info.kind == ExportTargetKind::Primitive) {
+                    if (!onEveryPath(blockOf.at(value))) return std::string("the primitive export is conditional");
                     if (auto failure = checkPrimitiveExport(*value)) return failure;
                     primitiveExports++;
                     continue;
@@ -102,13 +118,20 @@ public:
                 }
                 continue;
             }
-            if (opcode == IrOpcode::MeshAllocate || opcode == IrOpcode::Sendmsg) continue;
+            if (opcode == IrOpcode::MeshAllocate) {
+                if (!onEveryPath(blockOf.at(value))) return std::string("the allocation request is conditional");
+                if (auto failure = checkAllocation(*value)) return failure;
+                allocations++;
+                continue;
+            }
+            if (opcode == IrOpcode::Sendmsg) continue;
             if (value->MayHaveSideEffects()) {
                 for (std::size_t i = 0; i < value->ArgumentCount(); i++) {
                     if (dependent(value->Argument(i))) return std::string(IrOpcodeName(opcode)) + " depends on the subgroup or another lane";
                 }
             }
         }
+        if (allocations != 1u) return std::string("sends ") + std::to_string(allocations) + " allocation requests instead of one";
         if (primitiveExports != 1u) return std::string("exports ") + std::to_string(primitiveExports) + " primitives instead of one";
         return std::nullopt;
     }
@@ -123,6 +146,7 @@ private:
     IrProgram& program;
     NggSubgroupLimits limits;
     std::unordered_map<const IrValue*, State> states;
+    std::unordered_map<const IrValue*, const IrBlock*> blockOf;
     std::vector<SubgroupContext> vertexContexts;
     std::vector<SubgroupContext> laneContexts;
 
@@ -201,6 +225,7 @@ private:
         IrOpcode opcode = IrOpcode::Void;
         IrType type = IrType::Void;
         std::array<std::uint32_t, 4> args{};
+        std::uint32_t argumentCount = 0;
         Word fixed{};
         std::uint32_t clean = 0;
     };
@@ -260,6 +285,7 @@ private:
         } else {
             node.kind = NodeKind::Operation;
             node.opcode = value->Opcode();
+            node.argumentCount = static_cast<std::uint32_t>(value->ArgumentCount());
             for (std::size_t i = 0; i < value->ArgumentCount(); i++) {
                 const auto slot = collect(value->Argument(i), evaluation);
                 if (!slot) return std::nullopt;
@@ -360,6 +386,114 @@ private:
         return scratch.back();
     }
 
+    static std::vector<Word> unmodelledBits(const Evaluation& evaluation) {
+        std::vector<Word> unknown(evaluation.nodes.size());
+        for (std::size_t index = 0; index < evaluation.nodes.size(); index++) {
+            const Node& node = evaluation.nodes[index];
+            const auto full = widthBits(node.type);
+            Word result{};
+            if (node.kind == NodeKind::GroupInfo) {
+                result[0] = GroupInfoUnmodelledBits;
+            } else if (node.kind == NodeKind::WaveInfo) {
+                result[0] = WaveInfoUnmodelledBits;
+            } else if (node.kind == NodeKind::Operation) {
+                const auto u = [&](std::size_t i) -> const Word& { return unknown[node.args[i]]; };
+                const auto constant = [&](std::size_t i) -> std::optional<std::uint64_t> {
+                    const Node& argument = evaluation.nodes[node.args[i]];
+                    if (argument.kind != NodeKind::Fixed) return std::nullopt;
+                    return argument.fixed[0];
+                };
+                bool any = false;
+                for (std::uint32_t i = 0; i < node.argumentCount; i++) {
+                    for (const auto bits : u(i)) any = any || bits != 0u;
+                }
+                const auto shifted = [&](std::uint32_t width) -> std::optional<std::uint64_t> {
+                    const auto amount = constant(1);
+                    if (!amount || *amount >= width) return std::nullopt;
+                    return *amount;
+                };
+                const auto upward = [&](std::uint64_t bits) -> std::uint64_t {
+                    bits &= full;
+                    if (bits == 0u) return 0u;
+                    return full & ~((bits & (~bits + 1u)) - 1u);
+                };
+                switch (node.opcode) {
+                case IrOpcode::BitwiseAnd32: case IrOpcode::BitwiseAnd64:
+                    if (const auto c = constant(1)) result[0] = u(0)[0] & *c;
+                    else if (const auto c0 = constant(0)) result[0] = u(1)[0] & *c0;
+                    else result[0] = u(0)[0] | u(1)[0];
+                    break;
+                case IrOpcode::BitwiseOr32:
+                    if (const auto c = constant(1)) result[0] = u(0)[0] & ~*c;
+                    else if (const auto c0 = constant(0)) result[0] = u(1)[0] & ~*c0;
+                    else result[0] = u(0)[0] | u(1)[0];
+                    break;
+                case IrOpcode::BitwiseXor32: result[0] = u(0)[0] | u(1)[0]; break;
+                case IrOpcode::BitwiseNot32: result[0] = u(0)[0] & full; break;
+                case IrOpcode::ShiftLeftLogical32: case IrOpcode::ShiftLeftLogical64: case IrOpcode::ShiftRightLogical32: case IrOpcode::ShiftRightLogical64: case IrOpcode::ShiftRightArithmetic32: {
+                    const bool wide = node.opcode == IrOpcode::ShiftLeftLogical64 || node.opcode == IrOpcode::ShiftRightLogical64;
+                    const auto amount = shifted(wide ? 64u : 32u);
+                    if (!amount) {
+                        const std::uint64_t amountBits = wide ? 63u : 31u;
+                        result[0] = (u(0)[0] & full) != 0u || (u(1)[0] & amountBits) != 0u ? full : 0u;
+                        break;
+                    }
+                    const auto bits = u(0)[0] & full;
+                    if (node.opcode == IrOpcode::ShiftLeftLogical32 || node.opcode == IrOpcode::ShiftLeftLogical64) result[0] = (bits << *amount) & full;
+                    else result[0] = bits >> *amount;
+                    if (node.opcode == IrOpcode::ShiftRightArithmetic32 && (bits & 0x80000000u) != 0u) result[0] |= full & ~(full >> *amount);
+                    break;
+                }
+                case IrOpcode::BitFieldUExtract: {
+                    const auto offset = constant(1);
+                    const auto count = constant(2);
+                    if (!offset || !count || *offset > 31u || *count > 32u || *offset + *count > 32u) {
+                        result[0] = any ? full : 0u;
+                        break;
+                    }
+                    result[0] = *count == 0u ? 0u : (u(0)[0] >> *offset) & ((1ull << *count) - 1u);
+                    break;
+                }
+                case IrOpcode::CompositeConstructU64: result[0] = (u(0)[0] & 0xffffffffu) | (u(1)[0] << 32u); break;
+                case IrOpcode::CompositeExtractU64:
+                    if (const auto c = constant(1)) result[0] = *c == 0u ? u(0)[0] & 0xffffffffu : u(0)[0] >> 32u;
+                    else result[0] = any ? full : 0u;
+                    break;
+                case IrOpcode::CompositeConstructU32x2: case IrOpcode::CompositeConstructU32x3: case IrOpcode::CompositeConstructU32x4:
+                    for (std::uint32_t i = 0; i < node.argumentCount; i++) result[i] = u(i)[0];
+                    break;
+                case IrOpcode::CompositeExtractU32x2: case IrOpcode::CompositeExtractU32x3: case IrOpcode::CompositeExtractU32x4:
+                    if (const auto c = constant(1); c && u(1)[0] == 0u) result[0] = u(0)[*c & 3u];
+                    else result[0] = any ? full : 0u;
+                    break;
+                case IrOpcode::Select: case IrOpcode::SelectU32: case IrOpcode::SelectU1:
+                    if (u(0)[0] != 0u) result.fill(any ? full : 0u);
+                    else for (std::size_t i = 0; i < result.size(); i++) result[i] = u(1)[i] | u(2)[i];
+                    break;
+                case IrOpcode::LogicalAnd: case IrOpcode::LogicalOr: {
+                    const bool absorbing = node.opcode == IrOpcode::LogicalOr;
+                    const auto c0 = constant(0);
+                    const auto c1 = constant(1);
+                    if ((c0 && (*c0 != 0u) == absorbing) || (c1 && (*c1 != 0u) == absorbing)) result[0] = 0u;
+                    else result[0] = any ? 1u : 0u;
+                    break;
+                }
+                case IrOpcode::IAdd32: case IrOpcode::IAdd64: case IrOpcode::ISub32: case IrOpcode::ISub64: case IrOpcode::IMul32: case IrOpcode::IMul64:
+                    result[0] = upward(u(0)[0] | u(1)[0]);
+                    break;
+                case IrOpcode::IAddCarry32:
+                    if (any) result = {upward(u(0)[0] | u(1)[0]) & 0xffffffffu, 1u};
+                    break;
+                default:
+                    if (any) result.fill(full);
+                    break;
+                }
+            }
+            unknown[index] = result;
+        }
+        return unknown;
+    }
+
     std::string signature(const Evaluation& evaluation) const {
         std::string key;
         key.reserve(16u + evaluation.nodes.size() * sizeof(Node));
@@ -372,6 +506,7 @@ private:
             append(node.opcode);
             append(node.type);
             append(node.args);
+            append(node.argumentCount);
             append(node.fixed);
             append(node.clean);
         }
@@ -402,6 +537,10 @@ private:
             state.resolved = resolved;
             state.constant = constant;
         };
+        if (unmodelledBits(evaluation).back()[0] != 0u) {
+            remember(false, std::nullopt);
+            return;
+        }
         std::vector<Word> scratch;
         std::optional<bool> constant;
         bool first = true;
@@ -428,14 +567,57 @@ private:
         const IrValue* data = exportValue.Argument(0)->Resolve();
         if (data->Opcode() != IrOpcode::CompositeConstructU32x4 || markerOf(data->Argument(0)->Resolve()) != VectorZeroMarker) return std::string("exports a primitive other than the one it received");
         Evaluation evaluation;
-        if (!collect(exportValue.Argument(1), evaluation) || !evaluation.cleanBools.empty()) return std::string("the primitive export mask is not a subgroup function");
+        if (!collect(exportValue.Argument(1), evaluation) || !evaluation.cleanBools.empty() || unmodelledBits(evaluation).back()[0] != 0u) return std::string("the primitive export mask is not a subgroup function");
         std::vector<Word> scratch;
         for (const auto& context : laneContexts) {
-            if (context.lane >= context.primitives) continue;
             const auto word = evaluate(evaluation, context, 0u, scratch);
-            if (!word || (*word)[0] == 0u) return std::string("does not export every primitive of the subgroup");
+            if (!word) return std::string("the primitive export mask is not a subgroup function");
+            if (((*word)[0] != 0u) != (context.lane < context.primitives)) return std::string("does not export exactly the primitives of its wave");
         }
         return std::nullopt;
+    }
+
+    std::optional<std::string> checkAllocation(const IrValue& allocation) {
+        Evaluation evaluation;
+        if (allocation.ArgumentCount() != 1u || !collect(allocation.Argument(0), evaluation) || !evaluation.cleanBools.empty()) return std::string("the allocation request is not a subgroup function");
+        const auto requested = (static_cast<std::uint64_t>(AllocationPrimitiveBits) << AllocationPrimitiveShift) | AllocationVertexBits;
+        if ((unmodelledBits(evaluation).back()[0] & requested) != 0u) return std::string("the allocation request is not a subgroup function");
+        std::vector<Word> scratch;
+        for (const auto& context : laneContexts) {
+            if (context.lane != 0u) continue;
+            if (context.waves != 1u) return std::string("subgroups of up to ") + std::to_string(std::max(limits.vertices, limits.primitives)) + " threads span more than one wave and every wave requests the allocation";
+            const auto word = evaluate(evaluation, context, 0u, scratch);
+            if (!word) return std::string("the allocation request is not a subgroup function");
+            const auto vertices = (*word)[0] & AllocationVertexBits;
+            const auto primitives = ((*word)[0] >> AllocationPrimitiveShift) & AllocationPrimitiveBits;
+            if (vertices != context.groupVertices || primitives != context.groupPrimitives) return std::string("does not allocate exactly the vertices and primitives of its subgroup");
+        }
+        return std::nullopt;
+    }
+
+    bool onEveryPath(const IrBlock* block) const {
+        const IrBlock* entry = nullptr;
+        for (const auto& candidate : program.Blocks()) {
+            if (candidate->Predecessors().empty()) {
+                if (entry != nullptr) return false;
+                entry = candidate.get();
+            }
+        }
+        if (entry == nullptr) return false;
+        if (entry == block) return true;
+        std::vector<const IrBlock*> pending{entry};
+        std::unordered_map<const IrBlock*, bool> seen{{entry, true}};
+        while (!pending.empty()) {
+            const IrBlock* current = pending.back();
+            pending.pop_back();
+            if (current->Successors().empty()) return false;
+            for (const IrBlock* next : current->Successors()) {
+                if (next == block || seen.contains(next)) continue;
+                seen.emplace(next, true);
+                pending.push_back(next);
+            }
+        }
+        return true;
     }
 };
 
