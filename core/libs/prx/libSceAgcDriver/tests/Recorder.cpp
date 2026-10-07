@@ -1547,6 +1547,100 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+void misalignedRegionTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+    constexpr std::size_t bytes = 65536;
+    if (alignment < 8 || alignment > 256) {
+        std::cout << "storage buffer offset alignment " << alignment << ": misaligned draw regions not tested\n";
+        return;
+    }
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: misaligned draw regions not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<std::uint8_t*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = static_cast<std::uint8_t>(at * 5u + 1u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the watched block refused: misaligned draw regions not tested\n";
+        return;
+    }
+    constexpr std::uint32_t offset = 4096 + 4;
+    constexpr std::size_t elementBytes = 64;
+    const auto view = address + offset;
+    Require((view - import->base) % alignment != 0 && (view - import->base) % 4 == 0, "the test view is not a DWORD-aligned view off the storage buffer offset alignment");
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(view), static_cast<std::uint32_t>(view >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    binding.bufferWritten = {false};
+    vertex.bindings.push_back(binding);
+    vertex.pushConstants.resize(16);
+    vertex.memoryOffsetDword = 0;
+    const ShaderRecompiler::RecompileResult fragment;
+    const bool adjusted = std::getenv("APS5_NO_ADJUSTED_REGIONS") == nullptr;
+    {
+        auto regionContext = context;
+        DescriptorCache cache(regionContext);
+        regionContext.descriptorCache = &cache;
+        Recorder regionRecorder(regionContext);
+        regionRecorder.Activate();
+        const ColorTarget target{};
+        ShaderResources resources(regionContext, vertex, fragment, target, 0, 0);
+        if (!adjusted) {
+            Require(!resources.Reusable() && (resources.Refusal() == ShaderResources::ReuseRefusal::GpuCopy || resources.Refusal() == ShaderResources::ReuseRefusal::CpuCopy), "with APS5_NO_ADJUSTED_REGIONS a misaligned draw region is not copied");
+            std::cout << "APS5_NO_ADJUSTED_REGIONS: misaligned draw regions copied\n";
+        } else {
+            Require(resources.Reusable() && resources.Refusal() == ShaderResources::ReuseRefusal::None, "a misaligned read-only draw region bound in place is not reusable");
+            const auto reads = resources.InPlaceReads();
+            Require(reads.size() == 1 && reads.front().first == view && reads.front().second == view + elementBytes, "the misaligned draw region is not read in place");
+            std::array<std::byte, PipelinePushConstantBytes> push{};
+            resources.PatchPushConstants(push);
+            const auto adjustment = static_cast<std::uint32_t>(push[0]);
+            Require(adjustment == (view - import->base) % alignment, "the misaligned region's push constant offset is not its distance from the aligned binding offset");
+            const auto check = [&] {
+                const auto bindings = resources.PrepareDrawBindings(regionRecorder);
+                Require(bindings != nullptr && bindings->snapshots.size() == 1, "the read-only misaligned draw input was not snapshotted");
+                const auto contents = bindings->snapshots.front().buffer->Bytes();
+                Require(bindings->snapshots.front().address == view - adjustment && contents.size() == adjustment + elementBytes, "the draw snapshot does not start at the aligned offset below the view");
+                Require(std::memcmp(contents.data() + adjustment, guest + offset, elementBytes) == 0, "the shader's patched offset into the draw snapshot misses the view's bytes");
+            };
+            check();
+            guest[offset + 8] ^= 0xffu;
+            check();
+            std::cout << "misaligned draw regions bound in place\n";
+        }
+        regionRecorder.Sync();
+    }
+    recorder.Activate();
+}
+
 // Unit shadows (UnitShadow.hpp) over a host import of write-watched arena memory: a retile piece's
 // slab destination and its seeds, freshness from the tracker (a publish never stamps, a CPU write
 // makes the unit stale), the scopes, the slab boundary, and the retire publish. With
@@ -4690,6 +4784,7 @@ int main() {
             drawSnapshotReuseTests(device, recorder);
             drawSnapshotUncollectedTests(device, recorder);
             misalignedSnapshotTests(device, recorder);
+            misalignedRegionTests(device, recorder);
             drawSnapshotEvictionTests(device);
             drawInputReuseTests(device, recorder);
             storeRunTests(device, recorder);

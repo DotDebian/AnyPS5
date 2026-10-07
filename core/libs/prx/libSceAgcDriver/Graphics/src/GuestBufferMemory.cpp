@@ -1653,6 +1653,11 @@ bool gpuCopiesEnabled() {
     return !disabled;
 }
 
+bool adjustedRegionsEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_ADJUSTED_REGIONS") != nullptr;
+    return !disabled;
+}
+
 std::uint64_t gpuCopyLimit() {
     static const std::uint64_t limit = [] {
         const char* value = std::getenv("APS5_GPU_COPY_MAX_KIB");
@@ -1743,6 +1748,7 @@ struct CopyStats {
     // Written gpuCopy regions of a use that recorded no copy-back (a synchronous draw): stored
     // from the staging buffer by the CPU in WriteBack.
     std::atomic<std::uint64_t> stagingStores{0};
+    std::atomic<std::uint64_t> adjustedInPlace{0};
     // Staged regions copied in (every use), those with an atomic element, those of a reused build,
     // the bytes copied in and back, staged regions whose use recorded a copy-in but no copy-back
     // (counted when the build is reused or destroyed), and shadows the device refused.
@@ -1822,6 +1828,11 @@ GuestBufferMemory::~GuestBufferMemory() {
 bool GuestBufferMemory::gpuCopyEligible(const Region& region) const {
     if (!gpuCopiesEnabled() || region.sparse || !(region.hostBacked || region.writable)) return false;
     return region.end - region.begin <= gpuCopyLimit();
+}
+
+bool GuestBufferMemory::bindableInPlace(std::uint64_t offset, bool addressable) const {
+    if (adjustedRegions && !addressable && adjustedRegionsEnabled()) return offset % 4 == 0;
+    return offset % context.limits.minStorageBufferOffsetAlignment == 0;
 }
 
 bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) const {
@@ -1943,7 +1954,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             // device-local buffer that the CPU fallback replaces (none without a recorder to
             // record the copies: UploadFinish then binds the region in place).
             bool staged = Recorder::Active() != nullptr && stagingEligible(region, addressable);
-            const bool misaligned = (region.begin - entry->base) % context.limits.minStorageBufferOffsetAlignment != 0;
+            const bool misaligned = !bindableInPlace(region.begin - entry->base, addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
                 region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable));
@@ -2077,7 +2088,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
             const bool staged = recorder != nullptr && stagingEligible(region, addressable);
-            if (entry != nullptr && !staged && (region.begin - entry->base) % context.limits.minStorageBufferOffsetAlignment == 0) {
+            if (entry != nullptr && !staged && bindableInPlace(region.begin - entry->base, addressable)) {
+                if (profile && (region.begin - entry->base) % context.limits.minStorageBufferOffsetAlignment != 0) Copies().adjustedInPlace.fetch_add(1, std::memory_order_relaxed);
                 region.direct = entry;
                 region.snapshot.clear();
                 // A buffer UploadPrepare made for a GPU copy is not needed: the import serves the
@@ -2135,7 +2147,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     const auto uploads = uploadsProfiled.fetch_add(1, std::memory_order_relaxed) + 1;
     if (uploads % 2000 == 0) {
         const auto& copies = Copies();
-        std::fprintf(stderr, "[buffers] %llu uploads: import lookup %.0f ms, buffer allocation %.0f ms, guest read %.0f ms; copies on the GPU: %llu regions (%.0f KiB) copied out of imports, %llu written sub-ranges (%.0f KiB) copied back, %llu staging stores by the CPU at write-back\n", static_cast<unsigned long long>(uploads), importUs.load(std::memory_order_relaxed) / 1000.0, allocateUs.load(std::memory_order_relaxed) / 1000.0, readUs.load(std::memory_order_relaxed) / 1000.0, static_cast<unsigned long long>(copies.gpuCopies.load(std::memory_order_relaxed)), copies.gpuCopyBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.gpuCopyBacks.load(std::memory_order_relaxed)), copies.gpuCopyBackBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.stagingStores.load(std::memory_order_relaxed)));
+        std::fprintf(stderr, "[buffers] %llu uploads: import lookup %.0f ms, buffer allocation %.0f ms, guest read %.0f ms; copies on the GPU: %llu regions (%.0f KiB) copied out of imports, %llu written sub-ranges (%.0f KiB) copied back, %llu staging stores by the CPU at write-back; %llu misaligned regions bound in place\n", static_cast<unsigned long long>(uploads), importUs.load(std::memory_order_relaxed) / 1000.0, allocateUs.load(std::memory_order_relaxed) / 1000.0, readUs.load(std::memory_order_relaxed) / 1000.0, static_cast<unsigned long long>(copies.gpuCopies.load(std::memory_order_relaxed)), copies.gpuCopyBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.gpuCopyBacks.load(std::memory_order_relaxed)), copies.gpuCopyBackBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.stagingStores.load(std::memory_order_relaxed)), static_cast<unsigned long long>(copies.adjustedInPlace.load(std::memory_order_relaxed)));
     }
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     if (ms > 50) {
