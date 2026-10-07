@@ -773,13 +773,6 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto decoded = DecodeColorFormat(format, number, swap);
     // ROUND_MODE (bit 18) only affects unorm rounding. With DCC_ENABLE (bit 28) the target is written
     // uncompressed and only its fast-clear keys matter (see DccMetadata.hpp).
-    if ((info & 0x2000u) != 0) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            std::fprintf(stderr, "[gpu] color targets with CMASK fast clears (CB_COLOR_INFO.FAST_CLEAR) are rendered uncompressed; CMASK clears are not modeled\n");
-        }
-    }
     if ((info & ~(0x00039f7cu | 0x00040000u | 0x10000000u | 0x2000u)) != 0) throw std::runtime_error("AGC graphics: color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported (CB_COLOR_INFO 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", info); return std::string(text); }() + ")");
     Require((info & 0x8000u) != 0 || number == 7 || number == 4 || number == 5, "unclamped normalized color is unsupported");
     // CB_COLOR_VIEW: MIP_LEVEL (bits 26-29) selects the rendered mip; array slices are not modeled.
@@ -828,6 +821,16 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     for (std::uint32_t word = 0; word < 2; ++word) {
         const auto clear = find(cx, 0x323 + word + stride);
         color.clearWords[word] = clear == cx.end() ? 0u : clear->second;
+    }
+    if ((info & 0x2000u) != 0) {
+        Require(((attrib3 >> 19u) & 0x1fu) == 0x18u && (attrib3 & 0x4000000u) != 0, "CMASK fast clears need pipe-aligned SW_64KB_Z_X metadata (CB_COLOR_ATTRIB3 FMASK_SW_MODE 24, CMASK_PIPE_ALIGNED)");
+        Require(maxMip == 0 && !volume && slice == 0, "CMASK fast clears of mipmapped, 3D or array-slice color targets are not modeled");
+        Require(color.elementBytes <= sizeof(color.clearWords), "CMASK fast clears of texels over 64 bits are not modeled");
+        const auto cmaskHigh = find(cx, 0x398 + slot);
+        Require(cmaskHigh == cx.end() || (cmaskHigh->second & ~0xffu) == 0, "invalid CMASK address extension");
+        color.cmaskAddress = ((cmaskHigh == cx.end() ? 0ull : static_cast<std::uint64_t>(cmaskHigh->second)) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x31f + stride)) << 8u);
+        Require(color.cmaskAddress != 0, "CMASK fast clear without a CMASK surface");
+        GuestMemory::CheckRange(reinterpret_cast<const void*>(color.cmaskAddress), CmaskLayout(color.extent.width, color.extent.height).Bytes(), CmaskLayout::Alignment, true);
     }
     if ((info & 0x10000000u) != 0) {
         if (maxMip == 0) {

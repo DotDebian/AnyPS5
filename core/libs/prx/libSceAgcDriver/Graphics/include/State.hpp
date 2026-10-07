@@ -53,6 +53,7 @@ struct ColorTarget {
     std::uint32_t exportIndex = 0;
     std::uint32_t depth = 1;
     std::uint32_t depthSlice = 0;
+    std::uint64_t cmaskAddress = 0;
 };
 
 // The depth/stencil surface a draw tests against (DB_Z_INFO, DB_STENCIL_INFO, the DB_*_BASE words,
@@ -194,7 +195,7 @@ struct DrawKeyRange {
     std::uint32_t first;
     std::uint32_t count;
 };
-inline constexpr std::array<DrawKeyRange, 46> DrawKeyRegisters{{
+inline constexpr std::array<DrawKeyRange, 47> DrawKeyRegisters{{
     // DB_RENDER_CONTROL, DB_DEPTH_VIEW, DB_RENDER_OVERRIDE, DB_HTILE_DATA_BASE, DB_DEPTH_SIZE_XY, DB_DEPTH_BOUNDS_MIN/MAX,
     // DB_STENCIL_CLEAR and DB_DEPTH_CLEAR with PA_SC_SCREEN_SCISSOR, DB_Z_INFO .. DB_STENCIL_WRITE_BASE,
     // the *_BASE_HI words.
@@ -210,8 +211,8 @@ inline constexpr std::array<DrawKeyRange, 46> DrawKeyRegisters{{
     // VGT_ESGS_RING_ITEMSIZE, VGT_SHADER_STAGES_EN/GS_ONCHIP, VGT_TF_PARAM/DB_ALPHA_TO_MASK, PA_SC_AA_CONFIG and
     // PA_SU_VTX_CNTL, the sample masks, PA_SC_CONSERVATIVE_RASTERIZATION_CNTL; PA_SU_POLY_OFFSET_*.
     {RegisterBank::Context, 0x200, 8}, {RegisterBank::Context, 0x292, 2}, {RegisterBank::Context, 0x29b, 1}, {RegisterBank::Context, 0x2ab, 1}, {RegisterBank::Context, 0x2ce, 1}, {RegisterBank::Context, 0x2d5, 2}, {RegisterBank::Context, 0x2db, 2}, {RegisterBank::Context, 0x2de, 6}, {RegisterBank::Context, 0x2f8, 2}, {RegisterBank::Context, 0x30e, 2}, {RegisterBank::Context, 0x313, 1},
-    // CB_COLOR0..7_BASE .. DCC_BASE (15 words a slot), CB_COLOR0..7_BASE_EXT, DCC_BASE_EXT, ATTRIB2, ATTRIB3.
-    {RegisterBank::Context, 0x318, 0x78}, {RegisterBank::Context, 0x390, 8}, {RegisterBank::Context, 0x3a8, 0x18},
+    // CB_COLOR0..7_BASE .. DCC_BASE (15 words a slot), CB_COLOR0..7_BASE_EXT, CMASK_BASE_EXT, DCC_BASE_EXT, ATTRIB2, ATTRIB3.
+    {RegisterBank::Context, 0x318, 0x78}, {RegisterBank::Context, 0x390, 8}, {RegisterBank::Context, 0x398, 8}, {RegisterBank::Context, 0x3a8, 0x18},
     // The pixel program address, RSRC2 and user words; the geometry-back user pointer and program
     // address; the vertex/geometry-front RSRC1/RSRC2 and user words; the vertex program address;
     // the hull user pointer, program address, RSRC2 and user words; the local program address.
