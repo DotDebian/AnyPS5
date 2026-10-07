@@ -131,6 +131,8 @@ struct CachedTexture {
     std::uint64_t sourceVersion = 0;
     std::uint64_t accounted = 0;
     std::uint64_t lastUse = 0;
+    std::uint64_t snapshotSize = 0;
+    bool hostReleased = false;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -288,6 +290,9 @@ struct TextureCounters {
     std::atomic<std::uint64_t> exhaustedRetries{0};
     std::atomic<std::uint64_t> madeAfterEviction{0};
     std::atomic<std::uint64_t> madeAfterChange{0};
+    std::atomic<std::uint64_t> hostReleased{0};
+    std::atomic<std::uint64_t> hostReleasedBytes{0};
+    std::atomic<std::uint64_t> madeAfterRelease{0};
     std::atomic<std::uint64_t> snapshotReadUs{0};
     std::atomic<std::uint64_t> snapshotReadBytes{0};
     std::atomic<std::int64_t> lastReport{0};
@@ -397,7 +402,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; residency: sampled %llu MiB held (%llu MiB host copies, soft %llu, hard %llu), %llu evicted (%llu MiB), %llu rescued, %llu dead views dropped; storage %llu MiB held (soft %llu, hard %llu), %llu evicted (%llu MiB); %llu retries after device memory ran out; snapshots made after their key's eviction %llu, after a content change %llu; snapshot reads %llu ms for %llu MiB\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.sampledBytes) >> 20u, count(counters.sampledHostBytes) >> 20u, count(counters.sampledSoft) >> 20u, count(counters.sampledHard) >> 20u, count(counters.sampledEvicted), count(counters.sampledEvictedBytes) >> 20u, count(counters.sampledRescued), count(counters.deadViews), count(counters.storageBytes) >> 20u, count(counters.storageSoft) >> 20u, count(counters.storageHard) >> 20u, count(counters.storageEvicted), count(counters.storageEvictedBytes) >> 20u, count(counters.exhaustedRetries), count(counters.madeAfterEviction), count(counters.madeAfterChange), count(counters.snapshotReadUs) / 1000u, count(counters.snapshotReadBytes) >> 20u);
+    std::fprintf(stderr, "[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; residency: sampled %llu MiB held (%llu MiB host copies, soft %llu, hard %llu), %llu evicted (%llu MiB), %llu rescued, %llu dead views dropped; storage %llu MiB held (soft %llu, hard %llu), %llu evicted (%llu MiB); %llu retries after device memory ran out; snapshots made after their key's eviction %llu, after a content change %llu; snapshot reads %llu ms for %llu MiB; host copies released %llu (%llu MiB), made after their host copy's release %llu\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.sampledBytes) >> 20u, count(counters.sampledHostBytes) >> 20u, count(counters.sampledSoft) >> 20u, count(counters.sampledHard) >> 20u, count(counters.sampledEvicted), count(counters.sampledEvictedBytes) >> 20u, count(counters.sampledRescued), count(counters.deadViews), count(counters.storageBytes) >> 20u, count(counters.storageSoft) >> 20u, count(counters.storageHard) >> 20u, count(counters.storageEvicted), count(counters.storageEvictedBytes) >> 20u, count(counters.exhaustedRetries), count(counters.madeAfterEviction), count(counters.madeAfterChange), count(counters.snapshotReadUs) / 1000u, count(counters.snapshotReadBytes) >> 20u, count(counters.hostReleased), count(counters.hostReleasedBytes) >> 20u, count(counters.madeAfterRelease));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -500,12 +505,21 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false);
 
+bool HostCopyRelease() {
+    static const bool enabled = std::getenv("APS5_NO_TEXTURE_HOST_RELEASE") == nullptr;
+    return enabled;
+}
+
 EvictionOutcome evictSampled(TextureCache& cache, ResidencyUsage& usage, const ResidencyLimits& limits, const ResidencyPolicy& policy) {
     const auto& config = Residency();
     const auto window = ResidencyClock::Window(config.minIdleTicks, config.minIdleFrames);
+    const bool release = HostCopyRelease() && !policy.strictLru;
+    auto wholeLimits = limits;
+    if (release) wholeLimits.hostSoft = wholeLimits.hostHard = std::numeric_limits<std::uint64_t>::max();
+    const auto describe = [](const CachedTexture& entry) { return ResidencyEntryState{entry.lastUse, std::max(entry.lastUse, entry.texture->ResidencyUse()), entry.accounted, entry.bytes.size()}; };
     const auto outcome = RunEvictionPass(
-            cache.entries, usage, limits, window, policy,
-            [](const CachedTexture& entry) { return ResidencyEntryState{entry.lastUse, std::max(entry.lastUse, entry.texture->ResidencyUse()), entry.accounted, entry.bytes.size()}; },
+            cache.entries, usage, wholeLimits, window, policy,
+            describe,
             [&](std::list<CachedTexture>::iterator it) {
                 it->lastUse = std::max(it->lastUse, it->texture->ResidencyUse());
                 cache.entries.splice(cache.entries.begin(), cache.entries, it);
@@ -521,6 +535,14 @@ EvictionOutcome evictSampled(TextureCache& cache, ResidencyUsage& usage, const R
     counters.sampledEvicted.fetch_add(outcome.evicted, std::memory_order_relaxed);
     counters.sampledEvictedBytes.fetch_add(outcome.deviceBytes, std::memory_order_relaxed);
     counters.sampledRescued.fetch_add(outcome.rescued, std::memory_order_relaxed);
+    if (!release) return outcome;
+    const auto released = RunHostReleasePass(cache.entries, usage, limits, window, describe, [&](std::list<CachedTexture>::iterator it) {
+        cache.hostBytes -= it->bytes.size();
+        SnapshotBytes{}.swap(it->bytes);
+        it->hostReleased = true;
+    });
+    counters.hostReleased.fetch_add(released.released, std::memory_order_relaxed);
+    counters.hostReleasedBytes.fetch_add(released.hostBytes, std::memory_order_relaxed);
     return outcome;
 }
 
@@ -670,17 +692,18 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
-        } else if (source == nullptr && it->bytes.size() == guestBytes && it->keys == *keys) {
+        } else if (source == nullptr && it->snapshotSize == guestBytes && it->keys == *keys) {
             // Unwritten pages need no comparison; partially resident textures compare only committed
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
             const auto equalsCommitted = [&] {
+                if (it->hostReleased) return false;
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
             const bool residentDepth = depthAspect != 0 && it->texture->SamplesResidentDepth();
-            if (*keys != DccKeys::Uncompressed || residentDepth || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
+            if (*keys != DccKeys::Uncompressed || residentDepth || GuestMemory::UnchangedSince(address, static_cast<std::size_t>(it->snapshotSize), it->generation) || equalsCommitted()) {
                 it->generation = generation;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
@@ -689,6 +712,7 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
                 return it->texture;
             }
         }
+        if (profile && it->hostReleased) counters.madeAfterRelease.fetch_add(1, std::memory_order_relaxed);
         eraseTexture(cache, it);
         if (profile) counters.madeAfterChange.fetch_add(1, std::memory_order_relaxed);
     } else if (profile && cache.evictedKeys.erase(TextureKeyHash{}(key)) != 0) {
@@ -696,6 +720,7 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
     }
     const auto readStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CachedTexture entry{key, address, MakeSnapshotBytes(source != nullptr ? 0u : bytes, *keys == DccKeys::Uncompressed), nullptr, *keys, generation};
+    entry.snapshotSize = entry.bytes.size();
     entry.accounted = source != nullptr && !ChargeTextureViews() ? 0u : guestBytes;
     if (source != nullptr) {
         entry.source = source;

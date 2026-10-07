@@ -50,6 +50,11 @@ struct EvictionOutcome {
     std::uint64_t hostBytes = 0;
 };
 
+struct HostReleaseOutcome {
+    std::size_t released = 0;
+    std::uint64_t hostBytes = 0;
+};
+
 struct DeviceMemoryBudget {
     std::uint64_t budget = 0;
     std::uint64_t usage = 0;
@@ -103,6 +108,24 @@ EvictionOutcome RunEvictionPass(List& entries, ResidencyUsage& usage, const Resi
         outcome.hostBytes += state.host;
         ++outcome.evicted;
         evict(victim);
+    }
+    return outcome;
+}
+
+template<typename List, typename Describe, typename Release>
+HostReleaseOutcome RunHostReleasePass(List& entries, ResidencyUsage& usage, const ResidencyLimits& limits, const ResidencyWindow& window, Describe describe, Release release) {
+    HostReleaseOutcome outcome;
+    auto cursor = entries.end();
+    while (cursor != entries.begin() && usage.host > limits.hostSoft) {
+        --cursor;
+        const auto state = describe(*cursor);
+        const auto bound = usage.host > limits.hostHard ? window.frameStart : window.agedBefore;
+        if (state.listedUse >= bound) break;
+        if (state.host == 0 || state.lastUse >= bound) continue;
+        usage.host -= state.host < usage.host ? state.host : usage.host;
+        outcome.hostBytes += state.host;
+        ++outcome.released;
+        release(cursor);
     }
     return outcome;
 }

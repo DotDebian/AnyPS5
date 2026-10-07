@@ -198,6 +198,67 @@ std::uint64_t RecreationsOverCycles(const ResidencyPolicy& policy) {
     return simulation.created - warm;
 }
 
+struct HostCopies {
+    std::list<Entry> entries;
+    ResidencyUsage usage;
+    std::vector<int> released;
+
+    void Add(int id, std::uint64_t use, std::uint64_t device, std::uint64_t host) {
+        entries.push_front({id, use, use, device, host});
+        usage.device += device;
+        usage.host += host;
+    }
+
+    HostReleaseOutcome Pass(const ResidencyLimits& limits, const ResidencyWindow& window) {
+        auto usageCopy = usage;
+        const auto outcome = RunHostReleasePass(
+                entries, usageCopy, limits, window,
+                [](const Entry& entry) { return ResidencyEntryState{entry.listedUse, std::max(entry.listedUse, entry.objectUse), entry.device, entry.host}; },
+                [&](std::list<Entry>::iterator it) {
+                    usage.host -= it->host;
+                    it->host = 0;
+                    released.push_back(it->id);
+                });
+        Expect(usageCopy.device == usage.device && usageCopy.host == usage.host, "the release pass's usage follows the releases");
+        return outcome;
+    }
+};
+
+void ReleasesAgedHostCopiesAndKeepsTheEntries() {
+    HostCopies cache;
+    for (int i = 0; i < 6; ++i) cache.Add(i, 10 + static_cast<std::uint64_t>(i), 100 * MiB, 100 * MiB);
+    const auto outcome = cache.Pass(Limits(64 * GiB, 64 * GiB, 350 * MiB, 64 * GiB), {100, 400});
+    Expect(outcome.released == 3 && outcome.hostBytes == 300 * MiB, "host copies are released until the host bytes are under the soft limit");
+    Expect(cache.released == std::vector<int>({0, 1, 2}), "the oldest host copies go first");
+    Expect(cache.entries.size() == 6 && cache.usage.device == 600 * MiB, "releasing a host copy keeps the entry and its device bytes");
+    Expect(cache.usage.host == 300 * MiB, "the host bytes drop by the released copies");
+}
+
+void ReleaseSkipsReleasedAndRecentEntries() {
+    HostCopies cache;
+    cache.Add(0, 10, 100 * MiB, 0);
+    cache.Add(1, 11, 100 * MiB, 100 * MiB);
+    cache.Add(2, 12, 100 * MiB, 100 * MiB);
+    cache.Add(3, 13, 100 * MiB, 100 * MiB);
+    std::next(cache.entries.begin(), 2)->objectUse = 500;
+    const auto outcome = cache.Pass(Limits(64 * GiB, 64 * GiB, 100 * MiB, 64 * GiB), {100, 400});
+    Expect(outcome.released == 2 && cache.released == std::vector<int>({2, 3}), "an entry without a host copy and one its object used since the bound are passed over");
+    Expect(cache.usage.host == 100 * MiB, "the recently used entry keeps its host copy");
+}
+
+void ReleaseStopsAtRecentlyListedEntries() {
+    HostCopies cache;
+    cache.Add(0, 10, 100 * MiB, 100 * MiB);
+    cache.Add(1, 200, 100 * MiB, 100 * MiB);
+    cache.Add(2, 300, 100 * MiB, 100 * MiB);
+    const auto soft = cache.Pass(Limits(64 * GiB, 64 * GiB, 0, 64 * GiB), {100, 400});
+    Expect(soft.released == 1 && cache.released == std::vector<int>({0}), "under soft pressure only copies listed before the aged bound go");
+    const auto critical = cache.Pass(Limits(64 * GiB, 64 * GiB, 0, 50 * MiB), {100, 250});
+    Expect(critical.released == 1 && cache.released == std::vector<int>({0, 1}), "under critical pressure copies not used in the current frame go too");
+    const auto none = cache.Pass(Limits(0, 0, 64 * GiB, 64 * GiB), {1000, 1000});
+    Expect(none.released == 0, "no host pressure releases nothing, whatever the device usage");
+}
+
 void CyclicWorkingSetAboveBudgetDoesNotThrash() {
     const auto aged = RecreationsOverCycles({});
     Expect(aged == 0, "a per-frame working set larger than the soft budget is never recreated");
@@ -270,6 +331,9 @@ int main() {
     RescuesEntriesTheirObjectsStillUse();
     EvictsAgedEntriesThatHoldNothing();
     StrictLruEvictsRegardlessOfAge();
+    ReleasesAgedHostCopiesAndKeepsTheEntries();
+    ReleaseSkipsReleasedAndRecentEntries();
+    ReleaseStopsAtRecentlyListedEntries();
     CyclicWorkingSetAboveBudgetDoesNotThrash();
     AgedWorkingSetIsTrimmedAfterAScene();
     ClockWindowFollowsFrames();
