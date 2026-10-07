@@ -676,7 +676,7 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
     if (const auto frame = ResidencyClock::Frame(); frame != cache.maintainedFrame && !Residency().policy.strictLru) {
         cache.maintainedFrame = frame;
         ResidencyUsage usage{cache.bytes, cache.hostBytes};
-        evictSampled(cache, usage, CacheLimits(context, cache.bytes, 3, 8, Residency().sampledOverride, true), Residency().policy);
+        evictSampled(cache, usage, CacheLimits(context, cache.bytes, 1, 2, Residency().sampledOverride, true), Residency().policy);
     }
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         if (it->source != nullptr) {
@@ -750,7 +750,7 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
         cache.sweptDepartures = departures;
         counters.deadViews.fetch_add(dropDeadViews(cache), std::memory_order_relaxed);
     }
-    const auto limits = CacheLimits(context, cache.bytes, 3, 8, residency.sampledOverride, true);
+    const auto limits = CacheLimits(context, cache.bytes, 1, 2, residency.sampledOverride, true);
     ResidencyUsage usage{cache.bytes + entry.accounted, cache.hostBytes + entry.bytes.size()};
     evictSampled(cache, usage, limits, residency.policy);
     cache.bytes += entry.accounted;
