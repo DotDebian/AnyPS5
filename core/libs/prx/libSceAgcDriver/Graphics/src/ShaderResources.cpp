@@ -21,6 +21,8 @@
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <cstring>
+#include <type_traits>
+#include <utility>
 #include <limits>
 #include <list>
 #include <map>
@@ -81,10 +83,43 @@ TextureKey MakeTextureKey(VkDevice device, std::span<const std::uint32_t> words,
     return key;
 }
 
+template<typename T>
+struct DefaultInitAllocator : std::allocator<T> {
+    using value_type = T;
+    template<typename U>
+    struct rebind {
+        using other = DefaultInitAllocator<U>;
+    };
+    DefaultInitAllocator() noexcept = default;
+    template<typename U>
+    DefaultInitAllocator(const DefaultInitAllocator<U>&) noexcept {}
+    template<typename U>
+    void construct(U* pointer) noexcept(std::is_nothrow_default_constructible_v<U>) {
+        ::new (static_cast<void*>(pointer)) U;
+    }
+    template<typename U, typename... Args>
+    void construct(U* pointer, Args&&... args) {
+        ::new (static_cast<void*>(pointer)) U(std::forward<Args>(args)...);
+    }
+};
+
+using SnapshotBytes = std::vector<std::byte, DefaultInitAllocator<std::byte>>;
+
+bool RawTextureSnapshots() {
+    static const bool enabled = std::getenv("APS5_NO_RAW_TEXTURE_SNAPSHOTS") == nullptr;
+    return enabled;
+}
+
+SnapshotBytes MakeSnapshotBytes(std::size_t size, bool readCovers) {
+    SnapshotBytes bytes(size);
+    if (!(readCovers && RawTextureSnapshots()) && size != 0) std::memset(bytes.data(), 0, size);
+    return bytes;
+}
+
 struct CachedTexture {
     TextureKey key;
     std::uint64_t address;
-    std::vector<std::byte> bytes;
+    SnapshotBytes bytes;
     std::shared_ptr<Texture> texture;
     // A fast-cleared surface is cached as its clear texels; it stays valid while the keys are unchanged.
     DccKeys keys = DccKeys::Uncompressed;
@@ -660,7 +695,7 @@ std::shared_ptr<Texture> cachedTextureLookup(const Context& context, std::span<c
         counters.madeAfterEviction.fetch_add(1, std::memory_order_relaxed);
     }
     const auto readStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
+    CachedTexture entry{key, address, MakeSnapshotBytes(source != nullptr ? 0u : bytes, *keys == DccKeys::Uncompressed), nullptr, *keys, generation};
     entry.accounted = source != nullptr && !ChargeTextureViews() ? 0u : guestBytes;
     if (source != nullptr) {
         entry.source = source;
