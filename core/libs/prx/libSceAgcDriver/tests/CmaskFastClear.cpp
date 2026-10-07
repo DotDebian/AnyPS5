@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -30,7 +31,8 @@ constexpr std::uint32_t Stale = 0x5a5a5a5au;
 constexpr std::uint32_t Clear = 0x11223344u;
 constexpr std::uint32_t Drawn = 0xffffffffu;
 
-alignas(65536) std::array<std::byte, 65536> Surface{};
+alignas(4096) std::array<std::byte, 2 * 65536> SurfaceStorage{};
+const std::span<std::byte, 65536> Surface{reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(SurfaceStorage.data()) + 65535u) & ~std::uintptr_t{65535u}), 65536};
 alignas(4096) std::array<std::uint8_t, 4096> Cmask{};
 
 ColorTarget target(ColorTileMode mode) {
