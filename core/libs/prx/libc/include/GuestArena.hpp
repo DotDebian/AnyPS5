@@ -33,6 +33,11 @@ void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 void GuestArenaUnpinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* protection);
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear);
+// A look that resets nothing and holds no lock across GetWriteWatch: true when the whole range is
+// private watched memory with no page written since its last resetting collect. *serial receives
+// GuestArenaMappingSerial at the look; the answer only stands while that serial is unchanged.
+bool GuestArenaProbeClean_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint64_t* serial);
+std::uint64_t GuestArenaMappingSerial_nid_postfix();
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes);
 std::uint64_t GuestArenaCommitGeneration_nid_postfix();
 void GuestArenaSetPrivateMappingObserver_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes, std::uint64_t generation));

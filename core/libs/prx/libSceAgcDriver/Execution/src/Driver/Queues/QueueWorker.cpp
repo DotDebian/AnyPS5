@@ -73,6 +73,11 @@ void Driver::run(std::uint32_t id) noexcept {
     }
 
     GuestMemory::TagGpuLockThread(id);
+    // The write-watch prewalk helper of this worker lives until the worker returns.
+    struct Prewalk {
+        Prewalk() { GuestMemory::BeginPrewalk(); }
+        ~Prewalk() { GuestMemory::EndPrewalk(); }
+    } prewalk;
     if (id == 0) StartWorkerSampler();
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

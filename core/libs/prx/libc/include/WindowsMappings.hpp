@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <map>
@@ -31,6 +32,7 @@ public:
     std::vector<std::pair<std::uintptr_t, std::size_t>> Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
         std::lock_guard lock(mutex);
+        mappingSerial.fetch_add(1, std::memory_order_acq_rel);
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
         for (auto cursor = reinterpret_cast<std::uintptr_t>(address); cursor < end;) {
             const auto memory = query(cursor);
@@ -68,11 +70,13 @@ public:
 
     void Reset(void* address, std::size_t bytes) {
         std::lock_guard lock(mutex);
+        mappingSerial.fetch_add(1, std::memory_order_acq_rel);
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection) {
         std::lock_guard lock(mutex);
+        mappingSerial.fetch_add(1, std::memory_order_acq_rel);
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         reset(cursor, bytes);
         HANDLE duplicate = nullptr;
@@ -278,6 +282,50 @@ public:
         return true;
     }
 
+    // A look at [address, address + bytes) that resets nothing: true when every page is private
+    // write-watched memory that no write reached since its last resetting collect (pieces Collect
+    // skips as clean are skipped too). False when a page was written, is a shared view, is not
+    // committed, or the call failed. The mutex is held only to resolve the range, never across
+    // GetWriteWatch, so a look runs beside the resetting collects. *serial receives MappingSerial
+    // at the resolve: a caller that sees it changed afterwards drops the answer.
+    bool ProbeClean(std::uintptr_t address, std::size_t bytes, std::uint64_t* serial) {
+        thread_local std::vector<std::pair<std::uintptr_t, std::uintptr_t>> pieces;
+        pieces.clear();
+        {
+            std::lock_guard lock(mutex);
+            *serial = mappingSerial.load(std::memory_order_relaxed);
+            const auto end = address + bytes;
+            for (auto cursor = address; cursor < end;) {
+                const auto nextClean = cleanRanges.upper_bound(cursor);
+                if (nextClean != cleanRanges.begin()) {
+                    const auto clean = std::prev(nextClean);
+                    if (cursor < clean->second) {
+                        cursor = std::min(end, clean->second);
+                        continue;
+                    }
+                }
+                if (views.find(cursor & ~(pageBytes - 1)) != views.end()) return false;
+                const auto memory = query(cursor);
+                if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
+                const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                pieces.emplace_back(cursor, stop);
+                cursor = stop;
+            }
+        }
+        for (const auto& [begin, stop] : pieces) {
+            void* page = nullptr;
+            ULONG_PTR count = 1;
+            DWORD granularity = 0;
+            if (GetWriteWatch(0, reinterpret_cast<void*>(begin), stop - begin, &page, &count, &granularity) != 0 || count != 0) return false;
+        }
+        return true;
+    }
+
+    // Bumped by every call that commits, releases or maps guest memory.
+    std::uint64_t MappingSerial() const {
+        return mappingSerial.load(std::memory_order_acquire);
+    }
+
 private:
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         for (auto cursor = address; cursor < end;) {
@@ -432,6 +480,7 @@ private:
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;
+    std::atomic<std::uint64_t> mappingSerial{0};
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;
