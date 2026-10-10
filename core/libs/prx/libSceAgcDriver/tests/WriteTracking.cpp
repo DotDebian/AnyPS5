@@ -186,8 +186,6 @@ void CheckPrivateMappingReuse() {
     GuestArena::GuestArenaRelease_nid_postfix(replacement, 3 * Block);
 }
 
-// The write-watch prewalk: clean ranges of the last epoch are skipped, a page written before the
-// ordering point is never marked clean, and a write after a look is seen by the next epoch.
 void CheckPrewalk() {
     if (std::getenv("APS5_NO_PREWALK") != nullptr) return;
     void* memory = AllocateWatched(4 * Block);

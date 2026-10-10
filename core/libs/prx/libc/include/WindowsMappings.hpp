@@ -267,9 +267,6 @@ public:
                 const auto memory = query(cursor);
                 if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
-                // A buffer sized to the range, not to the caller's capacity: GetWriteWatch's cost
-                // follows the entry count it is given (about 7 us for 65536 entries against 0.5 us
-                // for the 16 of a 64 KiB range), and the range cannot report more pages than it has.
                 ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, (stop - cursor + 4095) / 4096);
                 if (available == 0) return true;
                 DWORD granularity = 0;
@@ -282,12 +279,6 @@ public:
         return true;
     }
 
-    // A look at [address, address + bytes) that resets nothing: true when every page is private
-    // write-watched memory that no write reached since its last resetting collect (pieces Collect
-    // skips as clean are skipped too). False when a page was written, is a shared view, is not
-    // committed, or the call failed. The mutex is held only to resolve the range, never across
-    // GetWriteWatch, so a look runs beside the resetting collects. *serial receives MappingSerial
-    // at the resolve: a caller that sees it changed afterwards drops the answer.
     bool ProbeClean(std::uintptr_t address, std::size_t bytes, std::uint64_t* serial) {
         thread_local std::vector<std::pair<std::uintptr_t, std::uintptr_t>> pieces;
         pieces.clear();
@@ -321,7 +312,6 @@ public:
         return true;
     }
 
-    // Bumped by every call that commits, releases or maps guest memory.
     std::uint64_t MappingSerial() const {
         return mappingSerial.load(std::memory_order_acquire);
     }

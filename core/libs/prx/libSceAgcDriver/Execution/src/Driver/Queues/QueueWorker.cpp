@@ -73,7 +73,6 @@ void Driver::run(std::uint32_t id) noexcept {
     }
 
     GuestMemory::TagGpuLockThread(id);
-    // The write-watch prewalk helper of this worker lives until the worker returns.
     struct Prewalk {
         Prewalk() { GuestMemory::BeginPrewalk(); }
         ~Prewalk() { GuestMemory::EndPrewalk(); }

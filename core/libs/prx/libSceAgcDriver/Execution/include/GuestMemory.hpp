@@ -95,23 +95,6 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 void BumpCollectEpoch();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
-// Write-watch prewalk (Windows): a queue worker's memoized walks are logged per collect epoch under
-// the address of the epoch's first walk. When a later epoch starts with a walk of the same address,
-// a helper thread of the worker looks at the ranges logged last time, while the worker records:
-// GetWriteWatch without reset and outside every lock. A range found clean has its 64 KiB blocks
-// marked with a tracker generation taken before the look, under the tracker mutex; a completed
-// resetting walk marks the blocks it covered whole the same way. A memoized collect of a prewalk
-// thread skips the blocks marked after its epoch began instead of walking them.
-// Why this keeps the epoch contract above: the look starts after the worker's ordering point (a walk
-// of the new epoch posts it). A CPU write made before that point either still has its dirty bit at
-// the look (the range is not marked, the worker walks it) or had it cleared by a resetting walk,
-// which stamps the block under the tracker mutex before releasing it; the mark is made under that
-// mutex after the look, so the stamp is already in. A mark only serves epochs that began before
-// its generation was taken, so it expires at the next ordering point. A commit, release or mapping
-// change between the look and the mark drops the mark.
-// BeginPrewalk enables it on the calling thread (the queue workers call it); EndPrewalk stops and
-// joins the thread's helper. APS5_NO_PREWALK=1 disables it. DrainPrewalk waits until the calling
-// thread's helper has finished its current job (tests).
 void BeginPrewalk();
 void EndPrewalk();
 void DrainPrewalk();
