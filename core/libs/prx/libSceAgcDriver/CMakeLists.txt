@@ -123,19 +123,6 @@ add_custom_command(
         VERBATIM
 )
 
-set(agcDeltaCopyShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/DeltaCopy.comp)
-set(agcDeltaCopyShaderSpv ${agcTextureDetileGeneratedDir}/DeltaCopy.spv)
-set(agcDeltaCopyShaderHeader ${agcTextureDetileGeneratedDir}/DeltaCopy_spv.h)
-add_custom_command(
-        OUTPUT "${agcDeltaCopyShaderHeader}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
-        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcDeltaCopyShaderSpv}" "${agcDeltaCopyShaderSource}"
-        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcDeltaCopyShaderSpv} -DOUTPUT=${agcDeltaCopyShaderHeader}
-        -DSYMBOL=DELTA_COPY_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
-        DEPENDS "${agcDeltaCopyShaderSource}" glslang-standalone
-        VERBATIM
-)
-
 foreach(agcPresentationStage IN ITEMS Vert Frag)
     string(TOLOWER "${agcPresentationStage}" agcPresentationExtension)
     string(TOUPPER "${agcPresentationStage}" agcPresentationSymbol)
@@ -252,7 +239,6 @@ set(agcDriverSources
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}
         ${agcMeshArgumentsShaderHeader}
-        ${agcDeltaCopyShaderHeader}
         ${agcGpuTimestampsShaderHeader}
         ${agcPresentationShaderHeaders}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
@@ -605,7 +591,6 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}
         ${agcMeshArgumentsShaderHeader}
-        ${agcDeltaCopyShaderHeader}
         ${agcGpuTimestampsShaderHeader}
         Execution/src/GuestMemory.cpp
         Execution/src/Pm4.cpp

@@ -112,36 +112,6 @@ public:
     // neither the mutex nor the recorder nor a particular thread. ~Recorder joins the release
     // thread and waits for every release in progress before the device goes.
     void Keep(std::shared_ptr<void> object);
-    // APS5_COPYBACK_BATCH=1 (local experiment): the copies back of staged regions (shadow -> import)
-    // are queued in the open batch instead of being recorded after each use, and recorded together
-    // (one barrier pair, one vkCmdCopyBuffer per source and destination) by FlushDeferredCopies,
-    // which every command recorded outside a deferral scope runs first: Commands() unless a
-    // DeferScope is held, the label and key store runs, Submit. Holders of a DeferScope (a
-    // dispatch that reads no import range a queued copy writes, the staging copy-ins) check their
-    // own import reads and writes against DeferredCopiesOverlap and flush when they touch one.
-    // Every reader of an import thus finds the copies recorded before it in queue order, and the
-    // batch's labels and fence follow them, so the CPU (which reads GPU results after a label or
-    // the batch's completion) never sees an import without them.
-    static bool CopyBackBatching();
-    // APS5_COPYBACK_DELTA=1 (implies the batching): a copy back queued with device addresses
-    // (shadow, reference, guest memory) is recorded as the DeltaCopy kernel instead of a copy:
-    // only the words that differ from the reference cross PCIe.
-    static bool CopyBackDelta();
-    void DeferDeltaCopyBack(VkBuffer source, VkDeviceAddress sourceAddress, VkDeviceAddress referenceAddress, VkBuffer destination, VkDeviceAddress destinationAddress, VkDeviceSize bytes, std::uint64_t guestAddress);
-    void DeferCopyBack(VkBuffer source, VkDeviceSize sourceOffset, VkBuffer destination, VkDeviceSize destinationOffset, VkDeviceSize bytes, std::uint64_t guestAddress);
-    bool DeferredCopiesOverlap(std::uint64_t address, std::size_t bytes) const;
-    bool HasDeferredCopies() const { return open != nullptr && !open->deferred.empty(); }
-    enum class CopyFlush : std::uint8_t { Commands, Submit, StoreRun, KeyStores, Dispatch, CopyIn, Conflict, Count };
-    void FlushDeferredCopies(CopyFlush reason);
-    class DeferScope {
-    public:
-        explicit DeferScope(Recorder& recorder) : recorder(recorder) { ++recorder.deferDepth; }
-        ~DeferScope() { --recorder.deferDepth; }
-        DeferScope(const DeferScope&) = delete;
-        DeferScope& operator=(const DeferScope&) = delete;
-    private:
-        Recorder& recorder;
-    };
     static void ReleaseLater(std::shared_ptr<void> object);
     static constexpr std::size_t ReleaseLaterGroup = 64;
     // Draw input snapshots (ShaderResources::PrepareDrawBindings) kept across draws: a recorded
@@ -705,20 +675,6 @@ private:
     void traceProgram();
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
-        // APS5_COPYBACK_BATCH: copies back queued by DeferCopyBack, with the guest range written.
-        struct DeferredCopy {
-            VkBuffer source;
-            VkDeviceSize sourceOffset;
-            VkBuffer destination;
-            VkDeviceSize destinationOffset;
-            VkDeviceSize bytes;
-            // APS5_COPYBACK_DELTA: non-zero for a delta copy (the offsets are then unused).
-            VkDeviceAddress sourceAddress = 0;
-            VkDeviceAddress referenceAddress = 0;
-            VkDeviceAddress destinationAddress = 0;
-        };
-        std::vector<DeferredCopy> deferred;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> deferredRanges;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::vector<std::function<void()>> completions;
@@ -918,16 +874,6 @@ private:
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
     // Commands() would close).
     std::uint32_t beginTiming(std::uint64_t key);
-    int deferDepth = 0;
-    int deltaCopyState = 0;
-    VkPipelineLayout deltaCopyLayout = VK_NULL_HANDLE;
-    VkPipeline deltaCopyPipeline = VK_NULL_HANDLE;
-    bool ensureDeltaCopy();
-    void queueDeferred(const Batch::DeferredCopy& entry, std::uint64_t guestAddress);
-public:
-    bool DeltaCopyAvailable() { return ensureDeltaCopy(); }
-private:
-    bool flushingDeferred = false;
     // Vulkan entry points resolved once (constructor): the loader's vkGetDeviceProcAddr is a name
     // lookup per call, paid by every reap, store and submit otherwise. APS5_NO_PROC_TABLE=1 leaves
     // them null and resolves per call as before; vkWaitSemaphoresKHR stays a lazy lookup (timeline

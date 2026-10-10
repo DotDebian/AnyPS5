@@ -1859,9 +1859,6 @@ void reportStaging() {
 // The copy-back is unchanged, so guest memory holds the results exactly as before.
 struct ResidentShadow {
     std::shared_ptr<Buffer> buffer;
-    // APS5_COPYBACK_DELTA: the shadow's range as the driver last made guest memory hold it (a
-    // copy-in fills both, a delta copy back updates the words it writes). Null: plain copies.
-    std::shared_ptr<Buffer> reference;
     std::uint64_t begin = 0;
     std::uint64_t end = 0;
     // Under GuestMemory::GpuMutex: the proof state of the last completed use.
@@ -1933,7 +1930,6 @@ std::shared_ptr<Buffer> takeStagingBuffer(const Context& context, std::uint64_t 
         }
         registry.entries.erase(found);
     }
-    if (Recorder::CopyBackDelta()) usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     auto buffer = stagingBuffer(context, bytes, usage);
     if (buffer == nullptr) {
         Residents().refused.fetch_add(1, std::memory_order_relaxed);
@@ -1943,7 +1939,6 @@ std::shared_ptr<Buffer> takeStagingBuffer(const Context& context, std::uint64_t 
     if (registry.entries.size() >= 4096) std::erase_if(registry.entries, [](const auto& entry) { return entry.second.expired(); });
     resident = std::make_shared<ResidentShadow>();
     resident->buffer = buffer;
-    if (Recorder::CopyBackDelta()) resident->reference = stagingBuffer(context, bytes, usage);
     resident->begin = begin;
     resident->end = end;
     registry.entries[key] = resident;
@@ -2328,7 +2323,6 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 region.deviceLocal = staged;
                 region.copySource = entry->buffer;
                 region.copySourceBase = entry->base;
-                region.copySourceAddress = entry->address;
             }
         }
         if (region.direct != nullptr) {
@@ -2468,9 +2462,6 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->FlushKeyStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
         recorder->FlushStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
-    // APS5_COPYBACK_BATCH: these copies read the imports only where a copy-in is made; such a
-    // range with a queued copy back gets it recorded first (below, before the copy).
-    const Recorder::DeferScope deferScope(*recorder);
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
@@ -2507,10 +2498,6 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             continue;
         }
         copiedBytes += bytes;
-        if (recorder->DeferredCopiesOverlap(region->begin, static_cast<std::size_t>(bytes))) {
-            recorder->FlushDeferredCopies(Recorder::CopyFlush::CopyIn);
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        }
         std::vector<std::byte> expected;
         const auto address = region->begin;
         const auto batch = static_cast<unsigned long long>(recorder->Submissions() + 1);
@@ -2535,10 +2522,6 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
-        if (region->deviceLocal && region->resident != nullptr && region->resident->buffer == region->buffer && region->resident->reference != nullptr) {
-            CopyBuffer(context, commands, copySource, copyOffset, region->resident->reference->Handle(), 0, bytes);
-            recorder->Keep(region->resident->reference);
-        }
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -2608,23 +2591,6 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
             if (from >= to) continue;
-            if (region.deviceLocal && Recorder::CopyBackBatching()) {
-                // Queued: recorded with the batch's other copies back before any reader of the import.
-                const auto* shadow = region.resident.get();
-                if (Recorder::CopyBackDelta() && recorder.DeltaCopyAvailable() && shadow != nullptr && shadow->buffer == region.buffer && shadow->reference != nullptr && region.copySourceAddress != 0 && (from - region.begin) % 4 == 0 && (to - from) % 4 == 0 && (from - region.copySourceBase) % 4 == 0) {
-                    recorder.DeferDeltaCopyBack(region.buffer->Handle(), region.buffer->DeviceAddress() + (from - region.begin), shadow->reference->DeviceAddress() + (from - region.begin), region.copySource, region.copySourceAddress + (from - region.copySourceBase), to - from, from);
-                    recorder.Keep(shadow->reference);
-                } else {
-                    recorder.DeferCopyBack(region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from, from);
-                    // The reference follows what guest memory now holds.
-                    if (shadow != nullptr && shadow->buffer == region.buffer && shadow->reference != nullptr) {
-                        recorder.DeferCopyBack(region.buffer->Handle(), from - region.begin, shadow->reference->Handle(), from - region.begin, to - from, from);
-                        recorder.Keep(shadow->reference);
-                    }
-                }
-                recorder.Keep(region.buffer);
-                continue;
-            }
             if (!recording) {
                 commands = recorder.Commands();
                 timing = recorder.BeginGpuTiming(StagingCopyBackKey);
