@@ -18,6 +18,9 @@ public:
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
     std::span<std::byte> Bytes();
     bool Mapped() const { return mapping != nullptr; }
+    // Whether the buffer's memory was allocated from a mappable video memory type: false for one
+    // asked for with VideoMemoryProperties() that fell back to system memory.
+    bool InVideoMemory() const { return video; }
     void Invalidate();
 
 private:
@@ -37,6 +40,7 @@ private:
     VkDeviceSize allocationBytes = 0;
     VkDeviceSize offset = 0;
     bool slab = false;
+    bool video = false;
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
     std::shared_ptr<BufferPool> cache;
@@ -50,6 +54,9 @@ private:
 // bit is clear, or a device without such a memory type, keeps the default.
 enum class GpuReadKind : unsigned { BdaTable = 1, DrawInput = 2, StorageCopy = 4, RegionCopy = 8, Mirror = 16, Fault = 32, MeshArguments = 64, Everything = 128 };
 VkMemoryPropertyFlags GpuReadProperties(GpuReadKind kind);
+// The properties of such video memory, whatever the mask says: for a buffer placed there by its own
+// switch (APS5_VRAM_MIRROR, see GuestBufferMemory.cpp). It falls back to system memory like the others.
+VkMemoryPropertyFlags VideoMemoryProperties();
 
 // Device-local scratch memory for GPU-side layout conversion. The detiler reads and writes scattered
 // elements, which crawls across PCIe, so guest bytes move between host and device buffers with DMA

@@ -3075,7 +3075,7 @@ GuestBufferMemory::SpaceLease GuestBufferMemory::AcquireShared(std::span<const G
         std::vector<ImageMirror*> heaps;
         for (const auto* region : sharedMirrors) {
             if (region->mirror->heap) {
-                if (heapRefreshDue(*region->mirror)) heaps.push_back(region->mirror.get());
+                heaps.push_back(region->mirror.get());
             }
             else if (region->mirror->writable && prepareRefresh(*region->mirror, region->begin, region->end - region->begin)) appendBlocks(blocks, *region->mirror, region->begin, region->end - region->begin);
         }
@@ -3092,7 +3092,6 @@ GuestBufferMemory::SpaceLease GuestBufferMemory::AcquireShared(std::span<const G
             sweepMirrors();
         }
         reportMirrors();
-        reportVramMirrors();
     }
     failure = SharedFailure::None;
     return current;

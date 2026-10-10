@@ -24,6 +24,8 @@ struct BufferAllocation {
     VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     VkDeviceSize offset = 0;
     bool slab = false;
+    // The memory came from a mappable video memory type (see Buffer::InVideoMemory).
+    bool video = false;
 };
 
 struct SlabSlot {
