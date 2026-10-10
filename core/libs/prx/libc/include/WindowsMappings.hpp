@@ -90,32 +90,30 @@ public:
             }
             return shared;
         };
+        const auto single = [&](std::size_t done) {
+            const auto& slot = slotOf(done);
+            const auto shared = slot.page.lock();
+            return !slot.stored && (!shared || shared->aliases.empty());
+        };
         for (std::size_t done = 0; done < bytes;) {
             const auto base = cursor + done;
-            if (pageOf(slotOf(done))->aliases.empty()) {
+            if (single(done)) {
                 auto runBytes = pageBytes;
-                while (done + runBytes < bytes && (base + runBytes) % chunkBytes != 0) {
-                    const auto next = slotOf(done + runBytes).page.lock();
-                    if (next && !next->aliases.empty()) break;
-                    runBytes += pageBytes;
-                }
+                while (done + runBytes < bytes && (base + runBytes) % chunkBytes != 0 && single(done + runBytes)) runBytes += pageBytes;
                 split(base, runBytes);
                 commitResident(base, runBytes);
                 residentRuns.emplace(base, Run{base + runBytes, {}, static_cast<std::uint32_t>(runBytes >> 12)});
-                Window window;
                 for (std::size_t at = 0; at < runBytes; at += pageBytes) {
                     auto& slot = slotOf(done + at);
                     const auto shared = pageOf(slot);
-                    if (slot.stored) {
-                        if (window.view == nullptr) window = open(section, offset + done, runBytes);
-                        commitSection(window.bytes + at);
-                        std::memcpy(reinterpret_cast<void*>(base + at), window.bytes + at, pageBytes);
+                    if (slot.saved) {
+                        std::memcpy(reinterpret_cast<void*>(base + at), slot.saved->bytes + slot.savedOffset, pageBytes);
+                        slot.saved.reset();
                     }
                     shared->aliases.push_back(base + at);
                     views.emplace(base + at, View{shared, protection, 0, false, owned, offset + done + at, 0, true, &slot});
                     invalidate(*shared);
                 }
-                close(window);
                 DWORD previous;
                 if (protection != PAGE_READWRITE && !VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect resident guest pages");
                 done += runBytes;
@@ -125,7 +123,7 @@ public:
             const auto shared = pageOf(slot);
             const auto aliases = shared->aliases;
             for (const auto alias : aliases) {
-                if (views.at(alias).resident) share(alias);
+                if (views.at(alias).resident) demote(alias);
             }
             split(base, pageBytes);
             mapShared(base, section, offset + done, protection);
@@ -188,6 +186,36 @@ public:
         return true;
     }
 
+    bool HandleRead(std::uintptr_t address) {
+        std::lock_guard lock(mutex);
+        if (!views.contains(address & ~(pageBytes - 1))) return false;
+        const auto memory = query(address);
+        return memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+    }
+
+    bool ResidentSpan(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end) {
+        std::lock_guard lock(mutex);
+        auto run = residentRuns.upper_bound(address);
+        if (run != residentRuns.begin() && std::prev(run)->second.end > address) --run;
+        if (run == residentRuns.end() || run->first >= address + bytes) return false;
+        *start = run->first;
+        for (; run != residentRuns.end() && run->first < address + bytes; ++run) *end = run->second.end;
+        return true;
+    }
+
+    void ForgetSection(HANDLE section) {
+        std::lock_guard lock(mutex);
+        const auto key = reinterpret_cast<std::uintptr_t>(section);
+        for (auto slot = physical.lower_bound(std::make_pair(key, std::uint64_t{0})); slot != physical.end() && slot->first.first == key;) {
+            const auto shared = slot->second.page.lock();
+            if (shared && !shared->aliases.empty()) {
+                ++slot;
+                continue;
+            }
+            slot = physical.erase(slot);
+        }
+    }
+
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
         std::lock_guard lock(mutex);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
@@ -226,7 +254,13 @@ public:
         if (address % pageBytes != 0 || bytes % pageBytes != 0 || bytes == 0) throw refuse("the range is not made of whole shared pages");
         for (std::size_t done = 0; done < bytes; done += pageBytes) {
             const auto found = views.find(address + done);
-            if (found != views.end() && found->second.resident) share(address + done);
+            if (found == views.end() || !found->second.resident) continue;
+            const auto run = std::prev(residentRuns.upper_bound(address + done));
+            if (run->first < address || run->second.end > address + bytes) return nullptr;
+        }
+        for (std::size_t done = 0; done < bytes; done += pageBytes) {
+            const auto found = views.find(address + done);
+            if (found != views.end() && found->second.resident) demote(address + done);
         }
         auto view = views.find(address);
         if (view == views.end()) throw refuse("the range does not start at a shared view");
@@ -282,6 +316,7 @@ public:
             const auto base = cursor & ~(pageBytes - 1);
             const auto found = views.find(base);
             if (found != views.end() && found->second.resident) {
+                if (!watchResident) return false;
                 const auto run = std::prev(residentRuns.upper_bound(cursor));
                 auto& state = run->second;
                 const auto stop = std::min(end, state.end);
@@ -296,7 +331,7 @@ public:
                     }
                     for (auto at = cursor; at < stop; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
                     if (clear) {
-                        if (watchResident && ResetWriteWatch(reinterpret_cast<void*>(cursor), stop - cursor) != 0) fail("reset resident guest writes");
+                        if (ResetWriteWatch(reinterpret_cast<void*>(cursor), stop - cursor) != 0) fail("reset resident guest writes");
                         for (auto bit = firstBit; bit <= lastBit; ++bit) {
                             auto& word = state.collected[bit >> 6];
                             if ((word >> (bit & 63) & 1) != 0) continue;
@@ -360,7 +395,7 @@ private:
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
             if (const auto found = views.find(base); found != views.end()) {
-                if (found->second.protection == PAGE_NOACCESS) return false;
+                if (found->second.protection == PAGE_NOACCESS || (found->second.resident && !watchResident)) return false;
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
@@ -385,9 +420,18 @@ private:
         Section& operator=(const Section&) = delete;
         ~Section() { CloseHandle(handle); }
     };
+    struct Saved {
+        unsigned char* bytes;
+        explicit Saved(unsigned char* bytes) : bytes(bytes) {}
+        Saved(const Saved&) = delete;
+        Saved& operator=(const Saved&) = delete;
+        ~Saved() { VirtualFree(bytes, 0, MEM_RELEASE); }
+    };
     struct Physical {
         std::weak_ptr<SharedPage> page;
         bool stored = false;
+        std::shared_ptr<Saved> saved;
+        std::size_t savedOffset = 0;
     };
     struct View {
         std::shared_ptr<SharedPage> page;
@@ -424,10 +468,6 @@ private:
         window = {};
     }
 
-    static void commitSection(void* page) {
-        if (!VirtualAlloc(page, pageBytes, MEM_COMMIT, PAGE_READWRITE)) fail("commit a direct memory page");
-    }
-
     void commitResident(std::uintptr_t base, std::size_t bytes) {
         const DWORD flags = MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | (watchResident ? MEM_WRITE_WATCH : 0);
         if (!allocate(GetCurrentProcess(), reinterpret_cast<void*>(base), bytes, flags, PAGE_READWRITE, nullptr, 0)) fail("replace guest placeholder with resident direct memory");
@@ -449,71 +489,64 @@ private:
         return true;
     }
 
-    void cut(std::uintptr_t at) {
-        auto it = residentRuns.upper_bound(at);
-        if (it == residentRuns.begin()) return;
-        --it;
-        const auto start = it->first;
-        const auto stop = it->second.end;
-        if (at <= start || at >= stop) return;
+    void demote(std::uintptr_t address) {
+        const auto run = std::prev(residentRuns.upper_bound(address));
+        const auto start = run->first;
+        const auto stop = run->second.end;
         DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READWRITE, &previous)) fail("open resident guest pages");
-        const std::vector<unsigned char> bytes(reinterpret_cast<const unsigned char*>(start), reinterpret_cast<const unsigned char*>(stop));
+        if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
+        const auto section = views.at(start).section;
+        auto window = open(section->handle, views.at(start).offset, stop - start);
+        if (!VirtualAlloc(window.bytes, stop - start, MEM_COMMIT, PAGE_READWRITE)) fail("commit direct memory pages");
+        std::memcpy(window.bytes, reinterpret_cast<const void*>(start), stop - start);
+        close(window);
         if (!VirtualFree(reinterpret_cast<void*>(start), stop - start, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release resident guest pages");
-        if (!VirtualFree(reinterpret_cast<void*>(start), at - start, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("split resident guest placeholder");
-        commitResident(start, at - start);
-        commitResident(at, stop - at);
-        std::memcpy(reinterpret_cast<void*>(start), bytes.data(), bytes.size());
         for (auto page = start; page < stop; page += pageBytes) {
-            const auto protection = views.at(page).protection;
-            if (protection != PAGE_READWRITE && !VirtualProtect(reinterpret_cast<void*>(page), pageBytes, protection, &previous)) fail("protect resident guest pages");
+            auto& view = views.at(page);
+            split(page, pageBytes);
+            mapShared(page, view.section->handle, view.offset, view.protection);
+            view.slot->stored = true;
+            view.resident = false;
+            view.seen = 0;
+            view.armed = false;
+            invalidate(*view.page);
         }
-        residentRuns.erase(it);
-        residentRuns.emplace(start, Run{at, {}, static_cast<std::uint32_t>((at - start) >> 12)});
-        residentRuns.emplace(at, Run{stop, {}, static_cast<std::uint32_t>((stop - at) >> 12)});
+        residentRuns.erase(run);
     }
 
-    void share(std::uintptr_t base) {
-        cut(base);
-        cut(base + pageBytes);
-        auto& view = views.at(base);
-        DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, PAGE_READWRITE, &previous)) fail("open a resident guest page");
-        auto window = open(view.section->handle, view.offset, pageBytes);
-        commitSection(window.bytes);
-        std::memcpy(window.bytes, reinterpret_cast<const void*>(base), pageBytes);
-        close(window);
-        view.slot->stored = true;
-        if (!VirtualFree(reinterpret_cast<void*>(base), pageBytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release a resident guest page");
-        residentRuns.erase(base);
-        mapShared(base, view.section->handle, view.offset, view.protection);
-        view.resident = false;
-        view.seen = 0;
-        view.armed = false;
-        invalidate(*view.page);
+    void breakRun(std::uintptr_t at) {
+        const auto next = residentRuns.upper_bound(at);
+        if (next == residentRuns.begin()) return;
+        const auto run = std::prev(next);
+        if (at > run->first && at < run->second.end) demote(at);
     }
 
     void evict(std::map<std::uintptr_t, Run>::iterator run) {
         const auto start = run->first;
         const auto stop = run->second.end;
         DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READWRITE, &previous)) fail("open resident guest pages");
-        const auto section = views.at(start).section;
-        auto window = open(section->handle, views.at(start).offset, stop - start);
+        if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("open resident guest pages");
+        std::shared_ptr<Saved> saved;
         for (auto page = start; page < stop; page += pageBytes) {
             const auto found = views.find(page);
             auto& view = found->second;
-            if (view.slot->stored || !blank(page)) {
-                commitSection(window.bytes + (page - start));
-                std::memcpy(window.bytes + (page - start), reinterpret_cast<const void*>(page), pageBytes);
-                view.slot->stored = true;
+            if (!blank(page)) {
+                if (!saved) {
+                    auto* bytes = static_cast<unsigned char*>(VirtualAlloc(nullptr, stop - start, MEM_RESERVE, PAGE_READWRITE));
+                    if (bytes == nullptr) fail("reserve unmapped direct memory");
+                    saved = std::make_shared<Saved>(bytes);
+                }
+                if (!VirtualAlloc(saved->bytes + (page - start), pageBytes, MEM_COMMIT, PAGE_READWRITE)) fail("keep unmapped direct memory");
+                std::memcpy(saved->bytes + (page - start), reinterpret_cast<const void*>(page), pageBytes);
+                view.slot->saved = saved;
+                view.slot->savedOffset = page - start;
             }
             std::erase(view.page->aliases, page);
             views.erase(found);
         }
-        close(window);
         residentRuns.erase(run);
     }
+
     void forgetClean(std::uintptr_t start, std::uintptr_t end) {
         auto it = cleanRanges.lower_bound(start);
         if (it != cleanRanges.begin() && std::prev(it)->second > start) --it;
@@ -593,8 +626,8 @@ private:
     void reset(std::uintptr_t address, std::size_t bytes) {
         const auto end = address + bytes;
         forgetClean(address, end);
-        cut(address);
-        cut(end);
+        breakRun(address);
+        breakRun(end);
         for (auto cursor = address; cursor < end;) {
             const auto memory = query(cursor);
             if (memory.State == MEM_RESERVE) {
