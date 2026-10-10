@@ -444,7 +444,10 @@ public:
                 const auto memory = query(cursor);
                 if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
-                ULONG_PTR available = capacity - *count;
+                // A buffer sized to the range, not to the caller's capacity: GetWriteWatch's cost
+                // follows the entry count it is given (about 7 us for 65536 entries against 0.5 us
+                // for the 16 of a 64 KiB range), and the range cannot report more pages than it has.
+                ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, (stop - cursor + 4095) / 4096);
                 if (available == 0) return true;
                 DWORD granularity = 0;
                 const auto watchStart = now();
