@@ -113,6 +113,8 @@ void Driver::execute(const Submission& submission) {
     thread_local PacketProfile* packetProfileSlot = nullptr;
     auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
     ++packetProfile.submissions;
+    static const bool lightTimes = std::getenv("APS5_PROFILE_PACKETS") != nullptr;
+    thread_local LightPacketTimes lightPacketTimes;
 
     bumpEpoch(&EpochBumps::submissions, GuestMemory::EpochReason::Submission);
     struct AheadScope {
@@ -140,8 +142,10 @@ void Driver::execute(const Submission& submission) {
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
 
-        const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto flushStart = profilePackets || lightTimes ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
+        LightPacketTimer lightTimer{lightTimes, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, lightPacketTimes, lightTimes ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
+        if (lightTimes) lightPacketTimes.flushMs += std::chrono::duration<double, std::milli>(lightTimer.start - flushStart).count();
         PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, std::chrono::steady_clock::now()};
 
         if (profilePackets) {

@@ -5,6 +5,31 @@
 
 namespace AgcDriver::DriverDetail {
 
+LightPacketTimer::~LightPacketTimer() {
+    if (!enabled) return;
+    const auto now = std::chrono::steady_clock::now();
+    auto& entry = times.byOpcode[key];
+    ++entry.first;
+    entry.second += std::chrono::duration<double, std::milli>(now - start).count();
+    const auto window = std::chrono::duration<double>(now - times.lastReport).count();
+    if (window < 10.0) return;
+    times.lastReport = now;
+    std::vector<std::pair<std::uint32_t, std::pair<std::uint64_t, double>>> hot(times.byOpcode.begin(), times.byOpcode.end());
+    std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    std::string report;
+    double total = times.flushMs;
+    for (std::size_t i = 0; i < hot.size(); ++i) {
+        total += hot[i].second.second;
+        if (i >= 12) continue;
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s x%llu %.0fms", hot[i].first == 0xffffu ? "flip" : Pm4::Name(hot[i].first << 8u).c_str(), static_cast<unsigned long long>(hot[i].second.first), hot[i].second.second);
+        report += text;
+    }
+    AgcDriver::ReportLine("[packet-times] queue 0x%x, %.1f s: %.0f ms in packets and the flushes between them, %.0f ms outside (waiting for a submission, its start and end);%s; flushes between packets %.0fms\n", queue, window, total, window * 1000.0 - total, report.c_str(), times.flushMs);
+    times.byOpcode.clear();
+    times.flushMs = 0;
+}
+
 PacketTimer::~PacketTimer() {
     if (!enabled) return;
     const auto now = std::chrono::steady_clock::now();

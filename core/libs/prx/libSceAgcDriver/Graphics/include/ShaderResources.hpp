@@ -343,7 +343,8 @@ public:
     // attached first and bounded; an attach under a key replaces that key's plan. Under
     // GuestMemory::GpuMutex.
     std::shared_ptr<const DrawRecipe> FindPlan(std::uint64_t planKey) const;
-    void AttachPlan(std::uint64_t planKey, std::shared_ptr<const DrawRecipe> plan);
+    // True when the attach put the oldest plan out (the template was full).
+    bool AttachPlan(std::uint64_t planKey, std::shared_ptr<const DrawRecipe> plan);
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken

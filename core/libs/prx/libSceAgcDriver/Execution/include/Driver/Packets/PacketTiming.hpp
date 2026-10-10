@@ -29,6 +29,20 @@ struct PacketProfile {
     std::array<std::pair<std::uint64_t, double>, static_cast<std::size_t>(DispatchOutcome::Count)> dispatchOutcomes{};
 };
 
+// APS5_PROFILE_PACKETS=1: the worker's time by packet kind, one [packet-times] line per queue
+// every 10 s. Two clock reads per packet and nothing else, unlike APS5_PROFILE_DRAW's rows, so
+// the frame rate under it is the frame rate.
+struct LightPacketTimes {
+    std::map<std::uint32_t, std::pair<std::uint64_t, double>> byOpcode;
+    double flushMs = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+struct LightPacketTimer {
+    bool enabled; std::uint32_t key; std::uint32_t queue; LightPacketTimes& times; std::chrono::steady_clock::time_point start;
+    ~LightPacketTimer();
+};
+
 struct PacketTimer {
     bool enabled; std::uint32_t key; std::uint32_t queue; PacketProfile& profile; std::chrono::steady_clock::time_point start;
     ~PacketTimer();
